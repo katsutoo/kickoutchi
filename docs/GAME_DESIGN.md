@@ -100,3 +100,14 @@ Safe examples:
 - Premium should unlock cosmetics, decorations, vanity effects.
 - Premium must not improve progression speed or social power.
 - Core gameplay stays fully accessible for free users.
+
+---
+
+## Landing page
+
+- Use ASCIIgen.art animations for the public landing page hero and visual accents.
+- ASCIIgen ships a React component and plain-text frame files at 3 quality tiers (L/M/H).
+- Port the rendering logic to a native Svelte 5 component (`ASCIIAnimation.svelte`) instead of pulling in React.
+- Key features to reimplement: frame cycling at configurable FPS, auto-scaling to container, IntersectionObserver pause, `prefers-reduced-motion` respect, quality prop with fallback.
+- Animation frame assets live in the SvelteKit app (e.g. `static/animations/` or `$lib/animations/`).
+- Pick animations from the included library or generate custom ones with the ASCIIgen live editor.
