@@ -49,7 +49,6 @@ go.work.sum
 /build/
 /api/tmp/
 /api/bin/*
-!/api/bin/.gitkeep
 
 # Go local caches/profiling artifacts (when repo-local)
 /.gocache/
