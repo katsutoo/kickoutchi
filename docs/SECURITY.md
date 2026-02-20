@@ -128,13 +128,13 @@ Network boundary rule:
 
 ## Secure release checklist
 
-- [ ] `go test ./...` and `go test -race ./...` pass
-- [ ] `go vet`, `staticcheck`, and `govulncheck` pass
+- [x] `go test ./...` and `go test -race ./...` pass
+- [x] `go vet`, `staticcheck`, and `govulncheck` pass
 - [ ] Cookie flags verified in production config
-- [ ] CSRF protections verified for state-changing cookie-auth routes
+- [x] CSRF protections verified for state-changing cookie-auth routes
 - [ ] WebSocket origin allowlist configured
 - [ ] WebSocket message-size and rate-limit protections configured
 - [ ] Polar webhook signature verification enabled
-- [ ] R2 upload validation (type, magic bytes, size) verified
+- [ ] R2 upload validation (type, magic bytes, size) verified (implemented in API; live bucket verification pending)
 - [ ] Resend DNS auth (SPF/DKIM/DMARC) validated
 - [ ] Backup restore test completed in staging

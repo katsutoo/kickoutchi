@@ -9,12 +9,12 @@ Each phase is intentionally small and shippable. Do not build Phase N+1 infrastr
 **Goal:** users can create accounts, log in, and manage basic profile data.
 
 **Backend**
-- [ ] Bootstrap Go API with Chi, pgx, sqlc, Goose, slog
-- [ ] Email/password auth with Argon2id
-- [ ] OAuth login: GitHub, Google, X
-- [ ] Resend integration for transactional auth email flows
-- [ ] Session management (httpOnly secure cookies)
-- [ ] User profile CRUD (display name, avatar metadata)
+- [x] Bootstrap Go API with Chi, pgx, sqlc, Goose, slog
+- [x] Email/password auth with Argon2id
+- [ ] OAuth login: GitHub, Google, X (GitHub implemented; Google/X pending)
+- [x] Resend integration for transactional auth email flows
+- [x] Session management (httpOnly secure cookies)
+- [x] User profile CRUD (display name, avatar metadata)
 
 **Frontend**
 - [ ] SvelteKit app shell with route groups `(public)` and `(app)`
@@ -27,17 +27,17 @@ Each phase is intentionally small and shippable. Do not build Phase N+1 infrastr
 - [ ] CI baseline: lint, typecheck, tests, build
 
 **Security gates**
-- [ ] Session cookies set with `HttpOnly`, `Secure`, `SameSite`
-- [ ] Session rotation on login and password reset
-- [ ] Auth endpoints protected by per-IP and per-account rate limits
-- [ ] CSRF controls enabled for state-changing cookie-auth routes
-- [ ] Request validation enforced on all auth/profile handlers
-- [ ] No plaintext secrets in repo or logs
+- [x] Session cookies set with `HttpOnly`, `Secure`, `SameSite`
+- [x] Session rotation on login and password reset
+- [x] Auth endpoints protected by per-IP and per-account rate limits
+- [x] CSRF controls enabled for state-changing cookie-auth routes
+- [x] Request validation enforced on all auth/profile handlers
+- [x] No plaintext secrets in repo or logs
 
 **Validation checkpoints**
-- [ ] Register, verify email, login, logout all work
+- [ ] Register, verify email, login, logout all work (verify-email end-to-end with real provider still pending)
 - [ ] OAuth login works for at least one provider end-to-end
-- [ ] Protected routes reject unauthenticated access
+- [x] Protected routes reject unauthenticated access
 
 ---
 

@@ -46,9 +46,19 @@ func run() error {
 	defer db.Close()
 
 	healthHandler := handler.NewHealthHandler(db, cfg.HTTP.ReadyTimeout)
+	authComponents, err := newAuthComponents(cfg, db, logger)
+	if err != nil {
+		return fmt.Errorf("initialize auth components: %w", err)
+	}
+
 	httpHandler := router.New(router.Dependencies{
-		Logger:        logger,
-		HealthHandler: healthHandler,
+		Logger:               logger,
+		HealthHandler:        healthHandler,
+		AuthHandler:          authComponents.Handler,
+		AuthRequired:         authComponents.RequireAuth,
+		CSRFProtection:       authComponents.CSRFProtection,
+		AuthIPRateLimit:      authComponents.AuthIPRateLimit,
+		AuthAccountRateLimit: authComponents.AuthAccountRateLimit,
 	})
 
 	server := &http.Server{

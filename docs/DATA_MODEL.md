@@ -16,7 +16,7 @@ Use PostgreSQL for all persistent domains from day one (auth, gameplay, social, 
 ## Phase 1 tables (Auth + Accounts)
 
 - `users`
-  - `id`, `email`, `password_hash`, `display_name`, `role`, `inserted_at`, `updated_at`
+  - `id`, `email`, `password_hash`, `display_name`, `role`, `email_verified_at`, `avatar_metadata`, `inserted_at`, `updated_at`
 - `oauth_identities`
   - `id`, `user_id`, `provider`, `provider_uid`, `provider_email`
   - launch default: do not store provider access/refresh tokens

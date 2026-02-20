@@ -13,8 +13,13 @@ import (
 )
 
 type Dependencies struct {
-	Logger        *slog.Logger
-	HealthHandler *handler.HealthHandler
+	Logger               *slog.Logger
+	HealthHandler        *handler.HealthHandler
+	AuthHandler          *handler.AuthHandler
+	AuthRequired         func(http.Handler) http.Handler
+	CSRFProtection       func(http.Handler) http.Handler
+	AuthIPRateLimit      func(http.Handler) http.Handler
+	AuthAccountRateLimit func(http.Handler) http.Handler
 }
 
 func New(deps Dependencies) http.Handler {
@@ -22,6 +27,10 @@ func New(deps Dependencies) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
+
+	authIPRateLimit := ensureMiddleware(deps.AuthIPRateLimit)
+	authAccountRateLimit := ensureMiddleware(deps.AuthAccountRateLimit)
+	csrfProtection := ensureMiddleware(deps.CSRFProtection)
 
 	r := chi.NewRouter()
 
@@ -48,5 +57,48 @@ func New(deps Dependencies) http.Handler {
 		r.Get("/health/ready", deps.HealthHandler.Ready)
 	}
 
+	if deps.AuthHandler != nil {
+		r.Route("/v1", func(r chi.Router) {
+			r.Route("/auth", func(r chi.Router) {
+				r.With(authIPRateLimit, authAccountRateLimit).Post("/register", deps.AuthHandler.Register)
+				r.With(authIPRateLimit, authAccountRateLimit).Post("/login", deps.AuthHandler.Login)
+				r.With(authIPRateLimit).Post("/forgot-password", deps.AuthHandler.ForgotPassword)
+				r.With(authIPRateLimit).Post("/reset-password", deps.AuthHandler.ResetPassword)
+				r.With(authIPRateLimit).Post("/verify-email", deps.AuthHandler.VerifyEmail)
+				r.Get("/oauth/{provider}/start", deps.AuthHandler.OAuthStart)
+				r.Get("/oauth/{provider}/callback", deps.AuthHandler.OAuthCallback)
+
+				if deps.AuthRequired != nil {
+					r.Group(func(r chi.Router) {
+						r.Use(deps.AuthRequired)
+						r.With(csrfProtection).Post("/logout", deps.AuthHandler.Logout)
+						r.With(csrfProtection).Post("/resend-verification", deps.AuthHandler.ResendVerification)
+					})
+				}
+			})
+
+			if deps.AuthRequired != nil {
+				r.Group(func(r chi.Router) {
+					r.Use(deps.AuthRequired)
+					r.Get("/me", deps.AuthHandler.Me)
+					r.With(csrfProtection).Patch("/me", deps.AuthHandler.UpdateMe)
+					r.With(csrfProtection).Post("/me/avatar/upload-url", deps.AuthHandler.CreateAvatarUploadURL)
+					r.With(csrfProtection).Post("/me/avatar/confirm", deps.AuthHandler.ConfirmAvatarUpload)
+					r.With(csrfProtection).Delete("/me/avatar", deps.AuthHandler.DeleteAvatar)
+				})
+			}
+		})
+	}
+
 	return r
+}
+
+func ensureMiddleware(mw func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	if mw != nil {
+		return mw
+	}
+
+	return func(next http.Handler) http.Handler {
+		return next
+	}
 }

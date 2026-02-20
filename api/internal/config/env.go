@@ -32,8 +32,8 @@ func LoadDotEnv(path string) error {
 			continue
 		}
 
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		if lineWithoutExport, ok := strings.CutPrefix(line, "export "); ok {
+			line = strings.TrimSpace(lineWithoutExport)
 		}
 
 		key, value, ok := strings.Cut(line, "=")

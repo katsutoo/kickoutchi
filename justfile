@@ -29,6 +29,12 @@ api-air:
 api-test:
 	cd {{api_dir}} && go test ./...
 
+api-seed:
+	cd {{api_dir}} && go run ./cmd/seed
+
+api-db-reset:
+	cd {{api_dir}} && set -a && source ".env" && set +a && goose -dir sql/schema postgres "$DATABASE_URL" reset && goose -dir sql/schema postgres "$DATABASE_URL" up && go run ./cmd/seed
+
 api-race:
 	cd {{api_dir}} && go test -race ./...
 
@@ -39,10 +45,10 @@ api-tidy:
 	cd {{api_dir}} && go mod tidy
 
 api-sqlc:
-	cd {{api_dir}} && sqlc generate
+	cd {{api_dir}} && sqlc generate -f sql/sqlc.yaml
 
 api-goose-up:
-	cd {{api_dir}} && goose -dir sql/schema postgres "$$DATABASE_URL" up
+	cd {{api_dir}} && goose -dir sql/schema postgres "$DATABASE_URL" up
 
 api-goose-down:
-	cd {{api_dir}} && goose -dir sql/schema postgres "$$DATABASE_URL" down
+	cd {{api_dir}} && goose -dir sql/schema postgres "$DATABASE_URL" down

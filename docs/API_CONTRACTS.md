@@ -46,10 +46,15 @@ Error:
 - `POST /v1/auth/logout`
 - `POST /v1/auth/forgot-password`
 - `POST /v1/auth/reset-password`
+- `POST /v1/auth/verify-email`
+- `POST /v1/auth/resend-verification`
 - `GET /v1/auth/oauth/:provider/start`
 - `GET /v1/auth/oauth/:provider/callback`
 - `GET /v1/me`
 - `PATCH /v1/me`
+- `POST /v1/me/avatar/upload-url`
+- `POST /v1/me/avatar/confirm`
+- `DELETE /v1/me/avatar`
 
 ---
 
