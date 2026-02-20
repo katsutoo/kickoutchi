@@ -35,7 +35,7 @@ Each phase is intentionally small and shippable. Do not build Phase N+1 infrastr
 - [x] No plaintext secrets in repo or logs
 
 **Validation checkpoints**
-- [ ] Register, verify email, login, logout all work (verify-email end-to-end with real provider still pending)
+- [x] Register, verify email, login, logout all work
 - [ ] OAuth login works for at least one provider end-to-end
 - [x] Protected routes reject unauthenticated access
 

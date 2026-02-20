@@ -26,8 +26,11 @@ air-install:
 api-air:
 	cd {{api_dir}} && air -c air.toml
 
+api-test-integration:
+	cd {{api_dir}} && go test -count=1 -tags=integration ./test/integration/...
+
 api-test:
-	cd {{api_dir}} && go test ./...
+	cd {{api_dir}} && go test ./... && go test -count=1 -tags=integration ./test/integration/...
 
 api-seed:
 	cd {{api_dir}} && go run ./cmd/seed
