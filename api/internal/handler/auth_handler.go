@@ -6,20 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	validatorv10 "github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 
 	"github.com/katsutoo/kickoutchi/api/internal/apierror"
 	"github.com/katsutoo/kickoutchi/api/internal/auth"
-	appmiddleware "github.com/katsutoo/kickoutchi/api/internal/middleware"
 	"github.com/katsutoo/kickoutchi/api/internal/service"
+	"github.com/katsutoo/kickoutchi/api/internal/sessioncookie"
 )
 
 const (
@@ -48,13 +49,7 @@ type requestValidator interface {
 	Struct(value any) error
 }
 
-type SessionCookieConfig struct {
-	Name     string
-	Domain   string
-	Secure   bool
-	SameSite string
-	TTL      time.Duration
-}
+type SessionCookieConfig = sessioncookie.Config
 
 type AuthHandler struct {
 	authService   authService
@@ -62,6 +57,7 @@ type AuthHandler struct {
 	sessionCookie SessionCookieConfig
 	webBaseURL    string
 	oauthStateTTL time.Duration
+	logger        *slog.Logger
 }
 
 type registerRequest struct {
@@ -135,21 +131,20 @@ func NewAuthHandler(
 	sessionCookie SessionCookieConfig,
 	webBaseURL string,
 	oauthStateTTL time.Duration,
+	logger *slog.Logger,
 ) *AuthHandler {
 	if validator == nil {
 		validator = noopRequestValidator{}
 	}
 
-	if sessionCookie.Name == "" {
-		sessionCookie.Name = "kickoutchi_session"
-	}
-
-	if sessionCookie.TTL <= 0 {
-		sessionCookie.TTL = 30 * 24 * time.Hour
-	}
+	sessionCookie = sessioncookie.NormalizeConfig(sessionCookie)
 
 	if oauthStateTTL <= 0 {
 		oauthStateTTL = defaultOAuthStateTTL
+	}
+
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	trimmedWebBaseURL := strings.TrimRight(strings.TrimSpace(webBaseURL), "/")
@@ -163,453 +158,8 @@ func NewAuthHandler(
 		sessionCookie: sessionCookie,
 		webBaseURL:    trimmedWebBaseURL,
 		oauthStateTTL: oauthStateTTL,
+		logger:        logger,
 	}
-}
-
-func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
-	var req registerRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	result, err := h.authService.Register(r.Context(), service.RegisterInput{
-		Email:       req.Email,
-		Password:    req.Password,
-		DisplayName: req.DisplayName,
-		RemoteIP:    requestRemoteIP(r.RemoteAddr),
-		UserAgent:   r.UserAgent(),
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidRegisterInput):
-			writeInvalidRequest(w, err)
-		case errors.Is(err, service.ErrEmailAlreadyInUse):
-			writeConflict(w, "EMAIL_ALREADY_IN_USE", "email is already in use", err)
-		case errors.Is(err, service.ErrDisplayNameAlreadyInUse):
-			writeConflict(w, "DISPLAY_NAME_ALREADY_IN_USE", "display name is already in use", err)
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	h.setSessionCookie(w, result.Session.Token, result.Session.ExpiresAt)
-
-	_ = apierror.WriteJSON(w, http.StatusCreated, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(result.User)},
-	})
-}
-
-func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
-	var req loginRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	currentSessionToken := h.currentSessionToken(r)
-
-	result, err := h.authService.Login(r.Context(), service.LoginInput{
-		Email:               req.Email,
-		Password:            req.Password,
-		CurrentSessionToken: currentSessionToken,
-		RemoteIP:            requestRemoteIP(r.RemoteAddr),
-		UserAgent:           r.UserAgent(),
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidLoginInput):
-			writeInvalidRequest(w, err)
-		case errors.Is(err, service.ErrInvalidCredentials):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "INVALID_CREDENTIALS", "invalid email or password", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	h.setSessionCookie(w, result.Session.Token, result.Session.ExpiresAt)
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(result.User)},
-	})
-}
-
-func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	if err := h.authService.Logout(r.Context(), h.currentSessionToken(r)); err != nil {
-		writeInternalError(w, err)
-		return
-	}
-
-	h.clearSessionCookie(w)
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[actionStatusResponse]{
-		Data: actionStatusResponse{Status: "ok"},
-	})
-}
-
-func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
-	var req forgotPasswordRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	if err := h.authService.ForgotPassword(r.Context(), req.Email); err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidForgotPasswordInput):
-			writeInvalidRequest(w, err)
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[actionStatusResponse]{
-		Data: actionStatusResponse{Status: "ok"},
-	})
-}
-
-func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
-	var req resetPasswordRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	if err := h.authService.ResetPassword(r.Context(), req.Token, req.Password); err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidResetPasswordInput):
-			writeInvalidRequest(w, err)
-		case errors.Is(err, service.ErrInvalidOrExpiredResetToken):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "INVALID_OR_EXPIRED_TOKEN", "token is invalid or expired", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[actionStatusResponse]{
-		Data: actionStatusResponse{Status: "ok"},
-	})
-}
-
-func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
-	var req verifyEmailRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	if err := h.authService.VerifyEmail(r.Context(), req.Token); err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidVerifyEmailInput):
-			writeInvalidRequest(w, err)
-		case errors.Is(err, service.ErrInvalidOrExpiredVerificationToken):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "INVALID_OR_EXPIRED_TOKEN", "token is invalid or expired", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[actionStatusResponse]{
-		Data: actionStatusResponse{Status: "ok"},
-	})
-}
-
-func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	if err := h.authService.ResendVerificationEmail(r.Context(), authSession.ID); err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidSession):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[actionStatusResponse]{
-		Data: actionStatusResponse{Status: "ok"},
-	})
-}
-
-func (h *AuthHandler) OAuthStart(w http.ResponseWriter, r *http.Request) {
-	provider := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "provider")))
-	if provider != "github" {
-		apierror.WriteError(w, apierror.New(http.StatusBadRequest, "INVALID_OAUTH_PROVIDER", "invalid oauth provider", service.ErrInvalidOAuthProvider))
-		return
-	}
-
-	state, err := h.generateOAuthState()
-	if err != nil {
-		writeInternalError(w, err)
-		return
-	}
-
-	authorizationURL, err := h.authService.GitHubAuthorizationURL(state)
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrOAuthUnavailable):
-			apierror.WriteError(w, apierror.New(http.StatusServiceUnavailable, "OAUTH_UNAVAILABLE", "oauth provider unavailable", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	h.setOAuthStateCookie(w, state)
-	http.Redirect(w, r, authorizationURL, http.StatusFound)
-}
-
-func (h *AuthHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
-	provider := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "provider")))
-	if provider != "github" {
-		h.redirectOAuthError(w, r, "invalid_provider")
-		return
-	}
-
-	state := strings.TrimSpace(r.URL.Query().Get("state"))
-	if !h.validateOAuthState(r, state) {
-		h.clearOAuthStateCookie(w)
-		h.redirectOAuthError(w, r, "invalid_state")
-		return
-	}
-	h.clearOAuthStateCookie(w)
-
-	result, err := h.authService.LoginWithOAuth(r.Context(), service.OAuthLoginInput{
-		Provider:            provider,
-		Code:                strings.TrimSpace(r.URL.Query().Get("code")),
-		CurrentSessionToken: h.currentSessionToken(r),
-		RemoteIP:            requestRemoteIP(r.RemoteAddr),
-		UserAgent:           r.UserAgent(),
-	})
-	if err != nil {
-		h.redirectOAuthError(w, r, "oauth_failed")
-		return
-	}
-
-	h.setSessionCookie(w, result.Session.Token, result.Session.ExpiresAt)
-	http.Redirect(w, r, h.webBaseURL, http.StatusFound)
-}
-
-func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(authSession)},
-	})
-}
-
-func (h *AuthHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	var req updateProfileRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	var avatarMetadata *json.RawMessage
-	if req.AvatarMetadata != nil {
-		avatarMetadata = &req.AvatarMetadata
-	}
-
-	updatedUser, err := h.authService.UpdateProfile(r.Context(), service.UpdateProfileInput{
-		UserID:         authSession.ID,
-		DisplayName:    req.DisplayName,
-		AvatarMetadata: avatarMetadata,
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidProfileUpdateInput):
-			writeInvalidRequest(w, err)
-		case errors.Is(err, service.ErrDisplayNameAlreadyInUse):
-			writeConflict(w, "DISPLAY_NAME_ALREADY_IN_USE", "display name is already in use", err)
-		case errors.Is(err, service.ErrInvalidSession):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(updatedUser)},
-	})
-}
-
-func (h *AuthHandler) CreateAvatarUploadURL(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	var req avatarUploadURLRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	result, err := h.authService.CreateAvatarUploadURL(r.Context(), service.CreateAvatarUploadURLInput{
-		UserID:        authSession.ID,
-		ContentType:   req.ContentType,
-		ContentLength: req.ContentLength,
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidSession):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
-		case errors.Is(err, service.ErrAvatarStorageUnavailable):
-			apierror.WriteError(w, apierror.New(http.StatusServiceUnavailable, "AVATAR_STORAGE_UNAVAILABLE", "avatar storage unavailable", err))
-		case errors.Is(err, service.ErrAvatarFileTooLarge):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "AVATAR_FILE_TOO_LARGE", "avatar file too large", err))
-		case errors.Is(err, service.ErrUnsupportedAvatarContentType):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "UNSUPPORTED_AVATAR_CONTENT_TYPE", "unsupported avatar content type", err))
-		case errors.Is(err, service.ErrInvalidAvatarUploadInput):
-			writeInvalidRequest(w, err)
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[avatarUploadURLResponse]{
-		Data: avatarUploadURLResponse{
-			UploadURL: result.UploadURL,
-			Method:    result.Method,
-			ObjectKey: result.ObjectKey,
-			ExpiresAt: result.ExpiresAt,
-			Headers:   result.Headers,
-		},
-	})
-}
-
-func (h *AuthHandler) ConfirmAvatarUpload(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	var req confirmAvatarUploadRequest
-	if err := decodeRequestBody(w, r, &req); err != nil {
-		writeInvalidRequest(w, err)
-		return
-	}
-
-	if err := h.validator.Struct(req); err != nil {
-		writeValidationError(w, err)
-		return
-	}
-
-	updatedUser, err := h.authService.ConfirmAvatarUpload(r.Context(), service.ConfirmAvatarUploadInput{
-		UserID:    authSession.ID,
-		ObjectKey: req.ObjectKey,
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidSession):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
-		case errors.Is(err, service.ErrAvatarStorageUnavailable):
-			apierror.WriteError(w, apierror.New(http.StatusServiceUnavailable, "AVATAR_STORAGE_UNAVAILABLE", "avatar storage unavailable", err))
-		case errors.Is(err, service.ErrAvatarObjectNotFound):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "AVATAR_OBJECT_NOT_FOUND", "avatar object not found", err))
-		case errors.Is(err, service.ErrAvatarFileTooLarge):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "AVATAR_FILE_TOO_LARGE", "avatar file too large", err))
-		case errors.Is(err, service.ErrUnsupportedAvatarContentType):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "UNSUPPORTED_AVATAR_CONTENT_TYPE", "unsupported avatar content type", err))
-		case errors.Is(err, service.ErrInvalidAvatarFileContent):
-			apierror.WriteError(w, apierror.New(http.StatusBadRequest, "INVALID_AVATAR_FILE_CONTENT", "avatar file content is invalid", err))
-		case errors.Is(err, service.ErrInvalidAvatarUploadInput), errors.Is(err, service.ErrInvalidProfileUpdateInput):
-			writeInvalidRequest(w, err)
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(updatedUser)},
-	})
-}
-
-func (h *AuthHandler) DeleteAvatar(w http.ResponseWriter, r *http.Request) {
-	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
-	if !ok {
-		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
-		return
-	}
-
-	updatedUser, err := h.authService.DeleteAvatar(r.Context(), authSession.ID)
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrInvalidSession):
-			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
-		case errors.Is(err, service.ErrAvatarStorageUnavailable):
-			apierror.WriteError(w, apierror.New(http.StatusServiceUnavailable, "AVATAR_STORAGE_UNAVAILABLE", "avatar storage unavailable", err))
-		case errors.Is(err, service.ErrInvalidAvatarUploadInput):
-			writeInvalidRequest(w, err)
-		default:
-			writeInternalError(w, err)
-		}
-		return
-	}
-
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[authResultResponse]{
-		Data: authResultResponse{User: toUserResponse(updatedUser)},
-	})
 }
 
 func (h *AuthHandler) currentSessionToken(r *http.Request) string {
@@ -622,40 +172,11 @@ func (h *AuthHandler) currentSessionToken(r *http.Request) string {
 }
 
 func (h *AuthHandler) setSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
-	maxAge := int(h.sessionCookie.TTL.Seconds())
-	if maxAge <= 0 {
-		maxAge = int(time.Until(expiresAt).Seconds())
-	}
-
-	if maxAge < 1 {
-		maxAge = 1
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     h.sessionCookie.Name,
-		Value:    token,
-		Path:     "/",
-		Domain:   h.sessionCookie.Domain,
-		Expires:  expiresAt,
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		Secure:   h.sessionCookie.Secure,
-		SameSite: parseSameSite(h.sessionCookie.SameSite),
-	})
+	sessioncookie.Set(w, h.sessionCookie, token, expiresAt)
 }
 
 func (h *AuthHandler) clearSessionCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     h.sessionCookie.Name,
-		Value:    "",
-		Path:     "/",
-		Domain:   h.sessionCookie.Domain,
-		Expires:  time.Unix(0, 0).UTC(),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   h.sessionCookie.Secure,
-		SameSite: parseSameSite(h.sessionCookie.SameSite),
-	})
+	sessioncookie.Clear(w, h.sessionCookie)
 }
 
 func (h *AuthHandler) setOAuthStateCookie(w http.ResponseWriter, state string) {
@@ -668,7 +189,7 @@ func (h *AuthHandler) setOAuthStateCookie(w http.ResponseWriter, state string) {
 		MaxAge:   int(h.oauthStateTTL.Seconds()),
 		HttpOnly: true,
 		Secure:   h.sessionCookie.Secure,
-		SameSite: parseSameSite(h.sessionCookie.SameSite),
+		SameSite: sessioncookie.ParseSameSite(h.sessionCookie.SameSite),
 	})
 }
 
@@ -682,7 +203,7 @@ func (h *AuthHandler) clearOAuthStateCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   h.sessionCookie.Secure,
-		SameSite: parseSameSite(h.sessionCookie.SameSite),
+		SameSite: sessioncookie.ParseSameSite(h.sessionCookie.SameSite),
 	})
 }
 
@@ -704,7 +225,7 @@ func (h *AuthHandler) validateOAuthState(r *http.Request, state string) bool {
 }
 
 func (h *AuthHandler) generateOAuthState() (string, error) {
-	state, _, err := auth.GenerateEmailToken()
+	state, _, err := auth.GenerateOAuthState()
 	if err != nil {
 		return "", err
 	}
@@ -716,17 +237,6 @@ func (h *AuthHandler) redirectOAuthError(w http.ResponseWriter, r *http.Request,
 	values := url.Values{}
 	values.Set("error", reason)
 	http.Redirect(w, r, h.webBaseURL+"/login?"+values.Encode(), http.StatusFound)
-}
-
-func parseSameSite(value string) http.SameSite {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "strict":
-		return http.SameSiteStrictMode
-	case "none":
-		return http.SameSiteNoneMode
-	default:
-		return http.SameSiteLaxMode
-	}
 }
 
 func requestRemoteIP(remoteAddr string) string {
@@ -749,6 +259,8 @@ func decodeRequestBody(w http.ResponseWriter, r *http.Request, target any) error
 		return err
 	}
 
+	// Enforce exactly one JSON object in the request body. The second decode
+	// must hit io.EOF, otherwise the client sent trailing data.
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return err
 	}
@@ -763,7 +275,7 @@ func writeValidationError(w http.ResponseWriter, err error) {
 	if errors.As(err, &validationErrors) {
 		fields := make(map[string]string, len(validationErrors))
 		for _, validationError := range validationErrors {
-			fields[toJSONField(validationError.Field())] = validationError.Tag()
+			fields[validationError.Field()] = validationError.Tag()
 		}
 		details["fields"] = fields
 	}
@@ -785,29 +297,25 @@ func writeConflict(w http.ResponseWriter, code, message string, err error) {
 	apierror.WriteError(w, apierror.New(http.StatusConflict, code, message, err))
 }
 
-func writeInternalError(w http.ResponseWriter, err error) {
-	apierror.WriteError(w, apierror.New(http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error", err))
-}
-
-func toJSONField(field string) string {
-	switch field {
-	case "Email":
-		return "email"
-	case "Password":
-		return "password"
-	case "DisplayName":
-		return "display_name"
-	case "Token":
-		return "token"
-	case "ContentType":
-		return "content_type"
-	case "ContentLength":
-		return "content_length"
-	case "ObjectKey":
-		return "object_key"
-	default:
-		return strings.ToLower(field)
+func (h *AuthHandler) writeInternalServerError(r *http.Request, w http.ResponseWriter, err error) {
+	logger := h.logger
+	if logger == nil {
+		logger = slog.Default()
 	}
+
+	if r != nil {
+		logger.Error(
+			"request_internal_error",
+			slog.String("request_id", chimiddleware.GetReqID(r.Context())),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Any("err", err),
+		)
+	} else {
+		logger.Error("request_internal_error", slog.Any("err", err))
+	}
+
+	apierror.WriteError(w, apierror.New(http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error", err))
 }
 
 func toUserResponse(user service.UserView) userResponse {

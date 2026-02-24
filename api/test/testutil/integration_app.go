@@ -72,12 +72,16 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 		emailSender,
 		nil,
 		nil,
-		24*time.Hour,
-		12*time.Hour,
-		time.Hour,
-		24*time.Hour,
-		10*time.Minute,
+		service.AuthServiceConfig{
+			SessionTTL:            24 * time.Hour,
+			SessionRefreshWindow:  12 * time.Hour,
+			PasswordResetTokenTTL: time.Hour,
+			EmailVerificationTTL:  24 * time.Hour,
+			AvatarUploadURLTTL:    10 * time.Minute,
+		},
 	)
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	requestValidator := appvalidator.New()
 	authHandler := handler.NewAuthHandler(
@@ -91,6 +95,7 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 		},
 		normalizedOptions.AllowedOrigin,
 		10*time.Minute,
+		logger,
 	)
 
 	requireAuth := appmiddleware.RequireAuth(authService, appmiddleware.SessionCookieConfig{
@@ -115,8 +120,6 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 		normalizedOptions.AuthAccountRateLimitWindow,
 		normalizedOptions.AuthAccountRateLimitBurst,
 	), "email")
-
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	httpHandler := router.New(router.Dependencies{
 		Logger:               logger,

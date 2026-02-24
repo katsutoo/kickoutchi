@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/katsutoo/kickoutchi/api/internal/apierror"
+	"github.com/katsutoo/kickoutchi/api/internal/apiresponse"
 )
 
 type readinessChecker interface {
@@ -33,7 +34,7 @@ func NewHealthHandler(checker readinessChecker, timeout time.Duration) *HealthHa
 }
 
 func (h *HealthHandler) Live(w http.ResponseWriter, _ *http.Request) {
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[healthResponse]{
+	_ = apiresponse.WriteJSON(w, http.StatusOK, apiresponse.DataEnvelope[healthResponse]{
 		Data: healthResponse{Status: "ok"},
 	})
 }
@@ -63,7 +64,7 @@ func (h *HealthHandler) Ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = apierror.WriteJSON(w, http.StatusOK, apierror.DataEnvelope[healthResponse]{
+	_ = apiresponse.WriteJSON(w, http.StatusOK, apiresponse.DataEnvelope[healthResponse]{
 		Data: healthResponse{Status: "ok"},
 	})
 }

@@ -268,6 +268,7 @@ func newTestAuthHandler(t *testing.T, authService authService) *AuthHandler {
 		},
 		"http://localhost:5173",
 		10*time.Minute,
+		nil,
 	)
 }
 

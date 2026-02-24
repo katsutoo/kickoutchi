@@ -25,6 +25,19 @@ type AuthComponents struct {
 	AuthAccountRateLimit func(http.Handler) http.Handler
 }
 
+type githubOAuthProvider interface {
+	AuthorizationURL(state string) string
+	FetchUser(ctx context.Context, code string) (client.GitHubOAuthUser, error)
+}
+
+type avatarStorageProvider interface {
+	CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string) (client.PresignedUpload, error)
+	HeadObject(ctx context.Context, objectKey string) (client.ObjectMetadata, error)
+	ReadObjectPrefix(ctx context.Context, objectKey string, maxBytes int64) ([]byte, error)
+	DeleteObject(ctx context.Context, objectKey string) error
+	PublicURL(objectKey string) string
+}
+
 func newDatabase(ctx context.Context, cfg config.Config) (*database.DB, error) {
 	db, err := database.New(ctx, database.Config{
 		URL:               cfg.Database.URL,
@@ -70,7 +83,7 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 		emailSender = client.NewResendAuthEmailSender(resendClient, cfg.WebBaseURL, logger)
 	}
 
-	var githubOAuthClient *client.GitHubOAuthClient
+	var githubOAuthClient githubOAuthProvider
 	if cfg.OAuth.GitHubClientID != "" {
 		createdGitHubOAuthClient, err := client.NewGitHubOAuthClient(client.GitHubOAuthClientConfig{
 			ClientID:     cfg.OAuth.GitHubClientID,
@@ -84,7 +97,7 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 		githubOAuthClient = createdGitHubOAuthClient
 	}
 
-	var avatarStorage *client.R2Client
+	var avatarStorage avatarStorageProvider
 	if cfg.R2.AccountID != "" {
 		createdR2Client, err := client.NewR2Client(client.R2ClientConfig{
 			AccountID:       cfg.R2.AccountID,
@@ -108,11 +121,13 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 		emailSender,
 		githubOAuthClient,
 		avatarStorage,
-		cfg.Session.TTL,
-		cfg.Session.RefreshWindow,
-		cfg.Auth.PasswordResetTokenTTL,
-		cfg.Auth.EmailVerificationTokenTTL,
-		cfg.R2.SignedUploadTTL,
+		service.AuthServiceConfig{
+			SessionTTL:            cfg.Session.TTL,
+			SessionRefreshWindow:  cfg.Session.RefreshWindow,
+			PasswordResetTokenTTL: cfg.Auth.PasswordResetTokenTTL,
+			EmailVerificationTTL:  cfg.Auth.EmailVerificationTokenTTL,
+			AvatarUploadURLTTL:    cfg.R2.SignedUploadTTL,
+		},
 	)
 	validator := appvalidator.New()
 	cookieConfig := handler.SessionCookieConfig{
@@ -129,6 +144,7 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 		cookieConfig,
 		cfg.WebBaseURL,
 		cfg.Auth.OAuthStateTTL,
+		logger,
 	)
 	requireAuth := appmiddleware.RequireAuth(authService, appmiddleware.SessionCookieConfig{
 		Name:     cfg.Session.CookieName,

@@ -4,20 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/katsutoo/kickoutchi/api/internal/apierror"
 	"github.com/katsutoo/kickoutchi/api/internal/service"
+	"github.com/katsutoo/kickoutchi/api/internal/sessioncookie"
 )
 
-type SessionCookieConfig struct {
-	Name     string
-	Domain   string
-	Secure   bool
-	SameSite string
-	TTL      time.Duration
-}
+type SessionCookieConfig = sessioncookie.Config
 
 type sessionAuthenticator interface {
 	AuthenticateSession(ctx context.Context, sessionToken string) (service.AuthenticatedSession, error)
@@ -26,13 +19,7 @@ type sessionAuthenticator interface {
 type authUserContextKey struct{}
 
 func RequireAuth(authenticator sessionAuthenticator, cookie SessionCookieConfig) func(http.Handler) http.Handler {
-	if cookie.Name == "" {
-		cookie.Name = "kickoutchi_session"
-	}
-
-	if cookie.TTL <= 0 {
-		cookie.TTL = 30 * 24 * time.Hour
-	}
+	cookie = sessioncookie.NormalizeConfig(cookie)
 
 	return func(next http.Handler) http.Handler {
 		if next == nil {
@@ -60,7 +47,7 @@ func RequireAuth(authenticator sessionAuthenticator, cookie SessionCookieConfig)
 			if err != nil {
 				switch {
 				case errors.Is(err, service.ErrInvalidSession):
-					clearSessionCookie(w, cookie)
+					sessioncookie.Clear(w, cookie)
 					writeUnauthorized(w)
 				default:
 					apierror.WriteError(w, apierror.New(
@@ -74,7 +61,7 @@ func RequireAuth(authenticator sessionAuthenticator, cookie SessionCookieConfig)
 			}
 
 			if authSession.Refreshed {
-				setSessionCookie(w, cookie, sessionCookie.Value, authSession.ExpiresAt)
+				sessioncookie.Set(w, cookie, sessionCookie.Value, authSession.ExpiresAt)
 			}
 
 			ctx := context.WithValue(r.Context(), authUserContextKey{}, authSession.User)
@@ -90,54 +77,6 @@ func AuthUserFromContext(ctx context.Context) (service.UserView, bool) {
 	}
 
 	return user, true
-}
-
-func setSessionCookie(w http.ResponseWriter, cfg SessionCookieConfig, token string, expiresAt time.Time) {
-	maxAge := int(cfg.TTL.Seconds())
-	if maxAge <= 0 {
-		maxAge = int(time.Until(expiresAt).Seconds())
-	}
-
-	if maxAge < 1 {
-		maxAge = 1
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     cfg.Name,
-		Value:    token,
-		Path:     "/",
-		Domain:   cfg.Domain,
-		Expires:  expiresAt,
-		MaxAge:   maxAge,
-		HttpOnly: true,
-		Secure:   cfg.Secure,
-		SameSite: parseSameSite(cfg.SameSite),
-	})
-}
-
-func clearSessionCookie(w http.ResponseWriter, cfg SessionCookieConfig) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     cfg.Name,
-		Value:    "",
-		Path:     "/",
-		Domain:   cfg.Domain,
-		Expires:  time.Unix(0, 0).UTC(),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   cfg.Secure,
-		SameSite: parseSameSite(cfg.SameSite),
-	})
-}
-
-func parseSameSite(value string) http.SameSite {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "strict":
-		return http.SameSiteStrictMode
-	case "none":
-		return http.SameSiteNoneMode
-	default:
-		return http.SameSiteLaxMode
-	}
 }
 
 func writeUnauthorized(w http.ResponseWriter) {

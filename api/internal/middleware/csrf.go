@@ -1,12 +1,12 @@
 package middleware
 
 import (
-	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/katsutoo/kickoutchi/api/internal/apierror"
+	originutil "github.com/katsutoo/kickoutchi/api/internal/origin"
 )
 
 type CSRFConfig struct {
@@ -16,7 +16,7 @@ type CSRFConfig struct {
 func CSRFOriginCheck(cfg CSRFConfig) func(http.Handler) http.Handler {
 	allowedOrigins := make(map[string]struct{}, len(cfg.AllowedOrigins))
 	for _, origin := range cfg.AllowedOrigins {
-		normalized, err := normalizeOrigin(origin)
+		normalized, err := originutil.Normalize(origin)
 		if err != nil {
 			continue
 		}
@@ -36,7 +36,7 @@ func CSRFOriginCheck(cfg CSRFConfig) func(http.Handler) http.Handler {
 				origin = originFromReferer(r.Header.Get("Referer"))
 			}
 
-			normalizedOrigin, err := normalizeOrigin(origin)
+			normalizedOrigin, err := originutil.Normalize(origin)
 			if err != nil {
 				writeCSRFFailure(w)
 				return
@@ -65,29 +65,6 @@ func isSafeMethod(method string) bool {
 	default:
 		return false
 	}
-}
-
-func normalizeOrigin(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", errors.New("origin is empty")
-	}
-
-	parsed, err := url.Parse(trimmed)
-	if err != nil {
-		return "", err
-	}
-
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", errors.New("origin must include scheme and host")
-	}
-
-	parsed.Path = ""
-	parsed.RawPath = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-
-	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func originFromReferer(rawReferer string) string {

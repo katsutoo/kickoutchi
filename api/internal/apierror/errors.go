@@ -1,9 +1,10 @@
 package apierror
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
+
+	"github.com/katsutoo/kickoutchi/api/internal/apiresponse"
 )
 
 type Error struct {
@@ -41,21 +42,6 @@ type ErrorEnvelope struct {
 	Details map[string]any `json:"details,omitempty"`
 }
 
-type DataEnvelope[T any] struct {
-	Data T `json:"data"`
-}
-
-func WriteJSON(w http.ResponseWriter, status int, payload any) error {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func WriteError(w http.ResponseWriter, appErr *Error) {
 	if appErr == nil {
 		appErr = New(http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error", nil)
@@ -73,7 +59,7 @@ func WriteError(w http.ResponseWriter, appErr *Error) {
 		appErr.Message = http.StatusText(appErr.Status)
 	}
 
-	_ = WriteJSON(w, appErr.Status, ErrorEnvelope{
+	_ = apiresponse.WriteJSON(w, appErr.Status, ErrorEnvelope{
 		Error:   appErr.Message,
 		Code:    appErr.Code,
 		Details: appErr.Details,

@@ -240,11 +240,7 @@ func TestAuthServiceRegister(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		_, err := svc.Register(t.Context(), RegisterInput{Email: "", Password: "short", DisplayName: "x"})
@@ -264,11 +260,7 @@ func TestAuthServiceRegister(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		_, err := svc.Register(t.Context(), RegisterInput{Email: "user@example.com", Password: "Str0ngPassw0rd!", DisplayName: "user_name"})
@@ -319,11 +311,7 @@ func TestAuthServiceRegister(t *testing.T) {
 			}},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		result, err := svc.Register(t.Context(), RegisterInput{Email: "USER@Example.com", Password: "Str0ngPassw0rd!", DisplayName: "user_name"})
@@ -359,11 +347,7 @@ func TestAuthServiceLogin(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		_, err := svc.Login(t.Context(), LoginInput{Email: "missing@example.com", Password: "Str0ngPassw0rd!"})
@@ -389,11 +373,7 @@ func TestAuthServiceLogin(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		result, err := svc.Login(t.Context(), LoginInput{Email: "user@example.com", Password: "Str0ngPassw0rd!"})
@@ -419,11 +399,7 @@ func TestAuthServiceResetPassword(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		err := svc.ResetPassword(t.Context(), "", "short")
@@ -443,11 +419,7 @@ func TestAuthServiceResetPassword(t *testing.T) {
 			&fakeAuthEmailSender{},
 			nil,
 			nil,
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		err := svc.ResetPassword(t.Context(), "valid-token", "N3wPassw0rd!")
@@ -470,11 +442,7 @@ func TestAuthServiceResendVerificationEmail(t *testing.T) {
 		&fakeAuthEmailSender{},
 		nil,
 		nil,
-		time.Hour,
-		time.Minute,
-		time.Hour,
-		time.Hour,
-		time.Minute,
+		defaultAuthServiceConfig(),
 	)
 
 	err := svc.ResendVerificationEmail(t.Context(), mustUUIDForServiceTest(t))
@@ -500,11 +468,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 				&fakeAuthEmailSender{},
 				nil,
 				nil,
-				time.Hour,
-				time.Minute,
-				time.Hour,
-				time.Hour,
-				time.Minute,
+				defaultAuthServiceConfig(),
 			),
 			input:       CreateAvatarUploadURLInput{UserID: userID, ContentType: "image/png", ContentLength: 1024},
 			expectedErr: ErrAvatarStorageUnavailable,
@@ -519,11 +483,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string) (client.PresignedUpload, error) {
 					return client.PresignedUpload{}, nil
 				}},
-				time.Hour,
-				time.Minute,
-				time.Hour,
-				time.Hour,
-				time.Minute,
+				defaultAuthServiceConfig(),
 			),
 			input:       CreateAvatarUploadURLInput{UserID: userID, ContentType: "image/gif", ContentLength: 1024},
 			expectedErr: ErrUnsupportedAvatarContentType,
@@ -538,11 +498,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string) (client.PresignedUpload, error) {
 					return client.PresignedUpload{}, nil
 				}},
-				time.Hour,
-				time.Minute,
-				time.Hour,
-				time.Hour,
-				time.Minute,
+				defaultAuthServiceConfig(),
 			),
 			input:       CreateAvatarUploadURLInput{UserID: userID, ContentType: "image/png", ContentLength: maxAvatarUploadBytes + 1},
 			expectedErr: ErrAvatarFileTooLarge,
@@ -574,11 +530,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 					Headers:   map[string]string{"Content-Type": contentType},
 				}, nil
 			}},
-			time.Hour,
-			time.Minute,
-			time.Hour,
-			time.Hour,
-			time.Minute,
+			defaultAuthServiceConfig(),
 		)
 
 		result, err := svc.CreateAvatarUploadURL(t.Context(), CreateAvatarUploadURLInput{
@@ -612,11 +564,7 @@ func TestAuthServiceConfirmAvatarUploadInvalidMagicBytes(t *testing.T) {
 				return []byte("not-a-real-png-signature"), nil
 			},
 		},
-		time.Hour,
-		time.Minute,
-		time.Hour,
-		time.Hour,
-		time.Minute,
+		defaultAuthServiceConfig(),
 	)
 
 	_, err := svc.ConfirmAvatarUpload(t.Context(), ConfirmAvatarUploadInput{
@@ -637,4 +585,14 @@ func mustUUIDForServiceTest(t *testing.T) uuid.UUID {
 	}
 
 	return id
+}
+
+func defaultAuthServiceConfig() AuthServiceConfig {
+	return AuthServiceConfig{
+		SessionTTL:            time.Hour,
+		SessionRefreshWindow:  time.Minute,
+		PasswordResetTokenTTL: time.Hour,
+		EmailVerificationTTL:  time.Hour,
+		AvatarUploadURLTTL:    time.Minute,
+	}
 }

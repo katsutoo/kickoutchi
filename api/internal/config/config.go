@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/katsutoo/kickoutchi/api/internal/origin"
 )
 
 type Config struct {
@@ -351,63 +353,71 @@ func Load() (Config, error) {
 		},
 	}
 
-	if cfg.Database.URL == "" {
-		return Config{}, errors.New("config: DATABASE_URL is required")
-	}
-
-	if err := validateAbsoluteURL("WEB_BASE_URL", cfg.WebBaseURL); err != nil {
-		return Config{}, err
-	}
-
-	if err := validateLogLevel(cfg.LogLevel); err != nil {
-		return Config{}, err
-	}
-
-	if err := validatePort(cfg.HTTP.Port); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.Session.CookieName == "" {
-		return Config{}, errors.New("config: SESSION_COOKIE_NAME is required")
-	}
-
-	if cfg.Session.RefreshWindow > cfg.Session.TTL {
-		return Config{}, errors.New("config: SESSION_REFRESH_WINDOW cannot be greater than SESSION_TTL")
-	}
-
-	if err := validateSameSite(cfg.Session.CookieSameSite); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.Database.MinConns > cfg.Database.MaxConns {
-		return Config{}, errors.New("config: DB_MIN_CONNS cannot be greater than DB_MAX_CONNS")
-	}
-
-	if cfg.Resend.APIKey != "" && cfg.Resend.FromEmail == "" {
-		return Config{}, errors.New("config: RESEND_FROM_EMAIL is required when RESEND_API_KEY is set")
-	}
-
-	if cfg.Resend.APIKey == "" && cfg.Resend.FromEmail != "" {
-		return Config{}, errors.New("config: RESEND_API_KEY is required when RESEND_FROM_EMAIL is set")
-	}
-
-	if cfg.Resend.APIBaseURL == "" {
-		return Config{}, errors.New("config: RESEND_API_BASE_URL is required")
-	}
-
-	if err := validateAbsoluteURL("RESEND_API_BASE_URL", cfg.Resend.APIBaseURL); err != nil {
-		return Config{}, err
-	}
-
-	if err := validateGitHubOAuthConfig(cfg.OAuth); err != nil {
-		return Config{}, err
-	}
-
-	if err := validateR2Config(cfg.R2); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 
 	return cfg, nil
+}
+
+func (c Config) Validate() error {
+	if c.Database.URL == "" {
+		return errors.New("config: DATABASE_URL is required")
+	}
+
+	if err := validateAbsoluteURL("WEB_BASE_URL", c.WebBaseURL); err != nil {
+		return err
+	}
+
+	if err := validateLogLevel(c.LogLevel); err != nil {
+		return err
+	}
+
+	if err := validatePort(c.HTTP.Port); err != nil {
+		return err
+	}
+
+	if c.Session.CookieName == "" {
+		return errors.New("config: SESSION_COOKIE_NAME is required")
+	}
+
+	if c.Session.RefreshWindow > c.Session.TTL {
+		return errors.New("config: SESSION_REFRESH_WINDOW cannot be greater than SESSION_TTL")
+	}
+
+	if err := validateSameSite(c.Session.CookieSameSite); err != nil {
+		return err
+	}
+
+	if c.Database.MinConns > c.Database.MaxConns {
+		return errors.New("config: DB_MIN_CONNS cannot be greater than DB_MAX_CONNS")
+	}
+
+	if c.Resend.APIKey != "" && c.Resend.FromEmail == "" {
+		return errors.New("config: RESEND_FROM_EMAIL is required when RESEND_API_KEY is set")
+	}
+
+	if c.Resend.APIKey == "" && c.Resend.FromEmail != "" {
+		return errors.New("config: RESEND_API_KEY is required when RESEND_FROM_EMAIL is set")
+	}
+
+	if c.Resend.APIBaseURL == "" {
+		return errors.New("config: RESEND_API_BASE_URL is required")
+	}
+
+	if err := validateAbsoluteURL("RESEND_API_BASE_URL", c.Resend.APIBaseURL); err != nil {
+		return err
+	}
+
+	if err := validateGitHubOAuthConfig(c.OAuth); err != nil {
+		return err
+	}
+
+	if err := validateR2Config(c.R2); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (c Config) HTTPAddr() string {
@@ -550,17 +560,17 @@ func originsFromEnv(raw, fallbackOrigin string) ([]string, error) {
 	normalized := make([]string, 0, len(values))
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		origin, err := normalizeOrigin(value)
+		normalizedOrigin, err := origin.Normalize(value)
 		if err != nil {
 			return nil, fmt.Errorf("config: invalid CSRF origin %q: %w", value, err)
 		}
 
-		if _, exists := seen[origin]; exists {
+		if _, exists := seen[normalizedOrigin]; exists {
 			continue
 		}
 
-		seen[origin] = struct{}{}
-		normalized = append(normalized, origin)
+		seen[normalizedOrigin] = struct{}{}
+		normalized = append(normalized, normalizedOrigin)
 	}
 
 	return normalized, nil
@@ -686,22 +696,4 @@ func validateR2Config(cfg R2Config) error {
 	}
 
 	return nil
-}
-
-func normalizeOrigin(value string) (string, error) {
-	parsed, err := url.Parse(value)
-	if err != nil {
-		return "", err
-	}
-
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", errors.New("origin must include scheme and host")
-	}
-
-	parsed.Path = ""
-	parsed.RawPath = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-
-	return strings.TrimRight(parsed.String(), "/"), nil
 }

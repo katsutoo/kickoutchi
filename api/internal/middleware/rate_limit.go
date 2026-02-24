@@ -19,11 +19,14 @@ import (
 const maxRateLimitBodyReadBytes = 1 << 20
 
 type KeyRateLimiter struct {
-	mu      sync.Mutex
-	entries map[string]*rateLimiterEntry
-	limit   rate.Limit
-	burst   int
-	now     func() time.Time
+	mu              sync.Mutex
+	entries         map[string]*rateLimiterEntry
+	limit           rate.Limit
+	burst           int
+	entryTTL        time.Duration
+	compactInterval time.Duration
+	nextCompactAt   time.Time
+	now             func() time.Time
 }
 
 type rateLimiterEntry struct {
@@ -47,10 +50,12 @@ func NewKeyRateLimiter(requests int, window time.Duration, burst int) *KeyRateLi
 	limit := rate.Every(window / time.Duration(requests))
 
 	return &KeyRateLimiter{
-		entries: make(map[string]*rateLimiterEntry),
-		limit:   limit,
-		burst:   burst,
-		now:     time.Now,
+		entries:         make(map[string]*rateLimiterEntry),
+		limit:           limit,
+		burst:           burst,
+		entryTTL:        30 * time.Minute,
+		compactInterval: 5 * time.Minute,
+		now:             time.Now,
 	}
 }
 
@@ -63,16 +68,21 @@ func (l *KeyRateLimiter) Allow(key string) (bool, time.Duration) {
 	now := l.now().UTC()
 
 	l.mu.Lock()
+	if l.nextCompactAt.IsZero() {
+		l.nextCompactAt = now.Add(l.compactInterval)
+	}
+
+	if !now.Before(l.nextCompactAt) {
+		l.compact(now)
+		l.nextCompactAt = now.Add(l.compactInterval)
+	}
+
 	entry, ok := l.entries[trimmedKey]
 	if !ok {
 		entry = &rateLimiterEntry{limiter: rate.NewLimiter(l.limit, l.burst)}
 		l.entries[trimmedKey] = entry
 	}
 	entry.lastSeen = now
-
-	if len(l.entries) > 10_000 {
-		l.compact(now)
-	}
 
 	limiter := entry.limiter
 	l.mu.Unlock()
@@ -97,7 +107,7 @@ func (l *KeyRateLimiter) Allow(key string) (bool, time.Duration) {
 }
 
 func (l *KeyRateLimiter) compact(now time.Time) {
-	cutoff := now.Add(-30 * time.Minute)
+	cutoff := now.Add(-l.entryTTL)
 	for key, entry := range l.entries {
 		if entry.lastSeen.Before(cutoff) {
 			delete(l.entries, key)

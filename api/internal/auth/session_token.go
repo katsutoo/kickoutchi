@@ -31,6 +31,15 @@ func GenerateEmailToken() (string, []byte, error) {
 	return token, hash, nil
 }
 
+func GenerateOAuthState() (string, []byte, error) {
+	token, hash, err := generateToken()
+	if err != nil {
+		return "", nil, fmt.Errorf("generate oauth state: %w", err)
+	}
+
+	return token, hash, nil
+}
+
 func HashEmailToken(token string) []byte {
 	return hashToken(token)
 }
