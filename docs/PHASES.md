@@ -24,7 +24,7 @@ Each phase is intentionally small and shippable. Do not build Phase N+1 infrastr
 **Infra**
 - [ ] Railway services: API, Web, Postgres
 - [ ] Cloudflare DNS and proxy
-- [ ] CI baseline: lint, typecheck, tests, build
+- [x] CI baseline: lint, typecheck, tests, build
 
 **Security gates**
 - [x] Session cookies set with `HttpOnly`, `Secure`, `SameSite`
