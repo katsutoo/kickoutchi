@@ -33,6 +33,7 @@ go.work.sum
 /.vscode-test/
 /.cursor/
 /.cursor*
+./tmp/
 
 # AI tooling metadata
 /.codex/
