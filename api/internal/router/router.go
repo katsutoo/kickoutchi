@@ -13,13 +13,15 @@ import (
 )
 
 type Dependencies struct {
-	Logger               *slog.Logger
-	HealthHandler        *handler.HealthHandler
-	AuthHandler          *handler.AuthHandler
-	AuthRequired         func(http.Handler) http.Handler
-	CSRFProtection       func(http.Handler) http.Handler
-	AuthIPRateLimit      func(http.Handler) http.Handler
-	AuthAccountRateLimit func(http.Handler) http.Handler
+	Logger                *slog.Logger
+	HealthHandler         *handler.HealthHandler
+	AuthHandler           *handler.AuthHandler
+	RealIP                func(http.Handler) http.Handler
+	AuthRequired          func(http.Handler) http.Handler
+	CSRFProtection        func(http.Handler) http.Handler
+	AuthIPRateLimit       func(http.Handler) http.Handler
+	AuthAccountRateLimit  func(http.Handler) http.Handler
+	ResendVerifyRateLimit func(http.Handler) http.Handler
 }
 
 func New(deps Dependencies) http.Handler {
@@ -30,12 +32,14 @@ func New(deps Dependencies) http.Handler {
 
 	authIPRateLimit := ensureMiddleware(deps.AuthIPRateLimit)
 	authAccountRateLimit := ensureMiddleware(deps.AuthAccountRateLimit)
+	resendVerifyRateLimit := ensureMiddleware(deps.ResendVerifyRateLimit)
 	csrfProtection := ensureMiddleware(deps.CSRFProtection)
+	realIP := ensureMiddleware(deps.RealIP)
 
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	r.Use(realIP)
 	r.Use(appmiddleware.Logging(logger))
 	r.Use(appmiddleware.Recovery(logger))
 
@@ -72,7 +76,7 @@ func New(deps Dependencies) http.Handler {
 					r.Group(func(r chi.Router) {
 						r.Use(deps.AuthRequired)
 						r.With(csrfProtection).Post("/logout", deps.AuthHandler.Logout)
-						r.With(csrfProtection).Post("/resend-verification", deps.AuthHandler.ResendVerification)
+						r.With(resendVerifyRateLimit, csrfProtection).Post("/resend-verification", deps.AuthHandler.ResendVerification)
 					})
 				}
 			})
@@ -82,6 +86,7 @@ func New(deps Dependencies) http.Handler {
 					r.Use(deps.AuthRequired)
 					r.Get("/me", deps.AuthHandler.Me)
 					r.With(csrfProtection).Patch("/me", deps.AuthHandler.UpdateMe)
+					r.Get("/me/avatar/access-url", deps.AuthHandler.GetAvatarAccessURL)
 					r.With(csrfProtection).Post("/me/avatar/upload-url", deps.AuthHandler.CreateAvatarUploadURL)
 					r.With(csrfProtection).Post("/me/avatar/confirm", deps.AuthHandler.ConfirmAvatarUpload)
 					r.With(csrfProtection).Delete("/me/avatar", deps.AuthHandler.DeleteAvatar)

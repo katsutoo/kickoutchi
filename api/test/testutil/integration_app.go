@@ -24,13 +24,16 @@ import (
 const defaultAllowedOrigin = "http://web.test"
 
 type IntegrationAppOptions struct {
-	AllowedOrigin                string
-	AuthIPRateLimitRequests      int
-	AuthIPRateLimitWindow        time.Duration
-	AuthIPRateLimitBurst         int
-	AuthAccountRateLimitRequests int
-	AuthAccountRateLimitWindow   time.Duration
-	AuthAccountRateLimitBurst    int
+	AllowedOrigin                 string
+	AuthIPRateLimitRequests       int
+	AuthIPRateLimitWindow         time.Duration
+	AuthIPRateLimitBurst          int
+	AuthAccountRateLimitRequests  int
+	AuthAccountRateLimitWindow    time.Duration
+	AuthAccountRateLimitBurst     int
+	ResendVerifyRateLimitRequests int
+	ResendVerifyRateLimitWindow   time.Duration
+	ResendVerifyRateLimitBurst    int
 }
 
 type IntegrationApp struct {
@@ -65,6 +68,7 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 	})
 
 	emailSender := NewCapturingAuthEmailSender()
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	authService := service.NewAuthService(
 		authRepository,
@@ -78,10 +82,9 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 			PasswordResetTokenTTL: time.Hour,
 			EmailVerificationTTL:  24 * time.Hour,
 			AvatarUploadURLTTL:    10 * time.Minute,
+			Logger:                logger,
 		},
 	)
-
-	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	requestValidator := appvalidator.New()
 	authHandler := handler.NewAuthHandler(
@@ -121,13 +124,21 @@ func NewIntegrationApp(t *testing.T, options IntegrationAppOptions) *Integration
 		normalizedOptions.AuthAccountRateLimitBurst,
 	), "email")
 
+	resendVerifyRateLimit := appmiddleware.RateLimitByAuthenticatedUser(appmiddleware.NewKeyRateLimiter(
+		normalizedOptions.ResendVerifyRateLimitRequests,
+		normalizedOptions.ResendVerifyRateLimitWindow,
+		normalizedOptions.ResendVerifyRateLimitBurst,
+	))
+
 	httpHandler := router.New(router.Dependencies{
-		Logger:               logger,
-		AuthHandler:          authHandler,
-		AuthRequired:         requireAuth,
-		CSRFProtection:       csrfProtection,
-		AuthIPRateLimit:      authIPRateLimit,
-		AuthAccountRateLimit: authAccountRateLimit,
+		Logger:                logger,
+		AuthHandler:           authHandler,
+		RealIP:                appmiddleware.RealIP(appmiddleware.RealIPConfig{}),
+		AuthRequired:          requireAuth,
+		CSRFProtection:        csrfProtection,
+		AuthIPRateLimit:       authIPRateLimit,
+		AuthAccountRateLimit:  authAccountRateLimit,
+		ResendVerifyRateLimit: resendVerifyRateLimit,
 	})
 
 	httpServer := httptest.NewServer(httpHandler)
@@ -233,6 +244,18 @@ func (o IntegrationAppOptions) withDefaults() IntegrationAppOptions {
 
 	if o.AuthAccountRateLimitBurst <= 0 {
 		o.AuthAccountRateLimitBurst = o.AuthAccountRateLimitRequests
+	}
+
+	if o.ResendVerifyRateLimitRequests <= 0 {
+		o.ResendVerifyRateLimitRequests = 1000
+	}
+
+	if o.ResendVerifyRateLimitWindow <= 0 {
+		o.ResendVerifyRateLimitWindow = time.Minute
+	}
+
+	if o.ResendVerifyRateLimitBurst <= 0 {
+		o.ResendVerifyRateLimitBurst = o.ResendVerifyRateLimitRequests
 	}
 
 	return o

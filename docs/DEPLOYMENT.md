@@ -55,30 +55,61 @@ Resend (subscription reminder and auth emails)
 
 - `DATABASE_URL`
 - `APP_ENV`
-- `SESSION_SECRET`
+- `LOG_LEVEL`
+- `WEB_BASE_URL`
+- `HOST`
+- `PORT`
+- `HTTP_READ_HEADER_TIMEOUT`
+- `HTTP_READ_TIMEOUT`
+- `HTTP_WRITE_TIMEOUT`
+- `HTTP_IDLE_TIMEOUT`
+- `HTTP_READY_TIMEOUT`
+- `HTTP_SHUTDOWN_TIMEOUT`
+- `DB_MAX_CONNS`
+- `DB_MIN_CONNS`
+- `DB_MAX_CONN_LIFETIME`
+- `DB_MAX_CONN_IDLE_TIME`
+- `DB_HEALTH_CHECK_PERIOD`
+- `DB_CONNECT_TIMEOUT`
+- `SESSION_COOKIE_NAME`
+- `SESSION_TTL`
+- `SESSION_REFRESH_WINDOW`
 - `COOKIE_DOMAIN`
 - `COOKIE_SECURE`
+- `COOKIE_SAME_SITE`
+- `PASSWORD_RESET_TOKEN_TTL`
+- `EMAIL_VERIFICATION_TOKEN_TTL`
+- `OAUTH_STATE_TTL`
+- `CSRF_ALLOWED_ORIGINS`
+- `TRUSTED_PROXY_CIDRS`
 - `ARGON2_MEMORY`
 - `ARGON2_TIME`
 - `ARGON2_THREADS`
-- `ALLOWED_ORIGINS`
-- `CSRF_TRUSTED_ORIGINS`
-- `WS_ALLOWED_ORIGINS`
-- `WS_MAX_MESSAGE_BYTES`
-- `TRUSTED_PROXY_CIDRS`
-- `OAUTH_GITHUB_ID`
-- `OAUTH_GITHUB_SECRET`
-- `OAUTH_GOOGLE_ID`
-- `OAUTH_GOOGLE_SECRET`
-- `OAUTH_X_ID`
-- `OAUTH_X_SECRET`
-- `R2_ENDPOINT`
+- `ARGON2_KEY_LENGTH`
+- `ARGON2_SALT_LENGTH`
+- `AUTH_IP_RATE_LIMIT_REQUESTS`
+- `AUTH_IP_RATE_LIMIT_WINDOW`
+- `AUTH_IP_RATE_LIMIT_BURST`
+- `AUTH_ACCOUNT_RATE_LIMIT_REQUESTS`
+- `AUTH_ACCOUNT_RATE_LIMIT_WINDOW`
+- `AUTH_ACCOUNT_RATE_LIMIT_BURST`
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_REQUESTS`
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_WINDOW`
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_BURST`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+- `GITHUB_REDIRECT_URL`
+- `R2_ACCOUNT_ID`
 - `R2_BUCKET`
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
+- `R2_REGION`
+- `R2_SIGNED_UPLOAD_TTL`
+- `R2_SIGNED_READ_TTL`
 - `POLAR_WEBHOOK_SECRET`
 - `RESEND_API_KEY`
 - `RESEND_FROM_EMAIL`
+- `RESEND_API_BASE_URL`
 
 ### Web
 
@@ -86,8 +117,10 @@ Resend (subscription reminder and auth emails)
 - `PUBLIC_API_URL`
 
 Recommended defaults:
-- `WS_MAX_MESSAGE_BYTES=16384`
 - `COOKIE_SECURE=true` in production
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_REQUESTS=1`
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_WINDOW=1m`
+- `AUTH_RESEND_VERIFICATION_RATE_LIMIT_BURST=1`
 
 ---
 
@@ -95,8 +128,8 @@ Recommended defaults:
 
 - Keep Cloudflare proxy enabled for public API/Web traffic
 - Enforce HTTPS and HSTS in production
-- Restrict CORS and WebSocket origins to known app domains only
-- Trust real client IP headers only from trusted proxy network
+- Restrict `CSRF_ALLOWED_ORIGINS` to known app domains only
+- Set `TRUSTED_PROXY_CIDRS` so forwarded client IP headers are only trusted from known proxies
 
 ---
 
@@ -106,6 +139,7 @@ Recommended defaults:
 - Configure DKIM keys provided by Resend
 - Set DMARC policy (`p=quarantine` or stronger when stable)
 - Validate DNS setup before enabling billing reminder emails
+- In `APP_ENV=production`, Resend config is required and the API will fail to start without it
 
 ---
 
@@ -129,4 +163,4 @@ Recommended defaults:
 - Alert on:
   - readiness failures
   - sustained 5xx spikes
-  - websocket connection instability
+  - repeated auth email delivery failures

@@ -74,12 +74,16 @@ type AuthConfig struct {
 
 type SecurityConfig struct {
 	CSRFAllowedOrigins           []string
+	TrustedProxyCIDRs            []string
 	AuthIPRateLimitRequests      int
 	AuthIPRateLimitWindow        time.Duration
 	AuthIPRateLimitBurst         int
 	AuthAccountRateLimitRequests int
 	AuthAccountRateLimitWindow   time.Duration
 	AuthAccountRateLimitBurst    int
+	ResendVerificationRequests   int
+	ResendVerificationWindow     time.Duration
+	ResendVerificationBurst      int
 }
 
 type ResendConfig struct {
@@ -100,8 +104,8 @@ type R2Config struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	Region          string
-	PublicBaseURL   string
 	SignedUploadTTL time.Duration
+	SignedReadTTL   time.Duration
 }
 
 func Load() (Config, error) {
@@ -222,9 +226,29 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	resendVerificationRequests, err := intFromEnv("AUTH_RESEND_VERIFICATION_RATE_LIMIT_REQUESTS", 1)
+	if err != nil {
+		return Config{}, err
+	}
+
+	resendVerificationWindow, err := durationFromEnv("AUTH_RESEND_VERIFICATION_RATE_LIMIT_WINDOW", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+
+	resendVerificationBurst, err := intFromEnv("AUTH_RESEND_VERIFICATION_RATE_LIMIT_BURST", 1)
+	if err != nil {
+		return Config{}, err
+	}
+
 	webBaseURL := strings.TrimSpace(getEnv("WEB_BASE_URL", "http://localhost:5173"))
 	csrfAllowedOriginsRaw := strings.TrimSpace(os.Getenv("CSRF_ALLOWED_ORIGINS"))
 	csrfAllowedOrigins, err := originsFromEnv(csrfAllowedOriginsRaw, webBaseURL)
+	if err != nil {
+		return Config{}, err
+	}
+
+	trustedProxyCIDRs, err := cidrsFromEnv(strings.TrimSpace(os.Getenv("TRUSTED_PROXY_CIDRS")))
 	if err != nil {
 		return Config{}, err
 	}
@@ -242,12 +266,16 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	r2SignedReadTTL, err := durationFromEnv("R2_SIGNED_READ_TTL", 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+
 	r2AccountID := strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID"))
 	r2Bucket := strings.TrimSpace(os.Getenv("R2_BUCKET"))
 	r2AccessKeyID := strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID"))
 	r2SecretAccessKey := strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY"))
 	r2Region := strings.TrimSpace(getEnv("R2_REGION", "auto"))
-	r2PublicBaseURL := strings.TrimSpace(os.Getenv("R2_PUBLIC_BASE_URL"))
 
 	cookieSecureDefault := strings.EqualFold(appEnv, "production")
 	cookieSecure, err := boolFromEnv("COOKIE_SECURE", cookieSecureDefault)
@@ -309,12 +337,16 @@ func Load() (Config, error) {
 		},
 		Security: SecurityConfig{
 			CSRFAllowedOrigins:           csrfAllowedOrigins,
+			TrustedProxyCIDRs:            trustedProxyCIDRs,
 			AuthIPRateLimitRequests:      authIPRateLimitRequests,
 			AuthIPRateLimitWindow:        authIPRateLimitWindow,
 			AuthIPRateLimitBurst:         authIPRateLimitBurst,
 			AuthAccountRateLimitRequests: authAccountRateLimitRequests,
 			AuthAccountRateLimitWindow:   authAccountRateLimitWindow,
 			AuthAccountRateLimitBurst:    authAccountRateLimitBurst,
+			ResendVerificationRequests:   resendVerificationRequests,
+			ResendVerificationWindow:     resendVerificationWindow,
+			ResendVerificationBurst:      resendVerificationBurst,
 		},
 		Resend: ResendConfig{
 			APIKey:     resendAPIKey,
@@ -332,8 +364,8 @@ func Load() (Config, error) {
 			AccessKeyID:     r2AccessKeyID,
 			SecretAccessKey: r2SecretAccessKey,
 			Region:          r2Region,
-			PublicBaseURL:   r2PublicBaseURL,
 			SignedUploadTTL: r2SignedUploadTTL,
+			SignedReadTTL:   r2SignedReadTTL,
 		},
 		Argon2: Argon2Config{
 			Memory:     argon2Memory,
@@ -389,8 +421,20 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if c.Session.CookieSameSite == "none" && !c.Session.CookieSecure {
+		return errors.New("config: COOKIE_SECURE must be true when COOKIE_SAME_SITE is none")
+	}
+
+	if strings.EqualFold(c.AppEnv, "production") && !c.Session.CookieSecure {
+		return errors.New("config: COOKIE_SECURE must be true in production")
+	}
+
 	if c.Database.MinConns > c.Database.MaxConns {
 		return errors.New("config: DB_MIN_CONNS cannot be greater than DB_MAX_CONNS")
+	}
+
+	if strings.EqualFold(c.AppEnv, "production") && c.Resend.APIKey == "" {
+		return errors.New("config: RESEND_API_KEY and RESEND_FROM_EMAIL are required in production")
 	}
 
 	if c.Resend.APIKey != "" && c.Resend.FromEmail == "" {
@@ -576,6 +620,43 @@ func originsFromEnv(raw, fallbackOrigin string) ([]string, error) {
 	return normalized, nil
 }
 
+func cidrsFromEnv(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	normalized := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+
+		if ip := net.ParseIP(trimmed); ip != nil {
+			if ip.To4() != nil {
+				trimmed += "/32"
+			} else {
+				trimmed += "/128"
+			}
+		}
+
+		if _, _, err := net.ParseCIDR(trimmed); err != nil {
+			return nil, fmt.Errorf("config: invalid TRUSTED_PROXY_CIDRS entry %q: %w", part, err)
+		}
+
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+
+	return normalized, nil
+}
+
 func validatePort(port string) error {
 	value, err := strconv.Atoi(port)
 	if err != nil {
@@ -674,10 +755,6 @@ func validateR2Config(cfg R2Config) error {
 	}
 
 	if fieldsSet == 0 {
-		if cfg.PublicBaseURL != "" {
-			return errors.New("config: R2_PUBLIC_BASE_URL requires R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY")
-		}
-
 		return nil
 	}
 
@@ -687,12 +764,6 @@ func validateR2Config(cfg R2Config) error {
 
 	if cfg.Region == "" {
 		return errors.New("config: R2_REGION is required when R2 is enabled")
-	}
-
-	if cfg.PublicBaseURL != "" {
-		if err := validateAbsoluteURL("R2_PUBLIC_BASE_URL", cfg.PublicBaseURL); err != nil {
-			return err
-		}
 	}
 
 	return nil

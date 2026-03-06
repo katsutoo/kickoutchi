@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ var (
 	ErrInvalidAvatarFileContent          = errors.New("invalid avatar file content")
 	ErrAvatarFileTooLarge                = errors.New("avatar file is too large")
 	ErrAvatarObjectNotFound              = errors.New("avatar object not found")
+	ErrAvatarNotFound                    = errors.New("avatar not found")
 )
 
 const (
@@ -65,6 +67,7 @@ type AuthService struct {
 	passwordResetTokenTTL time.Duration
 	emailVerificationTTL  time.Duration
 	avatarUploadURLTTL    time.Duration
+	logger                *slog.Logger
 }
 
 type authRepository interface {
@@ -72,6 +75,7 @@ type authRepository interface {
 	CreateUser(ctx context.Context, params repository.CreateUserParams) (repository.User, error)
 	GetUserByEmail(ctx context.Context, email string) (repository.User, error)
 	GetUserByID(ctx context.Context, userID uuid.UUID) (repository.User, error)
+	MarkUserEmailVerified(ctx context.Context, userID uuid.UUID) (repository.User, error)
 	UpdateUserProfile(ctx context.Context, params repository.UpdateUserProfileParams) (repository.User, error)
 	RotateSession(ctx context.Context, params repository.RotateSessionParams) (repository.Session, error)
 	GetSessionByTokenHashActive(ctx context.Context, tokenHash []byte) (repository.Session, error)
@@ -100,11 +104,11 @@ type githubOAuthClient interface {
 }
 
 type avatarStorage interface {
-	CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string) (client.PresignedUpload, error)
+	CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string, contentLength int64) (client.PresignedUpload, error)
 	HeadObject(ctx context.Context, objectKey string) (client.ObjectMetadata, error)
 	ReadObjectPrefix(ctx context.Context, objectKey string, maxBytes int64) ([]byte, error)
 	DeleteObject(ctx context.Context, objectKey string) error
-	PublicURL(objectKey string) string
+	CreatePresignedReadURL(ctx context.Context, objectKey string) (client.PresignedRead, error)
 }
 
 type RegisterInput struct {
@@ -132,9 +136,8 @@ type OAuthLoginInput struct {
 }
 
 type UpdateProfileInput struct {
-	UserID         uuid.UUID
-	DisplayName    *string
-	AvatarMetadata *json.RawMessage
+	UserID      uuid.UUID
+	DisplayName *string
 }
 
 type CreateAvatarUploadURLInput struct {
@@ -149,6 +152,11 @@ type CreateAvatarUploadURLResult struct {
 	ObjectKey string
 	ExpiresAt time.Time
 	Headers   map[string]string
+}
+
+type AvatarAccessURLResult struct {
+	URL       string
+	ExpiresAt time.Time
 }
 
 type ConfirmAvatarUploadInput struct {
@@ -194,6 +202,7 @@ type AuthServiceConfig struct {
 	PasswordResetTokenTTL time.Duration
 	EmailVerificationTTL  time.Duration
 	AvatarUploadURLTTL    time.Duration
+	Logger                *slog.Logger
 }
 
 func NewAuthService(
@@ -232,6 +241,10 @@ func NewAuthService(
 		emailSender = client.NewNoopAuthEmailSender(nil)
 	}
 
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
 	return &AuthService{
 		authRepository:        authRepository,
 		passwordHasher:        passwordHasher,
@@ -243,6 +256,7 @@ func NewAuthService(
 		passwordResetTokenTTL: cfg.PasswordResetTokenTTL,
 		emailVerificationTTL:  cfg.EmailVerificationTTL,
 		avatarUploadURLTTL:    cfg.AvatarUploadURLTTL,
+		logger:                cfg.Logger,
 	}
 }
 
@@ -304,7 +318,7 @@ func (s *AuthService) Register(ctx context.Context, input RegisterInput) (Regist
 	}
 
 	if err := s.issueAndSendVerificationEmail(ctx, registered.User); err != nil {
-		return RegisterResult{}, fmt.Errorf("send verification email: %w", err)
+		return RegisterResult{}, err
 	}
 
 	return RegisterResult{
@@ -444,7 +458,8 @@ func (s *AuthService) ForgotPassword(ctx context.Context, email string) error {
 	}
 
 	if err := s.emailSender.SendPasswordResetEmail(ctx, user.Email, user.DisplayName, rawToken); err != nil {
-		return fmt.Errorf("send password reset email: %w", err)
+		s.logEmailDeliveryFailure("password_reset_email_send_failed", user.Email, err)
+		return nil
 	}
 
 	return nil
@@ -567,10 +582,24 @@ func (s *AuthService) issueAndSendVerificationEmail(ctx context.Context, user re
 	}
 
 	if err := s.emailSender.SendVerificationEmail(ctx, user.Email, user.DisplayName, rawToken); err != nil {
-		return fmt.Errorf("send verification email: %w", err)
+		s.logEmailDeliveryFailure("verification_email_send_failed", user.Email, err)
+		return nil
 	}
 
 	return nil
+}
+
+func (s *AuthService) logEmailDeliveryFailure(eventName, email string, err error) {
+	logger := s.logger
+	if logger == nil {
+		return
+	}
+
+	logger.Error(
+		eventName,
+		slog.String("email", email),
+		slog.Any("err", err),
+	)
 }
 
 func toUserView(user repository.User) UserView {

@@ -97,6 +97,24 @@ func (r *AuthRepository) UpdateUserProfile(ctx context.Context, params UpdateUse
 	return user, nil
 }
 
+func (r *AuthRepository) MarkUserEmailVerified(ctx context.Context, userID uuid.UUID) (User, error) {
+	verifiedUser, err := r.queries.MarkUserEmailVerified(ctx, toPgUUID(userID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return User{}, ErrUserNotFound
+		}
+
+		return User{}, fmt.Errorf("mark user email verified: %w", err)
+	}
+
+	user, err := fromSQLCUser(verifiedUser)
+	if err != nil {
+		return User{}, fmt.Errorf("map verified user: %w", err)
+	}
+
+	return user, nil
+}
+
 func (r *AuthRepository) CreateUserAndSession(ctx context.Context, params RegisterParams) (RegisterResult, error) {
 	tx, err := r.db.Pool().BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

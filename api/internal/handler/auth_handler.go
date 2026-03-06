@@ -43,6 +43,7 @@ type authService interface {
 	CreateAvatarUploadURL(ctx context.Context, input service.CreateAvatarUploadURLInput) (service.CreateAvatarUploadURLResult, error)
 	ConfirmAvatarUpload(ctx context.Context, input service.ConfirmAvatarUploadInput) (service.UserView, error)
 	DeleteAvatar(ctx context.Context, userID uuid.UUID) (service.UserView, error)
+	GetAvatarAccessURL(ctx context.Context, userID uuid.UUID) (service.AvatarAccessURLResult, error)
 }
 
 type requestValidator interface {
@@ -85,8 +86,7 @@ type verifyEmailRequest struct {
 }
 
 type updateProfileRequest struct {
-	DisplayName    *string         `json:"display_name,omitempty" validate:"omitempty,min=3,max=30"`
-	AvatarMetadata json.RawMessage `json:"avatar_metadata,omitempty"`
+	DisplayName *string `json:"display_name,omitempty" validate:"omitempty,min=3,max=30"`
 }
 
 type avatarUploadURLRequest struct {
@@ -123,6 +123,11 @@ type avatarUploadURLResponse struct {
 	ObjectKey string            `json:"object_key"`
 	ExpiresAt time.Time         `json:"expires_at"`
 	Headers   map[string]string `json:"headers"`
+}
+
+type avatarAccessURLResponse struct {
+	URL       string    `json:"url"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 func NewAuthHandler(

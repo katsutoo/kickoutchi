@@ -129,10 +129,10 @@ func TestGitHubOAuthClientFetchUserErrorWhenNoUsableEmail(t *testing.T) {
 
 	_, err = githubClient.FetchUser(context.Background(), "oauth_code")
 	if err == nil {
-		t.Fatalf("expected error when github account has no usable email")
+		t.Fatalf("expected error when github account has no verified email")
 	}
 
-	if !strings.Contains(err.Error(), "no usable email") {
+	if !strings.Contains(err.Error(), "no verified email") {
 		t.Fatalf("unexpected error for missing github email: %v", err)
 	}
 }
@@ -195,11 +195,11 @@ func TestPickGitHubEmail(t *testing.T) {
 			expectedEmail: "verified@example.com",
 		},
 		{
-			name: "fallback to first non-empty",
+			name: "reject unverified only email addresses",
 			emails: []githubEmailResponse{
 				{Email: "first@example.com", Primary: false, Verified: false},
 			},
-			expectedEmail: "first@example.com",
+			expectedEmail: "",
 		},
 	}
 

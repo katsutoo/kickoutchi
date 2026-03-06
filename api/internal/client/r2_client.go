@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +25,8 @@ type R2ClientConfig struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	Region          string
-	PublicBaseURL   string
 	SignedUploadTTL time.Duration
+	SignedReadTTL   time.Duration
 	HTTPClient      *http.Client
 }
 
@@ -36,6 +36,11 @@ type PresignedUpload struct {
 	ObjectKey string
 	ExpiresAt time.Time
 	Headers   map[string]string
+}
+
+type PresignedRead struct {
+	URL       string
+	ExpiresAt time.Time
 }
 
 type ObjectMetadata struct {
@@ -48,8 +53,8 @@ type ObjectMetadata struct {
 
 type R2Client struct {
 	bucket          string
-	publicBaseURL   string
 	signedUploadTTL time.Duration
+	signedReadTTL   time.Duration
 	s3Client        *s3.Client
 	presignClient   *s3.PresignClient
 }
@@ -74,6 +79,11 @@ func NewR2Client(cfg R2ClientConfig) (*R2Client, error) {
 		signedUploadTTL = 10 * time.Minute
 	}
 
+	signedReadTTL := cfg.SignedReadTTL
+	if signedReadTTL <= 0 {
+		signedReadTTL = 10 * time.Minute
+	}
+
 	endpointURL := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID)
 
 	awsConfig, err := awscfg.LoadDefaultConfig(
@@ -94,21 +104,16 @@ func NewR2Client(cfg R2ClientConfig) (*R2Client, error) {
 		options.BaseEndpoint = aws.String(endpointURL)
 	})
 
-	publicBaseURL := strings.TrimRight(strings.TrimSpace(cfg.PublicBaseURL), "/")
-	if publicBaseURL == "" {
-		publicBaseURL = endpointURL + "/" + bucket
-	}
-
 	return &R2Client{
 		bucket:          bucket,
-		publicBaseURL:   publicBaseURL,
 		signedUploadTTL: signedUploadTTL,
+		signedReadTTL:   signedReadTTL,
 		s3Client:        s3Client,
 		presignClient:   s3.NewPresignClient(s3Client),
 	}, nil
 }
 
-func (c *R2Client) CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string) (PresignedUpload, error) {
+func (c *R2Client) CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string, contentLength int64) (PresignedUpload, error) {
 	trimmedKey := strings.Trim(strings.TrimSpace(objectKey), "/")
 	if trimmedKey == "" {
 		return PresignedUpload{}, errors.New("object key is required")
@@ -119,12 +124,17 @@ func (c *R2Client) CreatePresignedUploadURL(ctx context.Context, objectKey, cont
 		return PresignedUpload{}, errors.New("content type is required")
 	}
 
+	if contentLength <= 0 {
+		return PresignedUpload{}, errors.New("content length is required")
+	}
+
 	presignedRequest, err := c.presignClient.PresignPutObject(
 		ctx,
 		&s3.PutObjectInput{
-			Bucket:      aws.String(c.bucket),
-			Key:         aws.String(trimmedKey),
-			ContentType: aws.String(trimmedContentType),
+			Bucket:        aws.String(c.bucket),
+			Key:           aws.String(trimmedKey),
+			ContentType:   aws.String(trimmedContentType),
+			ContentLength: aws.Int64(contentLength),
 		},
 		func(options *s3.PresignOptions) {
 			options.Expires = c.signedUploadTTL
@@ -144,6 +154,7 @@ func (c *R2Client) CreatePresignedUploadURL(ctx context.Context, objectKey, cont
 	}
 
 	headers["Content-Type"] = trimmedContentType
+	headers["Content-Length"] = strconv.FormatInt(contentLength, 10)
 
 	return PresignedUpload{
 		URL:       presignedRequest.URL,
@@ -245,19 +256,30 @@ func (c *R2Client) ReadObjectPrefix(ctx context.Context, objectKey string, maxBy
 	return prefix, nil
 }
 
-func (c *R2Client) PublicURL(objectKey string) string {
+func (c *R2Client) CreatePresignedReadURL(ctx context.Context, objectKey string) (PresignedRead, error) {
 	trimmedKey := strings.Trim(strings.TrimSpace(objectKey), "/")
 	if trimmedKey == "" {
-		return c.publicBaseURL
+		return PresignedRead{}, errors.New("object key is required")
 	}
 
-	segments := strings.Split(trimmedKey, "/")
-	escapedSegments := make([]string, 0, len(segments))
-	for _, segment := range segments {
-		escapedSegments = append(escapedSegments, url.PathEscape(segment))
+	presignedRequest, err := c.presignClient.PresignGetObject(
+		ctx,
+		&s3.GetObjectInput{
+			Bucket: aws.String(c.bucket),
+			Key:    aws.String(trimmedKey),
+		},
+		func(options *s3.PresignOptions) {
+			options.Expires = c.signedReadTTL
+		},
+	)
+	if err != nil {
+		return PresignedRead{}, fmt.Errorf("presign get object: %w", err)
 	}
 
-	return c.publicBaseURL + "/" + strings.Join(escapedSegments, "/")
+	return PresignedRead{
+		URL:       presignedRequest.URL,
+		ExpiresAt: time.Now().UTC().Add(c.signedReadTTL),
+	}, nil
 }
 
 func isNotFoundError(err error) bool {

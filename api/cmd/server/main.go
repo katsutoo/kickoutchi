@@ -13,6 +13,7 @@ import (
 
 	"github.com/katsutoo/kickoutchi/api/internal/config"
 	"github.com/katsutoo/kickoutchi/api/internal/handler"
+	"github.com/katsutoo/kickoutchi/api/internal/middleware"
 	"github.com/katsutoo/kickoutchi/api/internal/router"
 )
 
@@ -52,13 +53,15 @@ func run() error {
 	}
 
 	httpHandler := router.New(router.Dependencies{
-		Logger:               logger,
-		HealthHandler:        healthHandler,
-		AuthHandler:          authComponents.Handler,
-		AuthRequired:         authComponents.RequireAuth,
-		CSRFProtection:       authComponents.CSRFProtection,
-		AuthIPRateLimit:      authComponents.AuthIPRateLimit,
-		AuthAccountRateLimit: authComponents.AuthAccountRateLimit,
+		Logger:                logger,
+		HealthHandler:         healthHandler,
+		AuthHandler:           authComponents.Handler,
+		RealIP:                middleware.RealIP(middleware.RealIPConfig{TrustedProxyCIDRs: cfg.Security.TrustedProxyCIDRs}),
+		AuthRequired:          authComponents.RequireAuth,
+		CSRFProtection:        authComponents.CSRFProtection,
+		AuthIPRateLimit:       authComponents.AuthIPRateLimit,
+		AuthAccountRateLimit:  authComponents.AuthAccountRateLimit,
+		ResendVerifyRateLimit: authComponents.ResendVerifyRateLimit,
 	})
 
 	server := &http.Server{

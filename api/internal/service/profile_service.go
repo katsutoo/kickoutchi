@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,7 +19,7 @@ func (s *AuthService) UpdateProfile(ctx context.Context, input UpdateProfileInpu
 		return UserView{}, ErrInvalidSession
 	}
 
-	if input.DisplayName == nil && input.AvatarMetadata == nil {
+	if input.DisplayName == nil {
 		return UserView{}, ErrInvalidProfileUpdateInput
 	}
 
@@ -40,19 +41,10 @@ func (s *AuthService) UpdateProfile(ctx context.Context, input UpdateProfileInpu
 		updatedDisplayName = displayName
 	}
 
-	updatedAvatarMetadata := user.AvatarMetadata
-	if input.AvatarMetadata != nil {
-		avatarMetadata, err := normalizeAvatarMetadata(*input.AvatarMetadata)
-		if err != nil {
-			return UserView{}, ErrInvalidProfileUpdateInput
-		}
-		updatedAvatarMetadata = avatarMetadata
-	}
-
 	updatedUser, err := s.authRepository.UpdateUserProfile(ctx, repository.UpdateUserProfileParams{
 		UserID:         user.ID,
 		DisplayName:    updatedDisplayName,
-		AvatarMetadata: updatedAvatarMetadata,
+		AvatarMetadata: user.AvatarMetadata,
 	})
 	if err != nil {
 		switch {
@@ -95,7 +87,7 @@ func (s *AuthService) CreateAvatarUploadURL(ctx context.Context, input CreateAva
 		return CreateAvatarUploadURLResult{}, fmt.Errorf("generate avatar object key: %w", err)
 	}
 
-	presignedUpload, err := s.avatarStorage.CreatePresignedUploadURL(ctx, objectKey, normalizedContentType)
+	presignedUpload, err := s.avatarStorage.CreatePresignedUploadURL(ctx, objectKey, normalizedContentType, input.ContentLength)
 	if err != nil {
 		return CreateAvatarUploadURLResult{}, fmt.Errorf("create avatar upload url: %w", err)
 	}
@@ -148,14 +140,17 @@ func (s *AuthService) ConfirmAvatarUpload(ctx context.Context, input ConfirmAvat
 
 	normalizedContentType, _, err := normalizeAvatarContentType(avatarObject.ContentType)
 	if err != nil {
+		s.cleanupAvatarObject(ctx, objectKey)
 		return UserView{}, ErrUnsupportedAvatarContentType
 	}
 
 	if avatarObject.ContentLength <= 0 {
+		s.cleanupAvatarObject(ctx, objectKey)
 		return UserView{}, ErrInvalidAvatarUploadInput
 	}
 
 	if avatarObject.ContentLength > maxAvatarUploadBytes {
+		s.cleanupAvatarObject(ctx, objectKey)
 		return UserView{}, ErrAvatarFileTooLarge
 	}
 
@@ -170,6 +165,7 @@ func (s *AuthService) ConfirmAvatarUpload(ctx context.Context, input ConfirmAvat
 
 	if err := validateAvatarMagicBytes(normalizedContentType, avatarPrefix); err != nil {
 		if errors.Is(err, ErrInvalidAvatarFileContent) {
+			s.cleanupAvatarObject(ctx, objectKey)
 			return UserView{}, ErrInvalidAvatarFileContent
 		}
 
@@ -179,16 +175,18 @@ func (s *AuthService) ConfirmAvatarUpload(ctx context.Context, input ConfirmAvat
 	user, err := s.authRepository.GetUserByID(ctx, input.UserID)
 	if err != nil {
 		if errors.Is(err, repository.ErrUserNotFound) {
+			s.cleanupAvatarObject(ctx, objectKey)
 			return UserView{}, ErrInvalidSession
 		}
 
 		return UserView{}, fmt.Errorf("get user for avatar confirm: %w", err)
 	}
 
+	previousObjectKey := avatarObjectKeyFromMetadata(user.AvatarMetadata)
+
 	avatarMetadata := map[string]any{
 		"provider":     "r2",
 		"key":          objectKey,
-		"url":          s.avatarStorage.PublicURL(objectKey),
 		"content_type": normalizedContentType,
 		"size_bytes":   avatarObject.ContentLength,
 		"updated_at":   time.Now().UTC().Format(time.RFC3339Nano),
@@ -215,12 +213,19 @@ func (s *AuthService) ConfirmAvatarUpload(ctx context.Context, input ConfirmAvat
 	if err != nil {
 		switch {
 		case errors.Is(err, repository.ErrDisplayNameAlreadyExists):
+			s.cleanupAvatarObject(ctx, objectKey)
 			return UserView{}, ErrDisplayNameAlreadyInUse
 		case errors.Is(err, repository.ErrUserNotFound):
+			s.cleanupAvatarObject(ctx, objectKey)
 			return UserView{}, ErrInvalidSession
 		default:
+			s.cleanupAvatarObject(ctx, objectKey)
 			return UserView{}, fmt.Errorf("update avatar metadata: %w", err)
 		}
+	}
+
+	if previousObjectKey != "" && previousObjectKey != objectKey {
+		s.cleanupAvatarObject(ctx, previousObjectKey)
 	}
 
 	return toUserView(updatedUser), nil
@@ -268,4 +273,60 @@ func (s *AuthService) DeleteAvatar(ctx context.Context, userID uuid.UUID) (UserV
 	}
 
 	return toUserView(updatedUser), nil
+}
+
+func (s *AuthService) GetAvatarAccessURL(ctx context.Context, userID uuid.UUID) (AvatarAccessURLResult, error) {
+	if userID == uuid.Nil {
+		return AvatarAccessURLResult{}, ErrInvalidSession
+	}
+
+	if s.avatarStorage == nil {
+		return AvatarAccessURLResult{}, ErrAvatarStorageUnavailable
+	}
+
+	user, err := s.authRepository.GetUserByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return AvatarAccessURLResult{}, ErrInvalidSession
+		}
+
+		return AvatarAccessURLResult{}, fmt.Errorf("get user for avatar access url: %w", err)
+	}
+
+	objectKey := avatarObjectKeyFromMetadata(user.AvatarMetadata)
+	if objectKey == "" {
+		return AvatarAccessURLResult{}, ErrAvatarNotFound
+	}
+
+	if _, err := s.avatarStorage.HeadObject(ctx, objectKey); err != nil {
+		if errors.Is(err, client.ErrObjectNotFound) {
+			return AvatarAccessURLResult{}, ErrAvatarNotFound
+		}
+
+		return AvatarAccessURLResult{}, fmt.Errorf("head avatar object for access url: %w", err)
+	}
+
+	presignedRead, err := s.avatarStorage.CreatePresignedReadURL(ctx, objectKey)
+	if err != nil {
+		return AvatarAccessURLResult{}, fmt.Errorf("create avatar access url: %w", err)
+	}
+
+	return AvatarAccessURLResult{
+		URL:       presignedRead.URL,
+		ExpiresAt: presignedRead.ExpiresAt,
+	}, nil
+}
+
+func (s *AuthService) cleanupAvatarObject(ctx context.Context, objectKey string) {
+	if s.avatarStorage == nil {
+		return
+	}
+
+	if err := s.avatarStorage.DeleteObject(ctx, objectKey); err != nil && s.logger != nil && !errors.Is(err, client.ErrObjectNotFound) {
+		s.logger.Warn(
+			"avatar_object_cleanup_failed",
+			slog.String("object_key", objectKey),
+			slog.Any("err", err),
+		)
+	}
 }

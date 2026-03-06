@@ -94,3 +94,52 @@ func TestAuthIPRateLimitIntegration(t *testing.T) {
 		t.Fatalf("expected Retry-After header when IP rate limit is exceeded")
 	}
 }
+
+func TestResendVerificationRateLimitIntegration(t *testing.T) {
+	app := testutil.NewIntegrationApp(t, testutil.IntegrationAppOptions{
+		ResendVerifyRateLimitRequests: 1,
+		ResendVerifyRateLimitWindow:   time.Hour,
+		ResendVerifyRateLimitBurst:    1,
+	})
+
+	client := app.NewCookieClient(t)
+	email := uniqueEmail("resend_verify")
+
+	status, body, _ := doJSONRequest(
+		t,
+		client,
+		http.MethodPost,
+		app.BaseURL+"/v1/auth/register",
+		map[string]string{
+			"email":        email,
+			"password":     "Str0ngPassw0rd!",
+			"display_name": uniqueDisplayName("resend_verify"),
+		},
+		nil,
+	)
+	requireStatus(t, status, http.StatusCreated, body)
+
+	status, body, _ = doJSONRequest(
+		t,
+		client,
+		http.MethodPost,
+		app.BaseURL+"/v1/auth/resend-verification",
+		nil,
+		map[string]string{"Origin": app.AllowedOrigin},
+	)
+	requireStatus(t, status, http.StatusOK, body)
+
+	status, body, headers := doJSONRequest(
+		t,
+		client,
+		http.MethodPost,
+		app.BaseURL+"/v1/auth/resend-verification",
+		nil,
+		map[string]string{"Origin": app.AllowedOrigin},
+	)
+	requireStatus(t, status, http.StatusTooManyRequests, body)
+
+	if retryAfter := headers.Get("Retry-After"); retryAfter == "" {
+		t.Fatalf("expected Retry-After header when resend verification rate limit is exceeded")
+	}
+}

@@ -33,6 +33,7 @@ Security is a release gate for every phase, not a final hardening task.
 - Session rotation on login, password reset, and sensitive account changes
 - Invalidate all sessions on password reset
 - Rate limits on login, register, and forgot-password endpoints
+- Rate limit authenticated verification-email resends
 - Email verification required before social/real-time features
 - CSRF protection on state-changing cookie-auth routes (origin checks and/or CSRF token)
 
@@ -42,6 +43,7 @@ Security is a release gate for every phase, not a final hardening task.
 
 - OAuth providers: GitHub, Google, X
 - Store only provider identity by default (`provider`, `provider_uid`, `provider_email`)
+- Only trust provider emails that are verified by the provider before linking or authenticating accounts
 - Do not store provider access/refresh tokens at launch unless a feature requires provider API access
 - If token storage is added later, encrypt at rest and rotate encryption keys
 
@@ -76,9 +78,9 @@ Network boundary rule:
 
 - Use short-lived signed upload URLs
 - Validate MIME type and magic bytes server-side
-- Enforce max size and image dimension limits
+- Enforce max size and clean up invalid/replaced avatar objects
 - Reject SVG unless sanitized pipeline exists
-- Keep buckets private; serve through signed read URLs or controlled proxy
+- Keep buckets private; serve avatars through short-lived signed read URLs
 
 ---
 
@@ -100,6 +102,7 @@ Network boundary rule:
 - Use dedicated sender identity (`RESEND_FROM_EMAIL`)
 - Keep reminder and auth templates versioned
 - Track message IDs in delivery records for support/debugging
+- Treat transient email delivery failures as operational incidents: log them, alert on them, and let the user retry rather than corrupting auth state
 
 ---
 
@@ -136,5 +139,6 @@ Network boundary rule:
 - [ ] WebSocket message-size and rate-limit protections configured
 - [ ] Polar webhook signature verification enabled
 - [ ] R2 upload validation (type, magic bytes, size) verified (implemented in API; live bucket verification pending)
+- [ ] R2 signed read URL flow verified against private bucket
 - [ ] Resend DNS auth (SPF/DKIM/DMARC) validated
 - [ ] Backup restore test completed in staging

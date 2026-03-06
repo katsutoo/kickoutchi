@@ -98,18 +98,14 @@ func (c *GitHubOAuthClient) FetchUser(ctx context.Context, code string) (GitHubO
 		return GitHubOAuthUser{}, err
 	}
 
-	email := strings.ToLower(strings.TrimSpace(user.Email))
-	if email == "" {
-		emails, err := c.fetchEmails(ctx, accessToken)
-		if err != nil {
-			return GitHubOAuthUser{}, err
-		}
-
-		email = pickGitHubEmail(emails)
+	emails, err := c.fetchEmails(ctx, accessToken)
+	if err != nil {
+		return GitHubOAuthUser{}, err
 	}
 
+	email := pickGitHubEmail(emails)
 	if email == "" {
-		return GitHubOAuthUser{}, errors.New("github account has no usable email")
+		return GitHubOAuthUser{}, errors.New("github account has no verified email")
 	}
 
 	if user.ID == 0 {
@@ -261,13 +257,6 @@ func pickGitHubEmail(emails []githubEmailResponse) string {
 	for _, email := range emails {
 		if email.Verified {
 			return strings.ToLower(strings.TrimSpace(email.Email))
-		}
-	}
-
-	for _, email := range emails {
-		trimmed := strings.ToLower(strings.TrimSpace(email.Email))
-		if trimmed != "" {
-			return trimmed
 		}
 	}
 

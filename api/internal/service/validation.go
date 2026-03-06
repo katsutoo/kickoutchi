@@ -47,7 +47,8 @@ func shouldRefreshSession(now, expiresAt time.Time, refreshWindow time.Duration)
 
 func validateDisplayName(displayName string) (string, error) {
 	trimmed := strings.TrimSpace(displayName)
-	if len(trimmed) < minDisplayNameLength || len(trimmed) > maxDisplayNameLength {
+	length := utf8.RuneCountInString(trimmed)
+	if length < minDisplayNameLength || length > maxDisplayNameLength {
 		return "", errors.New("display name length is invalid")
 	}
 

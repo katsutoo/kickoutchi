@@ -167,6 +167,25 @@ func RateLimitByJSONField(limiter *KeyRateLimiter, field string) func(http.Handl
 	}
 }
 
+func RateLimitByAuthenticatedUser(limiter *KeyRateLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := requestClientIP(r)
+
+			if authUser, ok := AuthUserFromContext(r.Context()); ok {
+				key = authUser.ID.String()
+			}
+
+			if allowed, retryAfter := limiter.Allow(key); !allowed {
+				writeRateLimited(w, retryAfter)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func writeRateLimited(w http.ResponseWriter, retryAfter time.Duration) {
 	seconds := int(retryAfter.Seconds())
 	if seconds < 1 {

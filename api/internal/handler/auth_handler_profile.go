@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -41,15 +40,9 @@ func (h *AuthHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var avatarMetadata *json.RawMessage
-	if req.AvatarMetadata != nil {
-		avatarMetadata = &req.AvatarMetadata
-	}
-
 	updatedUser, err := h.authService.UpdateProfile(r.Context(), service.UpdateProfileInput{
-		UserID:         authSession.ID,
-		DisplayName:    req.DisplayName,
-		AvatarMetadata: avatarMetadata,
+		UserID:      authSession.ID,
+		DisplayName: req.DisplayName,
 	})
 	if err != nil {
 		switch {
@@ -67,6 +60,36 @@ func (h *AuthHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 
 	_ = apiresponse.WriteJSON(w, http.StatusOK, apiresponse.DataEnvelope[authResultResponse]{
 		Data: authResultResponse{User: toUserResponse(updatedUser)},
+	})
+}
+
+func (h *AuthHandler) GetAvatarAccessURL(w http.ResponseWriter, r *http.Request) {
+	authSession, ok := appmiddleware.AuthUserFromContext(r.Context())
+	if !ok {
+		apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", nil))
+		return
+	}
+
+	result, err := h.authService.GetAvatarAccessURL(r.Context(), authSession.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidSession):
+			apierror.WriteError(w, apierror.New(http.StatusUnauthorized, "UNAUTHORIZED", "authentication required", err))
+		case errors.Is(err, service.ErrAvatarStorageUnavailable):
+			apierror.WriteError(w, apierror.New(http.StatusServiceUnavailable, "AVATAR_STORAGE_UNAVAILABLE", "avatar storage unavailable", err))
+		case errors.Is(err, service.ErrAvatarNotFound):
+			apierror.WriteError(w, apierror.New(http.StatusNotFound, "AVATAR_NOT_FOUND", "avatar not found", err))
+		default:
+			h.writeInternalServerError(r, w, err)
+		}
+		return
+	}
+
+	_ = apiresponse.WriteJSON(w, http.StatusOK, apiresponse.DataEnvelope[avatarAccessURLResponse]{
+		Data: avatarAccessURLResponse{
+			URL:       result.URL,
+			ExpiresAt: result.ExpiresAt,
+		},
 	})
 }
 

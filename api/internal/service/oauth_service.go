@@ -72,6 +72,15 @@ func (s *AuthService) resolveOAuthUser(ctx context.Context, provider string, oau
 			return repository.User{}, fmt.Errorf("get oauth user by identity: %w", err)
 		}
 
+		if user.EmailVerifiedAt == nil {
+			verifiedUser, err := s.authRepository.MarkUserEmailVerified(ctx, user.ID)
+			if err != nil {
+				return repository.User{}, fmt.Errorf("mark oauth-linked user email verified: %w", err)
+			}
+
+			user = verifiedUser
+		}
+
 		return user, nil
 	}
 
@@ -118,7 +127,25 @@ func (s *AuthService) resolveOAuthUser(ctx context.Context, provider string, oau
 			return repository.User{}, fmt.Errorf("resolve oauth identity user: %w", err)
 		}
 
+		if resolvedUser.EmailVerifiedAt == nil {
+			verifiedUser, err := s.authRepository.MarkUserEmailVerified(ctx, resolvedUser.ID)
+			if err != nil {
+				return repository.User{}, fmt.Errorf("mark resolved oauth user email verified: %w", err)
+			}
+
+			resolvedUser = verifiedUser
+		}
+
 		return resolvedUser, nil
+	}
+
+	if user.EmailVerifiedAt == nil {
+		verifiedUser, err := s.authRepository.MarkUserEmailVerified(ctx, user.ID)
+		if err != nil {
+			return repository.User{}, fmt.Errorf("mark oauth user email verified: %w", err)
+		}
+
+		user = verifiedUser
 	}
 
 	return user, nil
@@ -172,7 +199,12 @@ func (s *AuthService) createOAuthUser(ctx context.Context, oauthUser client.GitH
 			}
 		}
 
-		return createdUser, nil
+		verifiedUser, err := s.authRepository.MarkUserEmailVerified(ctx, createdUser.ID)
+		if err != nil {
+			return repository.User{}, fmt.Errorf("mark created oauth user email verified: %w", err)
+		}
+
+		return verifiedUser, nil
 	}
 
 	return repository.User{}, errors.New("unable to create oauth user with unique display name")

@@ -18,11 +18,12 @@ import (
 )
 
 type AuthComponents struct {
-	Handler              *handler.AuthHandler
-	RequireAuth          func(http.Handler) http.Handler
-	CSRFProtection       func(http.Handler) http.Handler
-	AuthIPRateLimit      func(http.Handler) http.Handler
-	AuthAccountRateLimit func(http.Handler) http.Handler
+	Handler               *handler.AuthHandler
+	RequireAuth           func(http.Handler) http.Handler
+	CSRFProtection        func(http.Handler) http.Handler
+	AuthIPRateLimit       func(http.Handler) http.Handler
+	AuthAccountRateLimit  func(http.Handler) http.Handler
+	ResendVerifyRateLimit func(http.Handler) http.Handler
 }
 
 type githubOAuthProvider interface {
@@ -31,11 +32,11 @@ type githubOAuthProvider interface {
 }
 
 type avatarStorageProvider interface {
-	CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string) (client.PresignedUpload, error)
+	CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string, contentLength int64) (client.PresignedUpload, error)
 	HeadObject(ctx context.Context, objectKey string) (client.ObjectMetadata, error)
 	ReadObjectPrefix(ctx context.Context, objectKey string, maxBytes int64) ([]byte, error)
 	DeleteObject(ctx context.Context, objectKey string) error
-	PublicURL(objectKey string) string
+	CreatePresignedReadURL(ctx context.Context, objectKey string) (client.PresignedRead, error)
 }
 
 func newDatabase(ctx context.Context, cfg config.Config) (*database.DB, error) {
@@ -105,8 +106,8 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 			AccessKeyID:     cfg.R2.AccessKeyID,
 			SecretAccessKey: cfg.R2.SecretAccessKey,
 			Region:          cfg.R2.Region,
-			PublicBaseURL:   cfg.R2.PublicBaseURL,
 			SignedUploadTTL: cfg.R2.SignedUploadTTL,
+			SignedReadTTL:   cfg.R2.SignedReadTTL,
 		})
 		if err != nil {
 			return AuthComponents{}, fmt.Errorf("create r2 client: %w", err)
@@ -127,6 +128,7 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 			PasswordResetTokenTTL: cfg.Auth.PasswordResetTokenTTL,
 			EmailVerificationTTL:  cfg.Auth.EmailVerificationTokenTTL,
 			AvatarUploadURLTTL:    cfg.R2.SignedUploadTTL,
+			Logger:                logger,
 		},
 	)
 	validator := appvalidator.New()
@@ -170,11 +172,18 @@ func newAuthComponents(cfg config.Config, db *database.DB, logger *slog.Logger) 
 		cfg.Security.AuthAccountRateLimitBurst,
 	), "email")
 
+	resendVerifyRateLimiter := appmiddleware.RateLimitByAuthenticatedUser(appmiddleware.NewKeyRateLimiter(
+		cfg.Security.ResendVerificationRequests,
+		cfg.Security.ResendVerificationWindow,
+		cfg.Security.ResendVerificationBurst,
+	))
+
 	return AuthComponents{
-		Handler:              authHandler,
-		RequireAuth:          requireAuth,
-		CSRFProtection:       csrfProtection,
-		AuthIPRateLimit:      authIPRateLimiter,
-		AuthAccountRateLimit: authAccountRateLimiter,
+		Handler:               authHandler,
+		RequireAuth:           requireAuth,
+		CSRFProtection:        csrfProtection,
+		AuthIPRateLimit:       authIPRateLimiter,
+		AuthAccountRateLimit:  authAccountRateLimiter,
+		ResendVerifyRateLimit: resendVerifyRateLimiter,
 	}, nil
 }

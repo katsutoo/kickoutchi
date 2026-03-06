@@ -18,6 +18,7 @@ type fakeAuthRepository struct {
 	createUserFn                    func(ctx context.Context, params repository.CreateUserParams) (repository.User, error)
 	getUserByEmailFn                func(ctx context.Context, email string) (repository.User, error)
 	getUserByIDFn                   func(ctx context.Context, userID uuid.UUID) (repository.User, error)
+	markUserEmailVerifiedFn         func(ctx context.Context, userID uuid.UUID) (repository.User, error)
 	updateUserProfileFn             func(ctx context.Context, params repository.UpdateUserProfileParams) (repository.User, error)
 	rotateSessionFn                 func(ctx context.Context, params repository.RotateSessionParams) (repository.Session, error)
 	getSessionByTokenHashActiveFn   func(ctx context.Context, tokenHash []byte) (repository.Session, error)
@@ -60,6 +61,14 @@ func (f *fakeAuthRepository) GetUserByID(ctx context.Context, userID uuid.UUID) 
 	}
 
 	return repository.User{}, errors.New("unexpected GetUserByID call")
+}
+
+func (f *fakeAuthRepository) MarkUserEmailVerified(ctx context.Context, userID uuid.UUID) (repository.User, error) {
+	if f.markUserEmailVerifiedFn != nil {
+		return f.markUserEmailVerifiedFn(ctx, userID)
+	}
+
+	return repository.User{}, errors.New("unexpected MarkUserEmailVerified call")
 }
 
 func (f *fakeAuthRepository) UpdateUserProfile(ctx context.Context, params repository.UpdateUserProfileParams) (repository.User, error) {
@@ -184,17 +193,38 @@ func (f *fakeAuthEmailSender) SendPasswordResetEmail(ctx context.Context, toEmai
 	return nil
 }
 
+type fakeGitHubOAuthClient struct {
+	authorizationURLFn func(state string) string
+	fetchUserFn        func(ctx context.Context, code string) (client.GitHubOAuthUser, error)
+}
+
+func (f *fakeGitHubOAuthClient) AuthorizationURL(state string) string {
+	if f.authorizationURLFn != nil {
+		return f.authorizationURLFn(state)
+	}
+
+	return ""
+}
+
+func (f *fakeGitHubOAuthClient) FetchUser(ctx context.Context, code string) (client.GitHubOAuthUser, error) {
+	if f.fetchUserFn != nil {
+		return f.fetchUserFn(ctx, code)
+	}
+
+	return client.GitHubOAuthUser{}, errors.New("unexpected FetchUser call")
+}
+
 type fakeAvatarStorage struct {
-	createPresignedUploadURLFn func(ctx context.Context, objectKey, contentType string) (client.PresignedUpload, error)
+	createPresignedUploadURLFn func(ctx context.Context, objectKey, contentType string, contentLength int64) (client.PresignedUpload, error)
 	headObjectFn               func(ctx context.Context, objectKey string) (client.ObjectMetadata, error)
 	readObjectPrefixFn         func(ctx context.Context, objectKey string, maxBytes int64) ([]byte, error)
 	deleteObjectFn             func(ctx context.Context, objectKey string) error
-	publicURLFn                func(objectKey string) string
+	createPresignedReadURLFn   func(ctx context.Context, objectKey string) (client.PresignedRead, error)
 }
 
-func (f *fakeAvatarStorage) CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string) (client.PresignedUpload, error) {
+func (f *fakeAvatarStorage) CreatePresignedUploadURL(ctx context.Context, objectKey, contentType string, contentLength int64) (client.PresignedUpload, error) {
 	if f.createPresignedUploadURLFn != nil {
-		return f.createPresignedUploadURLFn(ctx, objectKey, contentType)
+		return f.createPresignedUploadURLFn(ctx, objectKey, contentType, contentLength)
 	}
 
 	return client.PresignedUpload{}, errors.New("unexpected CreatePresignedUploadURL call")
@@ -224,12 +254,12 @@ func (f *fakeAvatarStorage) DeleteObject(ctx context.Context, objectKey string) 
 	return nil
 }
 
-func (f *fakeAvatarStorage) PublicURL(objectKey string) string {
-	if f.publicURLFn != nil {
-		return f.publicURLFn(objectKey)
+func (f *fakeAvatarStorage) CreatePresignedReadURL(ctx context.Context, objectKey string) (client.PresignedRead, error) {
+	if f.createPresignedReadURLFn != nil {
+		return f.createPresignedReadURLFn(ctx, objectKey)
 	}
 
-	return ""
+	return client.PresignedRead{}, errors.New("unexpected CreatePresignedReadURL call")
 }
 
 func TestAuthServiceRegister(t *testing.T) {
@@ -480,7 +510,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 				&fakePasswordHasher{},
 				&fakeAuthEmailSender{},
 				nil,
-				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string) (client.PresignedUpload, error) {
+				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string, int64) (client.PresignedUpload, error) {
 					return client.PresignedUpload{}, nil
 				}},
 				defaultAuthServiceConfig(),
@@ -495,7 +525,7 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 				&fakePasswordHasher{},
 				&fakeAuthEmailSender{},
 				nil,
-				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string) (client.PresignedUpload, error) {
+				&fakeAvatarStorage{createPresignedUploadURLFn: func(context.Context, string, string, int64) (client.PresignedUpload, error) {
 					return client.PresignedUpload{}, nil
 				}},
 				defaultAuthServiceConfig(),
@@ -521,13 +551,13 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 			&fakePasswordHasher{},
 			&fakeAuthEmailSender{},
 			nil,
-			&fakeAvatarStorage{createPresignedUploadURLFn: func(_ context.Context, objectKey, contentType string) (client.PresignedUpload, error) {
+			&fakeAvatarStorage{createPresignedUploadURLFn: func(_ context.Context, objectKey, contentType string, contentLength int64) (client.PresignedUpload, error) {
 				return client.PresignedUpload{
 					URL:       "https://upload.example.com",
 					Method:    "PUT",
 					ObjectKey: objectKey,
 					ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
-					Headers:   map[string]string{"Content-Type": contentType},
+					Headers:   map[string]string{"Content-Type": contentType, "Content-Length": "1024"},
 				}, nil
 			}},
 			defaultAuthServiceConfig(),
@@ -550,6 +580,8 @@ func TestAuthServiceCreateAvatarUploadURL(t *testing.T) {
 
 func TestAuthServiceConfirmAvatarUploadInvalidMagicBytes(t *testing.T) {
 	userID := mustUUIDForServiceTest(t)
+	objectKey := "users/" + userID.String() + "/avatars/avatar.png"
+	cleanedObjectKey := ""
 
 	svc := NewAuthService(
 		&fakeAuthRepository{},
@@ -563,16 +595,197 @@ func TestAuthServiceConfirmAvatarUploadInvalidMagicBytes(t *testing.T) {
 			readObjectPrefixFn: func(context.Context, string, int64) ([]byte, error) {
 				return []byte("not-a-real-png-signature"), nil
 			},
+			deleteObjectFn: func(_ context.Context, objectKey string) error {
+				cleanedObjectKey = objectKey
+				return nil
+			},
 		},
 		defaultAuthServiceConfig(),
 	)
 
 	_, err := svc.ConfirmAvatarUpload(t.Context(), ConfirmAvatarUploadInput{
 		UserID:    userID,
-		ObjectKey: "users/" + userID.String() + "/avatars/avatar.png",
+		ObjectKey: objectKey,
 	})
 	if !errors.Is(err, ErrInvalidAvatarFileContent) {
 		t.Fatalf("expected ErrInvalidAvatarFileContent, got: %v", err)
+	}
+
+	if cleanedObjectKey != objectKey {
+		t.Fatalf("expected invalid avatar upload to be cleaned up, got: %q", cleanedObjectKey)
+	}
+}
+
+func TestAuthServiceGetAvatarAccessURL(t *testing.T) {
+	userID := mustUUIDForServiceTest(t)
+	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+
+	svc := NewAuthService(
+		&fakeAuthRepository{
+			getUserByIDFn: func(context.Context, uuid.UUID) (repository.User, error) {
+				return repository.User{
+					ID:             userID,
+					Email:          "user@example.com",
+					DisplayName:    "user_name",
+					Role:           "user",
+					AvatarMetadata: json.RawMessage(`{"key":"users/` + userID.String() + `/avatars/avatar.png"}`),
+				}, nil
+			},
+		},
+		&fakePasswordHasher{},
+		&fakeAuthEmailSender{},
+		nil,
+		&fakeAvatarStorage{
+			headObjectFn: func(context.Context, string) (client.ObjectMetadata, error) {
+				return client.ObjectMetadata{ContentType: "image/png", ContentLength: 1024}, nil
+			},
+			createPresignedReadURLFn: func(_ context.Context, objectKey string) (client.PresignedRead, error) {
+				return client.PresignedRead{
+					URL:       "https://example.com/avatar.png",
+					ExpiresAt: expiresAt,
+				}, nil
+			},
+		},
+		defaultAuthServiceConfig(),
+	)
+
+	result, err := svc.GetAvatarAccessURL(t.Context(), userID)
+	if err != nil {
+		t.Fatalf("get avatar access url returned error: %v", err)
+	}
+
+	if result.URL != "https://example.com/avatar.png" {
+		t.Fatalf("unexpected avatar access url: %s", result.URL)
+	}
+
+	if !result.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("unexpected avatar access url expiration: got=%s expected=%s", result.ExpiresAt, expiresAt)
+	}
+}
+
+func TestAuthServiceLoginWithOAuthMarksUserVerified(t *testing.T) {
+	userID := mustUUIDForServiceTest(t)
+	verifiedAt := time.Now().UTC()
+	markedVerified := false
+
+	svc := NewAuthService(
+		&fakeAuthRepository{
+			getOAuthIdentityByProviderUIDFn: func(context.Context, string, string) (repository.OAuthIdentity, error) {
+				return repository.OAuthIdentity{}, repository.ErrOAuthIdentityNotFound
+			},
+			getUserByEmailFn: func(context.Context, string) (repository.User, error) {
+				return repository.User{
+					ID:             userID,
+					Email:          "user@example.com",
+					DisplayName:    "user_name",
+					Role:           "user",
+					AvatarMetadata: json.RawMessage("{}"),
+				}, nil
+			},
+			createOAuthIdentityFn: func(context.Context, repository.CreateOAuthIdentityParams) (repository.OAuthIdentity, error) {
+				return repository.OAuthIdentity{UserID: userID}, nil
+			},
+			markUserEmailVerifiedFn: func(context.Context, uuid.UUID) (repository.User, error) {
+				markedVerified = true
+				return repository.User{
+					ID:              userID,
+					Email:           "user@example.com",
+					DisplayName:     "user_name",
+					Role:            "user",
+					EmailVerifiedAt: &verifiedAt,
+					AvatarMetadata:  json.RawMessage("{}"),
+				}, nil
+			},
+			rotateSessionFn: func(context.Context, repository.RotateSessionParams) (repository.Session, error) {
+				return repository.Session{
+					ID:        mustUUIDForServiceTest(t),
+					UserID:    userID,
+					ExpiresAt: time.Now().UTC().Add(time.Hour),
+				}, nil
+			},
+		},
+		&fakePasswordHasher{},
+		&fakeAuthEmailSender{},
+		&fakeGitHubOAuthClient{
+			fetchUserFn: func(context.Context, string) (client.GitHubOAuthUser, error) {
+				return client.GitHubOAuthUser{
+					ProviderUID: "github-user-42",
+					Email:       "user@example.com",
+					Login:       "octocat",
+					Name:        "Octo Cat",
+				}, nil
+			},
+		},
+		nil,
+		defaultAuthServiceConfig(),
+	)
+
+	result, err := svc.LoginWithOAuth(t.Context(), OAuthLoginInput{
+		Provider:  repository.OAuthProviderGitHub,
+		Code:      "oauth_code",
+		RemoteIP:  "127.0.0.1",
+		UserAgent: "test-agent",
+	})
+	if err != nil {
+		t.Fatalf("login with oauth returned error: %v", err)
+	}
+
+	if !markedVerified {
+		t.Fatalf("expected oauth login to mark the user email as verified")
+	}
+
+	if result.User.EmailVerifiedAt == nil {
+		t.Fatalf("expected oauth login result to include email verification time")
+	}
+}
+
+func TestAuthServiceRegisterIgnoresVerificationEmailDeliveryError(t *testing.T) {
+	userID := mustUUIDForServiceTest(t)
+
+	svc := NewAuthService(
+		&fakeAuthRepository{
+			createUserAndSessionFn: func(_ context.Context, params repository.RegisterParams) (repository.RegisterResult, error) {
+				return repository.RegisterResult{
+					User: repository.User{
+						ID:             userID,
+						Email:          params.Email,
+						DisplayName:    params.DisplayName,
+						Role:           "user",
+						AvatarMetadata: json.RawMessage("{}"),
+						InsertedAt:     time.Now().UTC(),
+						UpdatedAt:      time.Now().UTC(),
+					},
+					Session: repository.Session{
+						ID:        mustUUIDForServiceTest(t),
+						UserID:    userID,
+						ExpiresAt: time.Now().UTC().Add(time.Hour),
+					},
+				}, nil
+			},
+			issueEmailTokenFn: func(context.Context, repository.IssueEmailTokenParams) (repository.EmailToken, error) {
+				return repository.EmailToken{}, nil
+			},
+		},
+		&fakePasswordHasher{hashFn: func(string) (string, error) { return "password_hash", nil }},
+		&fakeAuthEmailSender{sendVerificationFn: func(context.Context, string, string, string) error {
+			return errors.New("email delivery failed")
+		}},
+		nil,
+		nil,
+		defaultAuthServiceConfig(),
+	)
+
+	result, err := svc.Register(t.Context(), RegisterInput{
+		Email:       "user@example.com",
+		Password:    "Str0ngPassw0rd!",
+		DisplayName: "user_name",
+	})
+	if err != nil {
+		t.Fatalf("register returned error: %v", err)
+	}
+
+	if result.User.ID != userID {
+		t.Fatalf("unexpected registered user id: got=%s expected=%s", result.User.ID, userID)
 	}
 }
 

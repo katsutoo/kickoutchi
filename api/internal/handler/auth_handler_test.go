@@ -29,6 +29,7 @@ type stubAuthService struct {
 	createAvatarUploadURLFn  func(ctx context.Context, input service.CreateAvatarUploadURLInput) (service.CreateAvatarUploadURLResult, error)
 	confirmAvatarUploadFn    func(ctx context.Context, input service.ConfirmAvatarUploadInput) (service.UserView, error)
 	deleteAvatarFn           func(ctx context.Context, userID uuid.UUID) (service.UserView, error)
+	getAvatarAccessURLFn     func(ctx context.Context, userID uuid.UUID) (service.AvatarAccessURLResult, error)
 }
 
 func (s *stubAuthService) Register(ctx context.Context, input service.RegisterInput) (service.RegisterResult, error) {
@@ -133,6 +134,14 @@ func (s *stubAuthService) DeleteAvatar(ctx context.Context, userID uuid.UUID) (s
 	}
 
 	return service.UserView{}, nil
+}
+
+func (s *stubAuthService) GetAvatarAccessURL(ctx context.Context, userID uuid.UUID) (service.AvatarAccessURLResult, error) {
+	if s.getAvatarAccessURLFn != nil {
+		return s.getAvatarAccessURLFn(ctx, userID)
+	}
+
+	return service.AvatarAccessURLResult{}, nil
 }
 
 func TestAuthHandlerRegisterErrorMapping(t *testing.T) {
