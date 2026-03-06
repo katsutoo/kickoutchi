@@ -322,8 +322,9 @@ func (s *AuthService) cleanupAvatarObject(ctx context.Context, objectKey string)
 		return
 	}
 
-	if err := s.avatarStorage.DeleteObject(ctx, objectKey); err != nil && s.logger != nil && !errors.Is(err, client.ErrObjectNotFound) {
-		s.logger.Warn(
+	logger := s.loggerForContext(ctx)
+	if err := s.avatarStorage.DeleteObject(ctx, objectKey); err != nil && logger != nil && !errors.Is(err, client.ErrObjectNotFound) {
+		logger.Warn(
 			"avatar_object_cleanup_failed",
 			slog.String("object_key", objectKey),
 			slog.Any("err", err),

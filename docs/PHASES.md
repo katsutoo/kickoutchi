@@ -14,7 +14,7 @@ Each phase is intentionally small and shippable. Do not build Phase N+1 infrastr
 - [ ] OAuth login: GitHub, Google, X (GitHub implemented; Google/X pending)
 - [x] Resend integration for transactional auth email flows
 - [x] Session management (httpOnly secure cookies)
-- [x] User profile CRUD (display name, avatar metadata)
+- [x] Profile updates (display name) and controlled avatar upload/delete/access flow
 
 **Frontend**
 - [ ] SvelteKit app shell with route groups `(public)` and `(app)`

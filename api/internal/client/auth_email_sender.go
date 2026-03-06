@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 )
 
 type AuthEmailSender interface {
@@ -44,6 +46,18 @@ func NewNoopAuthEmailSender(logger *slog.Logger) *NoopAuthEmailSender {
 	return &NoopAuthEmailSender{logger: logger}
 }
 
+func loggerForContext(ctx context.Context, logger *slog.Logger) *slog.Logger {
+	if logger == nil {
+		return nil
+	}
+
+	if requestID := chimiddleware.GetReqID(ctx); requestID != "" {
+		return logger.With(slog.String("request_id", requestID))
+	}
+
+	return logger
+}
+
 func (s *ResendAuthEmailSender) SendVerificationEmail(ctx context.Context, toEmail, displayName, token string) error {
 	verificationURL := s.webBaseURL + "/verify-email?token=" + url.QueryEscape(token)
 	safeName := html.EscapeString(strings.TrimSpace(displayName))
@@ -61,7 +75,10 @@ func (s *ResendAuthEmailSender) SendVerificationEmail(ctx context.Context, toEma
 		return err
 	}
 
-	s.logger.Info("verification_email_sent", slog.String("to_email", toEmail), slog.String("message_id", messageID))
+	logger := loggerForContext(ctx, s.logger)
+	if logger != nil {
+		logger.Info("verification_email_sent", slog.String("to_email", toEmail), slog.String("message_id", messageID))
+	}
 	return nil
 }
 
@@ -82,16 +99,25 @@ func (s *ResendAuthEmailSender) SendPasswordResetEmail(ctx context.Context, toEm
 		return err
 	}
 
-	s.logger.Info("password_reset_email_sent", slog.String("to_email", toEmail), slog.String("message_id", messageID))
+	logger := loggerForContext(ctx, s.logger)
+	if logger != nil {
+		logger.Info("password_reset_email_sent", slog.String("to_email", toEmail), slog.String("message_id", messageID))
+	}
 	return nil
 }
 
-func (s *NoopAuthEmailSender) SendVerificationEmail(_ context.Context, toEmail, _ string, _ string) error {
-	s.logger.Warn("verification_email_skipped_no_sender", slog.String("to_email", toEmail))
+func (s *NoopAuthEmailSender) SendVerificationEmail(ctx context.Context, toEmail, _ string, _ string) error {
+	logger := loggerForContext(ctx, s.logger)
+	if logger != nil {
+		logger.Warn("verification_email_skipped_no_sender", slog.String("to_email", toEmail))
+	}
 	return nil
 }
 
-func (s *NoopAuthEmailSender) SendPasswordResetEmail(_ context.Context, toEmail, _ string, _ string) error {
-	s.logger.Warn("password_reset_email_skipped_no_sender", slog.String("to_email", toEmail))
+func (s *NoopAuthEmailSender) SendPasswordResetEmail(ctx context.Context, toEmail, _ string, _ string) error {
+	logger := loggerForContext(ctx, s.logger)
+	if logger != nil {
+		logger.Warn("password_reset_email_skipped_no_sender", slog.String("to_email", toEmail))
+	}
 	return nil
 }

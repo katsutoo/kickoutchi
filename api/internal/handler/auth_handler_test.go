@@ -263,6 +263,48 @@ func TestAuthHandlerVerifyEmailTokenMapping(t *testing.T) {
 	}
 }
 
+func TestSetOAuthStateCookieUsesProviderScopedNameAndPath(t *testing.T) {
+	h := newTestAuthHandler(t, &stubAuthService{})
+	recorder := httptest.NewRecorder()
+
+	h.setOAuthStateCookie(recorder, "github", "state-value")
+
+	response := recorder.Result()
+	defer response.Body.Close()
+
+	cookies := response.Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("unexpected cookie count: got=%d expected=1", len(cookies))
+	}
+
+	cookie := cookies[0]
+	if cookie.Name != "kickoutchi_oauth_state_github" {
+		t.Fatalf("unexpected cookie name: got=%s", cookie.Name)
+	}
+
+	if cookie.Path != "/v1/auth/oauth/github/callback" {
+		t.Fatalf("unexpected cookie path: got=%s", cookie.Path)
+	}
+}
+
+func TestValidateOAuthStateUsesProviderScopedCookie(t *testing.T) {
+	h := newTestAuthHandler(t, &stubAuthService{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/oauth/github/callback?state=state-value", nil)
+	req.AddCookie(&http.Cookie{
+		Name:  oauthStateCookieName("github"),
+		Value: "state-value",
+		Path:  oauthStateCookiePath("github"),
+	})
+
+	if !h.validateOAuthState(req, "github", "state-value") {
+		t.Fatal("expected github oauth state to validate")
+	}
+
+	if h.validateOAuthState(req, "google", "state-value") {
+		t.Fatal("expected provider-scoped oauth state cookie lookup")
+	}
+}
+
 func newTestAuthHandler(t *testing.T, authService authService) *AuthHandler {
 	t.Helper()
 

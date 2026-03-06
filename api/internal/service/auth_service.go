@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
 	"github.com/katsutoo/kickoutchi/api/internal/auth"
@@ -457,7 +458,7 @@ func (s *AuthService) ForgotPassword(ctx context.Context, email string) error {
 	}
 
 	if err := s.emailSender.SendPasswordResetEmail(ctx, user.Email, user.DisplayName, rawToken); err != nil {
-		s.logEmailDeliveryFailure("password_reset_email_send_failed", user.Email, err)
+		s.logEmailDeliveryFailure(ctx, "password_reset_email_send_failed", user.Email, err)
 		return nil
 	}
 
@@ -581,15 +582,28 @@ func (s *AuthService) issueAndSendVerificationEmail(ctx context.Context, user re
 	}
 
 	if err := s.emailSender.SendVerificationEmail(ctx, user.Email, user.DisplayName, rawToken); err != nil {
-		s.logEmailDeliveryFailure("verification_email_send_failed", user.Email, err)
+		s.logEmailDeliveryFailure(ctx, "verification_email_send_failed", user.Email, err)
 		return nil
 	}
 
 	return nil
 }
 
-func (s *AuthService) logEmailDeliveryFailure(eventName, email string, err error) {
+func (s *AuthService) loggerForContext(ctx context.Context) *slog.Logger {
 	logger := s.logger
+	if logger == nil {
+		return nil
+	}
+
+	if requestID := chimiddleware.GetReqID(ctx); requestID != "" {
+		return logger.With(slog.String("request_id", requestID))
+	}
+
+	return logger
+}
+
+func (s *AuthService) logEmailDeliveryFailure(ctx context.Context, eventName, email string, err error) {
+	logger := s.loggerForContext(ctx)
 	if logger == nil {
 		return
 	}

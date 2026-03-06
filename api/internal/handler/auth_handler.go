@@ -26,7 +26,7 @@ import (
 const (
 	maxAuthRequestBodyBytes = 1 << 20
 	defaultOAuthStateTTL    = 10 * time.Minute
-	oauthStateCookieName    = "kickoutchi_oauth_state"
+	oauthStateCookiePrefix  = "kickoutchi_oauth_state"
 )
 
 type authService interface {
@@ -184,11 +184,32 @@ func (h *AuthHandler) clearSessionCookie(w http.ResponseWriter) {
 	sessioncookie.Clear(w, h.sessionCookie)
 }
 
-func (h *AuthHandler) setOAuthStateCookie(w http.ResponseWriter, state string) {
+func normalizeOAuthProvider(provider string) string {
+	return strings.ToLower(strings.TrimSpace(provider))
+}
+
+func isSupportedOAuthProvider(provider string) bool {
+	return normalizeOAuthProvider(provider) == "github"
+}
+
+func oauthStateCookieName(provider string) string {
+	normalizedProvider := normalizeOAuthProvider(provider)
+	if normalizedProvider == "" {
+		return oauthStateCookiePrefix
+	}
+
+	return oauthStateCookiePrefix + "_" + normalizedProvider
+}
+
+func oauthStateCookiePath(provider string) string {
+	return "/v1/auth/oauth/" + normalizeOAuthProvider(provider) + "/callback"
+}
+
+func (h *AuthHandler) setOAuthStateCookie(w http.ResponseWriter, provider, state string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     oauthStateCookieName,
+		Name:     oauthStateCookieName(provider),
 		Value:    state,
-		Path:     "/v1/auth/oauth/github/callback",
+		Path:     oauthStateCookiePath(provider),
 		Domain:   h.sessionCookie.Domain,
 		Expires:  time.Now().UTC().Add(h.oauthStateTTL),
 		MaxAge:   int(h.oauthStateTTL.Seconds()),
@@ -198,11 +219,11 @@ func (h *AuthHandler) setOAuthStateCookie(w http.ResponseWriter, state string) {
 	})
 }
 
-func (h *AuthHandler) clearOAuthStateCookie(w http.ResponseWriter) {
+func (h *AuthHandler) clearOAuthStateCookie(w http.ResponseWriter, provider string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     oauthStateCookieName,
+		Name:     oauthStateCookieName(provider),
 		Value:    "",
-		Path:     "/v1/auth/oauth/github/callback",
+		Path:     oauthStateCookiePath(provider),
 		Domain:   h.sessionCookie.Domain,
 		Expires:  time.Unix(0, 0).UTC(),
 		MaxAge:   -1,
@@ -212,12 +233,12 @@ func (h *AuthHandler) clearOAuthStateCookie(w http.ResponseWriter) {
 	})
 }
 
-func (h *AuthHandler) validateOAuthState(r *http.Request, state string) bool {
+func (h *AuthHandler) validateOAuthState(r *http.Request, provider, state string) bool {
 	if strings.TrimSpace(state) == "" {
 		return false
 	}
 
-	cookie, err := r.Cookie(oauthStateCookieName)
+	cookie, err := r.Cookie(oauthStateCookieName(provider))
 	if err != nil {
 		return false
 	}

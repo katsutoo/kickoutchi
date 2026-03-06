@@ -214,8 +214,8 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *AuthHandler) OAuthStart(w http.ResponseWriter, r *http.Request) {
-	provider := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "provider")))
-	if provider != "github" {
+	provider := normalizeOAuthProvider(chi.URLParam(r, "provider"))
+	if !isSupportedOAuthProvider(provider) {
 		apierror.WriteError(w, apierror.New(http.StatusBadRequest, "INVALID_OAUTH_PROVIDER", "invalid oauth provider", service.ErrInvalidOAuthProvider))
 		return
 	}
@@ -237,24 +237,24 @@ func (h *AuthHandler) OAuthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.setOAuthStateCookie(w, state)
+	h.setOAuthStateCookie(w, provider, state)
 	http.Redirect(w, r, authorizationURL, http.StatusFound)
 }
 
 func (h *AuthHandler) OAuthCallback(w http.ResponseWriter, r *http.Request) {
-	provider := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "provider")))
-	if provider != "github" {
+	provider := normalizeOAuthProvider(chi.URLParam(r, "provider"))
+	if !isSupportedOAuthProvider(provider) {
 		h.redirectOAuthError(w, r, "invalid_provider")
 		return
 	}
 
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
-	if !h.validateOAuthState(r, state) {
-		h.clearOAuthStateCookie(w)
+	if !h.validateOAuthState(r, provider, state) {
+		h.clearOAuthStateCookie(w, provider)
 		h.redirectOAuthError(w, r, "invalid_state")
 		return
 	}
-	h.clearOAuthStateCookie(w)
+	h.clearOAuthStateCookie(w, provider)
 
 	result, err := h.authService.LoginWithOAuth(r.Context(), service.OAuthLoginInput{
 		Provider:            provider,
