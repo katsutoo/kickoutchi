@@ -51,7 +51,6 @@ const (
 	maxPasswordLen              = 128
 	maxDisplayNameLength        = 30
 	minDisplayNameLength        = 3
-	maxAvatarMetadataBytes      = 8 * 1024
 	maxAvatarUploadBytes        = 5 * 1024 * 1024
 	avatarMagicBytesReadLimit   = 64
 )

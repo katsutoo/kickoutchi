@@ -57,7 +57,7 @@ func forwardedClientIP(r *http.Request) net.IP {
 		}
 	}
 
-	for _, part := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+	for part := range strings.SplitSeq(r.Header.Get("X-Forwarded-For"), ",") {
 		if ip := requestIP(part); ip != nil {
 			return ip
 		}

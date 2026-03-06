@@ -59,29 +59,6 @@ func validateDisplayName(displayName string) (string, error) {
 	return trimmed, nil
 }
 
-func normalizeAvatarMetadata(raw json.RawMessage) (json.RawMessage, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return json.RawMessage("{}"), nil
-	}
-
-	if len(trimmed) > maxAvatarMetadataBytes {
-		return nil, errors.New("avatar metadata is too large")
-	}
-
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
-		return nil, errors.New("avatar metadata must be a valid JSON object")
-	}
-
-	normalized, err := json.Marshal(decoded)
-	if err != nil {
-		return nil, fmt.Errorf("normalize avatar metadata: %w", err)
-	}
-
-	return json.RawMessage(normalized), nil
-}
-
 func normalizeAvatarContentType(contentType string) (string, string, error) {
 	trimmed := strings.ToLower(strings.TrimSpace(contentType))
 	if trimmed == "" {
