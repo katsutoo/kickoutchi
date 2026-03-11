@@ -1,2 +1,3 @@
 # kickoutchi
-Kickoutchi is a browser-based multiplayer tamagotchi-style social game.
+
+I check about that project later, but a tamagotchi in terminal basically
