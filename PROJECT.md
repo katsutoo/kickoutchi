@@ -29,7 +29,7 @@ Build a local terminal application that:
 
 This is not an SSH-hosted app. Kickoutchi runs locally on the developer machine.
 
-Later, add a simple visual frontend landing page hosted on Cloudflare Pages with the project domain name to present Kickoutchi and link to install options.
+Separately, a static marketing landing page presents Kickoutchi and links to the install options. It is built with Astro, kept in its own repository, and deployed to Cloudflare Pages at the project domain `kickoutchi.com`, with download buttons that point at the GitHub Releases artifacts. The website lives outside this repository so this repo stays a clean, all-Rust project; it is not part of the cargo build or the phases below.
 
 Why local install is required:
 
@@ -62,7 +62,7 @@ SHA256SUMS
 Linux/macOS example:
 
 ```sh
-curl -L https://github.com/OWNER/kickoutchi/releases/latest/download/kickoutchi-linux-x86_64.tar.gz -o kickoutchi.tar.gz
+curl -L https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-linux-x86_64.tar.gz -o kickoutchi.tar.gz
 tar -xzf kickoutchi.tar.gz
 chmod +x kickoutchi
 ./kickoutchi
@@ -71,7 +71,7 @@ chmod +x kickoutchi
 Windows example:
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/OWNER/kickoutchi/releases/latest/download/kickoutchi-windows-x86_64.zip" -OutFile "kickoutchi.zip"
+Invoke-WebRequest -Uri "https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-windows-x86_64.zip" -OutFile "kickoutchi.zip"
 Expand-Archive .\kickoutchi.zip -DestinationPath .\kickoutchi
 .\kickoutchi\kickoutchi.exe
 ```
@@ -88,7 +88,7 @@ kickoutchi
 If installing from the Git repository before crates.io release:
 
 ```sh
-cargo install --git https://github.com/OWNER/kickoutchi
+cargo install --git https://github.com/nuggocto/kickoutchi
 kickoutchi
 ```
 
@@ -99,7 +99,7 @@ Recommended for contributors.
 The project should use `mise` to pin the Rust toolchain and keep contributor environments consistent.
 
 ```sh
-git clone https://github.com/OWNER/kickoutchi.git
+git clone https://github.com/nuggocto/kickoutchi.git
 cd kickoutchi
 mise trust
 mise install
@@ -128,10 +128,10 @@ winget install kickoutchi
 yay -S kickoutchi
 
 # Nix with flakes
-nix run github:OWNER/kickoutchi
+nix run github:nuggocto/kickoutchi
 
 # Nix install into profile
-nix profile install github:OWNER/kickoutchi
+nix profile install github:nuggocto/kickoutchi
 ```
 
 Arch and Nix should be treated as first-class packaging targets because they fit Rust CLI/TUI tools well.
@@ -1247,6 +1247,7 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 - The **AUR `PKGBUILD`** files under `packaging/arch/` stay hand-maintained and consume the `cargo-dist` release artifacts (for `kickoutchi-bin`) or build from source (for `kickoutchi`).
 - **crates.io** publishing (`cargo publish`) remains a separate step; `cargo-dist` handles binaries and installers, not the crate registry.
 - macOS **codesigning and notarization** are out of scope for the first release; unsigned binaries ship with clear install notes.
+- The **landing page website** (built with Astro, deployed to Cloudflare Pages at `kickoutchi.com`) lives in its own repository and deploys separately; `cargo-dist` only produces the release binaries and installers that the site links to.
 
 ### Build steps
 
@@ -1261,7 +1262,7 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 9. Let `cargo-dist generate` produce the `.github/workflows/release.yml` workflow, and commit it; verify the plan locally with `dist plan` and `dist build`.
 10. Confirm the release publishes per-artifact SHA-256 checksums and a `dist-manifest.json` to the GitHub Release.
 11. Cut releases by pushing a version tag (for example `v0.1.0`) so the generated workflow builds, checksums, and uploads every artifact to GitHub Releases.
-12. Add `README.md` install instructions for binary download, the `cargo-dist` shell/PowerShell installers, Cargo install, source build, Nix, Arch, Homebrew, and winget plans.
+12. Add `README.md` install instructions for binary download, the `cargo-dist` shell/PowerShell installers, Cargo install, source build, Nix, Arch, Homebrew, and winget plans, and link to the live landing page at `kickoutchi.com`.
 13. Add `LICENSE` with MIT text.
 14. Add shell completions and man page only if they are ready and tested.
 15. Add `flake.nix` for native Nix install and `nix run`.
@@ -1280,10 +1281,11 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 - Releases include per-artifact SHA-256 checksums and a `dist-manifest.json`.
 - The `curl | sh` and PowerShell installers download and install the correct binary for the host platform.
 - `cargo install kickoutchi` works after crates.io publication.
-- `nix run github:OWNER/kickoutchi` works on Linux and macOS.
-- `nix profile install github:OWNER/kickoutchi` works on Linux and macOS.
+- `nix run github:nuggocto/kickoutchi` works on Linux and macOS.
+- `nix profile install github:nuggocto/kickoutchi` works on Linux and macOS.
 - Arch AUR package can install with `yay -S kickoutchi-bin`.
 - README explains permissions, safe termination, protected processes, and platform limitations.
+- README links to the live landing page at `kickoutchi.com`.
 - A new user can install Kickoutchi and complete the core flow without reading the source code.
 
 ---
