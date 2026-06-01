@@ -4,3 +4,32 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# TUI + terminal control. crossterm is kept as a direct dependency (not only via
+# ratatui's re-export) because the event loop and terminal lifecycle use it.
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+
+# CLI parsing and (de)serialization. Declared now so the shared model, config,
+# and non-TUI commands in the next phase build on a fixed dependency set rather
+# than churning Cargo.toml feature flags later.
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2"
+
+# Error handling: thiserror for typed boundaries, anyhow reserved for internal
+# context. Tracing logs diagnostics to stderr only, never to the TUI surface.
+thiserror = "2.0.18"
+anyhow = "1.0.102"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+# Platform/process/clipboard crates (sysinfo, libc, windows-sys, arboard) are
+# intentionally NOT added here. They land in the phases that first use them so
+# `--all-features` stays buildable on every host during Phase 0.
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+pedantic = "warn"
