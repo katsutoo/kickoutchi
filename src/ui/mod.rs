@@ -1,8 +1,8 @@
-//! Terminal lifecycle, the event loop, and minimal rendering.
+//! Terminal lifecycle, the event loop, and rendering.
 //!
-//! The full table/details/help layout is a later phase. Phase 0 proves only that
-//! the terminal is entered and, above all, always restored: on clean quit, on a
-//! propagated error, and on panic.
+//! The central guarantee of this module is that the terminal is entered and,
+//! above all, always restored: on clean quit, on a propagated error, and on
+//! panic.
 
 use std::io::{self, Stdout};
 
@@ -119,7 +119,7 @@ fn event_loop(terminal: &mut Tui, config: &Config) -> AppResult<()> {
     }
 }
 
-// Placeholder Phase 0 screen; the real table/details layout comes later.
+// Placeholder screen; the real table/details layout comes later.
 fn draw(frame: &mut Frame) {
     let message = Paragraph::new("Kickoutchi: press q, Esc, or Ctrl+C to quit")
         .alignment(Alignment::Center)

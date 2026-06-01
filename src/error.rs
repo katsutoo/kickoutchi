@@ -6,7 +6,7 @@ use thiserror::Error;
 
 /// Top-level error for the Kickoutchi binary.
 ///
-/// Phase 0 only surfaces terminal/IO failures. Collector, process, and config
+/// Today this only surfaces terminal/IO failures; collector, process, and config
 /// errors get their own variants as those subsystems land. Keeping a single
 /// typed error at the binary boundary means `main` maps one enum to its exit
 /// behaviour instead of matching on stringly-typed failures.

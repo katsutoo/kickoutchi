@@ -1,9 +1,8 @@
 //! Kickoutchi: a cross-platform TUI port janitor.
 //!
-//! Phase 0 is intentionally minimal: it opens a terminal screen, runs an event
-//! loop that quits on `q`/`Esc`/`Ctrl+C`, and guarantees the terminal is always
-//! restored. Port collection, killing, and the full layout arrive in later
-//! phases.
+//! This is the binary entry point: it wires up tracing and the panic hook, then
+//! runs the terminal UI, opening a screen and running an event loop that quits on
+//! `q`/`Esc`/`Ctrl+C` while guaranteeing the terminal is always restored.
 
 mod config;
 mod error;
