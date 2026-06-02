@@ -729,7 +729,7 @@ Milestones:
 |---|---:|---|
 | Local prototype | Phase 2 | The app opens, renders fake data, and proves the TUI shape |
 | Linux MVP | Phase 6 | Linux can show real ports, filter them, and safely terminate stale processes |
-| Cross-platform app | Phase 8 | Linux, Windows, and macOS collectors all work |
+| Cross-platform app (optional) | Phase 8 | Linux, Windows, and macOS collectors all work; Windows and macOS are deferred until there is motivation to build them |
 | Public release | Phase 11 | Users can install binaries and packages |
 
 Recommended order:
@@ -1063,6 +1063,8 @@ pedantic = "warn"
 
 ## Phase 7 - Windows Native Collector And Termination
 
+**Status: Optional, deferred until there is motivation to support Windows.** Linux is the primary supported platform and Kickoutchi is considered complete without this phase. (WSL2 dev-server ports are already covered by the Linux build, since WSL2 is Linux.)
+
 **Goal:** Bring the same core behavior to Windows using Windows APIs instead of parsing `netstat`.
 
 **Why this comes after the Linux MVP:** The product behavior is already proven. This phase adapts collection and termination to Windows while reusing the shared model, UI, CLI, filters, and safety rules.
@@ -1106,6 +1108,8 @@ pedantic = "warn"
 ---
 
 ## Phase 8 - macOS Native Collector And Termination
+
+**Status: Optional, deferred until there is motivation to support macOS.** It needs a Mac to build and test, and has the most awkward native APIs of the three platforms. Kickoutchi is considered complete without this phase.
 
 **Goal:** Bring the same core behavior to macOS using native process/socket APIs by default.
 
