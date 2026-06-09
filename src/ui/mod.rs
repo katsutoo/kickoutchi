@@ -53,13 +53,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-// Reverse of `enter`: leave the alternate screen and disable raw mode.
-fn restore_terminal() -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    Ok(())
-}
-
 /// Restore the terminal, logging rather than propagating on failure.
 ///
 /// Used from `Drop` and the panic hook, where errors cannot be returned. A
@@ -67,9 +60,17 @@ fn restore_terminal() -> io::Result<()> {
 /// record why it may be left dirty without masking the failure in flight. Both
 /// callers may run during the same panic, so a redundant second restore is
 /// expected and harmless.
+///
+/// Teardown mirrors [`TerminalGuard::enter`] in reverse order: leave the
+/// alternate screen, then disable raw mode. Each step is attempted and logged
+/// independently — a short-circuit here could strand the user on a blank
+/// alternate screen, the exact failure this module exists to prevent.
 fn best_effort_restore() {
-    if let Err(error) = restore_terminal() {
-        tracing::warn!(%error, "failed to restore terminal");
+    if let Err(error) = execute!(io::stdout(), LeaveAlternateScreen) {
+        tracing::warn!(%error, "failed to leave alternate screen");
+    }
+    if let Err(error) = disable_raw_mode() {
+        tracing::warn!(%error, "failed to disable raw mode");
     }
 }
 

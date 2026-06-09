@@ -12,8 +12,9 @@ use thiserror::Error;
 /// behaviour instead of matching on stringly-typed failures.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
-    /// Entering raw mode / the alternate screen, drawing a frame, or restoring
-    /// the terminal failed.
+    /// Entering raw mode / the alternate screen, drawing a frame, or reading
+    /// input failed. Restore failures are not propagated here; they are logged
+    /// best-effort because they surface in `Drop` and the panic hook.
     #[error("terminal I/O failed: {0}")]
     Terminal(#[from] io::Error),
 }
