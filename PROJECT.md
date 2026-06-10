@@ -1,5 +1,5 @@
 ---
-title: Kickoutchi - Cross-Platform Rust + ratatui Port Janitor Roadmap
+title: Kickoutchi - Linux-First Rust + ratatui Port Janitor Roadmap
 tags: [rust, project, tui, ratatui, ports, processes, linux, windows, macos]
 created: 2026-05-30
 status: planning
@@ -15,7 +15,7 @@ Build a local terminal application that:
 
 - Lists listening TCP ports and bound UDP ports
 - Shows protocol, address, port, PID, process name, executable path, and command line when available
-- Works on Linux, Windows, and macOS
+- Works on Linux first; Windows and macOS are optional, deferred targets (Phases 7 and 8)
 - Lets the user refresh, search, filter, and sort ports
 - Provides a non-TUI CLI mode for scripts and quick checks
 - Shows the exact kill command for the selected process
@@ -48,15 +48,20 @@ Users should be able to install Kickoutchi in several ways.
 
 Recommended for most users.
 
-Release artifacts should include:
+Release artifacts for the first public release:
 
 ```txt
 kickoutchi-linux-x86_64.tar.gz
 kickoutchi-linux-aarch64.tar.gz
+SHA256SUMS
+```
+
+Added later, only if the optional Windows and macOS phases (7 and 8) are built:
+
+```txt
 kickoutchi-windows-x86_64.zip
 kickoutchi-macos-aarch64.tar.gz
 kickoutchi-macos-x86_64.tar.gz
-SHA256SUMS
 ```
 
 Linux/macOS example:
@@ -134,7 +139,7 @@ nix run github:nuggocto/kickoutchi
 nix profile install github:nuggocto/kickoutchi
 ```
 
-Arch and Nix should be treated as first-class packaging targets because they fit Rust CLI/TUI tools well.
+Arch and Nix should be treated as first-class packaging targets because they fit Rust CLI/TUI tools well. The Homebrew formula and winget distribution depend on the optional Windows and macOS phases (7 and 8) and are not part of the first public release.
 
 Arch packaging plan:
 
@@ -402,6 +407,8 @@ UI behavior:
 - Details modal can show child processes
 - Kill confirmation should mention if the selected PID has children
 - Later, add an option to terminate a process tree, but do not make tree-kill the default
+
+Collection note: `child_pids` on `PortEntry` is resolved lazily for the selected row only. Building the full child map for every row would mean walking the whole process table on every refresh, so on non-selected rows the field may simply stay empty.
 
 ### Docker And Container Awareness
 
@@ -732,7 +739,7 @@ Milestones:
 | Local prototype | Phase 2 | The app opens, renders fake data, and proves the TUI shape |
 | Linux MVP | Phase 6 | Linux can show real ports, filter them, and safely terminate stale processes |
 | Cross-platform app (optional) | Phase 8 | Linux, Windows, and macOS collectors all work; Windows and macOS are deferred until there is motivation to build them |
-| Public release | Phase 11 | Users can install binaries and packages |
+| Public release | Phase 11 | Users can install Linux binaries and packages; Windows/macOS artifacts ship only if Phases 7 and 8 are built |
 
 Recommended order:
 
@@ -1234,7 +1241,7 @@ pedantic = "warn"
 
 **Why this is last:** Packaging should happen after the behavior is stable enough that install instructions, release artifacts, and checksums will not churn constantly.
 
-**Expected result:** A pushed version tag drives a `cargo-dist`-generated release that publishes working binaries for Linux, Windows, and macOS with per-artifact checksums and ready-to-use installers, and the README explains every supported install path.
+**Expected result:** A pushed version tag drives a `cargo-dist`-generated release that publishes working Linux binaries (x86_64 and aarch64) with per-artifact checksums and a ready-to-use shell installer, and the README explains every supported install path. Windows and macOS artifacts are added to the same pipeline only if the optional Phases 7 and 8 are built — the release setup must not require platforms whose collectors do not exist, because the crate cannot compile for them.
 
 ### Release tooling decision
 
@@ -1258,18 +1265,18 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 
 ### Build steps
 
-1. Add GitHub Actions CI for Linux, Windows, and macOS that runs on pushes and pull requests, separate from the release workflow.
+1. Add GitHub Actions CI for Linux that runs on pushes and pull requests, separate from the release workflow. Extend CI to Windows and macOS only when Phases 7 and 8 land.
 2. Run `cargo fmt --all --check` in CI.
 3. Run clippy on all targets in CI.
-4. Run tests on all supported operating systems in CI.
+4. Run tests in CI on every operating system the project supports at the time (Linux at first).
 5. Install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`.
-6. Configure the release target triples: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin`.
-7. Configure archive formats so Linux and macOS produce `.tar.gz` and Windows produces `.zip`, matching the artifact names in Option 1.
-8. Enable the `shell` and `powershell` installers and the Homebrew installer/formula output.
+6. Configure the release target triples: `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Add `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin` only when Phases 7 and 8 land.
+7. Configure archive formats so Linux produces `.tar.gz`, matching the artifact names in Option 1 (Windows `.zip` and macOS `.tar.gz` follow with their phases).
+8. Enable the `shell` installer. Enable the `powershell` installer and the Homebrew installer/formula output only when their platforms ship.
 9. Let `cargo-dist generate` produce the `.github/workflows/release.yml` workflow, and commit it; verify the plan locally with `dist plan` and `dist build`.
 10. Confirm the release publishes per-artifact SHA-256 checksums and a `dist-manifest.json` to the GitHub Release.
 11. Cut releases by pushing a version tag (for example `v0.1.0`) so the generated workflow builds, checksums, and uploads every artifact to GitHub Releases.
-12. Add `README.md` install instructions for binary download, the `cargo-dist` shell/PowerShell installers, Cargo install, source build, Nix, Arch, Homebrew, and winget plans, and link to the live landing page at `kickoutchi.com`.
+12. Add `README.md` install instructions for binary download, the `cargo-dist` shell installer, Cargo install, source build, Nix, and Arch, and link to the live landing page at `kickoutchi.com`. Document the PowerShell installer, Homebrew, and winget paths only once their platforms ship.
 13. Add `LICENSE` with MIT text.
 14. Add shell completions and man page only if they are ready and tested.
 15. Add `flake.nix` for native Nix install and `nix run`.
@@ -1283,17 +1290,21 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 
 - Pushing a version tag triggers the `cargo-dist` release workflow with no manual build steps.
 - Linux release binaries work without extra packages.
-- Windows release binary works in Windows Terminal.
-- macOS release binaries work on supported architectures.
 - Releases include per-artifact SHA-256 checksums and a `dist-manifest.json`.
-- The `curl | sh` and PowerShell installers download and install the correct binary for the host platform.
+- The `curl | sh` installer downloads and installs the correct Linux binary.
 - `cargo install kickoutchi` works after crates.io publication.
-- `nix run github:nuggocto/kickoutchi` works on Linux and macOS.
-- `nix profile install github:nuggocto/kickoutchi` works on Linux and macOS.
+- `nix run github:nuggocto/kickoutchi` works on Linux.
+- `nix profile install github:nuggocto/kickoutchi` works on Linux.
 - Arch AUR package can install with `yay -S kickoutchi-bin`.
 - README explains permissions, safe termination, protected processes, and platform limitations.
 - README links to the live landing page at `kickoutchi.com`.
 - A new user can install Kickoutchi and complete the core flow without reading the source code.
+
+Additional done-when items that apply only if Phases 7 and 8 are built:
+
+- Windows release binary works in Windows Terminal and the PowerShell installer installs it correctly.
+- macOS release binaries work on supported architectures, and `nix run` / `nix profile install` work on macOS.
+- The Homebrew formula installs the correct binary.
 
 ---
 
@@ -1320,6 +1331,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo run
 ```
+
+`--all-features` is the verification standard, which means the optional `arboard` clipboard feature is always compiled during verification. On Linux, `arboard` needs system development packages (X11/Wayland clipboard libraries), so contributors must have them installed even though clipboard support is optional at runtime.
 
 Manual test commands:
 
