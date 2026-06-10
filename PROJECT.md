@@ -545,6 +545,7 @@ Current version snapshot checked on 2026-05-04 with crates.io metadata and local
 | Windows APIs     |                    `windows-sys` |             `0.61.2` | Direct access to IP Helper and process APIs                        |
 | Unix FFI         |                           `libc` |            `0.2.177` | Latest non-alpha Unix/macOS FFI bindings                           |
 | Clipboard        |                        `arboard` |              `3.6.1` | Optional copy command support                                      |
+| Config paths     |                            `dirs` |              `6.0.0` | Cross-platform config/cache directory resolution (`XDG_CONFIG_HOME`, `%APPDATA%`, `~/Library/...`) |
 | Errors           |           `thiserror` + `anyhow` | `2.0.18` + `1.0.102` | Typed collector errors plus app-level context                      |
 | Logging          | `tracing` + `tracing-subscriber` |  `0.1.44` + `0.3.23` | Debug collector failures without polluting the UI                  |
 | Release tooling  |          `cargo-dist` (`dist`) |    `0.30.0` available | Rust-native cross-platform release pipeline, configured from `Cargo.toml` |
@@ -566,6 +567,7 @@ cargo add clap@4.6.1 --features derive
 cargo add serde@1.0.228 --features derive
 cargo add serde_json@1.0.149 toml@1.1.2
 cargo add arboard@3.6.1 --optional
+cargo add dirs@6.0.0
 cargo add thiserror@2.0.18 anyhow@1.0.102
 cargo add tracing@0.1.44 tracing-subscriber@0.3.23
 cargo add libc@0.2.177 --target 'cfg(unix)'
@@ -765,10 +767,11 @@ Phase 10 is intentionally optional for the first public release. Docker awarenes
 
 1. Create the project with `cargo new kickoutchi`.
 2. Set `edition = "2024"` in `Cargo.toml`.
-3. Add `mise.toml` pinned to Rust `1.95.0`.
-4. Run `mise trust` and `mise install` so contributors use the same Rust toolchain.
-5. Add the dependencies from the stack table, starting with `ratatui`, `crossterm`, `clap`, `serde`, `serde_json`, `toml`, `thiserror`, `anyhow`, and `tracing`.
-6. Add strict project lints in `Cargo.toml`.
+3. Add required `Cargo.toml` metadata fields early: `license = "MIT"`, `description`, `repository`, `authors`, and `readme = "README.md"`. These are needed for both `cargo publish` and `cargo-dist` later.
+4. Add `mise.toml` pinned to Rust `1.95.0`.
+5. Run `mise trust` and `mise install` so contributors use the same Rust toolchain.
+6. Add the dependencies from the stack table, starting with `ratatui`, `crossterm`, `clap`, `serde`, `serde_json`, `toml`, `thiserror`, `anyhow`, and `tracing`.
+7. Add strict project lints in `Cargo.toml`.
 
 ```toml
 [lints.rust]
@@ -778,12 +781,12 @@ warnings = "deny"
 pedantic = "warn"
 ```
 
-7. Create the first module boundaries: `main.rs`, `config.rs`, `error.rs`, and a minimal `ui/mod.rs`.
-8. Add terminal setup code that enters raw mode and the alternate screen.
-9. Add a terminal guard type that restores raw mode and the alternate screen on normal exit.
-10. Add a panic hook that restores the terminal before printing the panic.
-11. Add a minimal event loop that exits on `q`, `Esc`, or Ctrl+C.
-12. Add `cargo fmt`, `cargo clippy`, and `cargo test` as the default local verification commands.
+8. Create the first module boundaries: `main.rs`, `config.rs`, `error.rs`, and a minimal `ui/mod.rs`.
+9. Add terminal setup code that enters raw mode and the alternate screen.
+10. Add a terminal guard type that restores raw mode and the alternate screen on normal exit.
+11. Add a panic hook that restores the terminal before printing the panic.
+12. Add a minimal event loop that exits on `q`, `Esc`, or Ctrl+C.
+13. Add `cargo fmt`, `cargo clippy`, and `cargo test` as the default local verification commands.
 
 ### Done when
 
