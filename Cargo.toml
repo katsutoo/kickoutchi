@@ -2,6 +2,11 @@
 name = "kickoutchi"
 version = "0.1.0"
 edition = "2024"
+description = "A clean TUI port janitor: see which process owns each open local port and kick it out safely"
+license = "MIT"
+repository = "https://github.com/nuggocto/kickoutchi"
+authors = ["nugget <vincent.lemaire1999@gmail.com>"]
+readme = "README.md"
 
 [dependencies]
 # TUI + terminal control. crossterm is kept as a direct dependency (not only via
@@ -23,6 +28,10 @@ thiserror = "2.0.18"
 anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+# Platform config-directory resolution (XDG on Linux). Added in Phase 1 because
+# config-file loading is part of the shared model/config/CLI foundation.
+dirs = "6.0.0"
 
 # Platform/process/clipboard crates (sysinfo, libc, windows-sys, arboard) are
 # intentionally NOT added here. They land in the phases that first use them so

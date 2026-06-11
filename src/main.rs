@@ -1,32 +1,63 @@
 //! Kickoutchi: a cross-platform TUI port janitor.
 //!
-//! This is the binary entry point: it wires up tracing and the panic hook, then
-//! runs the terminal UI, opening a screen and running an event loop that quits on
-//! `q`/`Esc`/`Ctrl+C` while guaranteeing the terminal is always restored.
+//! This is the binary entry point. It parses the command line, loads and
+//! merges configuration (defaults < config file < CLI flags), then dispatches:
+//! a subcommand runs headless through `cli` and exits with the stable exit
+//! codes; no subcommand opens the TUI.
 
+mod cli;
+mod collector;
 mod config;
 mod error;
+mod model;
+mod output;
 mod ui;
 
 use std::io;
 use std::process::ExitCode;
 
+use clap::Parser;
+
+use crate::cli::{Cli, ExitReason};
 use crate::config::Config;
 
 /// Entry point.
 ///
-/// Ordering is a safety constraint: install the panic hook *before* entering the
-/// alternate screen so a panic during TUI setup or rendering still restores the
-/// terminal before printing. The `Drop` guard inside [`ui::run`] covers normal
-/// and `?`-error exits.
+/// `Cli::parse` exits by itself on usage errors (code 2, matching the
+/// documented exit contract) and on `--help`/`--version`, so everything past
+/// it runs with validated arguments.
 fn main() -> ExitCode {
     init_tracing();
+    let args = Cli::parse();
+
+    let mut config = match Config::load(args.config.as_deref()) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitReason::Failure.into();
+        }
+    };
+    config.apply_cli_overrides(args.refresh_interval);
+
+    match args.command {
+        Some(command) => cli::run(&command, &config).into(),
+        None => run_tui(&config),
+    }
+}
+
+/// Run the TUI path. The panic hook is installed here, not in `main`,
+/// because its only job is restoring the terminal: the headless CLI path
+/// never enters the alternate screen and keeps the default panic output.
+///
+/// Ordering is a safety constraint: install the panic hook *before* entering
+/// the alternate screen so a panic during TUI setup or rendering still
+/// restores the terminal before printing. The `Drop` guard inside [`ui::run`]
+/// covers normal and `?`-error exits.
+fn run_tui(config: &Config) -> ExitCode {
     ui::install_panic_hook();
 
-    let config = Config::default();
-
-    match ui::run(&config) {
-        Ok(()) => ExitCode::SUCCESS,
+    match ui::run(config) {
+        Ok(()) => ExitReason::Success.into(),
         Err(error) => {
             // The terminal is already restored by this point, so this lands on
             // the normal screen. One user-facing line only: the tracing
@@ -34,7 +65,7 @@ fn main() -> ExitCode {
             // error here would print it twice. Internal diagnostics use tracing
             // (see the Drop/panic restore path); fatal user output uses eprintln.
             eprintln!("error: {error}");
-            ExitCode::FAILURE
+            ExitReason::Failure.into()
         }
     }
 }

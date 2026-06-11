@@ -4,12 +4,13 @@ use std::io;
 
 use thiserror::Error;
 
-/// Top-level error for the Kickoutchi binary.
+/// Top-level error for the TUI path of the Kickoutchi binary.
 ///
-/// Today this only surfaces terminal/IO failures; collector, process, and config
-/// errors get their own variants as those subsystems land. Keeping a single
-/// typed error at the binary boundary means `main` maps one enum to its exit
-/// behaviour instead of matching on stringly-typed failures.
+/// Today this only surfaces terminal/IO failures. Config and collector errors
+/// have their own standalone types (`config::ConfigError`,
+/// `collector::CollectorError`) because they are handled before or outside the
+/// TUI; subsystems whose failures must cross the TUI boundary (process
+/// termination, live collection) gain variants here as they land.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
     /// Entering raw mode / the alternate screen, drawing a frame, or reading

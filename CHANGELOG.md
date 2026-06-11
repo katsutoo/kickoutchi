@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shared domain model (Phase 1): `PortEntry` with the full
+  protocol/address/port/state/process/parent/permission shape, plus the
+  `Protocol`, `SocketState`, `Platform`, `PermissionStatus`, and `SortMode`
+  vocabulary shared by the CLI, TUI, and future collectors.
+- `Collector` trait with a deterministic `FakeCollector` covering full
+  metadata, permission-restricted partial rows, IPv6, bound UDP, and a
+  default-protected process name.
+- Config file support: `~/.config/kickoutchi/config.toml` (XDG via `dirs`)
+  with `refresh_interval_seconds`, `default_sort`, `confirm_force_kill`, and
+  `protected_processes`; missing file means safe defaults, invalid file is a
+  hard error naming the file and the bad value; bounded values and a capped
+  protected list.
+- Non-TUI CLI: `kickoutchi list` (`--port`, `--process`, `--json`) and the
+  `kickoutchi kill` command shape (`--pid`/`--port`, `--force`, `--yes`) with
+  confirmation prompts routed to a stub until real termination lands; CLI
+  commands never open the TUI.
+- Stable script-facing exit codes (0–6) defined and tested in one place;
+  `--yes` never bypasses the protected-process path (exit 6).
+- CLI-over-config precedence via global `--config <FILE>` and
+  `--refresh-interval <SECONDS>` flags, with shared bounds enforced by clap at
+  parse time.
+- Table and JSON output layer; missing metadata renders as `-` in tables and
+  `null` in JSON, and the JSON field/enum shape is pinned by tests.
+- Cargo manifest metadata (`description`, `license`, `repository`, `authors`,
+  `readme`) required for later `cargo publish`/`cargo-dist` phases.
 - Project foundation (Phase 0): Rust 1.95.0 pinned via `mise.toml`, edition
   2024, and strict lints (`warnings = "deny"`, `clippy::pedantic`).
 - Core dependency set: ratatui, crossterm, clap, serde, serde_json, toml,

@@ -101,7 +101,7 @@ pub(crate) fn run(config: &Config) -> AppResult<()> {
 // Draw, then wait for and handle one input event, repeating until a quit key.
 fn event_loop(terminal: &mut Tui, config: &Config) -> AppResult<()> {
     loop {
-        terminal.draw(draw)?;
+        terminal.draw(|frame| draw(frame, config))?;
 
         // Bounded wait so the loop can never block forever. `poll` returns the
         // instant input is queued, so the tick interval only caps idle latency
@@ -120,11 +120,18 @@ fn event_loop(terminal: &mut Tui, config: &Config) -> AppResult<()> {
     }
 }
 
-// Placeholder screen; the real table/details layout comes later.
-fn draw(frame: &mut Frame) {
-    let message = Paragraph::new("Kickoutchi: press q, Esc, or Ctrl+C to quit")
-        .alignment(Alignment::Center)
-        .block(Block::bordered().title("Kickoutchi"));
+// Placeholder screen; the real table/details layout comes later. It already
+// surfaces the active refresh interval because PROJECT.md requires the TUI to
+// expose effective config values, and showing it now proves the
+// defaults -> file -> CLI-flag merge end to end.
+fn draw(frame: &mut Frame, config: &Config) {
+    let refresh_seconds = config.refresh_interval.as_secs();
+    let message = Paragraph::new(format!(
+        "Kickoutchi: press q, Esc, or Ctrl+C to quit\n\
+         auto-refresh every {refresh_seconds}s (live table coming in a later phase)"
+    ))
+    .alignment(Alignment::Center)
+    .block(Block::bordered().title("Kickoutchi"));
     frame.render_widget(message, frame.area());
 }
 
