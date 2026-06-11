@@ -38,12 +38,31 @@ struct TerminalGuard {
 impl TerminalGuard {
     /// Enter raw mode and the alternate screen, returning a guard that will
     /// restore both on drop.
+    ///
+    /// Failures *after* raw mode is enabled restore the terminal before
+    /// propagating. No guard exists yet at that point, so `Drop` cannot run,
+    /// and the panic hook only fires on panics — without this pairing, an
+    /// error from entering the alternate screen or constructing the terminal
+    /// (its initial size query does real I/O) would strand the shell in raw
+    /// mode, the exact failure this module exists to prevent.
     fn enter() -> AppResult<Self> {
         enable_raw_mode()?;
+        match Self::enter_alternate_screen() {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                best_effort_restore();
+                Err(error)
+            }
+        }
+    }
+
+    /// The fallible steps between raw mode and a live guard, split out so
+    /// every failure in them funnels through the single restore in `enter`.
+    fn enter_alternate_screen() -> AppResult<Tui> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal })
+        Ok(terminal)
     }
 }
 
@@ -55,11 +74,14 @@ impl Drop for TerminalGuard {
 
 /// Restore the terminal, logging rather than propagating on failure.
 ///
-/// Used from `Drop` and the panic hook, where errors cannot be returned. A
-/// terminal we cannot reset is already unrecoverable, so the best we can do is
-/// record why it may be left dirty without masking the failure in flight. Both
-/// callers may run during the same panic, so a redundant second restore is
-/// expected and harmless.
+/// Used from `Drop` and the panic hook, where errors cannot be returned, and
+/// from [`TerminalGuard::enter`]'s failure path, where a restore failure must
+/// not mask the original error. A terminal we cannot reset is already
+/// unrecoverable, so the best we can do is record why it may be left dirty
+/// without masking the failure in flight. Callers may overlap (the panic hook
+/// and `Drop` both run during one panic, and the `enter` path restores before
+/// the alternate screen was ever entered), so a redundant restore is expected
+/// and harmless.
 ///
 /// Teardown mirrors [`TerminalGuard::enter`] in reverse order: leave the
 /// alternate screen, then disable raw mode. Each step is attempted and logged

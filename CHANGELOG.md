@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Terminal-state leak on TUI startup errors: a failure between enabling raw
+  mode and constructing the terminal (entering the alternate screen, or the
+  terminal's initial size query) now restores the terminal before the error
+  propagates, instead of leaving the shell stuck in raw mode. Clean exits,
+  propagated errors after startup, and panics were already covered by the
+  guard and panic hook; this closes the remaining error window during setup.
+
 ### Added
 
 - Shared domain model (Phase 1): `PortEntry` with the full

@@ -525,6 +525,7 @@ Implementation should use platform APIs where reasonable, but the UI should show
 Safety rules:
 
 - Never kill PID `0`, PID `1`, or the Kickoutchi process itself
+- Never resolve an ambiguous target by guessing: when a requested port is owned by more than one PID, refuse and require an explicit PID
 - Warn before killing processes owned by another user
 - Warn before killing known system/service processes
 - Prefer normal termination before force kill
@@ -1050,8 +1051,9 @@ pedantic = "warn"
 14. Refresh immediately after every kill attempt.
 15. Show clear success, cancelled, permission denied, already exited, and failure messages.
 16. Wire `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` to the same safety rules.
-17. Keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
-18. Add tests for unsafe PID guardrails, confirmation decisions, command rendering, and exit codes.
+17. Resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation must name every affected port, not just the first. (The Phase 1 stub in `cli.rs` uses a first-match `find`; replace it here.)
+18. Keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
+19. Add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution, command rendering, and exit codes.
 
 ### Done when
 
@@ -1059,6 +1061,7 @@ pedantic = "warn"
 - Force kill requires separate confirmation.
 - `python3 -m http.server 3000` can be terminated through the TUI and CLI.
 - The app cannot kill PID `0`, PID `1`, or itself.
+- `kill --port` on a port owned by more than one PID refuses to guess and names the candidate processes.
 - Protected processes require stronger confirmation.
 - Permission errors are shown clearly.
 - The table refreshes after termination and the freed port disappears.

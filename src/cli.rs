@@ -186,6 +186,11 @@ fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
     // The two legal target shapes are enumerated; anything else means the
     // clap ArgGroup ("exactly one of --pid/--port") was broken by a code
     // change, which is a programmer error worth crashing on.
+    //
+    // First-match resolution is a stub-only simplification: a port can be
+    // owned by several PIDs (TCP+UDP on one port, SO_REUSEPORT). Phase 6
+    // replaces this with explicit ambiguity rejection (see PROJECT.md,
+    // Phase 6 step 17) before any real termination ships.
     let target = match (args.pid, args.port) {
         (Some(pid), None) => entries.iter().find(|entry| entry.pid == Some(pid)),
         (None, Some(port)) => entries.iter().find(|entry| entry.matches_port(port)),
