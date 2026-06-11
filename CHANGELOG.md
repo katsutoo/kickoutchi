@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Short binary name `kick`: the crate now installs both `kickoutchi`
+  (canonical) and `kick` (short alias for CLI use) from the same source, with
+  `default-run` keeping `cargo run` on the canonical binary. The help usage
+  line follows the invoked name; `--version` reports the canonical name.
+
 - Shared domain model (Phase 1): `PortEntry` with the full
   protocol/address/port/state/process/parent/permission shape, plus the
   `Protocol`, `SocketState`, `Platform`, `PermissionStatus`, and `SortMode`

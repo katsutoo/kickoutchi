@@ -7,6 +7,22 @@ license = "MIT"
 repository = "https://github.com/nuggocto/kickoutchi"
 authors = ["nugget <vincent.lemaire1999@gmail.com>"]
 readme = "README.md"
+# Two binary names are declared below; `cargo run` without --bin needs this.
+default-run = "kickoutchi"
+
+# The same program ships under two names: `kickoutchi` is canonical (matches
+# the crate, docs, and kickoutchi.com), `kick` is the short form for daily CLI
+# use (`kick list`, `kick kill --port 3000`). Declaring any [[bin]] disables
+# bin auto-discovery, so the canonical target must be declared explicitly too.
+# `kick` was checked against the Arch repos, the AUR, and crates.io before
+# adoption (2026-06-11); `ko` was rejected as taken by the Go container tool.
+[[bin]]
+name = "kickoutchi"
+path = "src/main.rs"
+
+[[bin]]
+name = "kick"
+path = "src/main.rs"
 
 [dependencies]
 # TUI + terminal control. crossterm is kept as a direct dependency (not only via

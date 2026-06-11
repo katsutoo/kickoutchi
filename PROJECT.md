@@ -313,6 +313,8 @@ Behavior:
 - `--yes` should never bypass protected-process extra warnings unless a separate explicit flag is added later
 - Exit codes should be stable for scripts
 
+Short binary name: the crate builds the same program under two names, `kickoutchi` (canonical, used in all docs and on the website) and `kick` (short form for daily CLI use: `kick list`, `kick kill --port 3000`). Both behave identically, including opening the TUI when run bare; the help usage line follows the invoked name (`Usage: kick ...`) while `--version` reports the canonical `kickoutchi`. The project cannot be renamed (the `kickoutchi.com` domain is the brand), so the short form ships as a second binary instead. `kick` was verified free in the Arch official repos, the AUR, and as a crates.io binary before adoption; `ko` was rejected because the Go container tool `ko` owns it in Arch extra. Phase 11 packaging must ship both names (as a copy or a symlink, whichever the package format prefers) and re-verify the name is still free in each target repository before first publication.
+
 Suggested exit codes:
 
 ```txt

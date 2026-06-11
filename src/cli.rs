@@ -47,8 +47,17 @@ impl From<ExitReason> for ExitCode {
 
 /// Top-level argument shape. No subcommand opens the TUI; `list` and `kill`
 /// run headless and exit.
+///
+/// `about` pulls the user-facing summary from the Cargo.toml `description`;
+/// `long_about = None` is required so clap does not render this doc comment
+/// as `--help` output — these lines are for developers, not users.
+///
+/// The fixed `name` keeps `--version` reporting the canonical `kickoutchi`
+/// under both installed binary names, while clap takes the usage line from
+/// argv(0), so `kick --help` correctly shows `Usage: kick ...`. Both are the
+/// desired behavior for the short-alias binary;
 #[derive(Debug, Parser)]
-#[command(name = "kickoutchi", version, about)]
+#[command(name = "kickoutchi", version, about, long_about = None)]
 pub(crate) struct Cli {
     /// Path to an alternate config file (default: the platform config dir).
     #[arg(long, value_name = "FILE", global = true)]
