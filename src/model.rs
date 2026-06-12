@@ -125,6 +125,17 @@ impl PortEntry {
         };
         name.to_lowercase().contains(&needle.to_lowercase())
     }
+
+    /// Human-facing bind scope for table/details output.
+    pub(crate) fn scope_label(&self) -> &'static str {
+        if self.local_addr.is_loopback() {
+            "loopback"
+        } else if self.local_addr.is_unspecified() {
+            "public"
+        } else {
+            "local"
+        }
+    }
 }
 
 /// Table sort orders shared by the CLI now and the TUI in Phase 4.
@@ -136,6 +147,18 @@ pub(crate) enum SortMode {
     Pid,
     Protocol,
     Process,
+}
+
+impl SortMode {
+    /// Lowercase label used in status output and config-facing text.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Port => "port",
+            Self::Pid => "pid",
+            Self::Protocol => "protocol",
+            Self::Process => "process",
+        }
+    }
 }
 
 /// Sort entries in place by the given mode.
@@ -223,6 +246,26 @@ mod tests {
         assert!(!row.matches_process("vite"));
         // A hidden name must never match: that would claim knowledge we lack.
         assert!(!entry(53, None, None).matches_process("node"));
+    }
+
+    #[test]
+    fn scope_label_identifies_common_bind_shapes() {
+        let mut row = entry(3000, Some(1), Some("node"));
+        assert_eq!(row.scope_label(), "loopback");
+
+        row.local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(row.scope_label(), "public");
+
+        row.local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(row.scope_label(), "local");
+    }
+
+    #[test]
+    fn sort_mode_labels_match_config_values() {
+        assert_eq!(SortMode::Port.label(), "port");
+        assert_eq!(SortMode::Pid.label(), "pid");
+        assert_eq!(SortMode::Protocol.label(), "protocol");
+        assert_eq!(SortMode::Process.label(), "process");
     }
 
     #[test]

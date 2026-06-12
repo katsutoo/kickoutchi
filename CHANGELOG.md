@@ -31,6 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Static TUI skeleton (Phase 2): the bare `kickoutchi`/`kick` command now opens
+  a full fake-data TUI with a header, the open-ports table, a selected-row
+  details panel, and a status bar showing row count, refresh age, sort mode,
+  and filter state.
+- TUI app state (`app.rs`) and key-to-action input mapping (`input.rs`):
+  bounded `j`/`k`/Up/Down selection, `Enter` for a details modal, `?` for a
+  help modal, `Esc` closing modals (or quitting when none is open), and rows
+  marked protected and sorted through the same shared model code as the CLI.
+- UI modules `table`, `details`, `help`, and `theme`: missing metadata renders
+  as `-`, partial-permission and protected rows get distinct styling with the
+  reason explained in the details panel, child PIDs distinguish "not loaded"
+  from none, and `NO_COLOR` disables colors while keeping non-color emphasis.
+- Terminal-size fallback message when the viewport is smaller than 80x20.
+- Render tests over a ratatui `TestBackend` (default frame, help modal,
+  details modal, too-small fallback) plus app-state transition tests for
+  selection bounds, modal flow, and empty-row behavior.
+
 - Short binary name `kick`: the crate now installs both `kickoutchi`
   (canonical) and `kick` (short alias for CLI use) from the same source, with
   `default-run` keeping `cargo run` on the canonical binary. The help usage

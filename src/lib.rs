@@ -4,10 +4,12 @@
 //! tiny binaries (`kickoutchi` and `kick`) that both call [`run`], so Cargo does
 //! not compile and test the same `main.rs` as two separate binary targets.
 
+mod app;
 mod cli;
 mod collector;
 mod config;
 mod error;
+mod input;
 mod model;
 mod output;
 mod ui;

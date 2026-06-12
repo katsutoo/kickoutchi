@@ -4,20 +4,31 @@
 //! above all, always restored: on clean quit, on a propagated error, and on
 //! panic.
 
-use std::io::{self, Stdout};
+mod details;
+mod help;
+mod table;
+mod theme;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::io::{self, Stdout};
+use std::time::Duration;
+
+use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Alignment;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{Frame, Terminal};
 
+use crate::app::{App, Modal};
 use crate::config::Config;
 use crate::error::AppResult;
+use crate::input;
+
+use self::theme::Theme;
 
 // Concrete terminal type used throughout the UI.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -117,13 +128,15 @@ pub(crate) fn install_panic_hook() {
 /// of this function's scope, after the loop's result is computed.
 pub(crate) fn run(config: &Config) -> AppResult<()> {
     let mut guard = TerminalGuard::enter()?;
-    event_loop(&mut guard.terminal, config)
+    let mut app = App::new(config);
+    let theme = Theme::from_environment();
+    event_loop(&mut guard.terminal, &mut app, config, theme)
 }
 
 // Draw, then wait for and handle one input event, repeating until a quit key.
-fn event_loop(terminal: &mut Tui, config: &Config) -> AppResult<()> {
+fn event_loop(terminal: &mut Tui, app: &mut App, config: &Config, theme: Theme) -> AppResult<()> {
     loop {
-        terminal.draw(|frame| draw(frame, config))?;
+        terminal.draw(|frame| draw(frame, app, theme))?;
 
         // Bounded wait so the loop can never block forever. `poll` returns the
         // instant input is queued, so the tick interval only caps idle latency
@@ -136,88 +149,208 @@ fn event_loop(terminal: &mut Tui, config: &Config) -> AppResult<()> {
             continue;
         };
 
-        if is_quit(key) {
+        app.apply_action(input::action_for_key(key, app.modal()));
+        if app.should_quit() {
             return Ok(());
         }
     }
 }
 
-// Placeholder screen; the real table/details layout comes later. It already
-// surfaces the active refresh interval because PROJECT.md requires the TUI to
-// expose effective config values, and showing it now proves the
-// defaults -> file -> CLI-flag merge end to end.
-fn draw(frame: &mut Frame, config: &Config) {
-    let refresh_seconds = config.refresh_interval.as_secs();
-    let message = Paragraph::new(format!(
-        "Kickoutchi: press q, Esc, or Ctrl+C to quit\n\
-         auto-refresh every {refresh_seconds}s (live table coming in a later phase)"
-    ))
-    .alignment(Alignment::Center)
-    .block(Block::bordered().title("Kickoutchi"));
-    frame.render_widget(message, frame.area());
-}
+fn draw(frame: &mut Frame, app: &App, theme: Theme) {
+    let area = frame.area();
 
-/// Return whether a key event should quit the app.
-///
-/// Only key *presses* count: crossterm also emits release and repeat events on
-/// some platforms, and acting on those would quit on key-up as well.
-fn is_quit(key: KeyEvent) -> bool {
-    if key.kind != KeyEventKind::Press {
-        return false;
+    if is_too_small(area) {
+        render_too_small(frame, area, theme);
+        return;
     }
 
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-        _ => false,
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(7),
+            Constraint::Length(9),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    render_header(frame, chunks[0], theme);
+    table::render(frame, chunks[1], app, theme);
+    details::render_panel(frame, chunks[2], app, theme);
+    render_status(frame, chunks[3], app, theme);
+
+    let modal_area = centered_rect(76, 76, area);
+    match app.modal() {
+        Modal::None => {}
+        Modal::Details => details::render_modal(frame, modal_area, app, theme),
+        Modal::Help => help::render(frame, modal_area, theme),
+    }
+}
+
+fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
+    let line = Line::from(vec![
+        Span::styled("Kickoutchi", theme.title()),
+        Span::raw("   j/k move  Enter details  ? help  q quit"),
+    ]);
+    let header = Paragraph::new(line)
+        .alignment(Alignment::Center)
+        .block(Block::bordered().border_style(theme.border()));
+    frame.render_widget(header, area);
+}
+
+fn render_status(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let filter = if app.filter_text().is_empty() {
+        "none"
+    } else {
+        app.filter_text()
+    };
+    let mut status = format!(
+        "Status: {} open ports, refreshed {} ago | sort: {} | filter: {filter}",
+        app.rows().len(),
+        format_age(app.refresh_age()),
+        app.sort_mode().label(),
+    );
+
+    if let Some(error) = app.latest_error() {
+        status.push_str(" | error: ");
+        status.push_str(error);
+    }
+
+    frame.render_widget(Paragraph::new(status).style(theme.status()), area);
+}
+
+fn render_too_small(frame: &mut Frame, area: Rect, theme: Theme) {
+    let message = Paragraph::new("Terminal too small\nNeed at least 80x20 to show the table")
+        .alignment(Alignment::Center)
+        .style(theme.warning())
+        .block(
+            Block::bordered()
+                .title("Kickoutchi")
+                .border_style(theme.border()),
+        );
+    frame.render_widget(message, area);
+}
+
+fn is_too_small(area: Rect) -> bool {
+    area.width < 80 || area.height < 20
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    debug_assert!(percent_x <= 100);
+    debug_assert!(percent_y <= 100);
+
+    let vertical_margin = (100 - percent_y) / 2;
+    let horizontal_margin = (100 - percent_x) / 2;
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(vertical_margin),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage(vertical_margin),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(horizontal_margin),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage(horizontal_margin),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn format_age(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        let minutes = seconds / 60;
+        let seconds = seconds % 60;
+        format!("{minutes}m {seconds}s")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_quit;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    #[test]
-    fn quit_keys_quit() {
-        assert!(is_quit(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE
-        )));
-        assert!(is_quit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(is_quit(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
+    use super::{Theme, draw};
+    use crate::app::App;
+    use crate::config::Config;
+    use crate::input::Action;
+
+    fn render_text(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend must initialize");
+        terminal
+            .draw(|frame| draw(frame, app, Theme::from_environment()))
+            .expect("test frame must draw");
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut text = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 
     #[test]
-    fn non_quit_keys_do_not_quit() {
-        assert!(!is_quit(KeyEvent::new(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE
-        )));
-        // Plain 'c' without Ctrl must not quit; only Ctrl+C does.
-        assert!(!is_quit(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::NONE
-        )));
-        // Uppercase 'Q' is a distinct code; only lowercase 'q' quits.
-        assert!(!is_quit(KeyEvent::new(
-            KeyCode::Char('Q'),
-            KeyModifiers::NONE
-        )));
+    fn default_frame_renders_table_details_and_status() {
+        let config = Config::default();
+        let app = App::new(&config);
+
+        let text = render_text(&app, 100, 30);
+
+        assert!(text.contains("Kickoutchi"), "{text}");
+        assert!(text.contains("Open Ports"), "{text}");
+        assert!(text.contains("3000"), "{text}");
+        assert!(text.contains("node"), "{text}");
+        assert!(text.contains("Details"), "{text}");
+        assert!(text.contains("PID: 18422 | Process: node"), "{text}");
+        assert!(text.contains("Status: 5 open ports"), "{text}");
     }
 
     #[test]
-    fn only_key_press_quits() {
-        // Release/repeat events must be ignored so the app does not quit on
-        // key-up (crossterm emits these on some platforms).
-        let release = KeyEvent::new_with_kind(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        );
-        assert!(!is_quit(release));
+    fn help_modal_renders_keybinds() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.apply_action(Action::OpenHelp);
+
+        let text = render_text(&app, 100, 30);
+
+        assert!(text.contains("Help"), "{text}");
+        assert!(text.contains("Kickoutchi Phase 2"), "{text}");
+        assert!(text.contains("j / Down"), "{text}");
+        assert!(text.contains("Ctrl+C"), "{text}");
+    }
+
+    #[test]
+    fn details_modal_renders_selected_row_metadata() {
+        let config = Config::default();
+        let mut app = App::new(&config);
+        app.apply_action(Action::OpenDetails);
+
+        let text = render_text(&app, 100, 30);
+
+        assert!(text.contains("Port Details"), "{text}");
+        assert!(text.contains("cursor-agent (PID 18001)"), "{text}");
+        assert!(text.contains("node server.js"), "{text}");
+    }
+
+    #[test]
+    fn small_terminal_renders_fallback_message() {
+        let config = Config::default();
+        let app = App::new(&config);
+
+        let text = render_text(&app, 40, 10);
+
+        assert!(text.contains("Terminal too small"), "{text}");
+        assert!(text.contains("Need at least 80x20"), "{text}");
     }
 }
