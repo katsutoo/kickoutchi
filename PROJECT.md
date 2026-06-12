@@ -590,7 +590,9 @@ cargo add windows-sys@0.61.2 --target 'cfg(windows)' --features Win32_Foundation
 
 ```txt
 +----------------------------------------------------------------+
-| main.rs             - startup, terminal lifecycle, shutdown      |
+| lib.rs              - shared entrypoint: startup and dispatch     |
+| bin/kickoutchi.rs   - canonical binary, calls kickoutchi::run()   |
+| bin/kick.rs         - short-alias binary, calls kickoutchi::run() |
 +----------------------------------------------------------------+
 | app.rs              - app state, selected row, filters, mode     |
 | config.rs           - CLI options and defaults                   |
@@ -618,7 +620,10 @@ kickoutchi/
 |-- README.md
 |-- LICENSE
 |-- src/
-|   |-- main.rs
+|   |-- lib.rs
+|   |-- bin/
+|   |   |-- kickoutchi.rs
+|   |   |-- kick.rs
 |   |-- app.rs
 |   |-- config.rs
 |   |-- cli.rs

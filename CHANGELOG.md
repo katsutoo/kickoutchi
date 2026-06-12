@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `protected_processes` in the config file now extends the built-in defaults
+  instead of replacing them, with exact-match de-duplication. Adding `redis`
+  no longer silently removes protection from `systemd`, `postgres`, and the
+  other defaults; this matches the documented "can be extended in config"
+  behavior from PROJECT.md.
+- Internal restructure: shared application code moved from `src/main.rs` to
+  `src/lib.rs` (public surface: a single `kickoutchi::run()`), with thin
+  binary wrappers in `src/bin/kickoutchi.rs` and `src/bin/kick.rs`. Behavior
+  is unchanged; the shared code now compiles once for both binaries, unit
+  tests no longer run twice, and the duplicate-target Cargo warning is gone.
+
 ### Fixed
 
 - Terminal-state leak on TUI startup errors: a failure between enabling raw

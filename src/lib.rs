@@ -1,9 +1,8 @@
 //! Kickoutchi: a cross-platform TUI port janitor.
 //!
-//! This is the binary entry point. It parses the command line, loads and
-//! merges configuration (defaults < config file < CLI flags), then dispatches:
-//! a subcommand runs headless through `cli` and exits with the stable exit
-//! codes; no subcommand opens the TUI.
+//! This library owns the shared application entrypoint. The package ships two
+//! tiny binaries (`kickoutchi` and `kick`) that both call [`run`], so Cargo does
+//! not compile and test the same `main.rs` as two separate binary targets.
 
 mod cli;
 mod collector;
@@ -21,12 +20,13 @@ use clap::Parser;
 use crate::cli::{Cli, ExitReason};
 use crate::config::Config;
 
-/// Entry point.
+/// Run the Kickoutchi application and return the process exit code.
 ///
 /// `Cli::parse` exits by itself on usage errors (code 2, matching the
-/// documented exit contract) and on `--help`/`--version`, so everything past
-/// it runs with validated arguments.
-fn main() -> ExitCode {
+/// documented exit contract) and on `--help`/`--version`, so everything past it
+/// runs with validated arguments.
+#[must_use]
+pub fn run() -> ExitCode {
     init_tracing();
     let args = Cli::parse();
 
@@ -45,14 +45,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the TUI path. The panic hook is installed here, not in `main`,
-/// because its only job is restoring the terminal: the headless CLI path
-/// never enters the alternate screen and keeps the default panic output.
+/// Run the TUI path. The panic hook is installed here, not in [`run`], because
+/// its only job is restoring the terminal: the headless CLI path never enters
+/// the alternate screen and keeps the default panic output.
 ///
 /// Ordering is a safety constraint: install the panic hook *before* entering
-/// the alternate screen so a panic during TUI setup or rendering still
-/// restores the terminal before printing. The `Drop` guard inside [`ui::run`]
-/// covers normal and `?`-error exits.
+/// the alternate screen so a panic during TUI setup or rendering still restores
+/// the terminal before printing. The `Drop` guard inside [`ui::run`] covers
+/// normal and `?`-error exits.
 fn run_tui(config: &Config) -> ExitCode {
     ui::install_panic_hook();
 

@@ -18,11 +18,11 @@ default-run = "kickoutchi"
 # adoption (2026-06-11); `ko` was rejected as taken by the Go container tool.
 [[bin]]
 name = "kickoutchi"
-path = "src/main.rs"
+path = "src/bin/kickoutchi.rs"
 
 [[bin]]
 name = "kick"
-path = "src/main.rs"
+path = "src/bin/kick.rs"
 
 [dependencies]
 # TUI + terminal control. crossterm is kept as a direct dependency (not only via

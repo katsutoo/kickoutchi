@@ -82,7 +82,9 @@ impl Default for Config {
 }
 
 /// On-disk shape of the config file. Every field is optional so a partial
-/// file overrides only what it names. Unknown keys are rejected on purpose:
+/// file changes only what it names; most fields override their default, while
+/// `protected_processes` extends it (see `merge_protected_processes`).
+/// Unknown keys are rejected on purpose:
 /// in a hand-edited file an unknown key is almost always a typo, and ignoring
 /// it would make the user's setting silently do nothing.
 #[derive(Debug, Deserialize)]
@@ -154,11 +156,13 @@ impl Config {
             config.confirm_force_kill = confirm;
         }
         if let Some(protected) = file.protected_processes {
-            validate_protected_processes(&protected).map_err(|detail| ConfigError::Invalid {
-                path: path.to_path_buf(),
-                detail,
-            })?;
-            config.protected_processes = protected;
+            config.protected_processes =
+                merge_protected_processes(config.protected_processes, protected).map_err(
+                    |detail| ConfigError::Invalid {
+                        path: path.to_path_buf(),
+                        detail,
+                    },
+                )?;
         }
 
         Ok(config)
@@ -205,6 +209,24 @@ fn validate_protected_processes(names: &[String]) -> Result<(), String> {
         return Err("protected_processes must not contain empty names".to_owned());
     }
     Ok(())
+}
+
+/// Extend the built-in safety set with configured process names.
+///
+/// Config is additive by design: adding `redis` must not accidentally remove
+/// protection from `systemd` or `postgres`. Exact de-duplication keeps the
+/// bounded matching work stable without changing Unix case-sensitive semantics.
+fn merge_protected_processes(
+    mut defaults: Vec<String>,
+    configured: Vec<String>,
+) -> Result<Vec<String>, String> {
+    for name in configured {
+        if !defaults.iter().any(|existing| existing == &name) {
+            defaults.push(name);
+        }
+    }
+    validate_protected_processes(&defaults)?;
+    Ok(defaults)
 }
 
 /// Platform default config file path (`~/.config/kickoutchi/config.toml` on
@@ -267,14 +289,25 @@ mod tests {
             refresh_interval_seconds = 5
             default_sort = "pid"
             confirm_force_kill = false
-            protected_processes = ["docker", "postgres"]
+            protected_processes = ["redis", "postgres"]
             "#,
         )
         .expect("valid");
         assert_eq!(config.refresh_interval, Duration::from_secs(5));
         assert_eq!(config.default_sort, SortMode::Pid);
         assert!(!config.confirm_force_kill);
-        assert_eq!(config.protected_processes, vec!["docker", "postgres"]);
+        assert!(config.protected_processes.contains(&"docker".to_owned()));
+        assert!(config.protected_processes.contains(&"postgres".to_owned()));
+        assert!(config.protected_processes.contains(&"systemd".to_owned()));
+        assert!(config.protected_processes.contains(&"redis".to_owned()));
+        assert_eq!(
+            config
+                .protected_processes
+                .iter()
+                .filter(|name| name.as_str() == "postgres")
+                .count(),
+            1
+        );
     }
 
     #[test]
