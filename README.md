@@ -1,3 +1,3 @@
 # kickoutchi
 
-Cross-platform port janitor
+Port janitor
