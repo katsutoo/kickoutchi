@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn default_frame_renders_table_details_and_status() {
         let config = Config::default();
-        let app = App::new(&config);
+        let app = App::new_fake(&config);
 
         let text = render_text(&app, 100, 30);
 
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn help_modal_renders_keybinds() {
         let config = Config::default();
-        let mut app = App::new(&config);
+        let mut app = App::new_fake(&config);
         app.apply_action(Action::OpenHelp);
 
         let text = render_text(&app, 100, 30);
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn details_modal_renders_selected_row_metadata() {
         let config = Config::default();
-        let mut app = App::new(&config);
+        let mut app = App::new_fake(&config);
         app.apply_action(Action::OpenDetails);
 
         let text = render_text(&app, 100, 30);
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn small_terminal_renders_fallback_message() {
         let config = Config::default();
-        let app = App::new(&config);
+        let app = App::new_fake(&config);
 
         let text = render_text(&app, 40, 10);
 

@@ -12,6 +12,7 @@ mod error;
 mod input;
 mod model;
 mod output;
+mod platform;
 mod ui;
 
 use std::io;

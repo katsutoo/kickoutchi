@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Roadmap update: no-match port related-process diagnostics moved from Phase 4
+  to Phase 5, with stricter rules that keep the main table limited to
+  OS-confirmed sockets, preserve CLI exit codes, avoid polluting JSON output,
+  and require port-shaped matchers instead of raw substring matching.
 - `protected_processes` in the config file now extends the built-in defaults
   instead of replacing them, with exact-match de-duplication. Adding `redis`
   no longer silently removes protection from `systemd`, `postgres`, and the
@@ -22,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Linux collection no longer fails the whole scan when optional IPv6 socket
+  tables such as `/proc/net/tcp6` or `/proc/net/udp6` are absent; IPv4 socket
+  tables remain required.
+- IPv4-mapped IPv6 socket addresses such as `::ffff:127.0.0.1` are normalized
+  or classified as IPv4 loopback/local addresses instead of being mislabeled as
+  generic local IPv6 binds.
 - Terminal-state leak on TUI startup errors: a failure between enabling raw
   mode and constructing the terminal (entering the alternate screen, or the
   terminal's initial size query) now restores the terminal before the error
@@ -30,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Linux native collector (Phase 3): on Linux, `kickoutchi`/`kick` now reads
+  `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, and `/proc/net/udp6`
+  directly, keeps TCP `LISTEN` sockets and bound UDP sockets, decodes IPv4 and
+  IPv6 local addresses, extracts socket inodes, and maps them to owning PIDs by
+  walking `/proc/<pid>/fd` symlinks.
+- Linux process metadata enrichment: readable owners now include process name,
+  executable path, and command line from `/proc/<pid>/comm`, `/proc/<pid>/exe`,
+  and `/proc/<pid>/cmdline`; restricted or raced metadata keeps the port row and
+  marks it partial instead of dropping it.
+- Deterministic Phase 3 tests for `/proc/net` parsing, TCP state filtering, UDP
+  bound rows, IPv4/IPv6 decoding, malformed rows, socket inode parsing,
+  command-line decoding, and partial metadata behavior.
 
 - Static TUI skeleton (Phase 2): the bare `kickoutchi`/`kick` command now opens
   a full fake-data TUI with a header, the open-ports table, a selected-row

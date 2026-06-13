@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
-use crate::collector::{Collector, FakeCollector};
+use crate::collector;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
 use crate::model::{PortEntry, mark_protected, sort_entries};
 use crate::output;
@@ -132,7 +132,7 @@ pub(crate) struct KillArgs {
 /// mapping is this module's whole job, so letting errors escape to `main`
 /// would split that contract across two files.
 pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
-    let mut entries = match FakeCollector.collect() {
+    let mut entries = match collector::collect_ports() {
         Ok(entries) => entries,
         Err(error) => {
             eprintln!("error: collecting ports failed: {error}");

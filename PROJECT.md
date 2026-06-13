@@ -1005,15 +1005,19 @@ pedantic = "warn"
 3. Collect child PIDs for the selected process where practical.
 4. Resolve child process names where permitted.
 5. Add `process_start_time` and `current_user` if the chosen process metadata source provides them reliably.
-6. Add `protection.rs` for protected-process matching.
-7. Seed protected-process defaults with `docker`, `postgres`, `systemd`, `explorer.exe`, and `WindowServer`.
-8. Merge config-defined protected process names with defaults.
-9. Use platform-appropriate matching rules, such as case-insensitive matching on Windows.
-10. Render parent process in the details panel.
-11. Render child process count in the details panel.
-12. Add a details modal that can show child processes when available.
-13. Add visual warning text for protected processes.
-14. Add tests for protected-process matching and process-tree rendering.
+6. Add a separate no-match port diagnostic that can scan process command lines for likely related processes when an explicit port search/filter finds no confirmed socket. This must never create a fake port row, never claim ownership, and never weaken the invariant that the main table only contains OS-confirmed listening TCP or bound UDP sockets.
+7. Use strict port-shaped matchers for the diagnostic, not raw substring search. Good matches include socket-shaped text such as `:3000`, `127.0.0.1:3000`, `[::1]:3000`, flag-shaped text such as `--port 3000`, `--port=3000`, `-p 3000`, and environment/config-shaped text such as `PORT=3000`; weak incidental numbers such as `--timeout 3000`, `--max-bytes 3000`, `3000k`, or version numbers must not produce confident hints.
+8. Keep the CLI contract stable for diagnostics: `kickoutchi list --port 3000` still exits `3` when no confirmed socket exists, diagnostic hints print to stderr in human table mode, and `list --json` is not polluted with hints unless a dedicated JSON contract is designed later.
+9. Phrase diagnostics as evidence, not diagnosis: `No listening socket found on port 3000. Possible related process: PID 12345 python3 -m http.server 3000 references this port, but no socket was confirmed.` Do not claim whether the process failed to bind, is still starting, or is in another network namespace unless the app can prove that separately.
+10. Add `protection.rs` for protected-process matching.
+11. Seed protected-process defaults with `docker`, `postgres`, `systemd`, `explorer.exe`, and `WindowServer`.
+12. Merge config-defined protected process names with defaults.
+13. Use platform-appropriate matching rules, such as case-insensitive matching on Windows.
+14. Render parent process in the details panel.
+15. Render child process count in the details panel.
+16. Add a details modal that can show child processes when available.
+17. Add visual warning text for protected processes.
+18. Add tests for protected-process matching, process-tree rendering, diagnostic matcher behavior, CLI stderr/exit-code behavior, and JSON non-pollution.
 
 ### Done when
 
@@ -1023,6 +1027,7 @@ pedantic = "warn"
 - Default protected process names trigger a warning.
 - The protected process list can be extended in config.
 - Tests cover platform-specific protected-name matching.
+- No-match port diagnostics can point to possible related processes without adding unconfirmed rows or changing CLI exit-code/JSON contracts.
 
 ### Do not build yet
 

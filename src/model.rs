@@ -128,9 +128,14 @@ impl PortEntry {
 
     /// Human-facing bind scope for table/details output.
     pub(crate) fn scope_label(&self) -> &'static str {
-        if self.local_addr.is_loopback() {
+        let addr = match self.local_addr {
+            IpAddr::V4(addr) => IpAddr::V4(addr),
+            IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
+        };
+
+        if addr.is_loopback() {
             "loopback"
-        } else if self.local_addr.is_unspecified() {
+        } else if addr.is_unspecified() {
             "public"
         } else {
             "local"
@@ -203,7 +208,7 @@ pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[Strin
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
 
     use super::{
@@ -258,6 +263,9 @@ mod tests {
 
         row.local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
         assert_eq!(row.scope_label(), "local");
+
+        row.local_addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
+        assert_eq!(row.scope_label(), "loopback");
     }
 
     #[test]

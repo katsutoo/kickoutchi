@@ -5,20 +5,27 @@
 //! against `dyn`-free generic call sites today and swapping fake data for real
 //! collection never touches the output layer.
 
+#[cfg(any(test, not(target_os = "linux")))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+use crate::model::PortEntry;
+#[cfg(any(test, not(target_os = "linux")))]
+use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
 
 /// Why a collection pass failed.
-///
-/// Uninhabited on purpose: no collector can fail yet, and an empty enum lets
-/// the compiler prove it while call sites already handle the fallible
-/// contract. Real variants (I/O errors reading `/proc`, permission failures)
-/// arrive with the Linux collector in Phase 3.
 #[derive(Debug, Error)]
-pub(crate) enum CollectorError {}
+pub(crate) enum CollectorError {
+    /// A required collection path could not be read. Per-process metadata
+    /// failures are not fatal; they produce partial rows instead.
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
 
 /// A source of open-port snapshots.
 ///
@@ -30,13 +37,28 @@ pub(crate) trait Collector {
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError>;
 }
 
+/// Collect from the best collector for the current build target.
+pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::linux::LinuxCollector::new().collect()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        FakeCollector.collect()
+    }
+}
+
 /// Deterministic fake rows standing in for real collection until Phase 3.
 ///
 /// The rows are chosen to exercise every rendering path the model allows:
 /// full metadata, permission-restricted partial metadata, a default-protected
 /// process name, IPv6, and a bound UDP socket.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(crate) struct FakeCollector;
 
+#[cfg(any(test, not(target_os = "linux")))]
 impl Collector for FakeCollector {
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
         Ok(fake_entries())
@@ -46,6 +68,7 @@ impl Collector for FakeCollector {
 /// The fake snapshot. Hardcodes [`Platform::Linux`] because the data is
 /// invented, not host-derived; pretending to match the build target would
 /// only make fake rows look more real than they are.
+#[cfg(any(test, not(target_os = "linux")))]
 fn fake_entries() -> Vec<PortEntry> {
     vec![
         // A typical dev server with full metadata, parent context, and

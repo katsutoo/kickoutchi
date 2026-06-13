@@ -1,12 +1,14 @@
 //! TUI application state and state transitions.
 //!
-//! Phase 2 is deliberately static: the app owns one fake snapshot, selection,
-//! modal state, and status metadata. Real refresh and filtering arrive later,
-//! but the state shape already has the fields those features mutate so the UI
-//! does not need to be redesigned in Phase 4.
+//! The app owns the latest collected snapshot, selection, modal state, and
+//! status metadata. Refresh and filtering arrive later, but the state shape
+//! already has the fields those features mutate so the UI does not need to be
+//! redesigned in Phase 4.
 
 use std::time::{Duration, Instant};
 
+use crate::collector;
+#[cfg(test)]
 use crate::collector::{Collector, FakeCollector};
 use crate::config::Config;
 use crate::input::Action;
@@ -34,19 +36,42 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// Build the Phase 2 app from the fake collector.
+    /// Build the TUI app from the platform collector.
     pub(crate) fn new(config: &Config) -> Self {
-        let rows = match FakeCollector.collect() {
-            Ok(rows) => rows,
-            Err(error) => match error {},
+        let (rows, latest_error) = match collector::collect_ports() {
+            Ok(rows) => (rows, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
         };
+        Self::from_rows_with_error(
+            rows,
+            config.default_sort,
+            &config.protected_processes,
+            latest_error,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_fake(config: &Config) -> Self {
+        let rows = FakeCollector
+            .collect()
+            .expect("fake collection cannot fail");
         Self::from_rows(rows, config.default_sort, &config.protected_processes)
     }
 
+    #[cfg(test)]
     fn from_rows(
+        rows: Vec<PortEntry>,
+        sort_mode: SortMode,
+        protected_processes: &[String],
+    ) -> Self {
+        Self::from_rows_with_error(rows, sort_mode, protected_processes, None)
+    }
+
+    fn from_rows_with_error(
         mut rows: Vec<PortEntry>,
         sort_mode: SortMode,
         protected_processes: &[String],
+        latest_error: Option<String>,
     ) -> Self {
         mark_protected(&mut rows, protected_processes);
         sort_entries(&mut rows, sort_mode);
@@ -59,7 +84,7 @@ impl App {
             sort_mode,
             last_refresh: Instant::now(),
             modal: Modal::None,
-            latest_error: None,
+            latest_error,
             should_quit: false,
         }
     }
