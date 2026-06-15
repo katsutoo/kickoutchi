@@ -13,8 +13,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::collector;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
-use crate::model::{PortEntry, SortMode, mark_protected};
+use crate::diagnostic;
+use crate::model::{PortEntry, SortMode};
 use crate::output;
+use crate::platform;
+use crate::protection::mark_protected;
 use crate::query::{self, QueryOptions};
 
 /// Stable exit codes: the script-facing contract from PROJECT.md.
@@ -161,6 +164,10 @@ pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
 
 fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
     let sort_mode = args.sort.unwrap_or(config.default_sort);
+    let diagnostic_port = diagnostic::requested_diagnostic_port(
+        args.port,
+        args.filter.as_deref().unwrap_or_default(),
+    );
     let result = match query::query_entries(
         entries,
         QueryOptions {
@@ -177,17 +184,17 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
             return ExitReason::InvalidArguments;
         }
     };
-    let entries = result.entries;
+    let visible_entries = result.entries;
 
     if args.json {
-        match output::render_json(&entries) {
+        match output::render_json(&visible_entries) {
             Ok(json) => println!("{json}"),
             Err(error) => {
                 eprintln!("error: rendering JSON failed: {error}");
                 return ExitReason::Failure;
             }
         }
-    } else if entries.is_empty() {
+    } else if visible_entries.is_empty() {
         let suffix = if result.explicit_filter_active {
             " match the filter"
         } else if result.hidden_system_process_count > 0 {
@@ -196,17 +203,40 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
             ""
         };
         println!("no open ports{suffix}");
+        maybe_print_no_match_diagnostic(diagnostic_port, entries);
     } else {
-        println!("{}", output::render_table(&entries));
+        println!("{}", output::render_table(&visible_entries));
     }
 
     // An empty *filtered* result exits 3 so scripts can probe occupancy
     // (`kickoutchi list --port 3000 && echo busy`). An empty unfiltered list
     // is just a quiet machine, which is a success.
-    if result.explicit_filter_active && entries.is_empty() {
+    if result.explicit_filter_active && visible_entries.is_empty() {
         return ExitReason::NoMatch;
     }
     ExitReason::Success
+}
+
+fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntry]) {
+    let Some(port) = diagnostic_port_without_confirmed_socket(diagnostic_port, entries) else {
+        return;
+    };
+    let hints = platform::collect_related_process_hints(port);
+    if let Some(message) = diagnostic::diagnostic_message(port, &hints) {
+        eprint!("{message}");
+    }
+}
+
+fn diagnostic_port_without_confirmed_socket(
+    diagnostic_port: Option<u16>,
+    entries: &[PortEntry],
+) -> Option<u16> {
+    let port = diagnostic_port?;
+    if entries.iter().any(|entry| entry.local_port == port) {
+        None
+    } else {
+        Some(port)
+    }
 }
 
 fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
@@ -319,8 +349,31 @@ fn prompt_confirmation(target: &PortEntry, force: bool) -> std::io::Result<bool>
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ExitReason, kill_needs_confirmation};
-    use crate::model::SortMode;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{
+        Cli, Command, ExitReason, diagnostic_port_without_confirmed_socket, kill_needs_confirmation,
+    };
+    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
+
+    fn entry(port: u16) -> PortEntry {
+        PortEntry {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: port,
+            state: SocketState::Listen,
+            pid: Some(1),
+            process_name: Some("node".to_owned()),
+            executable_path: None,
+            command_line: None,
+            parent_pid: None,
+            parent_process_name: None,
+            child_pids: Vec::new(),
+            protected: false,
+            platform: Platform::Linux,
+            permission: PermissionStatus::Full,
+        }
+    }
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
@@ -411,5 +464,18 @@ mod tests {
         assert!(!kill_needs_confirmation(true, false, false));
         assert!(!kill_needs_confirmation(false, true, true));
         assert!(!kill_needs_confirmation(true, true, true));
+    }
+
+    #[test]
+    fn no_match_diagnostic_requires_absent_confirmed_socket() {
+        assert_eq!(
+            diagnostic_port_without_confirmed_socket(Some(3000), &[]),
+            Some(3000)
+        );
+        assert_eq!(
+            diagnostic_port_without_confirmed_socket(Some(3000), &[entry(3000)]),
+            None
+        );
+        assert_eq!(diagnostic_port_without_confirmed_socket(None, &[]), None);
     }
 }

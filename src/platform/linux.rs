@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::collector::{Collector, CollectorError};
-use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+use crate::diagnostic;
+use crate::model::{
+    ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
+    Protocol, RelatedProcessHint, SocketState,
+};
 
 const PROC_ROOT: &str = "/proc";
 const TCP_LISTEN_STATE: &str = "0A";
@@ -26,6 +30,8 @@ const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
 // the top of the file, well within this cap, so the limit can never truncate the
 // field the collector needs.
 const MAX_STATUS_BYTES: u64 = 8 * 1024;
+const MAX_CHILD_PROCESSES: usize = 64;
+const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
@@ -109,6 +115,20 @@ struct ProcessMetadata {
     parent_pid: Option<u32>,
     parent_process_name: Option<String>,
     partial: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProcessStatus {
+    parent_pid: Option<u32>,
+    owner_uid: Option<u32>,
+}
+
+pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
+    collect_process_context_from(&PathBuf::from(PROC_ROOT), pid)
+}
+
+pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint> {
+    collect_related_process_hints_from(&PathBuf::from(PROC_ROOT), port)
 }
 
 fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, CollectorError> {
@@ -294,13 +314,23 @@ fn collect_socket_owners(
         return Ok(HashMap::new());
     }
 
-    let mut pids = Vec::new();
-    let proc_entries = fs::read_dir(proc_root).map_err(|source| CollectorError::Read {
+    let pids = process_ids(proc_root).map_err(|source| CollectorError::Read {
         path: proc_root.to_path_buf(),
         source,
     })?;
 
-    for entry in proc_entries {
+    let mut owners = HashMap::with_capacity(target_inodes.len());
+    for pid in pids {
+        if collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners) {
+            break;
+        }
+    }
+    Ok(owners)
+}
+
+fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
+    let mut pids = Vec::new();
+    for entry in fs::read_dir(proc_root)? {
         let Ok(entry) = entry else {
             continue;
         };
@@ -313,14 +343,7 @@ fn collect_socket_owners(
         pids.push(pid);
     }
     pids.sort_unstable();
-
-    let mut owners = HashMap::with_capacity(target_inodes.len());
-    for pid in pids {
-        if collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners) {
-            break;
-        }
-    }
-    Ok(owners)
+    Ok(pids)
 }
 
 fn collect_pid_socket_owners(
@@ -423,8 +446,11 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
         Err(_) => metadata.partial = true,
     }
 
-    match read_parent_pid(&process_dir.join("status")) {
-        Ok(Some(parent_pid)) => {
+    match read_process_status(&process_dir.join("status")) {
+        Ok(ProcessStatus {
+            parent_pid: Some(parent_pid),
+            ..
+        }) => {
             metadata.parent_pid = Some(parent_pid);
             if parent_pid != 0 {
                 match read_process_name(&proc_root.join(parent_pid.to_string())) {
@@ -436,36 +462,125 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
                 }
             }
         }
-        Ok(None) | Err(_) => metadata.partial = true,
+        Ok(ProcessStatus {
+            parent_pid: None, ..
+        })
+        | Err(_) => metadata.partial = true,
     }
 
     metadata
+}
+
+fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
+    let process_dir = proc_root.join(pid.to_string());
+    let owner_uid = read_process_status(&process_dir.join("status"))
+        .ok()
+        .and_then(|status| status.owner_uid);
+    ProcessContext {
+        owner_uid,
+        children: collect_child_processes_from(proc_root, pid),
+    }
+}
+
+fn collect_child_processes_from(proc_root: &Path, parent_pid: u32) -> ChildProcessSnapshot {
+    let Ok(pids) = process_ids(proc_root) else {
+        return ChildProcessSnapshot::default();
+    };
+
+    let mut children = Vec::new();
+    let mut truncated = false;
+    for pid in pids {
+        if pid == parent_pid {
+            continue;
+        }
+        let process_dir = proc_root.join(pid.to_string());
+        let Ok(status) = read_process_status(&process_dir.join("status")) else {
+            continue;
+        };
+        if status.parent_pid != Some(parent_pid) {
+            continue;
+        }
+
+        if children.len() == MAX_CHILD_PROCESSES {
+            truncated = true;
+            break;
+        }
+        let process_name = read_process_name(&process_dir).ok().flatten();
+        children.push(ChildProcess { pid, process_name });
+    }
+
+    ChildProcessSnapshot {
+        children,
+        truncated,
+    }
+}
+
+fn collect_related_process_hints_from(proc_root: &Path, port: u16) -> Vec<RelatedProcessHint> {
+    let Ok(pids) = process_ids(proc_root) else {
+        return Vec::new();
+    };
+    let current_pid = std::process::id();
+    let mut hints = Vec::new();
+
+    for pid in pids {
+        if pid == current_pid {
+            continue;
+        }
+        let process_dir = proc_root.join(pid.to_string());
+        let Ok((Some(command_line), _truncated)) = read_cmdline(&process_dir.join("cmdline"))
+        else {
+            continue;
+        };
+        if !diagnostic::command_mentions_port(&command_line, port) {
+            continue;
+        }
+
+        let process_name = read_process_name(&process_dir).ok().flatten();
+        hints.push(RelatedProcessHint {
+            pid,
+            process_name,
+            command_line,
+        });
+        if hints.len() == MAX_RELATED_PROCESS_HINTS {
+            break;
+        }
+    }
+
+    hints
 }
 
 fn read_process_name(process_dir: &Path) -> std::io::Result<Option<String>> {
     fs::read_to_string(process_dir.join("comm")).map(|text| trimmed_non_empty(&text))
 }
 
-fn read_parent_pid(path: &Path) -> std::io::Result<Option<u32>> {
+fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
     let mut text = String::new();
     File::open(path)?
         .take(MAX_STATUS_BYTES)
         .read_to_string(&mut text)?;
-    parse_parent_pid(&text)
+    parse_process_status(&text)
 }
 
-fn parse_parent_pid(text: &str) -> std::io::Result<Option<u32>> {
+fn parse_process_status(text: &str) -> std::io::Result<ProcessStatus> {
+    let mut status = ProcessStatus::default();
     for line in text.lines() {
-        let Some(value) = line.strip_prefix("PPid:") else {
-            continue;
-        };
-        return value
-            .trim()
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source));
+        if let Some(value) = line.strip_prefix("PPid:") {
+            status.parent_pid = Some(parse_status_u32(value)?);
+        } else if let Some(value) = line.strip_prefix("Uid:") {
+            status.owner_uid = Some(parse_status_u32(value)?);
+        }
     }
-    Ok(None)
+    Ok(status)
+}
+
+fn parse_status_u32(value: &str) -> std::io::Result<u32> {
+    let first = value
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "missing numeric value"))?;
+    first
+        .parse::<u32>()
+        .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))
 }
 
 fn trimmed_non_empty(text: &str) -> Option<String> {
@@ -512,10 +627,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AddressFamily, LinuxCollector, SocketParseError, SocketRecord, collect_pid_socket_owners,
-        collect_socket_owners, collect_socket_records, decode_cmdline, entry_from_record,
-        parse_parent_pid, parse_socket_inode, parse_socket_line, parse_socket_table,
-        read_parent_pid,
+        AddressFamily, LinuxCollector, MAX_CHILD_PROCESSES, SocketParseError, SocketRecord,
+        collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
+        collect_related_process_hints_from, collect_socket_owners, collect_socket_records,
+        decode_cmdline, entry_from_record, parse_process_status, parse_socket_inode,
+        parse_socket_line, parse_socket_table, read_process_status,
     };
     use crate::collector::Collector;
     use crate::model::{PermissionStatus, Protocol, SocketState};
@@ -554,7 +670,7 @@ mod tests {
         .expect("test cmdline must be written");
         fs::write(
             process_dir.join("status"),
-            format!("Name:\t{name}\nPPid:\t{parent_pid}\n"),
+            format!("Name:\t{name}\nPPid:\t{parent_pid}\nUid:\t1000\t1000\t1000\t1000\n"),
         )
         .expect("test status must be written");
         std::os::unix::fs::symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
@@ -732,14 +848,27 @@ mod tests {
     #[test]
     fn parent_pid_is_read_from_status_text() {
         assert_eq!(
-            parse_parent_pid("Name:\tnode\nPPid:\t42\n").expect("valid status text must parse"),
-            Some(42)
+            parse_process_status("Name:\tnode\nPPid:\t42\n")
+                .expect("valid status text must parse")
+                .parent_pid,
+            Some(42),
         );
         assert_eq!(
-            parse_parent_pid("Name:\tnode\n").expect("missing PPid is not malformed"),
-            None
+            parse_process_status("Name:\tnode\n")
+                .expect("missing PPid is not malformed")
+                .parent_pid,
+            None,
         );
-        assert!(parse_parent_pid("PPid:\tnot-a-pid\n").is_err());
+        assert!(parse_process_status("PPid:\tnot-a-pid\n").is_err());
+    }
+
+    #[test]
+    fn process_status_reads_parent_and_owner_uid() {
+        let status = parse_process_status("Name:\tnode\nPPid:\t42\nUid:\t1000\t1001\t1002\t1003\n")
+            .expect("valid status text must parse");
+
+        assert_eq!(status.parent_pid, Some(42));
+        assert_eq!(status.owner_uid, Some(1000));
     }
 
     #[test]
@@ -752,8 +881,9 @@ mod tests {
         let status = format!("Name:\tnode\nPPid:\t42\n{}", "Filler:\t0\n".repeat(2000));
         fs::write(process_dir.join("status"), status).expect("test status must be written");
 
-        let parent =
-            read_parent_pid(&process_dir.join("status")).expect("status read must succeed");
+        let parent = read_process_status(&process_dir.join("status"))
+            .expect("status read must succeed")
+            .parent_pid;
 
         assert_eq!(parent, Some(42));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
@@ -805,6 +935,81 @@ mod tests {
         assert_eq!(entries[0].parent_process_name.as_deref(), Some("systemd"));
         assert_eq!(entries[0].permission, PermissionStatus::Full);
         assert!(entries[0].is_system_process());
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn selected_process_context_collects_owner_uid_and_direct_children() {
+        let proc_root = temp_proc_root("selected-context");
+        write_process(&proc_root, 100, "parent", 1);
+        write_process(&proc_root, 101, "worker-a", 100);
+        write_process(&proc_root, 102, "worker-b", 100);
+        write_process(&proc_root, 200, "unrelated", 1);
+
+        let context = collect_process_context_from(&proc_root, 100);
+
+        assert_eq!(context.owner_uid, Some(1000));
+        let children: Vec<(u32, Option<&str>)> = context
+            .children
+            .children
+            .iter()
+            .map(|child| (child.pid, child.process_name.as_deref()))
+            .collect();
+        assert_eq!(
+            children,
+            vec![(101, Some("worker-a")), (102, Some("worker-b"))]
+        );
+        assert!(!context.children.truncated);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn child_process_collection_is_bounded() {
+        let proc_root = temp_proc_root("bounded-children");
+        write_process(&proc_root, 100, "parent", 1);
+        let max_children = u32::try_from(MAX_CHILD_PROCESSES)
+            .expect("child-process cap must fit in u32 test PIDs");
+        for offset in 0..=max_children {
+            write_process(&proc_root, 1_000 + offset, "worker", 100);
+        }
+
+        let children = collect_child_processes_from(&proc_root, 100);
+
+        assert_eq!(children.children.len(), MAX_CHILD_PROCESSES);
+        assert!(children.truncated);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn related_process_hints_use_strict_command_line_evidence() {
+        let proc_root = temp_proc_root("related-hints");
+        write_process(&proc_root, 100, "candidate", 1);
+        fs::write(
+            proc_root.join("100").join("cmdline"),
+            b"python3\0-m\0http.server\0--port\x003000\0",
+        )
+        .expect("candidate cmdline must be written");
+        write_process(&proc_root, 101, "weak", 1);
+        fs::write(
+            proc_root.join("101").join("cmdline"),
+            b"worker\0--timeout\x003000\0",
+        )
+        .expect("weak cmdline must be written");
+        write_process(&proc_root, std::process::id(), "kickoutchi", 1);
+        fs::write(
+            proc_root
+                .join(std::process::id().to_string())
+                .join("cmdline"),
+            b"kickoutchi\0list\0--port\x003000\0",
+        )
+        .expect("self cmdline must be written");
+
+        let hints = collect_related_process_hints_from(&proc_root, 3000);
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].pid, 100);
+        assert_eq!(hints[0].process_name.as_deref(), Some("candidate"));
+        assert!(hints[0].command_line.contains("--port 3000"));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 

@@ -6,17 +6,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::model::{PermissionStatus, PortEntry};
+use crate::model::{ChildProcessSnapshot, PermissionStatus, PortEntry, ProcessContext};
 
 use super::theme::Theme;
 
 const MISSING: &str = "-";
 const PANEL_LINES_MAX: usize = 7;
+const CHILDREN_DISPLAY_MAX: usize = 8;
 
 pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let lines = app
-        .selected_row()
-        .map_or_else(|| empty_lines(theme), |entry| panel_lines(entry, theme));
+    let lines = app.selected_row().map_or_else(
+        || empty_lines(theme),
+        |entry| panel_lines(entry, app.selected_process_context(), theme),
+    );
     let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::bordered()
             .title("Details")
@@ -27,9 +29,10 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
 }
 
 pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let mut lines = app
-        .selected_row()
-        .map_or_else(|| empty_lines(theme), |entry| modal_lines(entry, theme));
+    let mut lines = app.selected_row().map_or_else(
+        || empty_lines(theme),
+        |entry| modal_lines(entry, app.selected_process_context(), theme),
+    );
     lines.push(Line::raw(""));
     // The footer names only the contextual dismiss key. `q`-quits is a global
     // behavior already shown in the header bar and the help modal, so repeating
@@ -50,7 +53,11 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
     frame.render_widget(modal, area);
 }
 
-fn panel_lines(entry: &PortEntry, theme: Theme) -> Vec<Line<'static>> {
+fn panel_lines(
+    entry: &PortEntry,
+    context: Option<&ProcessContext>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let warning_or_permission = if entry.protected {
         Line::styled(
             "Warning: protected process, stronger confirmation required later.",
@@ -83,7 +90,7 @@ fn panel_lines(entry: &PortEntry, theme: Theme) -> Vec<Line<'static>> {
             theme,
         ),
         field("Parent", parent_text(entry), theme),
-        field("Children", children_text(entry), theme),
+        field("Children", children_text(entry, context), theme),
         field("Path", path_text(entry), theme),
         field(
             "Command",
@@ -96,7 +103,11 @@ fn panel_lines(entry: &PortEntry, theme: Theme) -> Vec<Line<'static>> {
     lines
 }
 
-fn modal_lines(entry: &PortEntry, theme: Theme) -> Vec<Line<'static>> {
+fn modal_lines(
+    entry: &PortEntry,
+    context: Option<&ProcessContext>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         field("Protocol", entry.protocol.label().to_owned(), theme),
         field("Address", entry.local_addr.to_string(), theme),
@@ -110,7 +121,8 @@ fn modal_lines(entry: &PortEntry, theme: Theme) -> Vec<Line<'static>> {
             theme,
         ),
         field("Parent", parent_text(entry), theme),
-        field("Children", children_text(entry), theme),
+        field("Children", children_text(entry, context), theme),
+        field("User", user_text(context), theme),
         field("Permission", permission_text(entry.permission), theme),
     ];
 
@@ -166,18 +178,47 @@ fn parent_text(entry: &PortEntry) -> String {
     }
 }
 
-fn children_text(entry: &PortEntry) -> String {
-    if entry.child_pids.is_empty() {
-        return "not loaded".to_owned();
+fn children_text(entry: &PortEntry, context: Option<&ProcessContext>) -> String {
+    if entry.pid.is_none() {
+        return "unavailable (missing PID)".to_owned();
     }
 
-    let children = entry
-        .child_pids
+    let Some(context) = context else {
+        return "open details to load".to_owned();
+    };
+    children_snapshot_text(&context.children)
+}
+
+fn children_snapshot_text(snapshot: &ChildProcessSnapshot) -> String {
+    if snapshot.children.is_empty() {
+        return "none".to_owned();
+    }
+
+    let visible = snapshot
+        .children
         .iter()
-        .map(u32::to_string)
+        .take(CHILDREN_DISPLAY_MAX)
+        .map(|child| {
+            let name = child.process_name.as_deref().unwrap_or("<unknown>");
+            format!("PID {} ({name})", child.pid)
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{} ({children})", entry.child_pids.len())
+    let hidden = snapshot.children.len().saturating_sub(CHILDREN_DISPLAY_MAX);
+    let suffix = if snapshot.truncated {
+        " (truncated)".to_owned()
+    } else if hidden > 0 {
+        format!(" (+{hidden} more)")
+    } else {
+        String::new()
+    };
+    format!("{} ({visible}){suffix}", snapshot.children.len())
+}
+
+fn user_text(context: Option<&ProcessContext>) -> String {
+    context
+        .and_then(|context| context.owner_uid)
+        .map_or_else(|| MISSING.to_owned(), |uid| format!("uid {uid}"))
 }
 
 fn permission_text(permission: PermissionStatus) -> String {
@@ -194,8 +235,12 @@ mod tests {
 
     use super::{
         MISSING, PANEL_LINES_MAX, children_text, panel_lines, parent_text, permission_text,
+        user_text,
     };
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+    use crate::model::{
+        ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
+        Protocol, SocketState,
+    };
     use crate::ui::theme::Theme;
 
     fn entry() -> PortEntry {
@@ -219,7 +264,8 @@ mod tests {
 
     #[test]
     fn panel_summary_fits_the_default_details_area() {
-        let lines = panel_lines(&entry(), Theme::from_environment());
+        let context = ProcessContext::default();
+        let lines = panel_lines(&entry(), Some(&context), Theme::from_environment());
 
         assert_eq!(lines.len(), PANEL_LINES_MAX);
     }
@@ -237,12 +283,43 @@ mod tests {
     }
 
     #[test]
-    fn children_text_distinguishes_not_loaded_from_loaded_children() {
+    fn children_text_distinguishes_unavailable_none_and_named_children() {
         let mut row = entry();
-        assert_eq!(children_text(&row), "2 (18430, 18431)");
+        let context = ProcessContext {
+            owner_uid: Some(1000),
+            children: ChildProcessSnapshot {
+                children: vec![
+                    ChildProcess {
+                        pid: 18_430,
+                        process_name: Some("worker".to_owned()),
+                    },
+                    ChildProcess {
+                        pid: 18_431,
+                        process_name: None,
+                    },
+                ],
+                truncated: false,
+            },
+        };
 
-        row.child_pids.clear();
-        assert_eq!(children_text(&row), "not loaded");
+        assert_eq!(
+            children_text(&row, Some(&context)),
+            "2 (PID 18430 (worker), PID 18431 (<unknown>))"
+        );
+        assert_eq!(user_text(Some(&context)), "uid 1000");
+
+        row.pid = None;
+        assert_eq!(
+            children_text(&row, Some(&context)),
+            "unavailable (missing PID)"
+        );
+
+        row.pid = Some(18_422);
+        assert_eq!(
+            children_text(&row, Some(&ProcessContext::default())),
+            "none"
+        );
+        assert_eq!(children_text(&row, None), "open details to load");
     }
 
     #[test]

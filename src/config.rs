@@ -13,6 +13,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::model::SortMode;
+use crate::protection;
 
 /// Bounds on the user-configurable refresh interval. Zero would busy-loop the
 /// collector; anything above an hour is indistinguishable from "never" and
@@ -73,13 +74,7 @@ impl Default for Config {
             confirm_force_kill: true,
             // Defaults from PROJECT.md: things whose accidental death takes
             // down containers, databases, the init system, or a desktop.
-            protected_processes: vec![
-                "docker".to_owned(),
-                "postgres".to_owned(),
-                "systemd".to_owned(),
-                "explorer.exe".to_owned(),
-                "WindowServer".to_owned(),
-            ],
+            protected_processes: protection::default_protected_processes(),
         }
     }
 }

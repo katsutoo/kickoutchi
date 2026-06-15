@@ -410,7 +410,7 @@ UI behavior:
 - Kill confirmation should mention if the selected PID has children
 - Later, add an option to terminate a process tree, but do not make tree-kill the default
 
-Collection note: `child_pids` on `PortEntry` is resolved lazily for the selected row only. Building the full child map for every row would mean walking the whole process table on every refresh, so on non-selected rows the field may simply stay empty.
+Collection note: child context is resolved lazily only when the user asks for details on the selected row. Building the full child map for every row would mean walking the whole process table on every refresh, and doing that work on every selection move would make table navigation depend on process-table size. The side details panel may say child context is not loaded yet; the details modal loads and shows it.
 
 ### Docker And Container Awareness
 
@@ -1004,22 +1004,22 @@ pedantic = "warn"
 
 1. ~~Extend process metadata collection to include parent PID where the platform exposes it.~~ **Done in Phase 4** to back the `parent:` filter and parent sort: the Linux collector reads `PPid` from `/proc/<pid>/status`.
 2. ~~Resolve parent process name when permitted.~~ **Done in Phase 4:** the parent name is read from `/proc/<ppid>/comm`.
-3. Collect child PIDs for the selected process where practical.
-4. Resolve child process names where permitted.
-5. Add `process_start_time` and `current_user` if the chosen process metadata source provides them reliably.
-6. Add a separate no-match port diagnostic that can scan process command lines for likely related processes when an explicit port search/filter finds no confirmed socket. This must never create a fake port row, never claim ownership, and never weaken the invariant that the main table only contains OS-confirmed listening TCP or bound UDP sockets.
-7. Use strict port-shaped matchers for the diagnostic, not raw substring search. Good matches include socket-shaped text such as `:3000`, `127.0.0.1:3000`, `[::1]:3000`, flag-shaped text such as `--port 3000`, `--port=3000`, `-p 3000`, and environment/config-shaped text such as `PORT=3000`; weak incidental numbers such as `--timeout 3000`, `--max-bytes 3000`, `3000k`, or version numbers must not produce confident hints.
-8. Keep the CLI contract stable for diagnostics: `kickoutchi list --port 3000` still exits `3` when no confirmed socket exists, diagnostic hints print to stderr in human table mode, and `list --json` is not polluted with hints unless a dedicated JSON contract is designed later.
-9. Phrase diagnostics as evidence, not diagnosis: `No listening socket found on port 3000. Possible related process: PID 12345 python3 -m http.server 3000 references this port, but no socket was confirmed.` Do not claim whether the process failed to bind, is still starting, or is in another network namespace unless the app can prove that separately.
-10. Add `protection.rs` for protected-process matching.
-11. Seed protected-process defaults with `docker`, `postgres`, `systemd`, `explorer.exe`, and `WindowServer`.
-12. Merge config-defined protected process names with defaults.
-13. Use platform-appropriate matching rules, such as case-insensitive matching on Windows.
-14. Render parent process in the details panel.
-15. Render child process count in the details panel.
-16. Add a details modal that can show child processes when available.
-17. Add visual warning text for protected processes.
-18. Add tests for protected-process matching, process-tree rendering, diagnostic matcher behavior, CLI stderr/exit-code behavior, and JSON non-pollution.
+3. **Done in Phase 5:** collect direct child PIDs for the selected process where practical. The Linux implementation scans `/proc` only when the details modal is opened for the selected row, caches that selected-row context until refresh, and caps displayed children.
+4. **Done in Phase 5:** resolve child process names from `/proc/<pid>/comm` where permitted, as part of the details-modal context load.
+5. **Partially done in Phase 5:** show the selected process owner as a UID when `/proc/<pid>/status` exposes it. `process_start_time` is intentionally not displayed yet because the current `/proc` source needs clock-tick and boot-time conversion to become a useful timestamp; do not add a raw tick counter to the UI.
+6. **Done in Phase 5:** add a separate no-match port diagnostic that can scan process command lines for likely related processes when an explicit port search/filter finds no confirmed socket. This must never create a fake port row, never claim ownership, and never weaken the invariant that the main table only contains OS-confirmed listening TCP or bound UDP sockets.
+7. **Done in Phase 5:** use strict port-shaped matchers for the diagnostic, not raw substring search. Good matches include socket-shaped text such as `:3000`, `127.0.0.1:3000`, `[::1]:3000`, flag-shaped text such as `--port 3000`, `--port=3000`, `-p 3000`, and environment/config-shaped text such as `PORT=3000`; weak incidental numbers such as `--timeout 3000`, `--max-bytes 3000`, `3000k`, or version numbers must not produce confident hints.
+8. **Done in Phase 5:** keep the CLI contract stable for diagnostics: `kickoutchi list --port 3000` still exits `3` when no confirmed socket exists, diagnostic hints print to stderr in human table mode, and `list --json` is not polluted with hints unless a dedicated JSON contract is designed later.
+9. **Done in Phase 5:** phrase diagnostics as evidence, not diagnosis: `No listening socket found on port 3000. Possible related process: PID 12345 python3 -m http.server 3000 references this port, but no socket was confirmed.` Do not claim whether the process failed to bind, is still starting, or is in another network namespace unless the app can prove that separately.
+10. **Done in Phase 5:** add `protection.rs` for protected-process matching.
+11. **Done in Phase 1/5:** seed protected-process defaults with `docker`, `postgres`, `systemd`, `explorer.exe`, and `WindowServer`.
+12. **Done before Phase 5:** merge config-defined protected process names with defaults.
+13. **Done in Phase 5:** use platform-appropriate matching rules, such as case-insensitive matching on Windows.
+14. **Done in Phase 4:** render parent process in the details panel.
+15. **Done in Phase 5:** render child process count in the details panel.
+16. **Done in Phase 5:** add a details modal that can show child processes when available.
+17. **Done in Phase 2/5:** add visual warning text for protected processes.
+18. **Done in Phase 5:** add tests for protected-process matching, process-tree rendering, diagnostic matcher behavior, CLI stderr/exit-code behavior, and JSON non-pollution.
 
 ### Done when
 

@@ -8,11 +8,13 @@ mod app;
 mod cli;
 mod collector;
 mod config;
+mod diagnostic;
 mod error;
 mod input;
 mod model;
 mod output;
 mod platform;
+mod protection;
 mod query;
 mod ui;
 

@@ -129,6 +129,39 @@ pub(crate) struct PortEntry {
     pub(crate) permission: PermissionStatus,
 }
 
+/// Extra context collected lazily for the selected process.
+///
+/// Keeping this outside [`PortEntry`] preserves the rule that table rows and
+/// JSON output are OS-confirmed socket rows only; process-tree enrichment is a
+/// selected-row detail, not part of the main snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ProcessContext {
+    pub(crate) owner_uid: Option<u32>,
+    pub(crate) children: ChildProcessSnapshot,
+}
+
+/// Bounded child-process list for one selected PID.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ChildProcessSnapshot {
+    pub(crate) children: Vec<ChildProcess>,
+    pub(crate) truncated: bool,
+}
+
+/// One child process directly parented by the selected PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildProcess {
+    pub(crate) pid: u32,
+    pub(crate) process_name: Option<String>,
+}
+
+/// Evidence-only hint for the no-confirmed-socket diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelatedProcessHint {
+    pub(crate) pid: u32,
+    pub(crate) process_name: Option<String>,
+    pub(crate) command_line: String,
+}
+
 impl PortEntry {
     /// Exact port match, used by `list --port` and `kill --port`.
     pub(crate) fn matches_port(&self, port: u16) -> bool {
@@ -282,24 +315,6 @@ pub(crate) fn sort_entries(entries: &mut [PortEntry], mode: SortMode) {
     });
 }
 
-/// Flag entries whose process name is on the protected list.
-///
-/// Matching is exact and case-sensitive: this is the Unix convention from
-/// PROJECT.md, and a substring rule would over-protect (a user process named
-/// `postgres-backup-helper` must not inherit `postgres` protection and block
-/// its own termination path). Platform-aware matching (case-insensitive on
-/// Windows) moves into `protection.rs` in Phase 5.
-pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[String]) {
-    for entry in entries.iter_mut() {
-        let Some(name) = &entry.process_name else {
-            continue;
-        };
-        if protected_names.iter().any(|protected| protected == name) {
-            entry.protected = true;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -307,7 +322,7 @@ mod tests {
 
     use super::{
         BindScope, PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode,
-        mark_protected, sort_entries,
+        sort_entries,
     };
 
     /// Minimal entry builder so each test states only the fields it cares about.
@@ -478,20 +493,6 @@ mod tests {
         row.parent_pid = None;
         row.process_name = Some("systemd".to_owned());
         assert!(row.is_system_process());
-    }
-
-    #[test]
-    fn protection_marking_is_exact_not_substring() {
-        let protected = vec!["postgres".to_owned()];
-        let mut rows = vec![
-            entry(5432, Some(1), Some("postgres")),
-            entry(5433, Some(2), Some("postgres-backup-helper")),
-            entry(53, None, None),
-        ];
-        mark_protected(&mut rows, &protected);
-        assert!(rows[0].protected);
-        assert!(!rows[1].protected);
-        assert!(!rows[2].protected);
     }
 
     #[test]

@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Process context and protected-process policy (Phase 5): the selected TUI row
+  now resolves direct child PIDs and child process names only when the user opens
+  the details modal, shows owner UID when available, and keeps the child scan
+  bounded so scrolling the table does not walk the process list.
+- Protected-process matching now lives in `protection.rs`, with exact
+  case-sensitive matching on Unix-like platforms and exact case-insensitive
+  matching ready for Windows.
+- No-match port diagnostics for human CLI output: when an explicit port query
+  finds no confirmed listening TCP or bound UDP socket, Kickoutchi can print
+  evidence-only related-process hints to stderr based on strict port-shaped
+  command-line matches such as `:3000`, `--port 3000`, `--port=3000`, `-p 3000`,
+  `PORT=3000`, and `python3 -m http.server 3000`.
+- Diagnostic hints do not create fake table rows, do not claim ownership, do not
+  change the `list --port` no-match exit code, and do not pollute `list --json`.
+
 - Filtering, sorting, and refresh (Phase 4): the TUI now supports manual
   refresh with `r`, automatic refresh using the configured interval, search mode
   with `/`, and sort cycling with `s`.

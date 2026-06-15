@@ -10,7 +10,9 @@ use crate::collector;
 use crate::collector::{Collector, FakeCollector};
 use crate::config::Config;
 use crate::input::Action;
-use crate::model::{PortEntry, Protocol, SortMode, mark_protected};
+use crate::model::{PortEntry, ProcessContext, Protocol, SortMode};
+use crate::platform;
+use crate::protection::mark_protected;
 use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
 
 /// Modal currently covering the main table.
@@ -51,6 +53,8 @@ pub(crate) struct App {
     sort_mode: SortMode,
     hide_system_processes: bool,
     protected_processes: Vec<String>,
+    selected_context_key: Option<RowKey>,
+    selected_process_context: Option<ProcessContext>,
     last_successful_refresh: Option<Instant>,
     last_refresh_attempt: Instant,
     modal: Modal,
@@ -92,6 +96,8 @@ impl App {
             sort_mode: config.default_sort,
             hide_system_processes: config.hide_system_processes,
             protected_processes: config.protected_processes.clone(),
+            selected_context_key: None,
+            selected_process_context: None,
             last_successful_refresh: None,
             last_refresh_attempt: now,
             modal: Modal::None,
@@ -148,6 +154,15 @@ impl App {
 
     pub(crate) fn selected_row(&self) -> Option<&PortEntry> {
         self.selected_index.and_then(|index| self.rows.get(index))
+    }
+
+    pub(crate) fn selected_process_context(&self) -> Option<&ProcessContext> {
+        let selected_key = self.selected_row().map(RowKey::from)?;
+        if self.selected_context_key == Some(selected_key) {
+            self.selected_process_context.as_ref()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn filter_text(&self) -> &str {
@@ -220,6 +235,7 @@ impl App {
     fn open_details(&mut self) {
         if self.selected_row().is_some() {
             self.search_mode = false;
+            self.load_selected_process_context();
             self.modal = Modal::Details;
         }
     }
@@ -229,7 +245,12 @@ impl App {
         self.all_rows = rows;
         self.last_successful_refresh = Some(now);
         self.latest_error = None;
+        self.selected_context_key = None;
+        self.selected_process_context = None;
         self.rebuild_visible_rows();
+        if self.modal == Modal::Details {
+            self.load_selected_process_context();
+        }
     }
 
     fn rebuild_visible_rows(&mut self) {
@@ -257,6 +278,19 @@ impl App {
         }
 
         self.selected_index = preserved_selection(&self.rows, selected_key, fallback_index);
+    }
+
+    fn load_selected_process_context(&mut self) {
+        let selected_key = self.selected_row().map(RowKey::from);
+        if self.selected_context_key == selected_key {
+            return;
+        }
+
+        self.selected_context_key = selected_key;
+        self.selected_process_context = self
+            .selected_row()
+            .and_then(|entry| entry.pid)
+            .map(platform::collect_process_context);
     }
 
     fn append_search_char(&mut self, ch: char) {
@@ -361,12 +395,15 @@ mod tests {
 
         app.apply_action(Action::MoveUp);
         assert_eq!(app.selected_index(), Some(0));
+        assert_eq!(app.selected_process_context(), None);
 
         app.apply_action(Action::MoveDown);
         assert_eq!(app.selected_index(), Some(1));
+        assert_eq!(app.selected_process_context(), None);
 
         app.apply_action(Action::MoveDown);
         assert_eq!(app.selected_index(), Some(1));
+        assert_eq!(app.selected_process_context(), None);
     }
 
     #[test]
@@ -374,6 +411,7 @@ mod tests {
         let mut app = app_with_rows(Vec::new());
 
         assert_eq!(app.selected_index(), None);
+        assert_eq!(app.selected_process_context(), None);
         app.apply_action(Action::MoveDown);
         app.apply_action(Action::OpenDetails);
         assert_eq!(app.modal(), Modal::None);
@@ -383,8 +421,10 @@ mod tests {
     fn modal_and_quit_actions_update_state() {
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
 
+        assert_eq!(app.selected_process_context(), None);
         app.apply_action(Action::OpenDetails);
         assert_eq!(app.modal(), Modal::Details);
+        assert!(app.selected_process_context().is_some());
 
         app.apply_action(Action::CloseModal);
         assert_eq!(app.modal(), Modal::None);
@@ -439,6 +479,35 @@ mod tests {
         app.apply_successful_snapshot(refreshed, Instant::now());
 
         assert_eq!(app.selected_row().map(|row| row.local_port), Some(5173));
+    }
+
+    #[test]
+    fn refresh_reloads_details_context_when_modal_stays_open() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+        app.apply_action(Action::OpenDetails);
+        assert!(app.selected_process_context().is_some());
+
+        app.apply_successful_snapshot(vec![entry(3000, Some("node"))], Instant::now());
+
+        assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
+        assert_eq!(app.modal(), Modal::Details);
+        assert!(app.selected_process_context().is_some());
+    }
+
+    #[test]
+    fn refresh_invalidates_details_context_when_modal_is_closed() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+        app.apply_action(Action::OpenDetails);
+        assert!(app.selected_process_context().is_some());
+        app.apply_action(Action::CloseModal);
+
+        app.apply_successful_snapshot(vec![entry(3000, Some("node"))], Instant::now());
+
+        assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
+        assert_eq!(app.modal(), Modal::None);
+        assert_eq!(app.selected_process_context(), None);
     }
 
     #[test]
