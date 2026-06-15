@@ -20,6 +20,7 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
     let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::bordered()
             .title("Details")
+            .title_style(theme.title())
             .border_style(theme.border()),
     );
     frame.render_widget(panel, area);
@@ -30,16 +31,19 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
         .selected_row()
         .map_or_else(|| empty_lines(theme), |entry| modal_lines(entry, theme));
     lines.push(Line::raw(""));
+    // The footer names only the contextual dismiss key. `q`-quits is a global
+    // behavior already shown in the header bar and the help modal, so repeating
+    // it here would only nudge people toward quitting when they just want to
+    // close the panel.
     lines.push(Line::from(vec![
         Span::styled("Esc", theme.key()),
-        Span::raw(" closes this modal; "),
-        Span::styled("q", theme.key()),
-        Span::raw(" quits."),
+        Span::raw(" closes this modal."),
     ]));
 
     let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::bordered()
             .title("Port Details")
+            .title_style(theme.title())
             .border_style(theme.border()),
     );
     frame.render_widget(Clear, area);

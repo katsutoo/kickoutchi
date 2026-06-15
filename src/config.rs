@@ -53,8 +53,10 @@ pub(crate) struct Config {
     pub(crate) tick_interval: Duration,
     /// How often the TUI re-collects ports (auto-refresh lands in Phase 4).
     pub(crate) refresh_interval: Duration,
-    /// Default table sort for the CLI and, later, the TUI.
+    /// Default table sort for the CLI and TUI.
     pub(crate) default_sort: SortMode,
+    /// Hide conservative system/service rows from the default view.
+    pub(crate) hide_system_processes: bool,
     /// Whether force kill prompts for confirmation when `--yes` is absent.
     pub(crate) confirm_force_kill: bool,
     /// Process names that require stronger confirmation before termination.
@@ -67,6 +69,7 @@ impl Default for Config {
             tick_interval: Duration::from_millis(250),
             refresh_interval: Duration::from_secs(3),
             default_sort: SortMode::Port,
+            hide_system_processes: false,
             confirm_force_kill: true,
             // Defaults from PROJECT.md: things whose accidental death takes
             // down containers, databases, the init system, or a desktop.
@@ -92,6 +95,7 @@ impl Default for Config {
 struct ConfigFile {
     refresh_interval_seconds: Option<u64>,
     default_sort: Option<SortMode>,
+    hide_system_processes: Option<bool>,
     confirm_force_kill: Option<bool>,
     protected_processes: Option<Vec<String>>,
 }
@@ -151,6 +155,9 @@ impl Config {
         }
         if let Some(sort) = file.default_sort {
             config.default_sort = sort;
+        }
+        if let Some(hide) = file.hide_system_processes {
+            config.hide_system_processes = hide;
         }
         if let Some(confirm) = file.confirm_force_kill {
             config.confirm_force_kill = confirm;
@@ -262,6 +269,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.refresh_interval, Duration::from_secs(3));
         assert_eq!(config.default_sort, SortMode::Port);
+        assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
     }
@@ -271,6 +279,10 @@ mod tests {
         let config = parse("").expect("empty file is valid");
         assert_eq!(config.refresh_interval, Config::default().refresh_interval);
         assert_eq!(config.default_sort, Config::default().default_sort);
+        assert_eq!(
+            config.hide_system_processes,
+            Config::default().hide_system_processes
+        );
     }
 
     #[test]
@@ -279,6 +291,7 @@ mod tests {
         assert_eq!(config.refresh_interval, Duration::from_secs(10));
         // Everything else stays at its default.
         assert_eq!(config.default_sort, SortMode::Port);
+        assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
     }
 
@@ -287,14 +300,16 @@ mod tests {
         let config = parse(
             r#"
             refresh_interval_seconds = 5
-            default_sort = "pid"
+            default_sort = "scope"
+            hide_system_processes = true
             confirm_force_kill = false
             protected_processes = ["redis", "postgres"]
             "#,
         )
         .expect("valid");
         assert_eq!(config.refresh_interval, Duration::from_secs(5));
-        assert_eq!(config.default_sort, SortMode::Pid);
+        assert_eq!(config.default_sort, SortMode::Scope);
+        assert!(config.hide_system_processes);
         assert!(!config.confirm_force_kill);
         assert!(config.protected_processes.contains(&"docker".to_owned()));
         assert!(config.protected_processes.contains(&"postgres".to_owned()));

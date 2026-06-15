@@ -23,7 +23,7 @@ impl Theme {
     }
 
     pub(crate) fn border(self) -> Style {
-        self.fg(Color::DarkGray)
+        self.fg(Color::Reset)
     }
 
     pub(crate) fn table_header(self) -> Style {
@@ -50,7 +50,7 @@ impl Theme {
     }
 
     pub(crate) fn muted(self) -> Style {
-        self.fg(Color::DarkGray)
+        self.fg(Color::Reset)
     }
 
     pub(crate) fn label(self) -> Style {
@@ -61,12 +61,11 @@ impl Theme {
         self.fg(Color::Green).add_modifier(Modifier::BOLD)
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn status(self) -> Style {
-        if self.no_color {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().fg(Color::Black).bg(Color::DarkGray)
-        }
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD)
     }
 
     fn fg(self, color: Color) -> Style {

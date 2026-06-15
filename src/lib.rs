@@ -13,6 +13,7 @@ mod input;
 mod model;
 mod output;
 mod platform;
+mod query;
 mod ui;
 
 use std::io;

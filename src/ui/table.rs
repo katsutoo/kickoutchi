@@ -32,6 +32,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         .block(
             Block::bordered()
                 .title("Open Ports")
+                .title_style(theme.title())
                 .border_style(theme.border()),
         )
         .row_highlight_style(theme.selected())

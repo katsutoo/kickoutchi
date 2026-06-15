@@ -556,7 +556,7 @@ Current version snapshot checked on 2026-05-04 with crates.io metadata and local
 | Unix FFI         |                           `libc` |            `0.2.177` | Latest non-alpha Unix/macOS FFI bindings                           |
 | Clipboard        |                        `arboard` |              `3.6.1` | Optional copy command support                                      |
 | Config paths     |                            `dirs` |              `6.0.0` | Cross-platform config/cache directory resolution (`XDG_CONFIG_HOME`, `%APPDATA%`, `~/Library/...`) |
-| Errors           |           `thiserror` + `anyhow` | `2.0.18` + `1.0.102` | Typed collector errors plus app-level context                      |
+| Errors           |                        `thiserror` |             `2.0.18` | Typed errors at module boundaries; no app-level `anyhow` yet       |
 | Logging          | `tracing` + `tracing-subscriber` |  `0.1.44` + `0.3.23` | Debug collector failures without polluting the UI                  |
 | Release tooling  |          `cargo-dist` (`dist`) |    `0.30.0` available | Rust-native cross-platform release pipeline, configured from `Cargo.toml` |
 
@@ -578,7 +578,7 @@ cargo add serde@1.0.228 --features derive
 cargo add serde_json@1.0.149 toml@1.1.2
 cargo add arboard@3.6.1 --optional
 cargo add dirs@6.0.0
-cargo add thiserror@2.0.18 anyhow@1.0.102
+cargo add thiserror@2.0.18
 cargo add tracing@0.1.44 tracing-subscriber@0.3.23
 cargo add libc@0.2.177 --target 'cfg(unix)'
 cargo add windows-sys@0.61.2 --target 'cfg(windows)' --features Win32_Foundation,Win32_NetworkManagement_IpHelper,Win32_Networking_WinSock,Win32_System_ProcessStatus,Win32_System_Threading
@@ -785,7 +785,7 @@ Phase 10 is intentionally optional for the first public release. Docker awarenes
 3. Add required `Cargo.toml` metadata fields early: `license = "MIT"`, `description`, `repository`, `authors`, and `readme = "README.md"`. These are needed for both `cargo publish` and `cargo-dist` later.
 4. Add `mise.toml` pinned to Rust `1.95.0`.
 5. Run `mise trust` and `mise install` so contributors use the same Rust toolchain.
-6. Add the dependencies from the stack table, starting with `ratatui`, `crossterm`, `clap`, `serde`, `serde_json`, `toml`, `thiserror`, `anyhow`, and `tracing`.
+6. Add the dependencies from the stack table, starting with `ratatui`, `crossterm`, `clap`, `serde`, `serde_json`, `toml`, `thiserror`, and `tracing`.
 7. Add strict project lints in `Cargo.toml`.
 
 ```toml
@@ -974,6 +974,8 @@ pedantic = "warn"
 12. Add config-driven defaults for sort mode, refresh interval, and hidden system processes.
 13. Add tests for filter parsing, filter matching, sort ordering, and selection preservation.
 
+**Parent-context note:** Steps 8–9 add `parent:` filtering and parent sorting, which are only meaningful if rows actually carry parent data. To avoid shipping a filter and a sort that silently match nothing, the Linux collector's parent-PID and parent-name collection (originally Phase 5 steps 1–2) was implemented as part of this phase: `parent_pid` is read from `/proc/<pid>/status` and the parent name from `/proc/<ppid>/comm`, and the details-panel parent line is fed by the same data. Child-PID collection stays in Phase 5.
+
 ### Done when
 
 - Search feels immediate on normal developer machines.
@@ -1000,8 +1002,8 @@ pedantic = "warn"
 
 ### Build steps
 
-1. Extend process metadata collection to include parent PID where the platform exposes it.
-2. Resolve parent process name when permitted.
+1. ~~Extend process metadata collection to include parent PID where the platform exposes it.~~ **Done in Phase 4** to back the `parent:` filter and parent sort: the Linux collector reads `PPid` from `/proc/<pid>/status`.
+2. ~~Resolve parent process name when permitted.~~ **Done in Phase 4:** the parent name is read from `/proc/<ppid>/comm`.
 3. Collect child PIDs for the selected process where practical.
 4. Resolve child process names where permitted.
 5. Add `process_start_time` and `current_user` if the chosen process metadata source provides them reliably.

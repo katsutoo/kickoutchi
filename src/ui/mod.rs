@@ -138,20 +138,27 @@ fn event_loop(terminal: &mut Tui, app: &mut App, config: &Config, theme: Theme) 
     loop {
         terminal.draw(|frame| draw(frame, app, theme))?;
 
-        // Bounded wait so the loop can never block forever. `poll` returns the
-        // instant input is queued, so the tick interval only caps idle latency
-        // rather than busy-polling. Per-tick work (auto refresh) arrives later.
-        if !event::poll(config.tick_interval)? {
-            continue;
+        let wait = std::cmp::min(
+            config.tick_interval,
+            app.time_until_refresh(config.refresh_interval),
+        );
+        if event::poll(wait)?
+            && let Event::Key(key) = event::read()?
+        {
+            app.apply_action(input::action_for_key(
+                key,
+                app.modal(),
+                app.search_mode(),
+                !app.filter_text().is_empty(),
+            ));
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-
-        app.apply_action(input::action_for_key(key, app.modal()));
         if app.should_quit() {
             return Ok(());
+        }
+
+        if app.refresh_due(config.refresh_interval) {
+            app.refresh();
         }
     }
 }
@@ -190,7 +197,7 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
 fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
     let line = Line::from(vec![
         Span::styled("Kickoutchi", theme.title()),
-        Span::raw("   j/k move  Enter details  ? help  q quit"),
+        Span::raw("   r refresh  / search  s sort  j/k move  Enter details  ? help  q quit"),
     ]);
     let header = Paragraph::new(line)
         .alignment(Alignment::Center)
@@ -204,12 +211,19 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     } else {
         app.filter_text()
     };
+    let search = if app.search_mode() { "editing" } else { "idle" };
     let mut status = format!(
-        "Status: {} open ports, refreshed {} ago | sort: {} | filter: {filter}",
+        "Status: {}/{} open ports, refreshed {} | sort: {} | filter: {filter} | search: {search}",
         app.rows().len(),
+        app.total_row_count(),
         format_age(app.refresh_age()),
         app.sort_mode().label(),
     );
+
+    if let Some(error) = app.filter_error() {
+        status.push_str(" | filter error: ");
+        status.push_str(error);
+    }
 
     if let Some(error) = app.latest_error() {
         status.push_str(" | error: ");
@@ -226,6 +240,7 @@ fn render_too_small(frame: &mut Frame, area: Rect, theme: Theme) {
         .block(
             Block::bordered()
                 .title("Kickoutchi")
+                .title_style(theme.title())
                 .border_style(theme.border()),
         );
     frame.render_widget(message, area);
@@ -260,14 +275,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
-fn format_age(duration: Duration) -> String {
+fn format_age(duration: Option<Duration>) -> String {
+    let Some(duration) = duration else {
+        return "never".to_owned();
+    };
     let seconds = duration.as_secs();
     if seconds < 60 {
-        format!("{seconds}s")
+        format!("{seconds}s ago")
     } else {
         let minutes = seconds / 60;
         let seconds = seconds % 60;
-        format!("{minutes}m {seconds}s")
+        format!("{minutes}m {seconds}s ago")
     }
 }
 
@@ -313,7 +331,7 @@ mod tests {
         assert!(text.contains("node"), "{text}");
         assert!(text.contains("Details"), "{text}");
         assert!(text.contains("PID: 18422 | Process: node"), "{text}");
-        assert!(text.contains("Status: 5 open ports"), "{text}");
+        assert!(text.contains("Status: 5/5 open ports"), "{text}");
     }
 
     #[test]
@@ -325,9 +343,23 @@ mod tests {
         let text = render_text(&app, 100, 30);
 
         assert!(text.contains("Help"), "{text}");
-        assert!(text.contains("Kickoutchi Phase 2"), "{text}");
+        assert!(text.contains("Kickoutchi"), "{text}");
         assert!(text.contains("j / Down"), "{text}");
+        assert!(text.contains('/'), "{text}");
         assert!(text.contains("Ctrl+C"), "{text}");
+    }
+
+    #[test]
+    fn status_shows_active_search_text() {
+        let config = Config::default();
+        let mut app = App::new_fake(&config);
+        app.apply_action(Action::StartSearch);
+        app.apply_action(Action::SearchAppend('3'));
+
+        let text = render_text(&app, 100, 30);
+
+        assert!(text.contains("filter: 3"), "{text}");
+        assert!(text.contains("search: editing"), "{text}");
     }
 
     #[test]

@@ -16,12 +16,30 @@ pub(crate) enum Action {
     OpenDetails,
     OpenHelp,
     CloseModal,
+    Refresh,
+    StartSearch,
+    SearchAppend(char),
+    SearchBackspace,
+    FinishSearch,
+    CancelSearch,
+    CycleSort,
     Quit,
     Noop,
 }
 
 /// Map a key event to an app action.
-pub(crate) fn action_for_key(key: KeyEvent, modal: Modal) -> Action {
+///
+/// `filter_active` lets a single `Esc` outside search mode clear an applied
+/// filter instead of quitting: a user who set a filter, pressed Enter to finish
+/// editing, then reflexively hits Esc should lose the filter, not the whole
+/// session. Esc only quits once there is no modal to close and no filter to
+/// clear. Precedence is fixed: modal first, then filter, then quit.
+pub(crate) fn action_for_key(
+    key: KeyEvent,
+    modal: Modal,
+    search_mode: bool,
+    filter_active: bool,
+) -> Action {
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
     }
@@ -30,15 +48,37 @@ pub(crate) fn action_for_key(key: KeyEvent, modal: Modal) -> Action {
         return Action::Quit;
     }
 
+    if search_mode {
+        return search_action_for_key(key);
+    }
+
     match key.code {
-        KeyCode::Char('q') => Action::Quit,
-        KeyCode::Esc if modal == Modal::None => Action::Quit,
-        KeyCode::Esc => Action::CloseModal,
+        KeyCode::Esc if modal != Modal::None => Action::CloseModal,
+        KeyCode::Esc if filter_active => Action::CancelSearch,
+        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('?') => Action::OpenHelp,
         _ if modal != Modal::None => Action::Noop,
+        KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('/') => Action::StartSearch,
+        KeyCode::Char('s') => Action::CycleSort,
         KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
         KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
         KeyCode::Enter => Action::OpenDetails,
+        _ => Action::Noop,
+    }
+}
+
+fn search_action_for_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::CancelSearch,
+        KeyCode::Enter => Action::FinishSearch,
+        KeyCode::Backspace => Action::SearchBackspace,
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::SearchAppend(ch)
+        }
         _ => Action::Noop,
     }
 }
@@ -53,17 +93,23 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Most cases do not depend on an active filter; the Esc-clears-filter test
+    /// below passes `filter_active` explicitly. Keeping the common case in one
+    /// helper avoids two confusable trailing bools at every call site.
+    fn act(code: KeyCode, modal: Modal, search_mode: bool) -> Action {
+        action_for_key(key(code), modal, search_mode, false)
+    }
+
     #[test]
     fn quit_keys_quit() {
-        assert_eq!(
-            action_for_key(key(KeyCode::Char('q')), Modal::None),
-            Action::Quit
-        );
-        assert_eq!(action_for_key(key(KeyCode::Esc), Modal::None), Action::Quit);
+        assert_eq!(act(KeyCode::Char('q'), Modal::None, false), Action::Quit);
+        assert_eq!(act(KeyCode::Esc, Modal::None, false), Action::Quit);
         assert_eq!(
             action_for_key(
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                Modal::None
+                Modal::None,
+                false,
+                false,
             ),
             Action::Quit
         );
@@ -71,45 +117,61 @@ mod tests {
 
     #[test]
     fn navigation_keys_move_when_no_modal_is_open() {
-        assert_eq!(
-            action_for_key(key(KeyCode::Char('j')), Modal::None),
-            Action::MoveDown
-        );
-        assert_eq!(
-            action_for_key(key(KeyCode::Down), Modal::None),
-            Action::MoveDown
-        );
-        assert_eq!(
-            action_for_key(key(KeyCode::Char('k')), Modal::None),
-            Action::MoveUp
-        );
-        assert_eq!(
-            action_for_key(key(KeyCode::Up), Modal::None),
-            Action::MoveUp
-        );
+        assert_eq!(act(KeyCode::Char('j'), Modal::None, false), Action::MoveDown);
+        assert_eq!(act(KeyCode::Down, Modal::None, false), Action::MoveDown);
+        assert_eq!(act(KeyCode::Char('k'), Modal::None, false), Action::MoveUp);
+        assert_eq!(act(KeyCode::Up, Modal::None, false), Action::MoveUp);
     }
 
     #[test]
     fn modal_keys_are_contextual() {
+        assert_eq!(act(KeyCode::Enter, Modal::None, false), Action::OpenDetails);
+        assert_eq!(act(KeyCode::Char('?'), Modal::None, false), Action::OpenHelp);
+        assert_eq!(act(KeyCode::Esc, Modal::Help, false), Action::CloseModal);
+        assert_eq!(act(KeyCode::Down, Modal::Help, false), Action::Noop);
+        assert_eq!(act(KeyCode::Char('q'), Modal::Help, false), Action::Quit);
+    }
+
+    #[test]
+    fn refresh_search_and_sort_keys_work_without_modal() {
+        assert_eq!(act(KeyCode::Char('r'), Modal::None, false), Action::Refresh);
         assert_eq!(
-            action_for_key(key(KeyCode::Enter), Modal::None),
-            Action::OpenDetails
+            act(KeyCode::Char('/'), Modal::None, false),
+            Action::StartSearch
+        );
+        assert_eq!(act(KeyCode::Char('s'), Modal::None, false), Action::CycleSort);
+    }
+
+    #[test]
+    fn search_mode_treats_plain_keys_as_query_text() {
+        assert_eq!(
+            act(KeyCode::Char('q'), Modal::None, true),
+            Action::SearchAppend('q')
         );
         assert_eq!(
-            action_for_key(key(KeyCode::Char('?')), Modal::None),
-            Action::OpenHelp
+            act(KeyCode::Backspace, Modal::None, true),
+            Action::SearchBackspace
+        );
+        assert_eq!(act(KeyCode::Enter, Modal::None, true), Action::FinishSearch);
+        assert_eq!(act(KeyCode::Esc, Modal::None, true), Action::CancelSearch);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter_before_quitting() {
+        // Search editing is finished (search_mode false) but a filter is still
+        // applied: Esc must clear the filter, not quit. A second Esc, with no
+        // filter left, quits. An open modal still wins over both.
+        assert_eq!(
+            action_for_key(key(KeyCode::Esc), Modal::None, false, true),
+            Action::CancelSearch
         );
         assert_eq!(
-            action_for_key(key(KeyCode::Esc), Modal::Help),
-            Action::CloseModal
-        );
-        assert_eq!(
-            action_for_key(key(KeyCode::Down), Modal::Help),
-            Action::Noop
-        );
-        assert_eq!(
-            action_for_key(key(KeyCode::Char('q')), Modal::Help),
+            action_for_key(key(KeyCode::Esc), Modal::None, false, false),
             Action::Quit
+        );
+        assert_eq!(
+            action_for_key(key(KeyCode::Esc), Modal::Help, false, true),
+            Action::CloseModal
         );
     }
 
@@ -120,6 +182,9 @@ mod tests {
             KeyModifiers::NONE,
             KeyEventKind::Release,
         );
-        assert_eq!(action_for_key(release, Modal::None), Action::Noop);
+        assert_eq!(
+            action_for_key(release, Modal::None, false, false),
+            Action::Noop
+        );
     }
 }

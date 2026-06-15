@@ -13,8 +13,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::collector;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
-use crate::model::{PortEntry, mark_protected, sort_entries};
+use crate::model::{PortEntry, SortMode, mark_protected};
 use crate::output;
+use crate::query::{self, QueryOptions};
 
 /// Stable exit codes: the script-facing contract from PROJECT.md.
 ///
@@ -97,6 +98,17 @@ pub(crate) struct ListArgs {
     #[arg(long)]
     pub(crate) process: Option<String>,
 
+    /// Apply TUI-style search text or structured filters.
+    ///
+    /// Examples: `3000`, `port:3000`, `proto:udp`, `scope:public`,
+    /// `protected:true`, `parent:node`.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) filter: Option<String>,
+
+    /// Sort rows by port, pid, protocol, process, parent, or scope.
+    #[arg(long, value_name = "MODE", value_parser = parse_sort_mode)]
+    pub(crate) sort: Option<SortMode>,
+
     /// Print stable JSON instead of a table.
     #[arg(long)]
     pub(crate) json: bool,
@@ -142,21 +154,30 @@ pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
     mark_protected(&mut entries, &config.protected_processes);
 
     match command {
-        Command::List(args) => run_list(args, config, entries),
+        Command::List(args) => run_list(args, config, &entries),
         Command::Kill(args) => run_kill(args, config, &entries),
     }
 }
 
-fn run_list(args: &ListArgs, config: &Config, mut entries: Vec<PortEntry>) -> ExitReason {
-    let filter_active = args.port.is_some() || args.process.is_some();
-    entries.retain(|entry| {
-        args.port.is_none_or(|port| entry.matches_port(port))
-            && args
-                .process
-                .as_deref()
-                .is_none_or(|process| entry.matches_process(process))
-    });
-    sort_entries(&mut entries, config.default_sort);
+fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+    let sort_mode = args.sort.unwrap_or(config.default_sort);
+    let result = match query::query_entries(
+        entries,
+        QueryOptions {
+            port: args.port,
+            process: args.process.as_deref(),
+            filter_text: args.filter.as_deref().unwrap_or_default(),
+            sort_mode,
+            hide_system_processes: config.hide_system_processes,
+        },
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("error: invalid filter: {error}");
+            return ExitReason::InvalidArguments;
+        }
+    };
+    let entries = result.entries;
 
     if args.json {
         match output::render_json(&entries) {
@@ -167,14 +188,14 @@ fn run_list(args: &ListArgs, config: &Config, mut entries: Vec<PortEntry>) -> Ex
             }
         }
     } else if entries.is_empty() {
-        println!(
-            "no open ports{}",
-            if filter_active {
-                " match the filter"
-            } else {
-                ""
-            }
-        );
+        let suffix = if result.explicit_filter_active {
+            " match the filter"
+        } else if result.hidden_system_process_count > 0 {
+            " visible"
+        } else {
+            ""
+        };
+        println!("no open ports{suffix}");
     } else {
         println!("{}", output::render_table(&entries));
     }
@@ -182,10 +203,15 @@ fn run_list(args: &ListArgs, config: &Config, mut entries: Vec<PortEntry>) -> Ex
     // An empty *filtered* result exits 3 so scripts can probe occupancy
     // (`kickoutchi list --port 3000 && echo busy`). An empty unfiltered list
     // is just a quiet machine, which is a success.
-    if filter_active && entries.is_empty() {
+    if result.explicit_filter_active && entries.is_empty() {
         return ExitReason::NoMatch;
     }
     ExitReason::Success
+}
+
+fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
+    SortMode::from_label(value)
+        .ok_or_else(|| "expected one of: port, pid, protocol, process, parent, scope".to_owned())
 }
 
 /// The kill command shape: target selection, safety messaging, and the
@@ -294,6 +320,7 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command, ExitReason, kill_needs_confirmation};
+    use crate::model::SortMode;
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
@@ -323,6 +350,10 @@ mod tests {
             "3000",
             "--process",
             "node",
+            "--filter",
+            "scope:public",
+            "--sort",
+            "scope",
             "--json",
         ])
         .expect("valid list invocation");
@@ -331,7 +362,14 @@ mod tests {
         };
         assert_eq!(args.port, Some(3000));
         assert_eq!(args.process.as_deref(), Some("node"));
+        assert_eq!(args.filter.as_deref(), Some("scope:public"));
+        assert_eq!(args.sort, Some(SortMode::Scope));
         assert!(args.json);
+    }
+
+    #[test]
+    fn list_sort_rejects_unknown_modes_at_parse_time() {
+        assert!(Cli::try_parse_from(["kickoutchi", "list", "--sort", "alphabetical"]).is_err());
     }
 
     #[test]

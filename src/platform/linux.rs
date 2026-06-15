@@ -5,7 +5,7 @@
 //! and process metadata enrichment are kept in this module so Linux-specific
 //! formats never leak into the shared CLI or TUI code.
 
-use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::io::Read;
@@ -21,6 +21,11 @@ const PROC_ROOT: &str = "/proc";
 const TCP_LISTEN_STATE: &str = "0A";
 const MAX_CMDLINE_BYTES: usize = 16 * 1024;
 const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
+// `/proc/<pid>/status` is kernel-generated and small, but it is read on every
+// refresh, so it is bounded like every other /proc read here. `PPid` sits near
+// the top of the file, well within this cap, so the limit can never truncate the
+// field the collector needs.
+const MAX_STATUS_BYTES: u64 = 8 * 1024;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
@@ -45,7 +50,8 @@ impl LinuxCollector {
 impl Collector for LinuxCollector {
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
         let records = collect_socket_records(&self.proc_root)?;
-        let owners = collect_socket_owners(&self.proc_root)?;
+        let target_inodes: HashSet<u64> = records.iter().map(|record| record.inode).collect();
+        let owners = collect_socket_owners(&self.proc_root, &target_inodes)?;
 
         let mut entries = Vec::with_capacity(records.len());
         for record in records {
@@ -100,6 +106,8 @@ struct ProcessMetadata {
     process_name: Option<String>,
     executable_path: Option<PathBuf>,
     command_line: Option<String>,
+    parent_pid: Option<u32>,
+    parent_process_name: Option<String>,
     partial: bool,
 }
 
@@ -278,7 +286,14 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
     }
 }
 
-fn collect_socket_owners(proc_root: &Path) -> Result<BTreeMap<u64, u32>, CollectorError> {
+fn collect_socket_owners(
+    proc_root: &Path,
+    target_inodes: &HashSet<u64>,
+) -> Result<HashMap<u64, u32>, CollectorError> {
+    if target_inodes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let mut pids = Vec::new();
     let proc_entries = fs::read_dir(proc_root).map_err(|source| CollectorError::Read {
         path: proc_root.to_path_buf(),
@@ -299,17 +314,24 @@ fn collect_socket_owners(proc_root: &Path) -> Result<BTreeMap<u64, u32>, Collect
     }
     pids.sort_unstable();
 
-    let mut owners = BTreeMap::new();
+    let mut owners = HashMap::with_capacity(target_inodes.len());
     for pid in pids {
-        collect_pid_socket_owners(proc_root, pid, &mut owners);
+        if collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners) {
+            break;
+        }
     }
     Ok(owners)
 }
 
-fn collect_pid_socket_owners(proc_root: &Path, pid: u32, owners: &mut BTreeMap<u64, u32>) {
+fn collect_pid_socket_owners(
+    proc_root: &Path,
+    pid: u32,
+    target_inodes: &HashSet<u64>,
+    owners: &mut HashMap<u64, u32>,
+) -> bool {
     let fd_dir = proc_root.join(pid.to_string()).join("fd");
     let Ok(fd_entries) = fs::read_dir(fd_dir) else {
-        return;
+        return false;
     };
 
     for entry in fd_entries {
@@ -322,8 +344,15 @@ fn collect_pid_socket_owners(proc_root: &Path, pid: u32, owners: &mut BTreeMap<u
         let Some(inode) = parse_socket_inode(&target) else {
             continue;
         };
+        if !target_inodes.contains(&inode) {
+            continue;
+        }
         owners.entry(inode).or_insert(pid);
+        if owners.len() == target_inodes.len() {
+            return true;
+        }
     }
+    false
 }
 
 fn parse_socket_inode(target: &Path) -> Option<u64> {
@@ -358,8 +387,10 @@ fn entry_from_record(record: &SocketRecord, pid: Option<u32>, proc_root: &Path) 
         command_line: metadata
             .as_ref()
             .and_then(|metadata| metadata.command_line.clone()),
-        parent_pid: None,
-        parent_process_name: None,
+        parent_pid: metadata.as_ref().and_then(|metadata| metadata.parent_pid),
+        parent_process_name: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.parent_process_name.clone()),
         child_pids: Vec::new(),
         protected: false,
         platform: Platform::Linux,
@@ -371,9 +402,9 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
     let process_dir = proc_root.join(pid.to_string());
     let mut metadata = ProcessMetadata::default();
 
-    match fs::read_to_string(process_dir.join("comm")) {
-        Ok(text) => {
-            metadata.process_name = trimmed_non_empty(&text);
+    match read_process_name(&process_dir) {
+        Ok(name) => {
+            metadata.process_name = name;
             metadata.partial |= metadata.process_name.is_none();
         }
         Err(_) => metadata.partial = true,
@@ -392,7 +423,49 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
         Err(_) => metadata.partial = true,
     }
 
+    match read_parent_pid(&process_dir.join("status")) {
+        Ok(Some(parent_pid)) => {
+            metadata.parent_pid = Some(parent_pid);
+            if parent_pid != 0 {
+                match read_process_name(&proc_root.join(parent_pid.to_string())) {
+                    Ok(name) => {
+                        metadata.parent_process_name = name;
+                        metadata.partial |= metadata.parent_process_name.is_none();
+                    }
+                    Err(_) => metadata.partial = true,
+                }
+            }
+        }
+        Ok(None) | Err(_) => metadata.partial = true,
+    }
+
     metadata
+}
+
+fn read_process_name(process_dir: &Path) -> std::io::Result<Option<String>> {
+    fs::read_to_string(process_dir.join("comm")).map(|text| trimmed_non_empty(&text))
+}
+
+fn read_parent_pid(path: &Path) -> std::io::Result<Option<u32>> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(MAX_STATUS_BYTES)
+        .read_to_string(&mut text)?;
+    parse_parent_pid(&text)
+}
+
+fn parse_parent_pid(text: &str) -> std::io::Result<Option<u32>> {
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix("PPid:") else {
+            continue;
+        };
+        return value
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source));
+    }
+    Ok(None)
 }
 
 fn trimmed_non_empty(text: &str) -> Option<String> {
@@ -433,14 +506,16 @@ fn decode_cmdline(bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
 
     use super::{
-        AddressFamily, LinuxCollector, SocketParseError, SocketRecord, collect_socket_owners,
-        collect_socket_records, decode_cmdline, entry_from_record, parse_socket_inode,
-        parse_socket_line, parse_socket_table,
+        AddressFamily, LinuxCollector, SocketParseError, SocketRecord, collect_pid_socket_owners,
+        collect_socket_owners, collect_socket_records, decode_cmdline, entry_from_record,
+        parse_parent_pid, parse_socket_inode, parse_socket_line, parse_socket_table,
+        read_parent_pid,
     };
     use crate::collector::Collector;
     use crate::model::{PermissionStatus, Protocol, SocketState};
@@ -465,6 +540,25 @@ mod tests {
     fn write_socket_table(proc_root: &Path, relative_path: &str, rows: &[String]) {
         let text = format!("{HEADER}\n{}\n", rows.join("\n"));
         fs::write(proc_root.join(relative_path), text).expect("test socket table must be written");
+    }
+
+    fn write_process(proc_root: &Path, pid: u32, name: &str, parent_pid: u32) {
+        let process_dir = proc_root.join(pid.to_string());
+        fs::create_dir_all(process_dir.join("fd")).expect("test process directory must be created");
+        fs::write(process_dir.join("comm"), format!("{name}\n"))
+            .expect("test process name must be written");
+        fs::write(
+            process_dir.join("cmdline"),
+            format!("{name}\0--test\0").as_bytes(),
+        )
+        .expect("test cmdline must be written");
+        fs::write(
+            process_dir.join("status"),
+            format!("Name:\t{name}\nPPid:\t{parent_pid}\n"),
+        )
+        .expect("test status must be written");
+        std::os::unix::fs::symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
+            .expect("test exe symlink must be created");
     }
 
     #[test]
@@ -636,6 +730,36 @@ mod tests {
     }
 
     #[test]
+    fn parent_pid_is_read_from_status_text() {
+        assert_eq!(
+            parse_parent_pid("Name:\tnode\nPPid:\t42\n").expect("valid status text must parse"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_parent_pid("Name:\tnode\n").expect("missing PPid is not malformed"),
+            None
+        );
+        assert!(parse_parent_pid("PPid:\tnot-a-pid\n").is_err());
+    }
+
+    #[test]
+    fn parent_pid_read_is_bounded_and_still_finds_ppid_near_the_top() {
+        // `PPid` is near the top of `status`, so the byte cap on the read must
+        // never hide it, even when the rest of the file is larger than the cap.
+        let proc_root = temp_proc_root("status-cap");
+        let process_dir = proc_root.join("99");
+        fs::create_dir_all(&process_dir).expect("test process directory must exist");
+        let status = format!("Name:\tnode\nPPid:\t42\n{}", "Filler:\t0\n".repeat(2000));
+        fs::write(process_dir.join("status"), status).expect("test status must be written");
+
+        let parent =
+            read_parent_pid(&process_dir.join("status")).expect("status read must succeed");
+
+        assert_eq!(parent, Some(42));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn missing_process_metadata_produces_partial_rows_without_dropping_the_port() {
         let record = SocketRecord {
             protocol: Protocol::Tcp,
@@ -659,6 +783,32 @@ mod tests {
     }
 
     #[test]
+    fn linux_collection_enriches_rows_with_parent_metadata() {
+        let proc_root = temp_proc_root("parent-metadata");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 1234, "node", 1);
+        fs::create_dir_all(proc_root.join("1")).expect("test parent process directory must exist");
+        fs::write(proc_root.join("1").join("comm"), "systemd\n")
+            .expect("test parent process name must be written");
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234").join("fd").join("0"))
+            .expect("test socket symlink must be created");
+
+        let entries = LinuxCollector::with_proc_root(proc_root.clone())
+            .collect()
+            .expect("test proc root must collect");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pid, Some(1234));
+        assert_eq!(entries[0].process_name.as_deref(), Some("node"));
+        assert_eq!(entries[0].parent_pid, Some(1));
+        assert_eq!(entries[0].parent_process_name.as_deref(), Some("systemd"));
+        assert_eq!(entries[0].permission, PermissionStatus::Full);
+        assert!(entries[0].is_system_process());
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn missing_proc_root_is_a_collection_error() {
         let collector = LinuxCollector::with_proc_root(PathBuf::from(
             "/definitely-not-a-real-kickoutchi-proc-root",
@@ -672,9 +822,48 @@ mod tests {
 
     #[test]
     fn socket_owner_collection_requires_a_readable_proc_root() {
-        let error = collect_socket_owners(Path::new("/definitely-not-a-real-kickoutchi-proc-root"))
-            .expect_err("missing proc root must fail");
+        let target_inodes = HashSet::from([1]);
+        let error = collect_socket_owners(
+            Path::new("/definitely-not-a-real-kickoutchi-proc-root"),
+            &target_inodes,
+        )
+        .expect_err("missing proc root must fail");
 
         assert!(error.to_string().contains("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn socket_owner_collection_ignores_non_target_inodes() {
+        let proc_root = temp_proc_root("target-inodes");
+        let fd_dir = proc_root.join("1234").join("fd");
+        fs::create_dir_all(&fd_dir).expect("test fd directory must be created");
+        std::os::unix::fs::symlink("socket:[11]", fd_dir.join("0"))
+            .expect("test socket symlink must be created");
+        std::os::unix::fs::symlink("socket:[22]", fd_dir.join("1"))
+            .expect("test socket symlink must be created");
+
+        let owners = collect_socket_owners(&proc_root, &HashSet::from([22]))
+            .expect("targeted owner collection must succeed");
+
+        assert_eq!(owners.get(&22), Some(&1234));
+        assert!(!owners.contains_key(&11));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn pid_socket_owner_collection_reports_when_targets_are_complete() {
+        let proc_root = temp_proc_root("target-complete");
+        let fd_dir = proc_root.join("1234").join("fd");
+        fs::create_dir_all(&fd_dir).expect("test fd directory must be created");
+        std::os::unix::fs::symlink("socket:[44]", fd_dir.join("0"))
+            .expect("test socket symlink must be created");
+
+        let target_inodes = HashSet::from([44]);
+        let mut owners = HashMap::new();
+        let complete = collect_pid_socket_owners(&proc_root, 1234, &target_inodes, &mut owners);
+
+        assert!(complete);
+        assert_eq!(owners.get(&44), Some(&1234));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 }

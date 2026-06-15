@@ -38,10 +38,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.1.2"
 
-# Error handling: thiserror for typed boundaries, anyhow reserved for internal
-# context. Tracing logs diagnostics to stderr only, never to the TUI surface.
+# Error handling and diagnostics. Typed errors keep module boundaries explicit;
+# tracing logs diagnostics to stderr only, never to the TUI surface.
 thiserror = "2.0.18"
-anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 

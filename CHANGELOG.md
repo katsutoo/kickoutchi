@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Linux collector owner resolution now only records owners for socket inodes
+  found in the collected `/proc/net/*` rows, and stops scanning process file
+  descriptors once every target inode has been matched. This reduces repeated
+  auto-refresh work on noisy machines without changing output semantics.
+- Linux collector now reads `/proc/<pid>/status` through a byte-bounded reader,
+  matching the existing cap on `/proc/<pid>/cmdline`, so every `/proc` read in the
+  collector is explicitly limited; `PPid` sits near the top of `status`, so the
+  cap never truncates the parent PID.
+- TUI/CLI query matching now normalizes text filter needles once per query and
+  avoids formatting socket-address strings unless the search text is
+  socket-shaped, reducing per-keypress allocations in search mode.
+- Removed the unused direct `anyhow` dependency from `Cargo.toml`; typed module
+  errors remain the current error boundary.
 - Roadmap update: no-match port related-process diagnostics moved from Phase 4
   to Phase 5, with stricter rules that keep the main table limited to
   OS-confirmed sockets, preserve CLI exit codes, avoid polluting JSON output,
@@ -26,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TUI `Esc` no longer quits when a filter is still applied after search editing
+  finished: with no modal open and a non-empty filter, `Esc` now clears the
+  filter and only quits on a second press once nothing is left to clear. An open
+  modal still takes precedence. Previously, pressing `Enter` to finish a search
+  and then reflexively pressing `Esc` ended the session instead of dropping the
+  filter.
+- TUI auto-refresh now schedules the next refresh from collection completion
+  time instead of collection start time, avoiding an immediate repeat refresh
+  when a slow `/proc` scan takes longer than the configured interval.
+- CLI `list` now prints `no open ports visible` when `hide_system_processes`
+  suppresses every collected row, instead of implying the machine has no open
+  ports at all.
+- TUI help modal title now reads `Kickoutchi` instead of `Kickoutchi Phase 4`.
+- TUI status bar, borders, titles, and muted text now use terminal-default or
+  bold-reversed styles instead of fixed dark-gray/black combinations, so the
+  interface remains readable in both light and dark terminal themes.
 - Linux collection no longer fails the whole scan when optional IPv6 socket
   tables such as `/proc/net/tcp6` or `/proc/net/udp6` are absent; IPv4 socket
   tables remain required.
@@ -40,6 +69,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Filtering, sorting, and refresh (Phase 4): the TUI now supports manual
+  refresh with `r`, automatic refresh using the configured interval, search mode
+  with `/`, and sort cycling with `s`.
+- Shared query engine for CLI and TUI filtering: plain search matches visible
+  row fields such as port, PID, protocol, address, process name, executable
+  path, command line, bind scope, and parent process; structured filters support
+  `pid:`, `port:`, `proto:`, `scope:`, `protected:`, and `parent:`.
+- Additional sort modes for parent process and bind scope, with scope sorting
+  surfacing public binds before local and loopback binds.
+- Linux parent-process collection backing the parent filter and sort: `parent_pid`
+  from `/proc/<pid>/status` and the parent name from `/proc/<ppid>/comm`, feeding
+  the `parent:` filter, parent sorting, the details-panel parent line, and PID-1
+  child hiding. Pulled forward from Phase 5 so the Phase 4 parent filter and sort
+  operate on real data instead of always-empty fields.
+- TUI refresh state now keeps the last successful snapshot separate from the
+  latest collector error, so a failed refresh reports the error without erasing
+  the last good table.
+- Selection preservation across refresh/filter/sort by PID, protocol, local
+  address, and port, falling back to the nearest sensible row when the selected
+  process disappears.
+- `kickoutchi list --filter <TEXT>` and `kickoutchi list --sort <MODE>` for the
+  same search/filter/sort behavior used by the TUI.
+- Config support for `hide_system_processes`, implemented conservatively for
+  PID 0/1, direct PID-1 children, and known OS process names without hiding
+  protected app processes such as `postgres` by default.
 
 - Linux native collector (Phase 3): on Linux, `kickoutchi`/`kick` now reads
   `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, and `/proc/net/udp6`

@@ -83,6 +83,27 @@ pub(crate) enum PermissionStatus {
     Partial,
 }
 
+/// Human-facing bind scope for local socket addresses.
+///
+/// Ordering is safety-oriented for `sort: scope`: public binds sort before
+/// local interface binds, and loopback-only binds last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BindScope {
+    Public,
+    Local,
+    Loopback,
+}
+
+impl BindScope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Local => "local",
+            Self::Loopback => "loopback",
+        }
+    }
+}
+
 /// One open port and everything known about its owning process.
 ///
 /// `Option` fields are `None` when the OS withheld the data; `permission`
@@ -114,32 +135,54 @@ impl PortEntry {
         self.local_port == port
     }
 
-    /// Case-insensitive substring match on the process name, used by
-    /// `list --process`. Substring (not exact) because users type fragments
-    /// like `node`; case-insensitive because casing of process names is an OS
-    /// detail users should not have to remember. Rows with no readable name
-    /// never match: claiming a match on hidden data would be a guess.
-    pub(crate) fn matches_process(&self, needle: &str) -> bool {
+    /// Substring match on a pre-normalized process-name needle. Rows with no
+    /// readable name never match: claiming a match on hidden data would be a
+    /// guess.
+    pub(crate) fn matches_process_normalized(&self, needle_lower: &str) -> bool {
         let Some(name) = &self.process_name else {
             return false;
         };
-        name.to_lowercase().contains(&needle.to_lowercase())
+        name.to_lowercase().contains(needle_lower)
     }
 
     /// Human-facing bind scope for table/details output.
-    pub(crate) fn scope_label(&self) -> &'static str {
+    pub(crate) fn scope(&self) -> BindScope {
         let addr = match self.local_addr {
             IpAddr::V4(addr) => IpAddr::V4(addr),
             IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
         };
 
         if addr.is_loopback() {
-            "loopback"
+            BindScope::Loopback
         } else if addr.is_unspecified() {
-            "public"
+            BindScope::Public
         } else {
-            "local"
+            BindScope::Local
         }
+    }
+
+    /// Human-facing bind scope label for table/details output.
+    pub(crate) fn scope_label(&self) -> &'static str {
+        self.scope().label()
+    }
+
+    /// Best-effort system/service process classification for optional hiding.
+    ///
+    /// This is intentionally conservative until Phase 5 collects richer owner
+    /// data: PID 0/1, direct children of PID 1, and a short list of well-known
+    /// OS process names. Protected app names such as `postgres` are not treated
+    /// as system processes just because they are protected.
+    pub(crate) fn is_system_process(&self) -> bool {
+        if self.pid.is_some_and(|pid| pid <= 1) || self.parent_pid == Some(1) {
+            return true;
+        }
+
+        self.process_name.as_deref().is_some_and(|name| {
+            matches!(
+                name,
+                "systemd" | "launchd" | "init" | "explorer.exe" | "WindowServer"
+            )
+        })
     }
 }
 
@@ -152,6 +195,8 @@ pub(crate) enum SortMode {
     Pid,
     Protocol,
     Process,
+    Parent,
+    Scope,
 }
 
 impl SortMode {
@@ -162,6 +207,31 @@ impl SortMode {
             Self::Pid => "pid",
             Self::Protocol => "protocol",
             Self::Process => "process",
+            Self::Parent => "parent",
+            Self::Scope => "scope",
+        }
+    }
+
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "port" => Some(Self::Port),
+            "pid" => Some(Self::Pid),
+            "protocol" => Some(Self::Protocol),
+            "process" => Some(Self::Process),
+            "parent" => Some(Self::Parent),
+            "scope" => Some(Self::Scope),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Port => Self::Pid,
+            Self::Pid => Self::Protocol,
+            Self::Protocol => Self::Process,
+            Self::Process => Self::Parent,
+            Self::Parent => Self::Scope,
+            Self::Scope => Self::Port,
         }
     }
 }
@@ -183,8 +253,32 @@ pub(crate) fn sort_entries(entries: &mut [PortEntry], mode: SortMode) {
                 let name_b = b.process_name.as_ref().map(|n| n.to_lowercase());
                 (name_a.is_none(), name_a).cmp(&(name_b.is_none(), name_b))
             }
+            SortMode::Parent => {
+                let name_a = a.parent_process_name.as_ref().map(|n| n.to_lowercase());
+                let name_b = b.parent_process_name.as_ref().map(|n| n.to_lowercase());
+                (
+                    name_a.is_none(),
+                    name_a,
+                    a.parent_pid.is_none(),
+                    a.parent_pid,
+                )
+                    .cmp(&(
+                        name_b.is_none(),
+                        name_b,
+                        b.parent_pid.is_none(),
+                        b.parent_pid,
+                    ))
+            }
+            SortMode::Scope => a.scope().cmp(&b.scope()),
         };
-        key.then_with(|| (a.local_port, a.protocol).cmp(&(b.local_port, b.protocol)))
+        key.then_with(|| {
+            (a.local_port, a.protocol, a.local_addr, a.pid).cmp(&(
+                b.local_port,
+                b.protocol,
+                b.local_addr,
+                b.pid,
+            ))
+        })
     });
 }
 
@@ -212,8 +306,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode, mark_protected,
-        sort_entries,
+        BindScope, PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode,
+        mark_protected, sort_entries,
     };
 
     /// Minimal entry builder so each test states only the fields it cares about.
@@ -244,13 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn process_filter_is_case_insensitive_substring() {
+    fn normalized_process_filter_matches_substring() {
         let row = entry(3000, Some(1), Some("Node"));
-        assert!(row.matches_process("node"));
-        assert!(row.matches_process("od"));
-        assert!(!row.matches_process("vite"));
+        assert!(row.matches_process_normalized("node"));
+        assert!(row.matches_process_normalized("od"));
+        assert!(!row.matches_process_normalized("vite"));
         // A hidden name must never match: that would claim knowledge we lack.
-        assert!(!entry(53, None, None).matches_process("node"));
+        assert!(!entry(53, None, None).matches_process_normalized("node"));
     }
 
     #[test]
@@ -266,6 +360,7 @@ mod tests {
 
         row.local_addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
         assert_eq!(row.scope_label(), "loopback");
+        assert_eq!(row.scope(), BindScope::Loopback);
     }
 
     #[test]
@@ -274,6 +369,11 @@ mod tests {
         assert_eq!(SortMode::Pid.label(), "pid");
         assert_eq!(SortMode::Protocol.label(), "protocol");
         assert_eq!(SortMode::Process.label(), "process");
+        assert_eq!(SortMode::Parent.label(), "parent");
+        assert_eq!(SortMode::Scope.label(), "scope");
+        assert_eq!(SortMode::from_label("parent"), Some(SortMode::Parent));
+        assert_eq!(SortMode::from_label("unknown"), None);
+        assert_eq!(SortMode::Scope.next(), SortMode::Port);
     }
 
     #[test]
@@ -325,6 +425,59 @@ mod tests {
         sort_entries(&mut rows, SortMode::Protocol);
         let ports: Vec<u16> = rows.iter().map(|row| row.local_port).collect();
         assert_eq!(ports, vec![80, 3000, 5173]);
+    }
+
+    #[test]
+    fn sort_by_parent_uses_name_then_pid_with_unknown_last() {
+        let mut rows = vec![
+            entry(1, Some(1), Some("a")),
+            entry(2, Some(2), Some("b")),
+            entry(3, Some(3), Some("c")),
+        ];
+        rows[0].parent_process_name = None;
+        rows[0].parent_pid = Some(99);
+        rows[1].parent_process_name = Some("Zed".to_owned());
+        rows[1].parent_pid = Some(10);
+        rows[2].parent_process_name = Some("agent".to_owned());
+        rows[2].parent_pid = Some(20);
+
+        sort_entries(&mut rows, SortMode::Parent);
+
+        assert_eq!(rows[0].parent_process_name.as_deref(), Some("agent"));
+        assert_eq!(rows[1].parent_process_name.as_deref(), Some("Zed"));
+        assert_eq!(rows[2].parent_pid, Some(99));
+    }
+
+    #[test]
+    fn sort_by_scope_surfaces_public_binds_first() {
+        let mut rows = vec![
+            entry(1, Some(1), Some("loopback")),
+            entry(2, Some(2), Some("local")),
+            entry(3, Some(3), Some("public")),
+        ];
+        rows[1].local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        rows[2].local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+        sort_entries(&mut rows, SortMode::Scope);
+
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.process_name.as_deref())
+            .collect();
+        assert_eq!(names, vec!["public", "local", "loopback"]);
+    }
+
+    #[test]
+    fn system_process_classification_is_conservative() {
+        let mut row = entry(5432, Some(1201), Some("postgres"));
+        assert!(!row.is_system_process());
+
+        row.parent_pid = Some(1);
+        assert!(row.is_system_process());
+
+        row.parent_pid = None;
+        row.process_name = Some("systemd".to_owned());
+        assert!(row.is_system_process());
     }
 
     #[test]
