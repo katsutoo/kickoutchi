@@ -117,7 +117,10 @@ mod tests {
 
     #[test]
     fn navigation_keys_move_when_no_modal_is_open() {
-        assert_eq!(act(KeyCode::Char('j'), Modal::None, false), Action::MoveDown);
+        assert_eq!(
+            act(KeyCode::Char('j'), Modal::None, false),
+            Action::MoveDown
+        );
         assert_eq!(act(KeyCode::Down, Modal::None, false), Action::MoveDown);
         assert_eq!(act(KeyCode::Char('k'), Modal::None, false), Action::MoveUp);
         assert_eq!(act(KeyCode::Up, Modal::None, false), Action::MoveUp);
@@ -126,7 +129,10 @@ mod tests {
     #[test]
     fn modal_keys_are_contextual() {
         assert_eq!(act(KeyCode::Enter, Modal::None, false), Action::OpenDetails);
-        assert_eq!(act(KeyCode::Char('?'), Modal::None, false), Action::OpenHelp);
+        assert_eq!(
+            act(KeyCode::Char('?'), Modal::None, false),
+            Action::OpenHelp
+        );
         assert_eq!(act(KeyCode::Esc, Modal::Help, false), Action::CloseModal);
         assert_eq!(act(KeyCode::Down, Modal::Help, false), Action::Noop);
         assert_eq!(act(KeyCode::Char('q'), Modal::Help, false), Action::Quit);
@@ -139,7 +145,10 @@ mod tests {
             act(KeyCode::Char('/'), Modal::None, false),
             Action::StartSearch
         );
-        assert_eq!(act(KeyCode::Char('s'), Modal::None, false), Action::CycleSort);
+        assert_eq!(
+            act(KeyCode::Char('s'), Modal::None, false),
+            Action::CycleSort
+        );
     }
 
     #[test]

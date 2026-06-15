@@ -385,7 +385,8 @@ mod tests {
         let rows = vec![entry(3000, "node")];
         let too_long = "a".repeat(FILTER_TEXT_MAX_BYTES + 1);
 
-        let error = query_entries(&rows, query(&too_long)).expect_err("over-cap filter is rejected");
+        let error =
+            query_entries(&rows, query(&too_long)).expect_err("over-cap filter is rejected");
 
         assert_eq!(
             error,
