@@ -7,7 +7,7 @@ status: planning
 
 # Kickoutchi - Rust + ratatui Port Janitor
 
-> A clean cross-platform TUI that shows which local ports are open, which process owns each port, and how to stop the culprit safely without hunting through terminal commands.
+> A clean cross-platform TUI and CLI that shows which local ports are open, which process owns each port, and how to stop the culprit safely without hunting through terminal commands.
 
 ## Project Goal
 

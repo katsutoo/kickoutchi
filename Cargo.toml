@@ -2,10 +2,10 @@
 name = "kickoutchi"
 version = "0.1.0"
 edition = "2024"
-description = "A clean TUI port janitor: see which process owns each open local port and kick it out safely"
+description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
 license = "MIT"
 repository = "https://github.com/nuggocto/kickoutchi"
-authors = ["nugget <vincent.lemaire1999@gmail.com>"]
+authors = ["nugget <vincent@sshmoi.com>"]
 readme = "README.md"
 # Two binary names are declared below; `cargo run` without --bin needs this.
 default-run = "kickoutchi"

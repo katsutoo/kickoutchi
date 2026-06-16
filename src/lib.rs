@@ -1,4 +1,4 @@
-//! Kickoutchi: a cross-platform TUI port janitor.
+//! Kickoutchi: a cross-platform TUI and CLI port janitor.
 //!
 //! This library owns the shared application entrypoint. The package ships two
 //! tiny binaries (`kickoutchi` and `kick`) that both call [`run`], so Cargo does
