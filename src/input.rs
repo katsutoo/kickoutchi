@@ -16,6 +16,12 @@ pub(crate) enum Action {
     OpenDetails,
     OpenHelp,
     CloseModal,
+    RequestTerminate,
+    RequestForceKill,
+    SubmitKillConfirmation,
+    KillInputAppend(char),
+    KillInputBackspace,
+    CancelKill,
     Refresh,
     StartSearch,
     SearchAppend(char),
@@ -48,6 +54,10 @@ pub(crate) fn action_for_key(
         return Action::Quit;
     }
 
+    if modal == Modal::ConfirmKill {
+        return kill_confirmation_action_for_key(key);
+    }
+
     if search_mode {
         return search_action_for_key(key);
     }
@@ -61,9 +71,26 @@ pub(crate) fn action_for_key(
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::CycleSort,
+        KeyCode::Char('x') => Action::RequestTerminate,
+        KeyCode::Char('X') => Action::RequestForceKill,
         KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
         KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
         KeyCode::Enter => Action::OpenDetails,
+        _ => Action::Noop,
+    }
+}
+
+fn kill_confirmation_action_for_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::CancelKill,
+        KeyCode::Enter => Action::SubmitKillConfirmation,
+        KeyCode::Backspace => Action::KillInputBackspace,
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::KillInputAppend(ch)
+        }
         _ => Action::Noop,
     }
 }
@@ -148,6 +175,38 @@ mod tests {
         assert_eq!(
             act(KeyCode::Char('s'), Modal::None, false),
             Action::CycleSort
+        );
+    }
+
+    #[test]
+    fn kill_keys_request_termination_without_modal() {
+        assert_eq!(
+            act(KeyCode::Char('x'), Modal::None, false),
+            Action::RequestTerminate,
+        );
+        assert_eq!(
+            act(KeyCode::Char('X'), Modal::None, false),
+            Action::RequestForceKill,
+        );
+    }
+
+    #[test]
+    fn kill_confirmation_modal_captures_text_until_submit_or_cancel() {
+        assert_eq!(
+            act(KeyCode::Char('q'), Modal::ConfirmKill, false),
+            Action::KillInputAppend('q'),
+        );
+        assert_eq!(
+            act(KeyCode::Backspace, Modal::ConfirmKill, false),
+            Action::KillInputBackspace,
+        );
+        assert_eq!(
+            act(KeyCode::Enter, Modal::ConfirmKill, false),
+            Action::SubmitKillConfirmation,
+        );
+        assert_eq!(
+            act(KeyCode::Esc, Modal::ConfirmKill, false),
+            Action::CancelKill,
         );
     }
 

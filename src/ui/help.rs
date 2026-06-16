@@ -20,6 +20,8 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
         key_line("j / Down", "move selection down", theme),
         key_line("k / Up", "move selection up", theme),
         key_line("Enter", "open selected-row details", theme),
+        key_line("x", "terminate selected process", theme),
+        key_line("X", "force-kill selected process", theme),
         key_line("?", "open this help", theme),
         key_line("Esc", "clear search, close a modal, or quit", theme),
         key_line("q", "quit", theme),

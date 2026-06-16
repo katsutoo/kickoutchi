@@ -7,6 +7,7 @@
 mod app;
 mod cli;
 mod collector;
+mod command;
 mod config;
 mod diagnostic;
 mod error;
@@ -14,6 +15,7 @@ mod input;
 mod model;
 mod output;
 mod platform;
+mod process;
 mod protection;
 mod query;
 mod ui;

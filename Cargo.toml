@@ -48,9 +48,14 @@ tracing-subscriber = "0.3.23"
 # config-file loading is part of the shared model/config/CLI foundation.
 dirs = "6.0.0"
 
-# Platform/process/clipboard crates (sysinfo, libc, windows-sys, arboard) are
-# intentionally NOT added here. They land in the phases that first use them so
-# `--all-features` stays buildable on every host during Phase 0.
+# Platform/clipboard crates (sysinfo, windows-sys, arboard) are intentionally
+# NOT added here. They land in the phases that first use them so
+# `--all-features` stays buildable on every host.
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Phase 6 uses the OS signal API directly for SIGTERM/SIGKILL instead of
+# shelling out to `kill`; the unsafe boundary is kept inside process.rs.
+libc = "0.2.177"
 
 [lints.rust]
 warnings = "deny"

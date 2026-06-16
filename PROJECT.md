@@ -1049,25 +1049,25 @@ pedantic = "warn"
 
 ### Build steps
 
-1. Create `process.rs` for process termination operations.
-2. Add a typed result for termination outcomes: success, permission denied, already exited, cancelled, protected process, unsafe PID, and unknown failure.
-3. Add guardrails that block PID `0`, PID `1`, and Kickoutchi's own PID.
-4. Add normal terminate per platform, starting with Unix `SIGTERM` on Linux.
-5. Add force kill per platform, starting with Unix `SIGKILL` on Linux.
-6. Add `command.rs` to render the equivalent command shown to users.
-7. In the TUI, map `x` to normal termination confirmation.
-8. In the TUI, map `X` to force-kill confirmation.
-9. Show PID, process name, port, protocol, and equivalent command in the confirmation modal.
-10. Make force-kill require a different confirmation path from normal termination.
-11. Make protected processes require stronger confirmation, such as typing the PID or process name.
-12. Warn when the selected PID has child processes.
-13. Prefer normal termination before recommending force kill in UI copy.
-14. Refresh immediately after every kill attempt.
-15. Show clear success, cancelled, permission denied, already exited, and failure messages.
-16. Wire `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` to the same safety rules.
-17. Resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation must name every affected port, not just the first. (The Phase 1 stub in `cli.rs` uses a first-match `find`; replace it here.)
-18. Keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
-19. Add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution, command rendering, and exit codes.
+1. **Done in Phase 6:** create `process.rs` for process termination operations.
+2. **Done in Phase 6:** add a typed result for termination outcomes: success, permission denied, already exited, cancelled, protected process, stale confirmed target, unsafe PID, and unknown failure.
+3. **Done in Phase 6:** add guardrails that block PID `0`, PID `1`, and Kickoutchi's own PID.
+4. **Done in Phase 6:** add normal terminate per platform, starting with Unix `SIGTERM` on Linux. Real signal delivery is gated to Linux until native non-Linux collectors exist, so fake non-Linux rows can never terminate arbitrary local PIDs.
+5. **Done in Phase 6:** add force kill per platform, starting with Unix `SIGKILL` on Linux.
+6. **Done in Phase 6:** add `command.rs` to render the equivalent command shown to users.
+7. **Done in Phase 6:** in the TUI, map `x` to normal termination confirmation.
+8. **Done in Phase 6:** in the TUI, map `X` to force-kill confirmation.
+9. **Done in Phase 6:** show PID, process name, port, protocol, and equivalent command in the confirmation modal.
+10. **Done in Phase 6:** make force-kill require a different confirmation path from normal termination by requiring typed `force` confirmation when `confirm_force_kill` is enabled.
+11. **Done in Phase 6:** make protected processes require stronger confirmation by typing the PID or process name.
+12. **Done in Phase 6:** warn when the selected PID has child processes.
+13. **Done in Phase 6:** prefer normal termination before recommending force kill in UI copy.
+14. **Done in Phase 6:** refresh immediately after every kill attempt. Before sending a signal, re-collect and verify that the confirmed PID still owns the confirmed port rows; if the target changed, abort and refresh instead of risking PID reuse.
+15. **Done in Phase 6:** show clear success, cancelled, permission denied, already exited, and failure messages.
+16. **Done in Phase 6:** wire `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` to the same safety rules.
+17. **Done in Phase 6:** resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation names every affected port, not just the first.
+18. **Done in Phase 6:** keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
+19. **Done in Phase 6:** add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution, command rendering, and exit codes.
 
 ### Done when
 
@@ -1282,11 +1282,11 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 
 ### Build steps
 
-1. Add GitHub Actions CI for Linux that runs on pushes and pull requests, separate from the release workflow. Extend CI to Windows and macOS only when Phases 7 and 8 land.
-2. Run `cargo fmt --all --check` in CI.
-3. Run clippy on all targets in CI.
-4. Run tests in CI on every operating system the project supports at the time (Linux at first).
-5. Install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`.
+1. **Done after Phase 6:** add GitHub Actions CI for Linux that runs on pushes and pull requests, separate from the release workflow. Extend CI to Windows and macOS only when Phases 7 and 8 land.
+2. **Done after Phase 6:** run `cargo fmt --all --check` in CI.
+3. **Done after Phase 6:** run clippy on all targets in CI.
+4. **Done after Phase 6:** run tests in CI on every operating system the project supports at the time (Linux at first).
+5. **Later in Phase 11:** install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`. This is the CD/release workflow and stays separate from the CI workflow added after Phase 6.
 6. Configure the release target triples: `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Add `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin` only when Phases 7 and 8 land.
 7. Configure archive formats so Linux produces `.tar.gz`, matching the artifact names in Option 1 (Windows `.zip` and macOS `.tar.gz` follow with their phases).
 8. Enable the `shell` installer. Enable the `powershell` installer and the Homebrew installer/formula output only when their platforms ship.

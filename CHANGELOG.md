@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Post-Phase-6 internal cleanup, no external behavior change: collapsed the
+  duplicate `KillTarget` constructor into a single `from_entries`, switched the
+  confirmation modal's force-mode check from a signal-label string comparison to
+  `KillMode` equality, and narrowed `current_user_id` to private.
+- The `KillTarget` "at least one row" invariant is now a release assertion
+  instead of a debug-only one, so a future caller that builds a kill target from
+  no rows fails fast on the termination path instead of carrying a degenerate,
+  port-less target forward.
 - Linux collector owner resolution now only records owners for socket inodes
   found in the collected `/proc/net/*` rows, and stops scanning process file
   descriptors once every target inode has been matched. This reduces repeated
@@ -39,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Removed the stale `#[allow(dead_code)]` from `ExitReason`; every variant is
+  now constructed by the CLI exit path, so the lint suppression would have
+  hidden genuinely unreachable variants in future refactors.
 - TUI `Esc` no longer quits when a filter is still applied after search editing
   finished: with no modal open and a non-empty filter, `Esc` now clears the
   filter and only quits on a second press once nothing is left to clear. An open
@@ -69,6 +80,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
+  Rust toolchain to check formatting, strict Clippy, and the full test suite.
+  Release/CD automation remains deferred to the Phase 11 `cargo-dist` workflow.
+
+- Safe termination MVP (Phase 6): Linux `kill` now sends real `SIGTERM` or
+  `SIGKILL` through a small `libc` boundary instead of shelling out, with typed
+  outcomes for success, permission denied, already exited, cancelled, protected
+  process, stale confirmed target, unsafe PID, and unknown failure. Real signal
+  delivery is Linux-only until native non-Linux collectors exist.
+- Shared kill command rendering in `command.rs` shows the equivalent user-facing
+  command (`kill <PID>`, `kill -9 <PID>`, or future platform equivalents) in both
+  CLI and TUI confirmation flows.
+- CLI `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` now use
+  the same safety rules as the TUI: PID `0`, PID `1`, and Kickoutchi's own PID
+  are blocked; protected processes require typing the PID or process name;
+  `--yes` cannot bypass protected-process confirmation; and `kill --port`
+  refuses ambiguous targets instead of guessing. After confirmation, the target
+  is re-collected and must still match the confirmed PID and port rows before a
+  signal is sent.
+- TUI termination flow: `x` opens normal termination confirmation, `X` opens
+  force-kill confirmation, force kill requires typing `force`, protected
+  processes require typing the PID or process name, child/owner/permission
+  warnings are shown when available, and the table refreshes immediately after a
+  kill attempt.
+- Phase 6 tests cover PID guardrails, target ambiguity, confirmation decisions,
+  command rendering, TUI confirmation state/rendering, and CLI exit-code mapping.
+- TUI kill confirmation now lists every port owned by the target PID, gathered
+  from the full snapshot so active filters cannot hide a port the signal will
+  still free.
 
 - Process context and protected-process policy (Phase 5): the selected TUI row
   now resolves direct child PIDs and child process names only when the user opens

@@ -4,6 +4,7 @@
 //! above all, always restored: on clean quit, on a propagated error, and on
 //! panic.
 
+mod confirm;
 mod details;
 mod help;
 mod table;
@@ -191,13 +192,16 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
         Modal::None => {}
         Modal::Details => details::render_modal(frame, modal_area, app, theme),
         Modal::Help => help::render(frame, modal_area, theme),
+        Modal::ConfirmKill => confirm::render(frame, modal_area, app, theme),
     }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
     let line = Line::from(vec![
         Span::styled("Kickoutchi", theme.title()),
-        Span::raw("   r refresh  / search  s sort  j/k move  Enter details  ? help  q quit"),
+        Span::raw(
+            "   r refresh  / search  s sort  j/k move  Enter details  x kill  X force  ? help  q quit",
+        ),
     ]);
     let header = Paragraph::new(line)
         .alignment(Alignment::Center)
@@ -228,6 +232,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     if let Some(error) = app.latest_error() {
         status.push_str(" | error: ");
         status.push_str(error);
+    }
+
+    if let Some(kill_status) = app.kill_status() {
+        status.push_str(" | kill: ");
+        status.push_str(kill_status);
     }
 
     frame.render_widget(Paragraph::new(status).style(theme.status()), area);
@@ -345,6 +354,7 @@ mod tests {
         assert!(text.contains("Help"), "{text}");
         assert!(text.contains("Kickoutchi"), "{text}");
         assert!(text.contains("j / Down"), "{text}");
+        assert!(text.contains('x'), "{text}");
         assert!(text.contains('/'), "{text}");
         assert!(text.contains("Ctrl+C"), "{text}");
     }
@@ -373,6 +383,20 @@ mod tests {
         assert!(text.contains("Port Details"), "{text}");
         assert!(text.contains("cursor-agent (PID 18001)"), "{text}");
         assert!(text.contains("node server.js"), "{text}");
+    }
+
+    #[test]
+    fn kill_confirmation_modal_renders_target_and_command() {
+        let config = Config::default();
+        let mut app = App::new_fake(&config);
+        app.apply_action(Action::RequestForceKill);
+
+        let text = render_text(&app, 100, 30);
+
+        assert!(text.contains("Confirm Termination"), "{text}");
+        assert!(text.contains("Force-kill PID 18422"), "{text}");
+        assert!(text.contains("kill -9 18422"), "{text}");
+        assert!(text.contains("force"), "{text}");
     }
 
     #[test]

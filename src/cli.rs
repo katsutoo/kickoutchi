@@ -12,25 +12,25 @@ use std::process::ExitCode;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::collector;
+use crate::command;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
 use crate::diagnostic;
-use crate::model::{PortEntry, SortMode};
+use crate::model::{PortEntry, ProcessContext, SortMode};
 use crate::output;
 use crate::platform;
+use crate::process::{
+    self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
+    TerminationOutcome, UnsafePidReason,
+};
 use crate::protection::mark_protected;
 use crate::query::{self, QueryOptions};
 
 /// Stable exit codes: the script-facing contract from PROJECT.md.
 ///
 /// Defined in one place so scripts can rely on the numbers never drifting.
-/// `InvalidArguments` (2) is owned by clap, which exits with 2 on usage
-/// errors by itself; `PermissionDenied` (4) becomes constructible when real
-/// termination lands in Phase 6. Both are declared now anyway because the
-/// contract must be complete before anyone scripts against it.
-#[allow(
-    dead_code,
-    reason = "codes 2 and 4 are reserved contract slots until their flows land"
-)]
+/// Every variant is constructed by the CLI exit path so the dead-code lint
+/// should not be suppressed; keep the contract complete even though clap owns
+/// `InvalidArguments` (2) in practice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitReason {
@@ -244,45 +244,58 @@ fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
         .ok_or_else(|| "expected one of: port, pid, protocol, process, parent, scope".to_owned())
 }
 
-/// The kill command shape: target selection, safety messaging, and the
-/// confirmation flow are real; the termination itself is a stub until
-/// Phase 6 and always reports that honestly via exit code 1.
 fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
-    // The two legal target shapes are enumerated; anything else means the
-    // clap ArgGroup ("exactly one of --pid/--port") was broken by a code
-    // change, which is a programmer error worth crashing on.
-    //
-    // First-match resolution is a stub-only simplification: a port can be
-    // owned by several PIDs (TCP+UDP on one port, SO_REUSEPORT). Phase 6
-    // replaces this with explicit ambiguity rejection (see PROJECT.md,
-    // Phase 6 step 17) before any real termination ships.
-    let target = match (args.pid, args.port) {
-        (Some(pid), None) => entries.iter().find(|entry| entry.pid == Some(pid)),
-        (None, Some(port)) => entries.iter().find(|entry| entry.matches_port(port)),
-        (None, None) | (Some(_), Some(_)) => {
-            unreachable!("clap requires exactly one kill target")
+    run_kill_with(
+        args,
+        config,
+        entries,
+        platform::collect_process_context,
+        collector::collect_ports,
+        prompt_confirmation,
+        process::terminate_pid,
+    )
+}
+
+fn run_kill_with<CollectContext, CollectPorts, Prompt, Terminate>(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntry],
+    mut collect_context: CollectContext,
+    mut collect_ports: CollectPorts,
+    mut prompt: Prompt,
+    mut terminate: Terminate,
+) -> ExitReason
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    Prompt: FnMut(&KillTarget, KillMode, ConfirmationRequirement) -> std::io::Result<bool>,
+    Terminate: FnMut(u32, KillMode) -> TerminationOutcome,
+{
+    let mode = if args.force {
+        KillMode::Force
+    } else {
+        KillMode::Terminate
+    };
+    let target = match resolve_kill_target(args, entries, &mut collect_context) {
+        Ok(target) => target,
+        Err(error) => return print_target_error(error),
+    };
+
+    let requirement = match process::confirmation_requirement(
+        target.protected,
+        mode,
+        args.yes,
+        config.confirm_force_kill,
+    ) {
+        Ok(requirement) => requirement,
+        Err(outcome) => {
+            print_termination_outcome(&target, mode, &outcome);
+            return exit_reason_for_outcome(&outcome);
         }
     };
 
-    let Some(target) = target else {
-        eprintln!("error: no open port matches the requested target");
-        return ExitReason::NoMatch;
-    };
-
-    // Protected processes are checked before --yes on purpose: PROJECT.md
-    // forbids --yes from ever bypassing the protected-process path. The
-    // stronger typed confirmation arrives with real termination in Phase 6.
-    if target.protected {
-        eprintln!(
-            "error: {} is protected and requires explicit confirmation; \
-             protected termination is not implemented yet",
-            target_identity(target),
-        );
-        return ExitReason::ProtectedNeedsConfirmation;
-    }
-
-    if kill_needs_confirmation(args.force, args.yes, config.confirm_force_kill) {
-        let confirmed = match prompt_confirmation(target, args.force) {
+    if let Some(requirement) = requirement {
+        let confirmed = match prompt(&target, mode, requirement) {
             Ok(confirmed) => confirmed,
             Err(error) => {
                 eprintln!("error: reading confirmation failed: {error}");
@@ -290,59 +303,314 @@ fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
             }
         };
         if !confirmed {
-            eprintln!("kill cancelled");
-            return ExitReason::KillCancelled;
+            let outcome = TerminationOutcome::Cancelled;
+            print_termination_outcome(&target, mode, &outcome);
+            return exit_reason_for_outcome(&outcome);
         }
     }
 
-    eprintln!("error: real termination is not implemented yet (coming in Phase 6)");
-    ExitReason::Failure
+    let target = match revalidate_cli_target(
+        args,
+        config,
+        &target,
+        &mut collect_context,
+        &mut collect_ports,
+    ) {
+        Ok(target) => target,
+        Err(outcome) => {
+            print_termination_outcome(&target, mode, &outcome);
+            return exit_reason_for_outcome(&outcome);
+        }
+    };
+
+    let outcome = terminate(target.pid, mode);
+    print_termination_outcome(&target, mode, &outcome);
+    exit_reason_for_outcome(&outcome)
 }
 
-/// Whether the kill flow must ask before acting.
-///
-/// `--yes` skips prompting for scripts. For force kills the config's
-/// `confirm_force_kill` gates the prompt; normal kills always prompt unless
-/// `--yes` is given. Protected processes never reach this decision — they are
-/// rejected earlier regardless of every flag.
-fn kill_needs_confirmation(force: bool, yes: bool, confirm_force_kill: bool) -> bool {
-    if yes {
-        return false;
+fn revalidate_cli_target<CollectContext, CollectPorts>(
+    args: &KillArgs,
+    config: &Config,
+    confirmed: &KillTarget,
+    collect_context: &mut CollectContext,
+    collect_ports: &mut CollectPorts,
+) -> Result<KillTarget, TerminationOutcome>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    let mut fresh_entries = collect_ports().map_err(|error| {
+        TerminationOutcome::UnknownFailure(format!("collecting ports before kill failed: {error}"))
+    })?;
+    mark_protected(&mut fresh_entries, &config.protected_processes);
+
+    let fresh = match resolve_kill_target(args, &fresh_entries, collect_context) {
+        Ok(fresh) => fresh,
+        Err(KillTargetError::NoMatch | KillTargetError::MissingPid { .. }) => {
+            return Err(TerminationOutcome::TargetChanged);
+        }
+        Err(KillTargetError::AmbiguousPort { port, candidates }) => {
+            eprintln!(
+                "error: port {port} became ambiguous before termination; refusing to guess. Use --pid with one of:",
+            );
+            for candidate in candidates {
+                eprintln!("  {candidate}");
+            }
+            return Err(TerminationOutcome::TargetChanged);
+        }
+        Err(KillTargetError::UnsafePid(reason)) => {
+            return Err(TerminationOutcome::UnsafePid(reason));
+        }
+    };
+
+    if !process::target_still_matches_confirmation(confirmed, &fresh) {
+        return Err(TerminationOutcome::TargetChanged);
     }
-    if force {
-        return confirm_force_kill;
+    if fresh.protected && !confirmed.protected {
+        return Err(TerminationOutcome::ProtectedProcess);
     }
-    true
+    Ok(fresh)
 }
 
-/// Render `PID <pid> (<name>)` for kill-flow messages, with explicit
-/// placeholders for withheld metadata. One helper so the protected-process
-/// message and the confirmation prompt can never drift apart.
-fn target_identity(target: &PortEntry) -> String {
-    let pid = target
-        .pid
-        .map_or_else(|| "?".to_owned(), |pid| pid.to_string());
-    let name = target.process_name.as_deref().unwrap_or("<unknown>");
-    format!("PID {pid} ({name})")
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KillTargetError {
+    NoMatch,
+    MissingPid { port: u16 },
+    AmbiguousPort { port: u16, candidates: Vec<String> },
+    UnsafePid(UnsafePidReason),
 }
 
-/// Ask the user to confirm on stdin. Default is "no": only an explicit
-/// `y`/`yes` proceeds, so pressing Enter on reflex stays safe.
-fn prompt_confirmation(target: &PortEntry, force: bool) -> std::io::Result<bool> {
-    let action = if force { "Force-kill" } else { "Terminate" };
-    print!(
-        "{action} {} using port {}? [y/N] ",
-        target_identity(target),
-        target.local_port,
+fn resolve_kill_target<CollectContext>(
+    args: &KillArgs,
+    entries: &[PortEntry],
+    collect_context: CollectContext,
+) -> Result<KillTarget, KillTargetError>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+{
+    match (args.pid, args.port) {
+        (Some(pid), None) => resolve_pid_target(pid, entries, collect_context),
+        (None, Some(port)) => resolve_port_target(port, entries, collect_context),
+        (None, None) | (Some(_), Some(_)) => unreachable!("clap requires exactly one kill target"),
+    }
+}
+
+fn resolve_pid_target<CollectContext>(
+    pid: u32,
+    entries: &[PortEntry],
+    mut collect_context: CollectContext,
+) -> Result<KillTarget, KillTargetError>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+{
+    if let Some(reason) = process::unsafe_pid_reason(pid) {
+        return Err(KillTargetError::UnsafePid(reason));
+    }
+
+    let rows: Vec<&PortEntry> = entries
+        .iter()
+        .filter(|entry| entry.pid == Some(pid))
+        .collect();
+    if rows.is_empty() {
+        return Err(KillTargetError::NoMatch);
+    }
+    let context = collect_context(pid);
+    Ok(KillTarget::from_entries(pid, rows, Some(&context)))
+}
+
+fn resolve_port_target<CollectContext>(
+    port: u16,
+    entries: &[PortEntry],
+    mut collect_context: CollectContext,
+) -> Result<KillTarget, KillTargetError>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+{
+    let rows: Vec<&PortEntry> = entries
+        .iter()
+        .filter(|entry| entry.matches_port(port))
+        .collect();
+    if rows.is_empty() {
+        return Err(KillTargetError::NoMatch);
+    }
+    if rows.iter().any(|entry| entry.pid.is_none()) {
+        return Err(KillTargetError::MissingPid { port });
+    }
+
+    let mut pids = rows
+        .iter()
+        .filter_map(|entry| entry.pid)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    let [pid] = pids.as_slice() else {
+        return Err(KillTargetError::AmbiguousPort {
+            port,
+            candidates: candidate_labels(&rows),
+        });
+    };
+    if let Some(reason) = process::unsafe_pid_reason(*pid) {
+        return Err(KillTargetError::UnsafePid(reason));
+    }
+
+    let context = collect_context(*pid);
+    Ok(KillTarget::from_entries(*pid, rows, Some(&context)))
+}
+
+fn candidate_labels(rows: &[&PortEntry]) -> Vec<String> {
+    let mut candidates = rows
+        .iter()
+        .filter_map(|entry| {
+            let pid = entry.pid?;
+            let name = entry.process_name.as_deref().unwrap_or("<unknown>");
+            Some(format!(
+                "PID {pid} ({name}) {} {}:{}",
+                entry.protocol.label(),
+                entry.local_addr,
+                entry.local_port,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn print_target_error(error: KillTargetError) -> ExitReason {
+    match error {
+        KillTargetError::NoMatch => {
+            eprintln!("error: no open port matches the requested target");
+            ExitReason::NoMatch
+        }
+        KillTargetError::MissingPid { port } => {
+            eprintln!(
+                "error: port {port} is visible, but no owning PID is available; rerun with higher privileges or pass --pid when known",
+            );
+            ExitReason::NoMatch
+        }
+        KillTargetError::AmbiguousPort { port, candidates } => {
+            eprintln!(
+                "error: port {port} is owned by multiple PIDs; refusing to guess. Use --pid with one of:",
+            );
+            for candidate in candidates {
+                eprintln!("  {candidate}");
+            }
+            ExitReason::Failure
+        }
+        KillTargetError::UnsafePid(reason) => {
+            eprintln!("error: unsafe PID blocked: {}", reason.message());
+            ExitReason::Failure
+        }
+    }
+}
+
+fn prompt_confirmation(
+    target: &KillTarget,
+    mode: KillMode,
+    requirement: ConfirmationRequirement,
+) -> std::io::Result<bool> {
+    eprintln!("{} {}", mode.action_label(), target.identity());
+    eprintln!("Ports: {}", target.ports_text());
+    eprintln!(
+        "Command: {}",
+        command::render_kill_command(target.platform, target.pid, mode),
     );
+    if mode == KillMode::Force {
+        eprintln!("Warning: SIGKILL is immediate; prefer normal termination first.");
+    }
+    for warning in target.warning_lines() {
+        eprintln!("Warning: {warning}.");
+    }
+
+    match requirement {
+        ConfirmationRequirement::Yes => print!("Type y to confirm, or press Enter to cancel: "),
+        ConfirmationRequirement::ForceWord => print!("Type force to confirm SIGKILL: "),
+        ConfirmationRequirement::ProtectedProcess => print!(
+            "Protected process: type PID {} or process name {} to confirm: ",
+            target.pid,
+            target.process_name_or_unknown(),
+        ),
+    }
     std::io::stdout().flush()?;
 
+    let answer = read_confirmation_line(CONFIRMATION_INPUT_MAX_BYTES)?;
+    Ok(process::confirmation_input_matches(
+        &answer,
+        target,
+        requirement,
+    ))
+}
+
+fn read_confirmation_line(max_bytes: usize) -> std::io::Result<String> {
     let mut answer = String::new();
-    // Bounded read: 16 bytes is plenty for any yes/no answer, and the cap
-    // means piped or hostile stdin cannot grow the buffer without limit.
-    std::io::stdin().lock().take(16).read_line(&mut answer)?;
-    let answer = answer.trim();
-    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+    let limit = u64::try_from(max_bytes).expect("confirmation limit must fit in u64") + 1;
+    std::io::stdin().lock().take(limit).read_line(&mut answer)?;
+    truncate_to_char_boundary(&mut answer, max_bytes);
+    Ok(answer)
+}
+
+fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
+    match outcome {
+        TerminationOutcome::Success => eprintln!(
+            "sent {} to {}; refresh to verify the port disappeared",
+            mode.signal_label(),
+            target.identity(),
+        ),
+        TerminationOutcome::PermissionDenied => eprintln!(
+            "error: permission denied sending {} to {}",
+            mode.signal_label(),
+            target.identity(),
+        ),
+        TerminationOutcome::AlreadyExited => {
+            eprintln!(
+                "{} already exited before the signal was sent",
+                target.identity()
+            );
+        }
+        TerminationOutcome::Cancelled => eprintln!("kill cancelled"),
+        TerminationOutcome::ProtectedProcess => eprintln!(
+            "error: {} is protected; --yes cannot bypass protected-process confirmation",
+            target.identity(),
+        ),
+        TerminationOutcome::TargetChanged => eprintln!(
+            "error: {} no longer owns the confirmed port target; no signal was sent",
+            target.identity(),
+        ),
+        TerminationOutcome::UnsafePid(reason) => {
+            eprintln!("error: unsafe PID blocked: {}", reason.message());
+        }
+        TerminationOutcome::UnknownFailure(error) => eprintln!(
+            "error: sending {} to {} failed: {error}",
+            mode.signal_label(),
+            target.identity(),
+        ),
+    }
+}
+
+fn exit_reason_for_outcome(outcome: &TerminationOutcome) -> ExitReason {
+    match outcome {
+        TerminationOutcome::Success => ExitReason::Success,
+        TerminationOutcome::PermissionDenied => ExitReason::PermissionDenied,
+        TerminationOutcome::AlreadyExited | TerminationOutcome::TargetChanged => {
+            ExitReason::NoMatch
+        }
+        TerminationOutcome::Cancelled => ExitReason::KillCancelled,
+        TerminationOutcome::ProtectedProcess => ExitReason::ProtectedNeedsConfirmation,
+        TerminationOutcome::UnsafePid(_) | TerminationOutcome::UnknownFailure(_) => {
+            ExitReason::Failure
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,18 +620,31 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        Cli, Command, ExitReason, diagnostic_port_without_confirmed_socket, kill_needs_confirmation,
+        Cli, Command, ExitReason, KillArgs, KillTargetError,
+        diagnostic_port_without_confirmed_socket, resolve_kill_target, run_kill_with,
+        truncate_to_char_boundary,
     };
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
+    use crate::config::Config;
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState, SortMode,
+    };
+    use crate::process::{ConfirmationRequirement, KillMode, TerminationOutcome, UnsafePidReason};
 
     fn entry(port: u16) -> PortEntry {
+        entry_with_pid(port, Some(18_422), Protocol::Tcp, "node")
+    }
+
+    fn entry_with_pid(port: u16, pid: Option<u32>, protocol: Protocol, name: &str) -> PortEntry {
         PortEntry {
-            protocol: Protocol::Tcp,
+            protocol,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: port,
-            state: SocketState::Listen,
-            pid: Some(1),
-            process_name: Some("node".to_owned()),
+            state: match protocol {
+                Protocol::Tcp => SocketState::Listen,
+                Protocol::Udp => SocketState::Bound,
+            },
+            pid,
+            process_name: Some(name.to_owned()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -373,6 +654,28 @@ mod tests {
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
         }
+    }
+
+    fn kill_pid(pid: u32, force: bool, yes: bool) -> KillArgs {
+        KillArgs {
+            pid: Some(pid),
+            port: None,
+            force,
+            yes,
+        }
+    }
+
+    fn kill_port(port: u16, force: bool, yes: bool) -> KillArgs {
+        KillArgs {
+            pid: None,
+            port: Some(port),
+            force,
+            yes,
+        }
+    }
+
+    fn no_context(_: u32) -> ProcessContext {
+        ProcessContext::default()
     }
 
     #[test]
@@ -456,17 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_decision_covers_all_flag_combinations() {
-        // (force, yes, confirm_force_kill) -> must prompt?
-        assert!(kill_needs_confirmation(false, false, true));
-        assert!(kill_needs_confirmation(false, false, false));
-        assert!(kill_needs_confirmation(true, false, true));
-        assert!(!kill_needs_confirmation(true, false, false));
-        assert!(!kill_needs_confirmation(false, true, true));
-        assert!(!kill_needs_confirmation(true, true, true));
-    }
-
-    #[test]
     fn no_match_diagnostic_requires_absent_confirmed_socket() {
         assert_eq!(
             diagnostic_port_without_confirmed_socket(Some(3000), &[]),
@@ -477,5 +769,220 @@ mod tests {
             None
         );
         assert_eq!(diagnostic_port_without_confirmed_socket(None, &[]), None);
+    }
+
+    #[test]
+    fn kill_port_resolution_refuses_ambiguous_pids() {
+        let rows = vec![
+            entry_with_pid(3000, Some(100), Protocol::Tcp, "node"),
+            entry_with_pid(3000, Some(200), Protocol::Udp, "worker"),
+        ];
+
+        let error = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
+            .expect_err("two PIDs on one port must be ambiguous");
+
+        let KillTargetError::AmbiguousPort { port, candidates } = error else {
+            panic!("expected ambiguous port error, got {error:?}");
+        };
+        assert_eq!(port, 3000);
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.contains("PID 100"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.contains("PID 200"))
+        );
+    }
+
+    #[test]
+    fn kill_port_resolution_refuses_rows_without_pids() {
+        let rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+
+        let error = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
+            .expect_err("a port without a PID is not killable");
+
+        assert_eq!(error, KillTargetError::MissingPid { port: 3000 });
+    }
+
+    #[test]
+    fn kill_port_resolution_allows_one_pid_with_multiple_rows() {
+        let rows = vec![
+            entry_with_pid(3000, Some(100), Protocol::Tcp, "node"),
+            entry_with_pid(3000, Some(100), Protocol::Udp, "node"),
+        ];
+
+        let target = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
+            .expect("one PID can own multiple matching rows");
+
+        assert_eq!(target.pid, 100);
+        assert_eq!(
+            target.ports_text(),
+            "TCP 127.0.0.1:3000, UDP 127.0.0.1:3000"
+        );
+    }
+
+    #[test]
+    fn kill_pid_resolution_blocks_unsafe_pids_before_lookup() {
+        let error = resolve_kill_target(&kill_pid(1, false, true), &[], no_context)
+            .expect_err("PID 1 must be blocked even if no row exists");
+
+        assert_eq!(error, KillTargetError::UnsafePid(UnsafePidReason::One));
+    }
+
+    #[test]
+    fn kill_yes_sends_signal_without_prompt_for_unprotected_target() {
+        let rows = vec![entry(3000)];
+        let mut terminated = None;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(rows.clone()),
+            |_target, _mode, _requirement| panic!("--yes must skip normal prompts"),
+            |pid, mode| {
+                terminated = Some((pid, mode));
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        assert_eq!(terminated, Some((18_422, KillMode::Terminate)));
+    }
+
+    #[test]
+    fn protected_process_yes_returns_exit_6_without_signalling() {
+        let mut row = entry_with_pid(5432, Some(54_321), Protocol::Tcp, "postgres");
+        row.protected = true;
+        let rows = vec![row];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_port(5432, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(rows.clone()),
+            |_target, _mode, _requirement| panic!("protected --yes must not prompt"),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn force_kill_uses_force_word_confirmation_when_configured() {
+        let rows = vec![entry(3000)];
+        let mut prompted = None;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, true, false),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(rows.clone()),
+            |_target, mode, requirement| {
+                prompted = Some((mode, requirement));
+                Ok(true)
+            },
+            |_pid, _mode| TerminationOutcome::Success,
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        assert_eq!(
+            prompted,
+            Some((KillMode::Force, ConfirmationRequirement::ForceWord)),
+        );
+    }
+
+    #[test]
+    fn declined_confirmation_cancels_without_signalling() {
+        let rows = vec![entry(3000)];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, false),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(rows.clone()),
+            |_target, _mode, requirement| {
+                assert_eq!(requirement, ConfirmationRequirement::Yes);
+                Ok(false)
+            },
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::KillCancelled);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn target_is_revalidated_after_confirmation_before_signal() {
+        let rows = vec![entry(3000)];
+        let fresh_rows = vec![entry_with_pid(4000, Some(18_422), Protocol::Tcp, "node")];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(fresh_rows.clone()),
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn target_becoming_protected_after_confirmation_blocks_signal() {
+        let rows = vec![entry(3000)];
+        let mut protected = entry(3000);
+        protected.protected = true;
+        let fresh_rows = vec![protected];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(fresh_rows.clone()),
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn confirmation_input_truncation_preserves_utf8_boundaries() {
+        let mut input = "foé".to_owned();
+
+        truncate_to_char_boundary(&mut input, 3);
+
+        assert_eq!(input, "fo");
     }
 }

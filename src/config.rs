@@ -58,7 +58,7 @@ pub(crate) struct Config {
     pub(crate) default_sort: SortMode,
     /// Hide conservative system/service rows from the default view.
     pub(crate) hide_system_processes: bool,
-    /// Whether force kill prompts for confirmation when `--yes` is absent.
+    /// Whether force kill uses the stronger typed confirmation when `--yes` is absent.
     pub(crate) confirm_force_kill: bool,
     /// Process names that require stronger confirmation before termination.
     pub(crate) protected_processes: Vec<String>,
