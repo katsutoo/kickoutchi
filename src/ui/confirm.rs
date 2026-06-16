@@ -88,8 +88,6 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
                 confirmation.mode.action_label().to_ascii_lowercase(),
             )),
             Span::styled("n", theme.key()),
-            Span::raw(" or "),
-            Span::styled("Esc", theme.key()),
             Span::raw(" cancels."),
         ]),
         ConfirmationRequirement::ForceWord => Line::from(vec![

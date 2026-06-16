@@ -61,8 +61,14 @@ impl Collector for LinuxCollector {
 
         let mut entries = Vec::with_capacity(records.len());
         for record in records {
-            let pid = owners.get(&record.inode).copied();
-            entries.push(entry_from_record(&record, pid, &self.proc_root));
+            match owners.get(&record.inode) {
+                Some(pids) if !pids.is_empty() => {
+                    for pid in pids {
+                        entries.push(entry_from_record(&record, Some(*pid), &self.proc_root));
+                    }
+                }
+                _ => entries.push(entry_from_record(&record, None, &self.proc_root)),
+            }
         }
         Ok(entries)
     }
@@ -309,7 +315,7 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
 fn collect_socket_owners(
     proc_root: &Path,
     target_inodes: &HashSet<u64>,
-) -> Result<HashMap<u64, u32>, CollectorError> {
+) -> Result<HashMap<u64, Vec<u32>>, CollectorError> {
     if target_inodes.is_empty() {
         return Ok(HashMap::new());
     }
@@ -319,11 +325,18 @@ fn collect_socket_owners(
         source,
     })?;
 
+    // Scan every PID's file descriptors with no early exit. One listening socket
+    // can be shared by several processes (a parent that bound it and forked,
+    // inherited fds, SO_REUSEPORT), so the same inode may have multiple owners.
+    // Stopping once each inode has *an* owner would collapse those to one
+    // arbitrary PID and let `kill --port` signal a single process while the
+    // others keep the port open. Correctness here outranks the saved fd walks.
+    // If this scan ever dominates refresh latency on very large hosts, the
+    // planned remedy is netlink `sock_diag` (see PROJECT.md), not a
+    // correctness-breaking early stop.
     let mut owners = HashMap::with_capacity(target_inodes.len());
     for pid in pids {
-        if collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners) {
-            break;
-        }
+        collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners);
     }
     Ok(owners)
 }
@@ -350,11 +363,11 @@ fn collect_pid_socket_owners(
     proc_root: &Path,
     pid: u32,
     target_inodes: &HashSet<u64>,
-    owners: &mut HashMap<u64, u32>,
-) -> bool {
+    owners: &mut HashMap<u64, Vec<u32>>,
+) {
     let fd_dir = proc_root.join(pid.to_string()).join("fd");
     let Ok(fd_entries) = fs::read_dir(fd_dir) else {
-        return false;
+        return;
     };
 
     for entry in fd_entries {
@@ -370,12 +383,11 @@ fn collect_pid_socket_owners(
         if !target_inodes.contains(&inode) {
             continue;
         }
-        owners.entry(inode).or_insert(pid);
-        if owners.len() == target_inodes.len() {
-            return true;
+        let pids = owners.entry(inode).or_default();
+        if !pids.contains(&pid) {
+            pids.push(pid);
         }
     }
-    false
 }
 
 fn parse_socket_inode(target: &Path) -> Option<u64> {
@@ -939,6 +951,28 @@ mod tests {
     }
 
     #[test]
+    fn linux_collection_emits_one_row_per_shared_socket_owner() {
+        let proc_root = temp_proc_root("shared-socket-rows");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 1234, "parent", 1);
+        write_process(&proc_root, 1235, "child", 1234);
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234").join("fd").join("0"))
+            .expect("parent socket symlink must be created");
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("1235").join("fd").join("0"))
+            .expect("child socket symlink must be created");
+
+        let entries = LinuxCollector::with_proc_root(proc_root.clone())
+            .collect()
+            .expect("test proc root must collect");
+        let pids = entries.iter().map(|entry| entry.pid).collect::<Vec<_>>();
+
+        assert_eq!(pids, vec![Some(1234), Some(1235)]);
+        assert!(entries.iter().all(|entry| entry.local_port == 3000));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn selected_process_context_collects_owner_uid_and_direct_children() {
         let proc_root = temp_proc_root("selected-context");
         write_process(&proc_root, 100, "parent", 1);
@@ -1050,25 +1084,43 @@ mod tests {
         let owners = collect_socket_owners(&proc_root, &HashSet::from([22]))
             .expect("targeted owner collection must succeed");
 
-        assert_eq!(owners.get(&22), Some(&1234));
+        assert_eq!(owners.get(&22).map(Vec::as_slice), Some(&[1234][..]));
         assert!(!owners.contains_key(&11));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
     #[test]
-    fn pid_socket_owner_collection_reports_when_targets_are_complete() {
-        let proc_root = temp_proc_root("target-complete");
+    fn socket_owner_collection_retains_multiple_pids_for_shared_inodes() {
+        let proc_root = temp_proc_root("shared-inode-owners");
+        for pid in [100, 101] {
+            let fd_dir = proc_root.join(pid.to_string()).join("fd");
+            fs::create_dir_all(&fd_dir).expect("test fd directory must be created");
+            std::os::unix::fs::symlink("socket:[44]", fd_dir.join("0"))
+                .expect("test socket symlink must be created");
+        }
+
+        let owners = collect_socket_owners(&proc_root, &HashSet::from([44]))
+            .expect("targeted owner collection must succeed");
+
+        assert_eq!(owners.get(&44).map(Vec::as_slice), Some(&[100, 101][..]));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn pid_socket_owner_collection_records_matching_inode_once_per_pid() {
+        let proc_root = temp_proc_root("target-owner-once");
         let fd_dir = proc_root.join("1234").join("fd");
         fs::create_dir_all(&fd_dir).expect("test fd directory must be created");
         std::os::unix::fs::symlink("socket:[44]", fd_dir.join("0"))
             .expect("test socket symlink must be created");
+        std::os::unix::fs::symlink("socket:[44]", fd_dir.join("1"))
+            .expect("duplicate socket symlink must be created");
 
         let target_inodes = HashSet::from([44]);
         let mut owners = HashMap::new();
-        let complete = collect_pid_socket_owners(&proc_root, 1234, &target_inodes, &mut owners);
+        collect_pid_socket_owners(&proc_root, 1234, &target_inodes, &mut owners);
 
-        assert!(complete);
-        assert_eq!(owners.get(&44), Some(&1234));
+        assert_eq!(owners.get(&44).map(Vec::as_slice), Some(&[1234][..]));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 }

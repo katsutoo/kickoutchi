@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no rows fails fast on the termination path instead of carrying a degenerate,
   port-less target forward.
 - Linux collector owner resolution now only records owners for socket inodes
-  found in the collected `/proc/net/*` rows, and stops scanning process file
-  descriptors once every target inode has been matched. This reduces repeated
-  auto-refresh work on noisy machines without changing output semantics.
+  found in the collected `/proc/net/*` rows. It keeps every PID that references a
+  target socket inode, so forked or inherited listening sockets are represented
+  as multiple candidate owners instead of being collapsed to whichever PID was
+  scanned first.
 - Linux collector now reads `/proc/<pid>/status` through a byte-bounded reader,
   matching the existing cap on `/proc/<pid>/cmdline`, so every `/proc` read in the
   collector is explicitly limited; `PPid` sits near the top of `status`, so the
@@ -47,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `kill --port` now refuses inherited/shared listening sockets instead of
+  signaling one arbitrary owner and reporting success while another process keeps
+  the port open. The Linux collector emits one row per PID referencing the same
+  socket inode, which lets the existing ambiguous-target guard list every
+  candidate and require `--pid`.
+- `kill --port` on a visible port whose owning PID is unavailable now exits with
+  the documented permission-denied code `4` instead of the no-match code `3`,
+  including when ownership becomes unavailable during the mandatory pre-signal
+  revalidation.
+- TUI pre-signal revalidation now reports an owner whose PID became unreadable as
+  ownership-unavailable, matching the CLI, instead of labelling it a changed
+  target; both still refuse to send a signal.
 - Removed the stale `#[allow(dead_code)]` from `ExitReason`; every variant is
   now constructed by the CLI exit path, so the lint suppression would have
   hidden genuinely unreachable variants in future refactors.
@@ -84,6 +97,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
   Rust toolchain to check formatting, strict Clippy, and the full test suite.
   Release/CD automation remains deferred to the Phase 11 `cargo-dist` workflow.
+- CLI contract integration tests now exercise script-facing `list` behavior with
+  the real binary: human no-match diagnostics go to stderr, `list --json` stays
+  unpolluted, and explicit no-match filters exit `3`. The helper process uses
+  `sh`, so the suite needs no Python (or any other interpreter) on PATH.
 
 - Safe termination MVP (Phase 6): Linux `kill` now sends real `SIGTERM` or
   `SIGKILL` through a small `libc` boundary instead of shelling out, with typed

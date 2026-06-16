@@ -1062,12 +1062,12 @@ pedantic = "warn"
 11. **Done in Phase 6:** make protected processes require stronger confirmation by typing the PID or process name.
 12. **Done in Phase 6:** warn when the selected PID has child processes.
 13. **Done in Phase 6:** prefer normal termination before recommending force kill in UI copy.
-14. **Done in Phase 6:** refresh immediately after every kill attempt. Before sending a signal, re-collect and verify that the confirmed PID still owns the confirmed port rows; if the target changed, abort and refresh instead of risking PID reuse.
+14. **Done in Phase 6:** refresh immediately after every kill attempt. Before sending a signal, re-collect and verify that the confirmed PID still owns the confirmed port rows; if the target changed, abort and refresh instead of risking PID reuse, and if a visible port's owning PID becomes unavailable during revalidation, abort with the documented permission-denied exit path instead of sending a signal.
 15. **Done in Phase 6:** show clear success, cancelled, permission denied, already exited, and failure messages.
 16. **Done in Phase 6:** wire `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` to the same safety rules.
-17. **Done in Phase 6:** resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation names every affected port, not just the first.
+17. **Done in Phase 6:** resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs, or forked/inherited listeners that share the same socket inode), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation names every affected port, not just the first. On Linux, socket-inode ownership keeps every PID that references a collected target inode so shared listeners cannot be collapsed to one arbitrary owner.
 18. **Done in Phase 6:** keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
-19. **Done in Phase 6:** add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution, command rendering, and exit codes.
+19. **Done in Phase 6:** add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution including inherited/shared socket owners, command rendering, CLI diagnostic stdout/stderr contracts, JSON non-pollution, and exit codes.
 
 ### Done when
 
@@ -1339,6 +1339,7 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 - Unit tests for process-tree rendering
 - UI snapshot tests for table, details, help, and confirmation modal
 - Platform smoke tests for collectors behind `cfg(target_os = "...")`
+- Integration tests that run the built binary to pin script-facing CLI contracts (stderr diagnostics, `list --json` non-pollution, exit codes)
 
 Verification commands:
 

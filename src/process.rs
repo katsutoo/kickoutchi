@@ -61,6 +61,7 @@ impl UnsafePidReason {
 pub(crate) enum TerminationOutcome {
     Success,
     PermissionDenied,
+    OwnershipUnavailable,
     AlreadyExited,
     Cancelled,
     ProtectedProcess,
@@ -308,6 +309,15 @@ pub(crate) fn revalidate_confirmed_target(
         .filter(|entry| confirmed.ports.contains(&KillTargetPort::from(*entry)))
         .collect::<Vec<_>>();
     if rows.is_empty() {
+        // A confirmed port still present but with no readable owning PID is an
+        // ownership/permission situation, not a vanished target. Surface it as
+        // such (matching the CLI's permission-denied path) instead of as a
+        // generic change; either way no signal is sent.
+        if fresh_entries.iter().any(|entry| {
+            entry.pid.is_none() && confirmed.ports.contains(&KillTargetPort::from(entry))
+        }) {
+            return Err(TerminationOutcome::OwnershipUnavailable);
+        }
         return Err(TerminationOutcome::TargetChanged);
     }
 
@@ -567,6 +577,23 @@ mod tests {
         assert_eq!(
             revalidate_confirmed_target(&confirmed, &[changed_port]),
             Err(TerminationOutcome::TargetChanged),
+        );
+    }
+
+    #[test]
+    fn revalidation_reports_ownership_unavailable_when_owning_pid_becomes_unreadable() {
+        let confirmed_row = entry(3000, Protocol::Tcp);
+        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], None);
+
+        // The confirmed port is still listening, but its owner can no longer be
+        // mapped to a PID: that is permission/ownership loss, not a moved target.
+        let mut unreadable = entry(3000, Protocol::Tcp);
+        unreadable.pid = None;
+        unreadable.permission = PermissionStatus::Partial;
+
+        assert_eq!(
+            revalidate_confirmed_target(&confirmed, &[unreadable]),
+            Err(TerminationOutcome::OwnershipUnavailable),
         );
     }
 

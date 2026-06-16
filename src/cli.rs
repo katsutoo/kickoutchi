@@ -346,8 +346,11 @@ where
 
     let fresh = match resolve_kill_target(args, &fresh_entries, collect_context) {
         Ok(fresh) => fresh,
-        Err(KillTargetError::NoMatch | KillTargetError::MissingPid { .. }) => {
+        Err(KillTargetError::NoMatch) => {
             return Err(TerminationOutcome::TargetChanged);
+        }
+        Err(KillTargetError::MissingPid { .. }) => {
+            return Err(TerminationOutcome::OwnershipUnavailable);
         }
         Err(KillTargetError::AmbiguousPort { port, candidates }) => {
             eprintln!(
@@ -486,7 +489,7 @@ fn print_target_error(error: KillTargetError) -> ExitReason {
             eprintln!(
                 "error: port {port} is visible, but no owning PID is available; rerun with higher privileges or pass --pid when known",
             );
-            ExitReason::NoMatch
+            ExitReason::PermissionDenied
         }
         KillTargetError::AmbiguousPort { port, candidates } => {
             eprintln!(
@@ -572,6 +575,11 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             mode.signal_label(),
             target.identity(),
         ),
+        TerminationOutcome::OwnershipUnavailable => eprintln!(
+            "error: ownership for {} became unavailable before {}; no signal was sent",
+            target.identity(),
+            mode.signal_label(),
+        ),
         TerminationOutcome::AlreadyExited => {
             eprintln!(
                 "{} already exited before the signal was sent",
@@ -601,7 +609,9 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
 fn exit_reason_for_outcome(outcome: &TerminationOutcome) -> ExitReason {
     match outcome {
         TerminationOutcome::Success => ExitReason::Success,
-        TerminationOutcome::PermissionDenied => ExitReason::PermissionDenied,
+        TerminationOutcome::PermissionDenied | TerminationOutcome::OwnershipUnavailable => {
+            ExitReason::PermissionDenied
+        }
         TerminationOutcome::AlreadyExited | TerminationOutcome::TargetChanged => {
             ExitReason::NoMatch
         }
@@ -809,6 +819,28 @@ mod tests {
     }
 
     #[test]
+    fn kill_port_without_readable_pid_exits_permission_denied() {
+        let rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_port(3000, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || panic!("missing PID target must fail before revalidation"),
+            |_target, _mode, _requirement| panic!("missing PID target must not prompt"),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::PermissionDenied);
+        assert!(!terminated);
+    }
+
+    #[test]
     fn kill_port_resolution_allows_one_pid_with_multiple_rows() {
         let rows = vec![
             entry_with_pid(3000, Some(100), Protocol::Tcp, "node"),
@@ -949,6 +981,29 @@ mod tests {
         );
 
         assert_eq!(reason, ExitReason::NoMatch);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn target_losing_readable_pid_during_revalidation_exits_permission_denied() {
+        let rows = vec![entry(3000)];
+        let fresh_rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_port(3000, false, true),
+            &Config::default(),
+            &rows,
+            no_context,
+            || Ok(fresh_rows.clone()),
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::PermissionDenied);
         assert!(!terminated);
     }
 

@@ -584,6 +584,11 @@ fn termination_status_line(
             mode.signal_label(),
             target.identity(),
         ),
+        TerminationOutcome::OwnershipUnavailable => format!(
+            "ownership for {} became unavailable before {}; no signal was sent",
+            target.identity(),
+            mode.signal_label(),
+        ),
         TerminationOutcome::AlreadyExited => {
             format!("{} already exited; refreshed snapshot", target.identity())
         }
