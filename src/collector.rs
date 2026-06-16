@@ -1,6 +1,6 @@
 //! Collector abstraction and the fake data source.
 //!
-//! The trait fixes the contract every platform collector (Linux in Phase 3,
+//! The trait fixes the contract every platform collector (Linux today,
 //! optionally Windows/macOS later) must satisfy, so the CLI and TUI are wired
 //! against `dyn`-free generic call sites today and swapping fake data for real
 //! collection never touches the output layer.
@@ -50,7 +50,9 @@ pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
     }
 }
 
-/// Deterministic fake rows standing in for real collection until Phase 3.
+/// Deterministic fake rows: the test fixture and the non-Linux fallback
+/// collector (compiled for tests and for platforms without a native collector
+/// yet).
 ///
 /// The rows are chosen to exercise every rendering path the model allows:
 /// full metadata, permission-restricted partial metadata, a default-protected

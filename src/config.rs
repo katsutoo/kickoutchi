@@ -52,7 +52,7 @@ pub(crate) struct Config {
     /// immediately, so the interval only bounds idle wait time. Internal
     /// tuning, deliberately not user-configurable.
     pub(crate) tick_interval: Duration,
-    /// How often the TUI re-collects ports (auto-refresh lands in Phase 4).
+    /// How often the TUI re-collects ports for auto-refresh.
     pub(crate) refresh_interval: Duration,
     /// Default table sort for the CLI and TUI.
     pub(crate) default_sort: SortMode,

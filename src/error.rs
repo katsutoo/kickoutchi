@@ -6,11 +6,12 @@ use thiserror::Error;
 
 /// Top-level error for the TUI path of the Kickoutchi binary.
 ///
-/// Today this only surfaces terminal/IO failures. Config and collector errors
-/// have their own standalone types (`config::ConfigError`,
-/// `collector::CollectorError`) because they are handled before or outside the
-/// TUI; subsystems whose failures must cross the TUI boundary (process
-/// termination, live collection) gain variants here as they land.
+/// This surfaces only terminal/IO failures, the one error class that is fatal
+/// to the TUI run loop. Config errors have their own type
+/// (`config::ConfigError`, handled before the TUI starts), and collector and
+/// process-termination failures are operational rather than fatal: they are
+/// shown in the status line (last collector error, kill outcome) instead of
+/// being propagated here.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
     /// Entering raw mode / the alternate screen, drawing a frame, or reading

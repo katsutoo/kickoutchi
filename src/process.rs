@@ -1,6 +1,6 @@
 //! Process termination policy and platform signal delivery.
 //!
-//! This module owns the safety-critical boundary for Phase 6: target snapshots,
+//! This module owns the safety-critical boundary for termination: target snapshots,
 //! confirmation requirements, PID guardrails, and the small Unix FFI call that
 //! sends SIGTERM/SIGKILL. UI and CLI code decide *when* to ask the user; this
 //! module decides what is safe to execute.

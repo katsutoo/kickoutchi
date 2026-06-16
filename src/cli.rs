@@ -2,8 +2,9 @@
 //! contract, and the `list`/`kill` command implementations.
 //!
 //! CLI commands never open the TUI; they print to stdout/stderr and exit.
-//! Data flows through the same collector and model as the TUI will, so
-//! swapping the fake collector for a real one (Phase 3) changes nothing here.
+//! Data flows through the same collector and model as the TUI, so the two
+//! surfaces stay consistent and this output layer does not depend on which
+//! collector produced the rows.
 
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;

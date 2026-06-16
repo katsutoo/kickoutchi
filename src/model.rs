@@ -52,11 +52,11 @@ impl SocketState {
     }
 }
 
-/// OS a row was collected on. Carried per-row so the kill-command rendering
-/// (Phase 6/9) can show platform-correct commands without re-detecting the OS.
-/// All three variants are declared now because they are part of the JSON
-/// contract; `Windows`/`Macos` are first constructed by the optional Phase 7/8
-/// collectors.
+/// OS a row was collected on. Carried per-row so kill-command rendering can
+/// show platform-correct commands without re-detecting the OS. All three
+/// variants are declared now because they are part of the JSON contract;
+/// `Windows`/`Macos` stay unconstructed until the optional native collectors
+/// for those platforms are built.
 #[allow(
     dead_code,
     reason = "windows/macos are contract variants until their collectors land"
@@ -201,10 +201,12 @@ impl PortEntry {
 
     /// Best-effort system/service process classification for optional hiding.
     ///
-    /// This is intentionally conservative until Phase 5 collects richer owner
-    /// data: PID 0/1, direct children of PID 1, and a short list of well-known
-    /// OS process names. Protected app names such as `postgres` are not treated
-    /// as system processes just because they are protected.
+    /// This is intentionally conservative: PID 0/1, direct children of PID 1,
+    /// and a short list of well-known OS process names. Per-row owner UID is not
+    /// collected (it is resolved lazily only for the selected row), so this
+    /// table-wide classification cannot key on it. Protected app names such as
+    /// `postgres` are not treated as system processes just because they are
+    /// protected.
     pub(crate) fn is_system_process(&self) -> bool {
         if self.pid.is_some_and(|pid| pid <= 1) || self.parent_pid == Some(1) {
             return true;
@@ -219,7 +221,7 @@ impl PortEntry {
     }
 }
 
-/// Table sort orders shared by the CLI now and the TUI in Phase 4.
+/// Table sort orders shared by the CLI and the TUI.
 /// Deserialized from the config file (`default_sort = "port"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
