@@ -1,9 +1,9 @@
-//! Collector abstraction and the fake data source.
+//! The collector contract, plus the fake data we lean on for tests.
 //!
-//! The trait fixes the contract every platform collector (Linux today,
-//! optionally Windows/macOS later) must satisfy, so the CLI and TUI are wired
-//! against `dyn`-free generic call sites today and swapping fake data for real
-//! collection never touches the output layer.
+//! The trait pins down what every platform collector (Linux today, maybe
+//! Windows/macOS later) has to provide. The CLI and TUI talk to that contract,
+//! so swapping fake data for the real thing never ripples out into the output
+//! layer.
 
 #[cfg(any(test, not(target_os = "linux")))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -15,29 +15,33 @@ use crate::model::PortEntry;
 #[cfg(any(test, not(target_os = "linux")))]
 use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
 
-/// Why a collection pass failed.
+/// What went wrong during a collection pass.
 #[derive(Debug, Error)]
 pub(crate) enum CollectorError {
-    /// A required collection path could not be read. Per-process metadata
-    /// failures are not fatal; they produce partial rows instead.
+    /// We couldn't read a path we genuinely need. This is for the must-have
+    /// paths only — one process being cagey about its metadata isn't fatal, it
+    /// just becomes a partial row.
     #[error("cannot read {path}: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A background TUI refresh worker disappeared before sending its result.
+    #[error("refresh worker exited before returning a snapshot")]
+    WorkerExited,
 }
 
-/// A source of open-port snapshots.
+/// Anything that can hand us a snapshot of the open ports.
 ///
-/// Implementations return a full snapshot per call; incremental updates are
-/// deliberately not part of the contract because a snapshot is trivially
-/// consistent and refresh happens at human cadence (seconds, not micros).
+/// Every call returns a full snapshot — no incremental updates, on purpose. A
+/// whole snapshot is trivially self-consistent, and we refresh at human speed
+/// (seconds, not microseconds), so the extra complexity would buy us nothing.
 pub(crate) trait Collector {
-    /// Collect the current open ports, in no particular order.
+    /// Grab the current open ports, in whatever order they turn up.
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError>;
 }
 
-/// Collect from the best collector for the current build target.
+/// Pick whichever collector fits the platform we were built for.
 pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
     #[cfg(target_os = "linux")]
     {
@@ -50,13 +54,12 @@ pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
     }
 }
 
-/// Deterministic fake rows: the test fixture and the non-Linux fallback
-/// collector (compiled for tests and for platforms without a native collector
-/// yet).
+/// Deterministic fake rows: both the test fixture and the fallback collector on
+/// platforms that don't have a native one yet.
 ///
-/// The rows are chosen to exercise every rendering path the model allows:
-/// full metadata, permission-restricted partial metadata, a default-protected
-/// process name, IPv6, and a bound UDP socket.
+/// The rows are hand-picked to hit every rendering path the model allows: full
+/// metadata, permission-restricted partial metadata, a default-protected process
+/// name, IPv6, and a bound UDP socket.
 #[cfg(any(test, not(target_os = "linux")))]
 pub(crate) struct FakeCollector;
 
@@ -67,14 +70,14 @@ impl Collector for FakeCollector {
     }
 }
 
-/// The fake snapshot. Hardcodes [`Platform::Linux`] because the data is
-/// invented, not host-derived; pretending to match the build target would
-/// only make fake rows look more real than they are.
+/// The fake snapshot. Everything is hardcoded to [`Platform::Linux`] because
+/// this data is made up, not read from the host — dressing it up to match the
+/// build target would just make pretend rows look more legit than they are.
 #[cfg(any(test, not(target_os = "linux")))]
 fn fake_entries() -> Vec<PortEntry> {
     vec![
-        // A typical dev server with full metadata, parent context, and
-        // children: the row the core product flow is designed around.
+        // The classic dev server: full metadata, a parent, a couple of kids.
+        // This is the row the whole product flow is built around.
         PortEntry {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -91,7 +94,7 @@ fn fake_entries() -> Vec<PortEntry> {
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
         },
-        // A second dev server so filters have something to exclude.
+        // A second dev server, so filters actually have something to exclude.
         PortEntry {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -108,11 +111,11 @@ fn fake_entries() -> Vec<PortEntry> {
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
         },
-        // A name on the default protected list, running as another user the
-        // realistic Linux way: name and command line are world-readable in
-        // /proc, but /proc/<pid>/exe is not, hence the missing path and the
-        // Partial status. `protected` starts false here because marking is
-        // the pipeline's job (config-driven), not the collector's.
+        // A name on the default protected list, running as another user the way
+        // Linux actually does it: name and command line are world-readable in
+        // /proc, but /proc/<pid>/exe isn't, so the path is missing and the status
+        // is Partial. `protected` starts false here on purpose — tagging it is
+        // the pipeline's job (driven by config), not the collector's.
         PortEntry {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -129,9 +132,9 @@ fn fake_entries() -> Vec<PortEntry> {
             platform: Platform::Linux,
             permission: PermissionStatus::Partial,
         },
-        // IPv6 socket owned by another user: the port is visible but every
-        // piece of process metadata is withheld. Exercises the "render the
-        // row anyway and explain why it is empty" requirement.
+        // IPv6 socket owned by someone else: we can see the port, but every
+        // scrap of process metadata is off-limits. This is the "show the row
+        // anyway and explain why it's empty" case.
         PortEntry {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -148,8 +151,8 @@ fn fake_entries() -> Vec<PortEntry> {
             platform: Platform::Linux,
             permission: PermissionStatus::Partial,
         },
-        // Bound UDP socket: UDP has no listen state, so `Bound` is what
-        // "open" means for it.
+        // Bound UDP socket: UDP has no listen state, so for UDP "bound" is the
+        // closest thing to "open".
         PortEntry {
             protocol: Protocol::Udp,
             local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -180,17 +183,17 @@ mod tests {
             .collect()
             .expect("fake collection cannot fail");
 
-        // Port 3000 must exist: PROJECT.md's "done when" examples and the
-        // CLI filter tests rely on it.
+        // Port 3000 has to be here: PROJECT.md's "done when" examples and the
+        // CLI filter tests both lean on it.
         assert!(entries.iter().any(|entry| entry.local_port == 3000));
-        // At least one row with fully withheld metadata.
+        // At least one row where all the metadata is withheld.
         assert!(
             entries
                 .iter()
                 .any(|entry| entry.pid.is_none() && entry.permission == PermissionStatus::Partial)
         );
-        // And one partially withheld row: PID and name readable, executable
-        // path hidden (the "another user's process" shape from PROJECT.md).
+        // And one half-withheld row: PID and name readable, executable path
+        // hidden (the "someone else's process" shape from PROJECT.md).
         assert!(entries.iter().any(|entry| {
             entry.pid.is_some()
                 && entry.executable_path.is_none()
@@ -203,7 +206,7 @@ mod tests {
                 .any(|entry| entry.protocol == Protocol::Udp && entry.state == SocketState::Bound)
         );
         assert!(entries.iter().any(|entry| entry.local_addr.is_ipv6()));
-        // The collector never pre-marks protection; that is config's job.
+        // The collector never pre-marks protection — that's config's job.
         assert!(entries.iter().all(|entry| !entry.protected));
     }
 }

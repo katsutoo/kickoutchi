@@ -1,9 +1,9 @@
-//! Linux `/proc` collector.
+//! The Linux `/proc` collector.
 //!
-//! This collector intentionally reads kernel-provided `/proc` files directly
-//! instead of shelling out to `ss`, `lsof`, or `netstat`. Socket table parsing
-//! and process metadata enrichment are kept in this module so Linux-specific
-//! formats never leak into the shared CLI or TUI code.
+//! This reads kernel-provided `/proc` files straight from disk on purpose,
+//! rather than shelling out to `ss`, `lsof`, or `netstat`. All the socket-table
+//! parsing and process-metadata digging stays in here, so Linux's particular
+//! file formats never leak out into the shared CLI or TUI code.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -25,10 +25,10 @@ const PROC_ROOT: &str = "/proc";
 const TCP_LISTEN_STATE: &str = "0A";
 const MAX_CMDLINE_BYTES: usize = 16 * 1024;
 const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
-// `/proc/<pid>/status` is kernel-generated and small, but it is read on every
-// refresh, so it is bounded like every other /proc read here. `PPid` sits near
-// the top of the file, well within this cap, so the limit can never truncate the
-// field the collector needs.
+// `/proc/<pid>/status` is kernel-generated and small, but we read it on every
+// refresh, so we bound it like every other /proc read here. `PPid` lives near
+// the top of the file, comfortably inside this cap, so the limit can never chop
+// off the field the collector actually wants.
 const MAX_STATUS_BYTES: u64 = 8 * 1024;
 const MAX_STAT_BYTES: u64 = 4 * 1024;
 const MAX_CHILD_PROCESSES: usize = 64;
@@ -36,7 +36,7 @@ const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
-/// Linux implementation of the collector contract.
+/// The Linux end of the collector contract.
 pub(crate) struct LinuxCollector {
     proc_root: PathBuf,
 }
@@ -326,15 +326,15 @@ fn collect_socket_owners(
         source,
     })?;
 
-    // Scan every PID's file descriptors with no early exit. One listening socket
-    // can be shared by several processes (a parent that bound it and forked,
-    // inherited fds, SO_REUSEPORT), so the same inode may have multiple owners.
-    // Stopping once each inode has *an* owner would collapse those to one
-    // arbitrary PID and let `kill --port` signal a single process while the
-    // others keep the port open. Correctness here outranks the saved fd walks.
-    // If this scan ever dominates refresh latency on very large hosts, the
-    // planned remedy is netlink `sock_diag` (see PROJECT.md), not a
-    // correctness-breaking early stop.
+    // Walk every PID's file descriptors, no early exit. A single listening socket
+    // can be shared by several processes (a parent that bound it then forked,
+    // inherited fds, SO_REUSEPORT), so one inode can have several owners. Bailing
+    // out the moment each inode has *an* owner would collapse those down to one
+    // arbitrary PID — and then `kill --port` would signal one process while the
+    // others happily keep the port open. Correctness wins over the fd walks we'd
+    // save. If this scan ever becomes the refresh bottleneck on a huge host, the
+    // fix is netlink `sock_diag` (see PROJECT.md), not a correctness-breaking
+    // early stop.
     let mut owners = HashMap::with_capacity(target_inodes.len());
     for pid in pids {
         collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners);
@@ -933,8 +933,8 @@ mod tests {
 
     #[test]
     fn parent_pid_read_is_bounded_and_still_finds_ppid_near_the_top() {
-        // `PPid` is near the top of `status`, so the byte cap on the read must
-        // never hide it, even when the rest of the file is larger than the cap.
+        // `PPid` lives near the top of `status`, so the byte cap on the read must
+        // never hide it, even when the rest of the file runs well past the cap.
         let proc_root = temp_proc_root("status-cap");
         let process_dir = proc_root.join("99");
         fs::create_dir_all(&process_dir).expect("test process directory must exist");

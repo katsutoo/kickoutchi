@@ -1,7 +1,7 @@
-//! User-facing command rendering for process termination.
+//! Turning a kill into the shell command we show the user.
 //!
-//! Real termination uses platform APIs, but showing the equivalent shell command
-//! keeps the destructive action auditable before the user confirms it.
+//! The real termination goes through platform APIs, but showing the matching
+//! shell command keeps the destructive bit auditable before the user says yes.
 
 use crate::model::Platform;
 use crate::process::KillMode;

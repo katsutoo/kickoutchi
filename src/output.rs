@@ -1,28 +1,29 @@
 //! Table and JSON rendering for CLI mode.
 //!
-//! This layer only formats `Vec<PortEntry>`; it knows nothing about where the
-//! data came from, which is what lets real collectors replace the fake one
-//! without touching output.
+//! This layer only knows how to format a `Vec<PortEntry>` — it has no idea where
+//! the data came from. That's exactly what lets real collectors swap in for the
+//! fake one without anyone touching this file.
 
 use crate::model::PortEntry;
 
 const COLUMN_COUNT: usize = 6;
 const HEADERS: [&str; COLUMN_COUNT] = ["PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE"];
 
-/// Placeholder for metadata the OS withheld. A visible dash keeps columns
-/// aligned and makes "unknown" explicit instead of leaving a hole.
+/// Stand-in for metadata the OS wouldn't give us. A visible dash keeps the
+/// columns lined up and says "unknown" out loud instead of leaving a gap.
 const MISSING: &str = "-";
 
-/// Render entries as a plain-text table with columns padded to fit content.
+/// Render entries as a plain-text table, columns padded to fit their content.
 ///
-/// Plain spaces, no box drawing: CLI output gets piped to `grep`/`awk`, so
-/// every line must stay machine-splittable on whitespace.
+/// Plain spaces, no box-drawing characters: this output gets piped into
+/// `grep`/`awk` all the time, so every line has to stay splittable on
+/// whitespace.
 pub(crate) fn render_table(entries: &[PortEntry]) -> String {
     let rows: Vec<[String; COLUMN_COUNT]> = entries.iter().map(row_cells).collect();
 
-    // Column widths fit the widest cell. Content is bounded by the model's
-    // types (addresses, ports, PIDs, comm-style names), so no width cap is
-    // needed; command lines are deliberately not table columns.
+    // Each column grows to its widest cell. The model's own types keep content
+    // in check (addresses, ports, PIDs, short comm-style names), so there's no
+    // need for a width cap — and command lines deliberately aren't columns here.
     let mut widths: [usize; COLUMN_COUNT] = HEADERS.map(str::len);
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row.iter()) {
@@ -40,8 +41,8 @@ pub(crate) fn render_table(entries: &[PortEntry]) -> String {
 }
 
 /// Render entries as pretty-printed JSON. The shape is the serde contract on
-/// `PortEntry` (pinned by tests in `model`); pretty printing is for humans
-/// and changes nothing for parsers.
+/// `PortEntry` (pinned by tests in `model`); the pretty-printing is just for
+/// human eyes and means nothing to a parser.
 pub(crate) fn render_json(entries: &[PortEntry]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(entries)
 }
@@ -68,7 +69,7 @@ fn push_row(out: &mut String, cells: &[String; COLUMN_COUNT], widths: &[usize; C
             out.push_str("  ");
         }
         out.push_str(cell);
-        // Pad all but the last column; trailing spaces would be invisible
+        // Pad every column but the last — trailing spaces are just invisible
         // noise for diffs and shells.
         if index < COLUMN_COUNT - 1 {
             for _ in cell.len()..*width {
@@ -126,9 +127,9 @@ mod tests {
             entry(80, Some(1), Some("nginx")),
             entry(65000, Some(4_000_000), Some("a-much-longer-name")),
         ]);
-        // Every row must place the STATE column at the same offset; checking
-        // the column header's position against the cell positions pins the
-        // padding logic without snapshotting the whole table.
+        // Every row must put the STATE column at the same offset; comparing the
+        // header's position against the cells pins the padding logic without
+        // snapshotting the whole table.
         let lines: Vec<&str> = table.lines().collect();
         let state_offset = lines[0].find("STATE").expect("header has STATE");
         assert_eq!(lines[1].find("LISTEN"), Some(state_offset));

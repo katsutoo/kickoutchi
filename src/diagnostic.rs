@@ -1,14 +1,15 @@
-//! Strict port-reference diagnostics.
+//! Strict "hey, this command line mentions your port" diagnostics.
 //!
-//! Diagnostics are evidence only. They can say that a command line references a
-//! requested port, but they must never create a table row or claim ownership of
-//! a socket the OS did not confirm.
+//! These are evidence, nothing more. They can point out that some command line
+//! references the port you asked about, but they must never invent a table row
+//! or claim ownership of a socket the OS didn't actually confirm. Hints, not
+//! accusations.
 
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
 
-/// Extract one unambiguous diagnostic port from CLI list filters.
+/// Pull a single, unambiguous port to diagnose out of the CLI list filters.
 pub(crate) fn requested_diagnostic_port(port_arg: Option<u16>, filter_text: &str) -> Option<u16> {
     if port_arg.is_some() {
         return port_arg;
@@ -33,7 +34,8 @@ pub(crate) fn requested_diagnostic_port(port_arg: Option<u16>, filter_text: &str
     requested
 }
 
-/// True when a command line contains strict, port-shaped evidence.
+/// True when a command line carries strict, port-shaped evidence — not just a
+/// number that happens to look like the port.
 pub(crate) fn command_mentions_port(command_line: &str, port: u16) -> bool {
     let port_text = port.to_string();
     let tokens: Vec<&str> = command_line.split_whitespace().collect();

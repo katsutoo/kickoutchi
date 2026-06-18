@@ -1,4 +1,4 @@
-//! Help modal rendering.
+//! Drawing the help modal.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

@@ -65,12 +65,12 @@ mod linux {
     fn spawn_related_process(port: u16) -> ChildGuard {
         let port_text = port.to_string();
         // A dependency-free stand-in for "a process that names this port on its
-        // command line but holds no socket", so the suite needs no Python (or any
-        // other interpreter) on PATH. The `sleep 30; :` body is a command list,
-        // not a single command, which keeps `sh` resident with its full argv: a
-        // bare `sleep 30` would let `sh` exec-optimize into `sleep` and drop the
-        // trailing `--port <port>` from /proc/<pid>/cmdline that the diagnostic
-        // matches on.
+        // command line but holds no socket" — so the suite needs no Python (or
+        // any other interpreter) on PATH. The `sleep 30; :` body is a command
+        // list, not a single command, which keeps `sh` hanging around with its
+        // full argv: a bare `sleep 30` would let `sh` exec-optimize itself into
+        // `sleep` and drop the trailing `--port <port>` from /proc/<pid>/cmdline
+        // that the diagnostic keys off.
         let child = Command::new("sh")
             .args(["-c", "sleep 30; :", "--port", port_text.as_str()])
             .spawn()

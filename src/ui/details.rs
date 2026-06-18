@@ -1,4 +1,4 @@
-//! Selected-row details panel and modal.
+//! The selected-row details: the panel down the side, and the bigger modal.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -34,9 +34,9 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
         |entry| modal_lines(entry, app.selected_process_context(), theme),
     );
     lines.push(Line::raw(""));
-    // The footer names only the contextual dismiss key. `q`-quits is a global
-    // behavior already shown in the header bar and the help modal, so repeating
-    // it here would only nudge people toward quitting when they just want to
+    // The footer only mentions the dismiss key for this modal. `q` quitting is a
+    // global thing already shown in the header and the help modal, so repeating
+    // it here would just tempt people into quitting when all they wanted was to
     // close the panel.
     lines.push(Line::from(vec![
         Span::styled("Esc", theme.key()),

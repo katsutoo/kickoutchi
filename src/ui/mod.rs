@@ -1,8 +1,8 @@
-//! Terminal lifecycle, the event loop, and rendering.
+//! Terminal lifecycle, the event loop, and drawing.
 //!
-//! The central guarantee of this module is that the terminal is entered and,
-//! above all, always restored: on clean quit, on a propagated error, and on
-//! panic.
+//! The one promise this module makes: we enter the terminal and — above all —
+//! always put it back. Clean quit, a propagated error, or a full-on panic, the
+//! terminal gets restored either way.
 
 mod confirm;
 mod details;
@@ -31,32 +31,32 @@ use crate::input;
 
 use self::theme::Theme;
 
-// Concrete terminal type used throughout the UI.
+// The concrete terminal type we use all over the UI.
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// RAII guard that owns the terminal's raw-mode and alternate-screen state.
 ///
-/// Acquisition (raw mode + alternate screen) happens in [`TerminalGuard::enter`];
-/// release happens in `Drop`. Pairing the two in one type makes a leak visible at
-/// the type level: while the guard is alive the terminal is in TUI mode, and the
-/// moment it drops the terminal is restored, whether that drop comes from a
-/// normal return, from `?` error unwinding, or from a panic unwinding. This is
-/// the safety-first reason the guard exists instead of scattered enable/disable
-/// calls that an early return could skip.
+/// Setup (raw mode + alternate screen) happens in [`TerminalGuard::enter`];
+/// teardown happens in `Drop`. Bundling the two into one type makes a leak
+/// impossible to miss at the type level: while the guard is alive the terminal is
+/// in TUI mode, and the instant it drops the terminal is back to normal — whether
+/// that drop came from a normal return, `?` unwinding an error, or a panic
+/// unwinding the stack. That's the whole reason this guard exists instead of
+/// loose enable/disable calls that an early return could quietly skip.
 struct TerminalGuard {
     terminal: Tui,
 }
 
 impl TerminalGuard {
-    /// Enter raw mode and the alternate screen, returning a guard that will
-    /// restore both on drop.
+    /// Enter raw mode and the alternate screen, handing back a guard that puts
+    /// both back on drop.
     ///
-    /// Failures *after* raw mode is enabled restore the terminal before
-    /// propagating. No guard exists yet at that point, so `Drop` cannot run,
-    /// and the panic hook only fires on panics — without this pairing, an
-    /// error from entering the alternate screen or constructing the terminal
-    /// (its initial size query does real I/O) would strand the shell in raw
-    /// mode, the exact failure this module exists to prevent.
+    /// Anything that fails *after* raw mode is on restores the terminal before
+    /// propagating. There's no guard yet at that point, so `Drop` can't run, and
+    /// the panic hook only fires on panics — so without this little dance, an
+    /// error from entering the alternate screen or building the terminal (its
+    /// first size query does real I/O) would leave the shell stuck in raw mode,
+    /// the exact thing this module exists to prevent.
     fn enter() -> AppResult<Self> {
         enable_raw_mode()?;
         match Self::enter_alternate_screen() {
@@ -68,8 +68,8 @@ impl TerminalGuard {
         }
     }
 
-    /// The fallible steps between raw mode and a live guard, split out so
-    /// every failure in them funnels through the single restore in `enter`.
+    /// The fallible steps between raw mode and a live guard, pulled out so every
+    /// failure in here funnels through that one restore back in `enter`.
     fn enter_alternate_screen() -> AppResult<Tui> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -84,21 +84,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Restore the terminal, logging rather than propagating on failure.
+/// Put the terminal back, logging instead of propagating if a step fails.
 ///
-/// Used from `Drop` and the panic hook, where errors cannot be returned, and
-/// from [`TerminalGuard::enter`]'s failure path, where a restore failure must
-/// not mask the original error. A terminal we cannot reset is already
-/// unrecoverable, so the best we can do is record why it may be left dirty
-/// without masking the failure in flight. Callers may overlap (the panic hook
-/// and `Drop` both run during one panic, and the `enter` path restores before
-/// the alternate screen was ever entered), so a redundant restore is expected
-/// and harmless.
+/// Called from `Drop` and the panic hook (where we can't return an error) and
+/// from [`TerminalGuard::enter`]'s failure path (where a restore failure must not
+/// clobber the original error). A terminal we can't reset is already a lost
+/// cause, so the best we can do is note why it might be left messy without hiding
+/// the failure that's already in flight. Callers can overlap — the panic hook and
+/// `Drop` both run during one panic, and the `enter` path restores before the
+/// alternate screen was ever entered — so a redundant restore is expected and
+/// totally harmless.
 ///
-/// Teardown mirrors [`TerminalGuard::enter`] in reverse order: leave the
-/// alternate screen, then disable raw mode. Each step is attempted and logged
-/// independently — a short-circuit here could strand the user on a blank
-/// alternate screen, the exact failure this module exists to prevent.
+/// Teardown undoes [`TerminalGuard::enter`] in reverse: leave the alternate
+/// screen, then disable raw mode. Each step is tried and logged on its own — bail
+/// out early here and you could strand the user on a blank alternate screen,
+/// which is the exact failure this module exists to prevent.
 fn best_effort_restore() {
     if let Err(error) = execute!(io::stdout(), LeaveAlternateScreen) {
         tracing::warn!(%error, "failed to leave alternate screen");
@@ -108,13 +108,13 @@ fn best_effort_restore() {
     }
 }
 
-/// Install a panic hook that restores the terminal before the panic is printed.
+/// Install a panic hook that restores the terminal before the panic prints.
 ///
-/// Must be called before entering the alternate screen. Without it, the default
-/// hook would print the panic message onto the alternate screen, which is then
-/// torn down by the guard's `Drop`, losing the message. Restoring first means the
-/// message lands on the normal screen where the user can read it. The original
-/// hook is preserved so backtraces and `RUST_BACKTRACE` still work.
+/// Has to run before we enter the alternate screen. Without it, the default hook
+/// would print the panic onto the alternate screen, which the guard's `Drop` then
+/// tears down — and poof, the message is gone. Restoring first means the panic
+/// lands on the normal screen where the user can actually read it. We keep the
+/// original hook so backtraces and `RUST_BACKTRACE` still work.
 pub(crate) fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -125,8 +125,8 @@ pub(crate) fn install_panic_hook() {
 
 /// Enter the TUI and run the event loop until the user quits.
 ///
-/// The terminal is restored in every exit path because the guard drops at the end
-/// of this function's scope, after the loop's result is computed.
+/// Every exit path restores the terminal because the guard drops at the end of
+/// this function's scope, after the loop's result has been computed.
 pub(crate) fn run(config: &Config) -> AppResult<()> {
     let mut guard = TerminalGuard::enter()?;
     let mut app = App::new(config);
@@ -134,9 +134,11 @@ pub(crate) fn run(config: &Config) -> AppResult<()> {
     event_loop(&mut guard.terminal, &mut app, config, theme)
 }
 
-// Draw, then wait for and handle one input event, repeating until a quit key.
+// Draw a frame, wait for one input event, handle it, then go round again until
+// a quit key shows up.
 fn event_loop(terminal: &mut Tui, app: &mut App, config: &Config, theme: Theme) -> AppResult<()> {
     loop {
+        app.poll_refresh();
         terminal.draw(|frame| draw(frame, app, theme))?;
 
         let wait = std::cmp::min(
@@ -199,9 +201,7 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
 fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
     let line = Line::from(vec![
         Span::styled("Kickoutchi", theme.title()),
-        Span::raw(
-            "   r refresh  / search  s sort  j/k move  Enter details  x kill  X force  ? help  q quit",
-        ),
+        Span::raw("   r refresh  / search  s sort  x kill  ? help  q quit"),
     ]);
     let header = Paragraph::new(line)
         .alignment(Alignment::Center)

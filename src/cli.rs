@@ -1,10 +1,9 @@
-//! Non-TUI command-line surface: argument shape, the stable exit-code
-//! contract, and the `list`/`kill` command implementations.
+//! The non-TUI command-line side: the argument shape, the stable exit-code
+//! contract, and the `list`/`kill` commands themselves.
 //!
-//! CLI commands never open the TUI; they print to stdout/stderr and exit.
-//! Data flows through the same collector and model as the TUI, so the two
-//! surfaces stay consistent and this output layer does not depend on which
-//! collector produced the rows.
+//! CLI commands never pop open the TUI — they print to stdout/stderr and exit.
+//! The data flows through the same collector and model as the TUI, so the two
+//! stay in sync and this layer doesn't care which collector produced the rows.
 
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
@@ -26,12 +25,12 @@ use crate::process::{
 use crate::protection::mark_protected;
 use crate::query::{self, QueryOptions};
 
-/// Stable exit codes: the script-facing contract from PROJECT.md.
+/// Stable exit codes — the script-facing contract from PROJECT.md.
 ///
-/// Defined in one place so scripts can rely on the numbers never drifting.
-/// Every variant is constructed by the CLI exit path so the dead-code lint
-/// should not be suppressed; keep the contract complete even though clap owns
-/// `InvalidArguments` (2) in practice.
+/// All in one place so scripts can count on the numbers never drifting. Every
+/// variant really is constructed somewhere on the CLI exit path, so don't reach
+/// for a dead-code allow here; keep the contract complete even though clap is the
+/// one that actually hands out `InvalidArguments` (2) in practice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitReason {
@@ -53,14 +52,14 @@ impl From<ExitReason> for ExitCode {
 /// Top-level argument shape. No subcommand opens the TUI; `list` and `kill`
 /// run headless and exit.
 ///
-/// `about` pulls the user-facing summary from the Cargo.toml `description`;
-/// `long_about = None` is required so clap does not render this doc comment
-/// as `--help` output — these lines are for developers, not users.
+/// `about` pulls the user-facing summary straight from the Cargo.toml
+/// `description`; `long_about = None` is there so clap *doesn't* dump this doc
+/// comment into `--help` — these lines are notes for developers, not users.
 ///
-/// The fixed `name` keeps `--version` reporting the canonical `kickoutchi`
-/// under both installed binary names, while clap takes the usage line from
-/// argv(0), so `kick --help` correctly shows `Usage: kick ...`. Both are the
-/// desired behavior for the short-alias binary;
+/// The fixed `name` keeps `--version` reporting the canonical `kickoutchi` under
+/// both binary names, while clap takes the usage line from argv(0), so
+/// `kick --help` correctly shows `Usage: kick ...`. Both are exactly what we want
+/// for the short-alias binary.
 #[derive(Debug, Parser)]
 #[command(name = "kickoutchi", version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -209,9 +208,9 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
         println!("{}", output::render_table(&visible_entries));
     }
 
-    // An empty *filtered* result exits 3 so scripts can probe occupancy
-    // (`kickoutchi list --port 3000 && echo busy`). An empty unfiltered list
-    // is just a quiet machine, which is a success.
+    // An empty *filtered* result exits 3, so scripts can probe occupancy
+    // (`kickoutchi list --port 3000 && echo busy`). An empty *unfiltered* list
+    // just means a quiet machine — that's a success, not a failure.
     if result.explicit_filter_active && visible_entries.is_empty() {
         return ExitReason::NoMatch;
     }
@@ -250,34 +249,43 @@ fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
         args,
         config,
         entries,
-        platform::collect_process_context,
-        collector::collect_ports,
+        KillCollectors {
+            collect_context: platform::collect_process_context,
+            collect_ports: collector::collect_ports,
+        },
         prompt_confirmation,
-        process::terminate_pid,
+        process::prepare_termination,
+        process::terminate_handle,
     )
 }
 
-fn run_kill_with<CollectContext, CollectPorts, Prompt, Terminate>(
+struct KillCollectors<CollectContext, CollectPorts> {
+    collect_context: CollectContext,
+    collect_ports: CollectPorts,
+}
+
+fn run_kill_with<CollectContext, CollectPorts, Prompt, Prepare, Terminate, Handle>(
     args: &KillArgs,
     config: &Config,
     entries: &[PortEntry],
-    mut collect_context: CollectContext,
-    mut collect_ports: CollectPorts,
+    mut collectors: KillCollectors<CollectContext, CollectPorts>,
     mut prompt: Prompt,
+    mut prepare: Prepare,
     mut terminate: Terminate,
 ) -> ExitReason
 where
     CollectContext: FnMut(u32) -> ProcessContext,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     Prompt: FnMut(&KillTarget, KillMode, ConfirmationRequirement) -> std::io::Result<bool>,
-    Terminate: FnMut(u32, KillMode) -> TerminationOutcome,
+    Prepare: FnMut(u32) -> Result<Handle, TerminationOutcome>,
+    Terminate: FnMut(&Handle, KillMode) -> TerminationOutcome,
 {
     let mode = if args.force {
         KillMode::Force
     } else {
         KillMode::Terminate
     };
-    let target = match resolve_kill_target(args, entries, &mut collect_context) {
+    let target = match resolve_kill_target(args, entries, &mut collectors.collect_context) {
         Ok(target) => target,
         Err(error) => return print_target_error(error),
     };
@@ -310,12 +318,20 @@ where
         }
     }
 
+    let handle = match prepare(target.pid) {
+        Ok(handle) => handle,
+        Err(outcome) => {
+            print_termination_outcome(&target, mode, &outcome);
+            return exit_reason_for_outcome(&outcome);
+        }
+    };
+
     let target = match revalidate_cli_target(
         args,
         config,
         &target,
-        &mut collect_context,
-        &mut collect_ports,
+        &mut collectors.collect_context,
+        &mut collectors.collect_ports,
     ) {
         Ok(target) => target,
         Err(outcome) => {
@@ -324,7 +340,7 @@ where
         }
     };
 
-    let outcome = terminate(target.pid, mode);
+    let outcome = terminate(&handle, mode);
     print_termination_outcome(&target, mode, &outcome);
     exit_reason_for_outcome(&outcome)
 }
@@ -344,6 +360,17 @@ where
         TerminationOutcome::UnknownFailure(format!("collecting ports before kill failed: {error}"))
     })?;
     mark_protected(&mut fresh_entries, &config.protected_processes);
+
+    // A confirmed port that's still listening but whose owner PID is now
+    // unreadable is ownership loss, not a moved target. Re-resolving a `--pid`
+    // kill by PID alone would miss this: the owner-less row just drops out and
+    // looks like the target vanished (exit 3). Check it up front so `--pid`
+    // reports the same permission-denied exit `4` as `--port` (whose resolver
+    // already flags it as `MissingPid`) and as the TUI. Sharing
+    // `confirmed_port_owner_unavailable` keeps all three from drifting.
+    if process::confirmed_port_owner_unavailable(confirmed, &fresh_entries) {
+        return Err(TerminationOutcome::OwnershipUnavailable);
+    }
 
     let fresh = match resolve_kill_target(args, &fresh_entries, collect_context) {
         Ok(fresh) => fresh,
@@ -572,9 +599,10 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             target.identity(),
         ),
         TerminationOutcome::PermissionDenied => eprintln!(
-            "error: permission denied sending {} to {}",
+            "error: permission denied sending {} to {}; {}",
             mode.signal_label(),
             target.identity(),
+            process::PERMISSION_DENIED_SANDBOX_HINT,
         ),
         TerminationOutcome::OwnershipUnavailable => eprintln!(
             "error: ownership for {} became unavailable before {}; no signal was sent",
@@ -631,7 +659,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        Cli, Command, ExitReason, KillArgs, KillTargetError,
+        Cli, Command, ExitReason, KillArgs, KillCollectors, KillTargetError,
         diagnostic_port_without_confirmed_socket, resolve_kill_target, run_kill_with,
         truncate_to_char_boundary,
     };
@@ -694,8 +722,8 @@ mod tests {
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
-        // These numbers are the script-facing API; a failure here means a
-        // breaking change, not a refactor.
+        // These numbers are the script-facing API: if this test breaks, you've
+        // made a breaking change, not done a refactor.
         assert_eq!(ExitReason::Success as u8, 0);
         assert_eq!(ExitReason::Failure as u8, 1);
         assert_eq!(ExitReason::InvalidArguments as u8, 2);
@@ -766,8 +794,8 @@ mod tests {
 
     #[test]
     fn out_of_range_refresh_interval_is_a_usage_error() {
-        // clap owns exit code 2; this pins that the bound is enforced at
-        // parse time rather than leaking into config validation.
+        // clap is the one that hands out exit code 2; this pins that the bound is
+        // caught at parse time instead of leaking into config validation.
         assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "0"]).is_err());
         assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "3601"]).is_err());
     }
@@ -831,10 +859,15 @@ mod tests {
             &kill_port(3000, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || panic!("missing PID target must fail before revalidation"),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || panic!("missing PID target must fail before revalidation"),
+            },
             |_target, _mode, _requirement| panic!("missing PID target must not prompt"),
-            |_pid, _mode| {
+            |_pid| -> Result<u32, TerminationOutcome> {
+                panic!("missing PID target must not prepare termination")
+            },
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -878,11 +911,14 @@ mod tests {
             &kill_pid(18_422, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(rows.clone()),
+            },
             |_target, _mode, _requirement| panic!("--yes must skip normal prompts"),
-            |pid, mode| {
-                terminated = Some((pid, mode));
+            Ok::<u32, TerminationOutcome>,
+            |pid: &u32, mode| {
+                terminated = Some((*pid, mode));
                 TerminationOutcome::Success
             },
         );
@@ -902,10 +938,15 @@ mod tests {
             &kill_port(5432, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(rows.clone()),
+            },
             |_target, _mode, _requirement| panic!("protected --yes must not prompt"),
-            |_pid, _mode| {
+            |_pid| -> Result<u32, TerminationOutcome> {
+                panic!("protected --yes must not prepare termination")
+            },
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -924,13 +965,16 @@ mod tests {
             &kill_pid(18_422, true, false),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(rows.clone()),
+            },
             |_target, mode, requirement| {
                 prompted = Some((mode, requirement));
                 Ok(true)
             },
-            |_pid, _mode| TerminationOutcome::Success,
+            Ok::<u32, TerminationOutcome>,
+            |_pid: &u32, _mode| TerminationOutcome::Success,
         );
 
         assert_eq!(reason, ExitReason::Success);
@@ -949,13 +993,18 @@ mod tests {
             &kill_pid(18_422, false, false),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(rows.clone()),
+            },
             |_target, _mode, requirement| {
                 assert_eq!(requirement, ConfirmationRequirement::Yes);
                 Ok(false)
             },
-            |_pid, _mode| {
+            |_pid| -> Result<u32, TerminationOutcome> {
+                panic!("declined confirmation must not prepare termination")
+            },
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -969,22 +1018,60 @@ mod tests {
     fn target_is_revalidated_after_confirmation_before_signal() {
         let rows = vec![entry(3000)];
         let fresh_rows = vec![entry_with_pid(4000, Some(18_422), Protocol::Tcp, "node")];
+        let mut prepared = None;
         let mut terminated = false;
 
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(fresh_rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(fresh_rows.clone()),
+            },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            |_pid, _mode| {
+            |pid| {
+                prepared = Some(pid);
+                Ok(pid)
+            },
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
         );
 
         assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(prepared, Some(18_422));
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn prepare_failure_stops_before_revalidation_or_signal() {
+        let rows = vec![entry(3000)];
+        let mut collected = false;
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || {
+                    collected = true;
+                    Ok(rows.clone())
+                },
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |_pid| -> Result<u32, TerminationOutcome> { Err(TerminationOutcome::AlreadyExited) },
+            |_pid: &u32, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert!(!collected);
         assert!(!terminated);
     }
 
@@ -998,10 +1085,43 @@ mod tests {
             &kill_port(3000, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(fresh_rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(fresh_rows.clone()),
+            },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            |_pid, _mode| {
+            Ok::<u32, TerminationOutcome>,
+            |_pid: &u32, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::PermissionDenied);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn kill_pid_losing_readable_owner_during_revalidation_exits_permission_denied() {
+        // A `--pid` kill whose confirmed port stays visible but whose owner PID
+        // becomes unreadable during revalidation must abort as
+        // ownership-unavailable (exit 4), matching `--port` and the TUI, instead
+        // of looking like a vanished target (exit 3). No signal is sent.
+        let rows = vec![entry(3000)];
+        let fresh_rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(fresh_rows.clone()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            Ok::<u32, TerminationOutcome>,
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -1023,10 +1143,13 @@ mod tests {
             &kill_pid(18_422, false, true),
             &Config::default(),
             &rows,
-            no_context,
-            || Ok(fresh_rows.clone()),
+            KillCollectors {
+                collect_context: no_context,
+                collect_ports: || Ok(fresh_rows.clone()),
+            },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            |_pid, _mode| {
+            Ok::<u32, TerminationOutcome>,
+            |_pid: &u32, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },

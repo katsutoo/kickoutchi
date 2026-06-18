@@ -1,4 +1,4 @@
-//! Termination confirmation modal.
+//! The "wait, are you sure you want to kill this?" modal.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

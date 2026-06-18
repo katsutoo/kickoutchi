@@ -1,8 +1,10 @@
-//! TUI application state and state transitions.
+//! The TUI's state, and every way it's allowed to change.
 //!
-//! The app owns the latest successful collected snapshot, the filtered table
-//! view, selection, search/sort state, modal state, and status metadata.
+//! `App` holds the latest good snapshot, the filtered table view, the selection,
+//! search/sort state, which modal is open, and the bits of status we show.
 
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::collector;
@@ -20,7 +22,15 @@ use crate::process::{
 use crate::protection::mark_protected;
 use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
 
-/// Modal currently covering the main table.
+type RefreshResult = Result<Vec<PortEntry>, collector::CollectorError>;
+
+#[derive(Debug)]
+struct RefreshWorker {
+    receiver: Receiver<RefreshResult>,
+    stale: bool,
+}
+
+/// Whichever modal is currently sitting over the main table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Modal {
     None,
@@ -69,12 +79,13 @@ impl KillConfirmation {
     }
 }
 
-/// Force-kill confirmation strength derived from `Config::confirm_force_kill`.
+/// How strict force-kill confirmation should be, taken from
+/// `Config::confirm_force_kill`.
 ///
-/// A named two-state type rather than a bare `bool` field on `App`: it keeps the
-/// struct's boolean count down (clippy `struct_excessive_bools`) and states the
-/// intent at the call site. It only selects *which* confirmation the force path
-/// uses, never whether the TUI confirms at all.
+/// A named two-state type instead of yet another `bool` on `App`: it keeps the
+/// struct's bool count down (clippy `struct_excessive_bools`) and spells out the
+/// intent at the call site. It only picks *which* confirmation the force path
+/// uses — never whether the TUI confirms at all. (It always does.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceKillConfirmation {
     TypedForce,
@@ -95,7 +106,7 @@ impl ForceKillConfirmation {
     }
 }
 
-/// Mutable TUI state.
+/// The mutable guts of the TUI.
 #[derive(Debug)]
 pub(crate) struct App {
     all_rows: Vec<PortEntry>,
@@ -111,6 +122,7 @@ pub(crate) struct App {
     selected_process_context: Option<ProcessContext>,
     kill_confirmation: Option<KillConfirmation>,
     kill_status: Option<String>,
+    refresh_worker: Option<RefreshWorker>,
     last_successful_refresh: Option<Instant>,
     last_refresh_attempt: Instant,
     modal: Modal,
@@ -120,10 +132,16 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// Build the TUI app from the platform collector.
+    /// Build the app with its first snapshot already populated.
+    ///
+    /// The initial collect runs on this thread, not the background worker: the
+    /// event loop parks in `event::poll` for a whole tick, and a worker finishing
+    /// does not wake it, so an async first load would leave the table blank for
+    /// ~one tick on every launch. Only this initial load blocks — manual `r` and
+    /// the auto-refresh tick still go through the off-thread [`App::refresh`].
     pub(crate) fn new(config: &Config) -> Self {
         let mut app = Self::empty(config, Instant::now());
-        app.refresh();
+        app.refresh_blocking();
         app
     }
 
@@ -157,6 +175,7 @@ impl App {
             selected_process_context: None,
             kill_confirmation: None,
             kill_status: None,
+            refresh_worker: None,
             last_successful_refresh: None,
             last_refresh_attempt: now,
             modal: Modal::None,
@@ -166,9 +185,56 @@ impl App {
         }
     }
 
+    /// Collect one snapshot on the calling thread. Used only for the initial
+    /// load in [`App::new`]; every refresh after that runs through the worker.
+    fn refresh_blocking(&mut self) {
+        self.finish_refresh_attempt(collector::collect_ports(), Instant::now());
+    }
+
     pub(crate) fn refresh(&mut self) {
-        let result = collector::collect_ports();
-        self.finish_refresh_attempt(result, Instant::now());
+        if self.refresh_worker.is_some() {
+            return;
+        }
+
+        // One refresh worker at a time. The Linux collector may walk every
+        // process fd directory to preserve shared-socket correctness; doing that
+        // off the render loop keeps key handling out of the swamp mud without
+        // letting scans pile up behind it.
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("kickoutchi-refresh".to_owned())
+            .spawn(move || {
+                let _ = sender.send(collector::collect_ports());
+            }) {
+            Ok(_handle) => {
+                self.refresh_worker = Some(RefreshWorker {
+                    receiver,
+                    stale: false,
+                });
+            }
+            Err(error) => {
+                self.last_refresh_attempt = Instant::now();
+                self.latest_error = Some(format!("starting refresh worker failed: {error}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_refresh(&mut self) {
+        let Some(worker) = self.refresh_worker.as_ref() else {
+            return;
+        };
+
+        let result = match worker.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(collector::CollectorError::WorkerExited),
+        };
+        let stale = worker.stale;
+
+        self.refresh_worker = None;
+        if !stale {
+            self.finish_refresh_attempt(result, Instant::now());
+        }
     }
 
     fn finish_refresh_attempt(
@@ -195,11 +261,17 @@ impl App {
         if self.modal == Modal::ConfirmKill {
             return false;
         }
+        if self.refresh_worker.is_some() {
+            return false;
+        }
         now.saturating_duration_since(self.last_refresh_attempt) >= refresh_interval
     }
 
     fn time_until_refresh_at(&self, now: Instant, refresh_interval: Duration) -> Duration {
         if self.modal == Modal::ConfirmKill {
+            return refresh_interval;
+        }
+        if self.refresh_worker.is_some() {
             return refresh_interval;
         }
         refresh_interval.saturating_sub(now.saturating_duration_since(self.last_refresh_attempt))
@@ -236,6 +308,13 @@ impl App {
 
     pub(crate) fn kill_status(&self) -> Option<&str> {
         self.kill_status.as_deref()
+    }
+
+    /// Whether a background refresh worker is still in flight. Test-only: the
+    /// status bar deliberately does not surface refresh progress to the user.
+    #[cfg(test)]
+    pub(crate) fn refresh_in_progress(&self) -> bool {
+        self.refresh_worker.is_some()
     }
 
     pub(crate) fn filter_text(&self) -> &str {
@@ -346,10 +425,11 @@ impl App {
             Some(&context),
         );
         // `yes` is always false here: the interactive TUI has no `--yes`, so the
-        // shared policy can only return `Some(_)` (a confirmation to satisfy).
-        // The `None` arm is the CLI's `--yes` "skip confirmation" result and is
-        // unreachable from the TUI; map it to a require-`y` prompt so a future
-        // policy change degrades to asking, never to skipping a kill.
+        // shared policy can only ever hand back `Some(_)` (a confirmation to
+        // satisfy). The `None` arm is the CLI's `--yes` "skip confirmation" path
+        // and can't happen from the TUI — but we still map it to a require-`y`
+        // prompt, so if that policy ever changes the worst case is "asks again",
+        // never "kills without asking".
         let requirement = match process::confirmation_requirement(
             target.protected,
             mode,
@@ -447,24 +527,47 @@ impl App {
         self.execute_kill_confirmation_with(
             collector::collect_ports,
             platform::collect_process_context,
-            process::terminate_pid,
+            process::prepare_termination,
+            process::terminate_handle,
         );
     }
 
-    fn execute_kill_confirmation_with<CollectPorts, CollectContext, Terminate>(
+    fn execute_kill_confirmation_with<CollectPorts, CollectContext, Prepare, Terminate, Handle>(
         &mut self,
         mut collect_ports: CollectPorts,
         mut collect_context: CollectContext,
+        mut prepare: Prepare,
         mut terminate: Terminate,
     ) where
         CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
         CollectContext: FnMut(u32) -> ProcessContext,
-        Terminate: FnMut(u32, KillMode) -> TerminationOutcome,
+        Prepare: FnMut(u32) -> Result<Handle, TerminationOutcome>,
+        Terminate: FnMut(&Handle, KillMode) -> TerminationOutcome,
     {
         let Some(confirmation) = self.kill_confirmation.take() else {
             return;
         };
         self.modal = Modal::None;
+
+        let handle = match prepare(confirmation.target.pid) {
+            Ok(handle) => handle,
+            Err(outcome) => {
+                self.kill_status = Some(termination_status_line(
+                    &confirmation.target,
+                    confirmation.mode,
+                    &outcome,
+                ));
+                // A target that exited before we could open its pidfd is gone for
+                // good, so re-collect to drop its freed row and make the "already
+                // exited; refreshed snapshot" status line actually true. The other
+                // prepare failures leave the process running and their messages
+                // never promise a refresh, so the table is already current.
+                if matches!(outcome, TerminationOutcome::AlreadyExited) {
+                    self.finish_refresh_attempt(collect_ports(), Instant::now());
+                }
+                return;
+            }
+        };
 
         let mut fresh_rows = match collect_ports() {
             Ok(rows) => rows,
@@ -495,7 +598,7 @@ impl App {
             }
         };
 
-        let outcome = terminate(target.pid, confirmation.mode);
+        let outcome = terminate(&handle, confirmation.mode);
         self.kill_status = Some(termination_status_line(
             &target,
             confirmation.mode,
@@ -505,6 +608,13 @@ impl App {
     }
 
     fn apply_successful_snapshot(&mut self, mut rows: Vec<PortEntry>, now: Instant) {
+        // Installing a snapshot here makes it the authoritative view. If an older
+        // worker is still running, keep its receiver installed so `refresh` cannot
+        // start another scan, but discard that stale result when it eventually
+        // lands. `poll_refresh` clears the worker before applying fresh results.
+        if let Some(worker) = self.refresh_worker.as_mut() {
+            worker.stale = true;
+        }
         mark_protected(&mut rows, &self.protected_processes);
         self.all_rows = rows;
         self.last_successful_refresh = Some(now);
@@ -602,9 +712,10 @@ fn termination_status_line(
             target.identity(),
         ),
         TerminationOutcome::PermissionDenied => format!(
-            "permission denied sending {} to {}",
+            "permission denied sending {} to {}; {}",
             mode.signal_label(),
             target.identity(),
+            process::PERMISSION_DENIED_SANDBOX_HINT,
         ),
         TerminationOutcome::OwnershipUnavailable => format!(
             "ownership for {} became unavailable before {}; no signal was sent",
@@ -657,9 +768,10 @@ fn preserved_selection(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::{App, Modal};
+    use super::{App, Modal, RefreshWorker};
     use crate::config::Config;
     use crate::input::Action;
     use crate::model::{
@@ -950,8 +1062,9 @@ mod tests {
                 }
             },
             |_| context(55),
+            Ok::<u32, TerminationOutcome>,
             |pid, mode| {
-                terminated = Some((pid, mode));
+                terminated = Some((*pid, mode));
                 TerminationOutcome::Success
             },
         );
@@ -977,6 +1090,7 @@ mod tests {
         app.execute_kill_confirmation_with(
             || Ok(fresh_rows.clone()),
             |_| context(99),
+            Ok::<u32, TerminationOutcome>,
             |_pid, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
@@ -989,6 +1103,94 @@ mod tests {
             app.kill_status()
                 .is_some_and(|status| status.contains("no longer owns")),
         );
+    }
+
+    #[test]
+    fn prepare_already_exited_refreshes_snapshot_so_freed_port_drops() {
+        // The target exits between confirmation and pidfd_open, so prepare reports
+        // AlreadyExited before any signal is attempted. The status line promises a
+        // refreshed snapshot, so the freed port must actually drop from the table.
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        app.apply_action(Action::RequestTerminate);
+        let fresh_after_exit: Vec<PortEntry> = Vec::new();
+        let mut collect_calls = 0;
+        let mut terminated = false;
+
+        app.execute_kill_confirmation_with(
+            || {
+                collect_calls += 1;
+                Ok(fresh_after_exit.clone())
+            },
+            |_| context(55),
+            |_pid| -> Result<u32, TerminationOutcome> { Err(TerminationOutcome::AlreadyExited) },
+            |_handle: &u32, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        // Prepare failed, so no signal was ever attempted...
+        assert!(!terminated);
+        // ...but the post-kill refresh still ran once and dropped the freed port,
+        // so the "already exited; refreshed snapshot" status stays truthful.
+        assert_eq!(collect_calls, 1);
+        assert_eq!(app.rows().len(), 0);
+        assert_eq!(app.modal(), Modal::None);
+        assert!(
+            app.kill_status()
+                .is_some_and(|status| status.contains("already exited")),
+        );
+    }
+
+    #[test]
+    fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear() {
+        // A background refresh spawned before the kill carries a pre-kill snapshot
+        // (port 3000 still listening). Once the kill's own synchronous refresh
+        // shows the port gone, that stale worker result must not be applied later
+        // and resurrect the freed port. Keeping the in-flight receiver installed
+        // also prevents a manual refresh from starting another worker before the
+        // stale one drains.
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+        let (stale_sender, stale_receiver) = mpsc::channel();
+        app.refresh_worker = Some(RefreshWorker {
+            receiver: stale_receiver,
+            stale: false,
+        });
+
+        app.apply_action(Action::RequestTerminate);
+        set_confirmation_start_time(&mut app, 55);
+        let fresh_before_signal = vec![entry(3000, Some("node"))];
+        let fresh_after_signal: Vec<PortEntry> = Vec::new();
+        let mut collect_calls = 0;
+
+        app.execute_kill_confirmation_with(
+            || {
+                collect_calls += 1;
+                if collect_calls == 1 {
+                    Ok(fresh_before_signal.clone())
+                } else {
+                    Ok(fresh_after_signal.clone())
+                }
+            },
+            |_| context(55),
+            Ok::<u32, TerminationOutcome>,
+            |_pid, _mode| TerminationOutcome::Success,
+        );
+
+        // The kill went through and the freed port is gone.
+        assert_eq!(app.rows().len(), 0);
+        // The pre-kill worker is still the only active worker; a manual refresh
+        // must not replace its receiver before it drains.
+        assert!(app.refresh_in_progress());
+        app.apply_action(Action::Refresh);
+        stale_sender
+            .send(Ok(vec![entry(3000, Some("node"))]))
+            .expect("stale worker receiver must stay installed");
+
+        app.poll_refresh();
+        assert!(!app.refresh_in_progress());
+        assert!(app.rows().iter().all(|row| row.local_port != 3000));
     }
 
     #[test]
@@ -1112,6 +1314,49 @@ mod tests {
             app.time_until_refresh_at(completed_at, Duration::from_secs(3)),
             Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn refresh_due_waits_for_in_flight_background_refresh() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        let (_sender, receiver) = mpsc::channel();
+        app.refresh_worker = Some(RefreshWorker {
+            receiver,
+            stale: false,
+        });
+
+        assert!(app.refresh_in_progress());
+        assert!(!app.refresh_due_at(
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(1),
+        ));
+        assert_eq!(
+            app.time_until_refresh_at(
+                Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(1),
+            ),
+            Duration::from_secs(1),
+        );
+    }
+
+    #[test]
+    fn polling_finished_background_refresh_applies_snapshot() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        let (sender, receiver) = mpsc::channel();
+        app.refresh_worker = Some(RefreshWorker {
+            receiver,
+            stale: false,
+        });
+        sender
+            .send(Ok(vec![entry(5173, Some("vite"))]))
+            .expect("test refresh result must send");
+
+        app.poll_refresh();
+
+        assert!(!app.refresh_in_progress());
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.rows()[0].local_port, 5173);
+        assert_eq!(app.latest_error(), None);
     }
 
     #[test]

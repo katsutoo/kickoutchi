@@ -1,15 +1,26 @@
-//! Process termination policy and platform signal delivery.
+//! The "are we really doing this?" brain, plus the actual signal delivery.
 //!
-//! This module owns the safety-critical boundary for termination: target snapshots,
-//! confirmation requirements, PID guardrails, and the small Unix FFI call that
-//! sends SIGTERM/SIGKILL. UI and CLI code decide *when* to ask the user; this
-//! module decides what is safe to execute.
+//! This is the safety-critical side of termination: target snapshots,
+//! confirmation rules, PID guardrails, and the tiny Linux pidfd FFI path that
+//! sends SIGTERM/SIGKILL. The UI and CLI decide *when* to ask the user; this
+//! module decides what's actually safe to run. When in doubt, it says no.
 
 use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, Protocol};
 
 pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
+
+/// Suffix appended to permission-denied termination messages.
+///
+/// `EPERM`/`EACCES` from the pidfd syscalls almost always means a genuine lack of
+/// permission to signal the target (same rule as `kill`), but a sandbox or
+/// seccomp policy that blocks `pidfd_open`/`pidfd_send_signal` produces the same
+/// errno. We can't tell the two apart at this layer, so the message names both.
+pub(crate) const PERMISSION_DENIED_SANDBOX_HINT: &str =
+    "a sandbox or seccomp policy blocking the pidfd syscalls can also cause this";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillMode {
@@ -70,6 +81,21 @@ pub(crate) enum TerminationOutcome {
     UnknownFailure(String),
 }
 
+#[derive(Debug)]
+pub(crate) struct TerminationHandle {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: OwnedFd,
+    #[cfg(not(target_os = "linux"))]
+    _unsupported: (),
+}
+
+impl TerminationHandle {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KillTarget {
     pub(crate) pid: u32,
@@ -114,11 +140,12 @@ impl KillTarget {
             ports.push(KillTargetPort::from(entry));
         }
         // A kill target with no rows would carry an empty port set, and the
-        // confirmation/revalidation flow leans on those ports to identify the
-        // process. Assert in release too (this runs once per kill request, not
-        // on a hot path): an empty call is a programmer error, and a degenerate
-        // target on a termination path is exactly what TigerStyle says to crash
-        // on rather than carry forward silently.
+        // confirmation/revalidation flow leans on those ports to know which
+        // process it's even looking at. We assert in release too (this runs once
+        // per kill request, not on a hot path): calling this with zero rows is a
+        // programmer bug, and a port-less target sitting on a termination path is
+        // exactly the kind of thing you want to crash on, not quietly wave
+        // through.
         assert!(saw_entry, "kill target must contain at least one row");
 
         ports.sort_by(|left, right| {
@@ -321,15 +348,29 @@ pub(crate) fn target_still_matches_confirmation(
         .all(|confirmed_port| fresh.ports.contains(confirmed_port))
 }
 
+/// True when a confirmed target port is still visible but its owning PID is no
+/// longer readable.
+///
+/// Both kill surfaces (CLI `--pid`/`--port` and the TUI) treat this as ownership
+/// loss and bail out without signalling, instead of calling it a moved target:
+/// the exact port the user confirmed is still listening, we just can't prove who
+/// owns it anymore, so firing a signal now could hit the wrong process. One
+/// shared check keeps those surfaces from drifting apart on this safety line.
+pub(crate) fn confirmed_port_owner_unavailable(
+    confirmed: &KillTarget,
+    fresh_entries: &[PortEntry],
+) -> bool {
+    fresh_entries
+        .iter()
+        .any(|entry| entry.pid.is_none() && confirmed.ports.contains(&KillTargetPort::from(entry)))
+}
+
 pub(crate) fn revalidate_confirmed_target(
     confirmed: &KillTarget,
     fresh_entries: &[PortEntry],
     fresh_context: Option<&ProcessContext>,
 ) -> Result<KillTarget, TerminationOutcome> {
-    if fresh_entries
-        .iter()
-        .any(|entry| entry.pid.is_none() && confirmed.ports.contains(&KillTargetPort::from(entry)))
-    {
+    if confirmed_port_owner_unavailable(confirmed, fresh_entries) {
         return Err(TerminationOutcome::OwnershipUnavailable);
     }
 
@@ -353,6 +394,10 @@ pub(crate) fn revalidate_confirmed_target(
 }
 
 pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
+    // Three PIDs we'll never signal, no matter how nicely you ask: 0 (a whole
+    // process group, not a single process), 1 (init — the load-bearing ogre;
+    // pull it out and the whole swamp comes down), and our own PID (Kickoutchi
+    // doesn't get to kick itself out of its own swamp).
     match pid {
         0 => Some(UnsafePidReason::Zero),
         1 => Some(UnsafePidReason::One),
@@ -361,51 +406,123 @@ pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
     }
 }
 
-pub(crate) fn terminate_pid(pid: u32, mode: KillMode) -> TerminationOutcome {
+pub(crate) fn prepare_termination(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
     if let Some(reason) = unsafe_pid_reason(pid) {
-        return TerminationOutcome::UnsafePid(reason);
+        return Err(TerminationOutcome::UnsafePid(reason));
     }
 
-    terminate_pid_platform(pid, mode)
+    prepare_termination_platform(pid)
+}
+
+pub(crate) fn terminate_handle(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
+    debug_assert!(
+        unsafe_pid_reason(handle.pid()).is_none(),
+        "prepared termination handles must never target unsafe PIDs"
+    );
+    terminate_handle_platform(handle, mode)
 }
 
 #[cfg(target_os = "linux")]
 fn current_user_id() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot invalidate memory; it
-    // only returns the effective UID for this process.
+    // SAFETY: geteuid takes no arguments, touches no memory, and can't fail —
+    // it just hands back this process's effective UID.
     unsafe { libc::geteuid() }
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_pid_platform(pid: u32, mode: KillMode) -> TerminationOutcome {
+fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return TerminationOutcome::UnknownFailure("PID does not fit platform pid_t".to_owned());
+        return Err(TerminationOutcome::UnknownFailure(
+            "PID does not fit platform pid_t".to_owned(),
+        ));
     };
+
+    // Open the pidfd before revalidation. That gives us a stable handle to the
+    // process we are about to re-check, so if the old swamp squatter exits and
+    // Linux recycles the numeric PID before signal delivery, the signal still
+    // goes through this handle instead of chasing the recycled number.
+    // SAFETY: pid has already been range-checked to pid_t, flags is zero as
+    // required by pidfd_open(2), and the syscall writes no Rust-managed memory.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(outcome_from_errno("pidfd_open", &error));
+    }
+
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        return Err(TerminationOutcome::UnknownFailure(
+            "pidfd_open returned a file descriptor that does not fit c_int".to_owned(),
+        ));
+    };
+
+    // SAFETY: pidfd_open returned this fd successfully, so we now own exactly one
+    // descriptor and hand that ownership to OwnedFd for close-on-drop.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    Ok(TerminationHandle {
+        pid: u32::try_from(pid).expect("pid_t came from u32 and must fit back into u32"),
+        pidfd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
     let signal = match mode {
         KillMode::Terminate => libc::SIGTERM,
         KillMode::Force => libc::SIGKILL,
     };
 
-    // SAFETY: pid has been range-checked for pid_t, signal is one of the two
-    // constants supported by this module, and kill only crosses the OS boundary.
-    let result = unsafe { libc::kill(pid, signal) };
+    // SAFETY: pidfd is an open descriptor from pidfd_open, signal is one of the
+    // two constants this module supports, siginfo is null by pidfd_send_signal(2)
+    // convention, and flags is zero. No Rust-managed memory is written.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
     if result == 0 {
         return TerminationOutcome::Success;
     }
 
     let error = std::io::Error::last_os_error();
+    outcome_from_errno("pidfd_send_signal", &error)
+}
+
+#[cfg(target_os = "linux")]
+fn outcome_from_errno(operation: &str, error: &std::io::Error) -> TerminationOutcome {
     match error.raw_os_error() {
         Some(code) if code == libc::ESRCH => TerminationOutcome::AlreadyExited,
-        Some(code) if code == libc::EPERM => TerminationOutcome::PermissionDenied,
+        // EACCES isn't documented for pidfd_open/pidfd_send_signal (they report
+        // EPERM), but map any permission-shaped errno to denial defensively.
+        Some(code) if code == libc::EPERM || code == libc::EACCES => {
+            TerminationOutcome::PermissionDenied
+        }
+        // pidfd_open landed in Linux 5.3 and pidfd_send_signal in 5.1, so an
+        // older kernel reports ENOSYS for the missing syscall. Name the floor so
+        // the message is actionable rather than just "unsupported".
+        Some(code) if code == libc::ENOSYS => TerminationOutcome::UnknownFailure(format!(
+            "process termination requires Linux 5.3+ (pidfd); {operation} is unavailable on this kernel and no signal was sent",
+        )),
         _ if error.kind() == std::io::ErrorKind::PermissionDenied => {
             TerminationOutcome::PermissionDenied
         }
-        _ => TerminationOutcome::UnknownFailure(error.to_string()),
+        _ => TerminationOutcome::UnknownFailure(format!("{operation} failed: {error}")),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn terminate_pid_platform(_pid: u32, _mode: KillMode) -> TerminationOutcome {
+fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
+    Ok(TerminationHandle {
+        pid,
+        _unsupported: (),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_handle_platform(_handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
     TerminationOutcome::UnknownFailure(
         "termination is only implemented for the Linux collector".to_owned(),
     )
@@ -659,8 +776,8 @@ mod tests {
         let confirmed_row = entry(3000, Protocol::Tcp);
         let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
 
-        // The confirmed port is still listening, but its owner can no longer be
-        // mapped to a PID: that is permission/ownership loss, not a moved target.
+        // The confirmed port is still listening, but we can't map its owner to a
+        // PID anymore: that's permission/ownership loss, not the target moving.
         let mut unreadable = entry(3000, Protocol::Tcp);
         unreadable.pid = None;
         unreadable.permission = PermissionStatus::Partial;

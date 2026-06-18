@@ -1,8 +1,9 @@
-//! Protected-process matching policy.
+//! Deciding which processes get an "are you *sure*?" before we kick them out.
 //!
-//! This module owns safety classification for names that require stronger
-//! confirmation before termination. The collector only reports process facts;
-//! protection is a user/config policy layered on top.
+//! The collector just reports the facts; protection is a policy we layer on top
+//! from the user's config. Some swamp residents — init, your database, Docker —
+//! are load-bearing, and you really don't want them wandering off because of a
+//! stray keypress.
 
 use crate::model::{Platform, PortEntry};
 
@@ -21,7 +22,7 @@ pub(crate) fn default_protected_processes() -> Vec<String> {
         .collect()
 }
 
-/// Flag entries whose process name is on the protected list.
+/// Tag any entry whose process name is on the protected list.
 pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[String]) {
     for entry in entries.iter_mut() {
         let Some(name) = &entry.process_name else {
@@ -35,10 +36,10 @@ pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[Strin
 
 /// Platform-aware protected-name match.
 ///
-/// Unix process names are exact and case-sensitive. Windows process names are
-/// matched case-insensitively because that is the platform convention. Matching
-/// is never substring-based: `postgres-backup-helper` must not inherit
-/// `postgres` protection by accident.
+/// Unix names are exact and case-sensitive. Windows names match
+/// case-insensitively, because that's the platform convention. We never match on
+/// substrings: `postgres-backup-helper` doesn't get to ride on `postgres`'s
+/// protection by accident.
 pub(crate) fn is_protected_process_name(
     platform: Platform,
     process_name: &str,

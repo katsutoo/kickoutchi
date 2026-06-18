@@ -1,10 +1,10 @@
-//! Shared domain model: the types the CLI, TUI, collectors, filters, and the
-//! future kill flow all exchange.
+//! The shared vocabulary: the types the CLI, TUI, collectors, filters, and the
+//! kill flow all pass around.
 //!
-//! Every collector returns the same [`PortEntry`] shape so platform weirdness
-//! stays inside `platform/` and the rest of the app reasons about one model.
-//! The serde derives define the stable JSON contract for `list --json`:
-//! renaming a field or enum variant here is a breaking change for scripts.
+//! Every collector hands back the same [`PortEntry`] shape, so platform weirdness
+//! stays bottled up in `platform/` and the rest of the app only ever thinks about
+//! one model. The serde derives are the stable JSON contract for `list --json`,
+//! so renaming a field or an enum variant here quietly breaks people's scripts.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -29,11 +29,11 @@ impl Protocol {
     }
 }
 
-/// Socket state Kickoutchi considers "open".
+/// What "open" actually means to Kickoutchi.
 ///
-/// Only two states exist by design: a TCP socket counts when it is listening,
-/// and a UDP socket counts when it is bound (UDP has no listen state).
-/// Established-connection visibility is a possible later filter, not part of
+/// Just two states, on purpose: a TCP socket counts when it's listening, and a
+/// UDP socket counts when it's bound (UDP has no listen state to speak of).
+/// Showing established connections could be a later filter, but it's not part of
 /// the core model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,11 +52,10 @@ impl SocketState {
     }
 }
 
-/// OS a row was collected on. Carried per-row so kill-command rendering can
-/// show platform-correct commands without re-detecting the OS. All three
-/// variants are declared now because they are part of the JSON contract;
-/// `Windows`/`Macos` stay unconstructed until the optional native collectors
-/// for those platforms are built.
+/// Which OS a row came from. Carried per-row so kill-command rendering can show
+/// the right command without re-sniffing the OS. All three variants exist now
+/// because they're part of the JSON contract; `Windows`/`Macos` just sit unused
+/// until their native collectors actually get built.
 #[allow(
     dead_code,
     reason = "windows/macos are contract variants until their collectors land"
@@ -69,24 +68,24 @@ pub(crate) enum Platform {
     Macos,
 }
 
-/// How much process metadata the collector could read for a row.
+/// How much of the process metadata the collector actually got to read.
 ///
-/// Ports must still appear when metadata is restricted, so this status exists
-/// to let the UI and CLI *explain* missing fields instead of hiding the row.
+/// Ports still show up even when metadata is locked down, so this status lets the
+/// UI and CLI *explain* the blanks instead of just dropping the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PermissionStatus {
-    /// All process metadata was readable.
+    /// We could read everything.
     Full,
-    /// The socket is visible but some process metadata was not readable,
-    /// typically because the process belongs to another user.
+    /// The socket's visible, but some process metadata wasn't readable — usually
+    /// because the process belongs to another user.
     Partial,
 }
 
-/// Human-facing bind scope for local socket addresses.
+/// Human-facing bind scope for a local socket address.
 ///
-/// Ordering is safety-oriented for `sort: scope`: public binds sort before
-/// local interface binds, and loopback-only binds last.
+/// The ordering is safety-first for `sort: scope`: public binds come first, then
+/// local-interface binds, with loopback-only binds last (the least scary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BindScope {
     Public,
@@ -104,11 +103,11 @@ impl BindScope {
     }
 }
 
-/// One open port and everything known about its owning process.
+/// One open port and everything we know about the process behind it.
 ///
-/// `Option` fields are `None` when the OS withheld the data; `permission`
-/// records that this happened so consumers can tell "no value" apart from
-/// "not allowed to know".
+/// `Option` fields are `None` when the OS wouldn't tell us; `permission` records
+/// that it happened, so consumers can tell "there's no value" apart from "we
+/// weren't allowed to look".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PortEntry {
     pub(crate) protocol: Protocol,
@@ -121,45 +120,46 @@ pub(crate) struct PortEntry {
     pub(crate) command_line: Option<String>,
     pub(crate) parent_pid: Option<u32>,
     pub(crate) parent_process_name: Option<String>,
-    /// Resolved lazily for the selected row only; empty does not mean "no
-    /// children", it can mean "not asked yet" (see PROJECT.md collection note).
+    /// Filled in lazily, and only for the selected row. Empty doesn't mean "no
+    /// children" — it can just mean "haven't asked yet" (see the PROJECT.md
+    /// collection note).
     pub(crate) child_pids: Vec<u32>,
     pub(crate) protected: bool,
     pub(crate) platform: Platform,
     pub(crate) permission: PermissionStatus,
 }
 
-/// Extra context collected lazily for the selected process.
+/// Extra context we gather lazily for the selected process.
 ///
-/// Keeping this outside [`PortEntry`] preserves the rule that table rows and
-/// JSON output are OS-confirmed socket rows only; process-tree enrichment is a
-/// selected-row detail, not part of the main snapshot.
+/// This lives outside [`PortEntry`] on purpose: it keeps the rule that table rows
+/// and JSON output are OS-confirmed sockets and nothing else. Process-tree stuff
+/// is a selected-row detail, not part of the main snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ProcessContext {
     pub(crate) owner_uid: Option<u32>,
-    /// Raw Linux `/proc/<pid>/stat` start-time tick, used only as a kill-target
-    /// identity guard. It is intentionally not rendered or serialized: turning
-    /// ticks into a useful timestamp needs platform clock context, while the raw
-    /// value is still enough to detect PID reuse before sending a signal.
+    /// Raw start-time tick from Linux `/proc/<pid>/stat`, used purely as a
+    /// kill-target identity guard. We never render or serialize it: turning ticks
+    /// into a real timestamp needs clock context we don't bother with, but the raw
+    /// number is plenty to catch PID reuse before we fire off a signal.
     pub(crate) process_start_time_ticks: Option<u64>,
     pub(crate) children: ChildProcessSnapshot,
 }
 
-/// Bounded child-process list for one selected PID.
+/// A capped list of children for one selected PID.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ChildProcessSnapshot {
     pub(crate) children: Vec<ChildProcess>,
     pub(crate) truncated: bool,
 }
 
-/// One child process directly parented by the selected PID.
+/// A single direct child of the selected PID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChildProcess {
     pub(crate) pid: u32,
     pub(crate) process_name: Option<String>,
 }
 
-/// Evidence-only hint for the no-confirmed-socket diagnostic.
+/// An evidence-only hint for the "no socket confirmed" diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelatedProcessHint {
     pub(crate) pid: u32,
@@ -173,9 +173,9 @@ impl PortEntry {
         self.local_port == port
     }
 
-    /// Substring match on a pre-normalized process-name needle. Rows with no
-    /// readable name never match: claiming a match on hidden data would be a
-    /// guess.
+    /// Substring match against an already-lowercased needle. Rows with no
+    /// readable name never match — claiming a hit on data we can't see would
+    /// just be a guess.
     pub(crate) fn matches_process_normalized(&self, needle_lower: &str) -> bool {
         let Some(name) = &self.process_name else {
             return false;
@@ -186,6 +186,9 @@ impl PortEntry {
     /// Human-facing bind scope for table/details output.
     pub(crate) fn scope(&self) -> BindScope {
         let addr = match self.local_addr {
+            // Normalize IPv4-mapped IPv6 (::ffff:127.0.0.1) down to real V4 so the
+            // loopback/unspecified checks below see the actual address family. The
+            // V4 arm is just the passthrough that keeps the match exhaustive.
             IpAddr::V4(addr) => IpAddr::V4(addr),
             IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
         };
@@ -204,14 +207,14 @@ impl PortEntry {
         self.scope().label()
     }
 
-    /// Best-effort system/service process classification for optional hiding.
+    /// Best-effort "is this a system/service process?" check, used for optional
+    /// hiding.
     ///
-    /// This is intentionally conservative: PID 0/1, direct children of PID 1,
-    /// and a short list of well-known OS process names. Per-row owner UID is not
-    /// collected (it is resolved lazily only for the selected row), so this
-    /// table-wide classification cannot key on it. Protected app names such as
-    /// `postgres` are not treated as system processes just because they are
-    /// protected.
+    /// Deliberately cautious: PID 0/1, direct children of PID 1, and a short list
+    /// of well-known OS names. We don't collect per-row owner UID (that's resolved
+    /// lazily for the selected row only), so this table-wide check can't lean on
+    /// it. And a protected app like `postgres` doesn't count as a system process
+    /// just because it's protected — those are two different ideas.
     pub(crate) fn is_system_process(&self) -> bool {
         if self.pid.is_some_and(|pid| pid <= 1) || self.parent_pid == Some(1) {
             return true;
@@ -226,8 +229,8 @@ impl PortEntry {
     }
 }
 
-/// Table sort orders shared by the CLI and the TUI.
-/// Deserialized from the config file (`default_sort = "port"`).
+/// The table sort orders, shared by the CLI and the TUI.
+/// Read straight from the config file (`default_sort = "port"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SortMode {
@@ -279,9 +282,9 @@ impl SortMode {
 /// Sort entries in place by the given mode.
 ///
 /// Every mode falls back to (port, protocol) so the order is total and stable
-/// across refreshes: equal keys must not reshuffle, or the future TUI table
-/// would jitter. Rows missing the sort key (`None` PID or name) sort last so
-/// the most informative rows surface first.
+/// across refreshes — equal keys must never reshuffle, or the table would
+/// visibly jitter on each tick. Rows missing the sort key (`None` PID or name)
+/// sink to the bottom, so the rows you can actually act on float to the top.
 pub(crate) fn sort_entries(entries: &mut [PortEntry], mode: SortMode) {
     entries.sort_by(|a, b| {
         let key = match mode {
@@ -332,7 +335,8 @@ mod tests {
         sort_entries,
     };
 
-    /// Minimal entry builder so each test states only the fields it cares about.
+    /// A tiny entry builder so each test only spells out the fields it cares
+    /// about.
     fn entry(port: u16, pid: Option<u32>, name: Option<&str>) -> PortEntry {
         PortEntry {
             protocol: Protocol::Tcp,
@@ -365,7 +369,8 @@ mod tests {
         assert!(row.matches_process_normalized("node"));
         assert!(row.matches_process_normalized("od"));
         assert!(!row.matches_process_normalized("vite"));
-        // A hidden name must never match: that would claim knowledge we lack.
+        // A hidden name must never match — that'd be claiming we know something
+        // we don't.
         assert!(!entry(53, None, None).matches_process_normalized("node"));
     }
 
@@ -437,8 +442,8 @@ mod tests {
 
     #[test]
     fn equal_sort_keys_fall_back_to_port_order() {
-        // Same protocol everywhere, so the protocol sort must still produce a
-        // deterministic order via the (port, protocol) tie-breaker.
+        // Same protocol on every row, so the protocol sort has to fall back to
+        // the (port, protocol) tie-breaker to stay deterministic.
         let mut rows = vec![
             entry(5173, Some(2), Some("vite")),
             entry(80, Some(1), Some("nginx")),
@@ -505,7 +510,8 @@ mod tests {
     #[test]
     fn json_shape_is_stable() {
         // This pins the script-facing JSON contract: field names, enum casing,
-        // and null handling. Changing any assertion here is a breaking change.
+        // null handling. Touch any assertion here and you've broken someone's
+        // script.
         let mut row = entry(3000, Some(18422), Some("node"));
         row.executable_path = Some(PathBuf::from("/usr/bin/node"));
         row.command_line = Some("node server.js".to_owned());

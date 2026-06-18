@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Linux termination now opens a pidfd before the mandatory pre-signal
+  revalidation and sends `SIGTERM`/`SIGKILL` through `pidfd_send_signal` instead
+  of raw `kill(pid, signal)`. This keeps the signal tied to the prepared process
+  handle after the PID/start-time/port checks pass. It raises the floor for
+  termination to Linux 5.3+ (`pidfd_open`); older kernels fail closed with an
+  actionable error that names the requirement, without sending a signal.
+- TUI refresh now uses a single in-flight background worker instead of running
+  the full Linux `/proc/<pid>/fd` owner scan on the render/input loop. The last
+  good snapshot remains visible while refresh is running. The first snapshot is
+  still collected synchronously so the TUI opens onto real rows instead of a
+  blank table, and any in-flight background refresh is abandoned when a
+  synchronous snapshot (such as the post-kill refresh) is applied, so a stale
+  scan cannot overwrite newer rows.
 - Safe termination now carries an internal Linux process-start identity from
   `/proc/<pid>/stat` through confirmation and pre-signal revalidation. The raw
   tick value is not rendered or serialized, but it lets Kickoutchi refuse a kill
@@ -52,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- TUI termination now re-collects the port snapshot when a target exits between
+  confirmation and `pidfd_open`. The `already exited; refreshed snapshot` status
+  line promised a refresh, but the prepare-error path returned without
+  re-collecting, leaving the freed port on the table for up to one refresh
+  interval. Other prepare failures (permission denied, an old kernel) leave the
+  process running, so their messages never claimed a refresh and stay correct.
 - Termination confirmations now warn when a target is classified as a
   system/service process, not only when it is on the protected-process list.
 - Pre-signal revalidation now reports ownership unavailable if any confirmed
@@ -68,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the documented permission-denied code `4` instead of the no-match code `3`,
   including when ownership becomes unavailable during the mandatory pre-signal
   revalidation.
+- `kill --pid` now matches `kill --port` and the TUI when a confirmed target port
+  stays visible but its owning PID becomes unreadable during pre-signal
+  revalidation: it exits with the permission-denied code `4` instead of the
+  no-match code `3`, and still sends no signal. A shared ownership-unavailable
+  check now backs all three paths so they cannot drift.
 - TUI pre-signal revalidation now reports an owner whose PID became unreadable as
   ownership-unavailable, matching the CLI, instead of labelling it a changed
   target; both still refuse to send a signal.
@@ -113,7 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal without sending a signal.
 - GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
   Rust toolchain to check formatting, strict Clippy, and the full test suite.
-  Release/CD automation remains deferred to the Phase 11 `cargo-dist` workflow.
+  Release/CD automation remains deferred to the Phase 10 `cargo-dist` workflow.
 - CLI contract integration tests now exercise script-facing `list` behavior with
   the real binary: human no-match diagnostics go to stderr, `list --json` stays
   unpolluted, and explicit no-match filters exit `3`. The helper process uses

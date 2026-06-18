@@ -313,7 +313,7 @@ Behavior:
 - `--yes` should never bypass protected-process extra warnings unless a separate explicit flag is added later
 - Exit codes should be stable for scripts
 
-Short binary name: the crate builds the same program under two names, `kickoutchi` (canonical, used in all docs and on the website) and `kick` (short form for daily CLI use: `kick list`, `kick kill --port 3000`). Both behave identically, including opening the TUI when run bare; the help usage line follows the invoked name (`Usage: kick ...`) while `--version` reports the canonical `kickoutchi`. The project cannot be renamed (the `kickoutchi.com` domain is the brand), so the short form ships as a second binary instead. `kick` was verified free in the Arch official repos, the AUR, and as a crates.io binary before adoption; `ko` was rejected because the Go container tool `ko` owns it in Arch extra. Phase 11 packaging must ship both names (as a copy or a symlink, whichever the package format prefers) and re-verify the name is still free in each target repository before first publication.
+Short binary name: the crate builds the same program under two names, `kickoutchi` (canonical, used in all docs and on the website) and `kick` (short form for daily CLI use: `kick list`, `kick kill --port 3000`). Both behave identically, including opening the TUI when run bare; the help usage line follows the invoked name (`Usage: kick ...`) while `--version` reports the canonical `kickoutchi`. The project cannot be renamed (the `kickoutchi.com` domain is the brand), so the short form ships as a second binary instead. `kick` was verified free in the Arch official repos, the AUR, and as a crates.io binary before adoption; `ko` was rejected because the Go container tool `ko` owns it in Arch extra. Phase 10 packaging must ship both names (as a copy or a symlink, whichever the package format prefers) and re-verify the name is still free in each target repository before first publication.
 
 Suggested exit codes:
 
@@ -554,7 +554,6 @@ Current version snapshot checked on 2026-05-04 with crates.io metadata and local
 | Config format    |                            `toml` |              `1.1.2` | Human-editable user config                                         |
 | Windows APIs     |                    `windows-sys` |             `0.61.2` | Direct access to IP Helper and process APIs                        |
 | Unix FFI         |                           `libc` |            `0.2.177` | Latest non-alpha Unix/macOS FFI bindings                           |
-| Clipboard        |                        `arboard` |              `3.6.1` | Optional copy command support                                      |
 | Config paths     |                            `dirs` |              `6.0.0` | Cross-platform config/cache directory resolution (`XDG_CONFIG_HOME`, `%APPDATA%`, `~/Library/...`) |
 | Errors           |                        `thiserror` |             `2.0.18` | Typed errors at module boundaries; no app-level `anyhow` yet       |
 | Logging          | `tracing` + `tracing-subscriber` |  `0.1.44` + `0.3.23` | Debug collector failures without polluting the UI                  |
@@ -576,7 +575,6 @@ cargo add sysinfo@0.38.4
 cargo add clap@4.6.1 --features derive
 cargo add serde@1.0.228 --features derive
 cargo add serde_json@1.0.149 toml@1.1.2
-cargo add arboard@3.6.1 --optional
 cargo add dirs@6.0.0
 cargo add thiserror@2.0.18
 cargo add tracing@0.1.44 tracing-subscriber@0.3.23
@@ -656,8 +654,8 @@ kickoutchi/
 
 - Main thread owns the terminal UI
 - Collector runs on refresh tick or manual refresh
-- Collection should not block rendering longer than necessary
-- Slow platform collection can run through `spawn_blocking` if async is introduced later
+- TUI collection runs in a single in-flight background worker so the Linux `/proc/<pid>/fd` owner scan does not block rendering or input
+- If a refresh is already running, another automatic or manual refresh does not start a second scan; the last successful snapshot stays visible until the worker returns
 - UI stores the last successful snapshot and the latest collector error
 - Kill action targets a PID from the latest snapshot
 - After kill attempt, refresh immediately
@@ -711,7 +709,6 @@ Keybinds:
 | `Enter` | Open details modal |
 | `x` | Terminate selected process normally |
 | `X` | Force-kill selected process |
-| `c` | Copy/show kill command |
 | `s` | Change sort |
 | `p` | Toggle process-tree details |
 | `?` | Help |
@@ -747,7 +744,7 @@ Milestones:
 | Local prototype | Phase 2 | The app opens, renders fake data, and proves the TUI shape |
 | Linux MVP | Phase 6 | Linux can show real ports, filter them, and safely terminate stale processes |
 | Cross-platform app (optional) | Phase 8 | Linux, Windows, and macOS collectors all work; Windows and macOS are deferred until there is motivation to build them |
-| Public release | Phase 11 | Users can install Linux binaries and packages; Windows/macOS artifacts ship only if Phases 7 and 8 are built |
+| Public release | Phase 10 | Users can install Linux binaries and packages; Windows/macOS artifacts ship only if Phases 7 and 8 are built |
 
 Recommended order:
 
@@ -761,12 +758,11 @@ setup
 -> safe termination
 -> Windows collector
 -> macOS collector
--> copy/show command helpers
 -> optional Docker awareness
 -> packaging and release
 ```
 
-Phase 10 is intentionally optional for the first public release. Docker awareness is useful, but the core product is complete when native port collection and safe termination work reliably on all target platforms.
+Phase 9 is intentionally optional for the first public release. Docker awareness is useful, but the core product is complete when native port collection and safe termination work reliably on all target platforms.
 
 ---
 
@@ -974,6 +970,8 @@ pedantic = "warn"
 12. Add config-driven defaults for sort mode, refresh interval, and hidden system processes.
 13. Add tests for filter parsing, filter matching, sort ordering, and selection preservation.
 
+**Refresh hardening note:** After Phase 6, the TUI refresh path was moved to a single in-flight background worker. This preserves the correctness-first Linux `/proc/<pid>/fd` owner scan, including shared socket owner detection, without making table navigation and key handling wait for the scan on large hosts. The first snapshot is collected synchronously so the TUI opens onto real rows instead of a blank table, refresh requests do not pile up, and an in-flight refresh is abandoned when an authoritative snapshot (such as the post-kill refresh) is applied so a stale scan cannot overwrite newer rows. Refresh progress is intentionally not surfaced in the status bar.
+
 **Parent-context note:** Steps 8–9 add `parent:` filtering and parent sorting, which are only meaningful if rows actually carry parent data. To avoid shipping a filter and a sort that silently match nothing, the Linux collector's parent-PID and parent-name collection (originally Phase 5 steps 1–2) was implemented as part of this phase: `parent_pid` is read from `/proc/<pid>/status` and the parent name from `/proc/<ppid>/comm`, and the details-panel parent line is fed by the same data. Child-PID collection stays in Phase 5.
 
 ### Done when
@@ -1052,8 +1050,8 @@ pedantic = "warn"
 1. **Done in Phase 6:** create `process.rs` for process termination operations.
 2. **Done in Phase 6:** add a typed result for termination outcomes: success, permission denied, already exited, cancelled, protected process, stale confirmed target, unsafe PID, and unknown failure.
 3. **Done in Phase 6:** add guardrails that block PID `0`, PID `1`, and Kickoutchi's own PID.
-4. **Done in Phase 6:** add normal terminate per platform, starting with Unix `SIGTERM` on Linux. Real signal delivery is gated to Linux until native non-Linux collectors exist, so fake non-Linux rows can never terminate arbitrary local PIDs.
-5. **Done in Phase 6:** add force kill per platform, starting with Unix `SIGKILL` on Linux.
+4. **Done in Phase 6 and hardened after Phase 6:** add normal terminate per platform, starting with Unix `SIGTERM` on Linux. Linux opens a pidfd before pre-signal revalidation and sends through `pidfd_send_signal`, so the final signal is tied to the prepared process handle rather than a recycled raw PID. Real signal delivery is gated to Linux until native non-Linux collectors exist, so fake non-Linux rows can never terminate arbitrary local PIDs.
+5. **Done in Phase 6 and hardened after Phase 6:** add force kill per platform, starting with Unix `SIGKILL` on Linux, using the same pidfd-backed delivery path.
 6. **Done in Phase 6:** add `command.rs` to render the equivalent command shown to users.
 7. **Done in Phase 6:** in the TUI, map `x` to normal termination confirmation.
 8. **Done in Phase 6:** in the TUI, map `X` to force-kill confirmation.
@@ -1062,12 +1060,12 @@ pedantic = "warn"
 11. **Done in Phase 6:** make protected processes require stronger confirmation by typing the PID or process name.
 12. **Done in Phase 6:** warn when the selected PID has child processes.
 13. **Done in Phase 6:** prefer normal termination before recommending force kill in UI copy.
-14. **Done in Phase 6:** refresh immediately after every kill attempt. Before sending a signal, re-collect and verify that the confirmed PID still owns the confirmed port rows; if the target changed, abort and refresh instead of risking PID reuse, and if a visible port's owning PID becomes unavailable during revalidation, abort with the documented permission-denied exit path instead of sending a signal.
+14. **Done in Phase 6 and hardened after Phase 6:** refresh immediately after every kill attempt. Before sending a signal, open the Linux pidfd, re-collect, and verify that the confirmed PID still owns the confirmed port rows; if the target changed, abort and refresh instead of risking PID reuse, and if a visible port's owning PID becomes unavailable during revalidation, abort with the documented permission-denied exit path instead of sending a signal. The pidfd is opened before revalidation so a post-validation PID recycle cannot redirect the signal to a different process.
 15. **Done in Phase 6:** show clear success, cancelled, permission denied, already exited, and failure messages.
 16. **Done in Phase 6:** wire `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` to the same safety rules.
 17. **Done in Phase 6:** resolve ambiguous kill targets explicitly instead of silently acting on the first match. A port number can be owned by more than one process (TCP and UDP sharing the same port, `SO_REUSEPORT` listeners with different PIDs, or forked/inherited listeners that share the same socket inode), so when `kill --port` matches rows with more than one distinct PID, refuse with a message listing the candidates and require `--pid`. When one PID owns several matching rows, the confirmation names every affected port, not just the first. On Linux, socket-inode ownership keeps every PID that references a collected target inode so shared listeners cannot be collapsed to one arbitrary owner.
 18. **Done in Phase 6:** keep `--yes` convenient for scripts, but do not let it bypass protected-process extra confirmation.
-19. **Done in Phase 6:** add tests for unsafe PID guardrails, confirmation decisions, ambiguous-target resolution including inherited/shared socket owners, command rendering, CLI diagnostic stdout/stderr contracts, JSON non-pollution, and exit codes.
+19. **Done in Phase 6 and hardened after Phase 6:** add tests for unsafe PID guardrails, confirmation decisions, prepared-handle ordering, ambiguous-target resolution including inherited/shared socket owners, command rendering, CLI diagnostic stdout/stderr contracts, JSON non-pollution, and exit codes.
 
 ### Done when
 
@@ -1181,41 +1179,7 @@ pedantic = "warn"
 
 ---
 
-## Phase 9 - Clipboard And Command Mode
-
-**Goal:** Let users copy or view the exact command instead of executing it inside Kickoutchi.
-
-**Why this comes after safe termination:** Command rendering should match the real termination behavior, so it should be based on the already-tested process abstraction.
-
-**Expected result:** Users can press `c` to copy or show the normal kill command, and the details panel always shows normal and force variants.
-
-### Build steps
-
-1. Finalize `command.rs` so it renders commands for Linux, Windows, and macOS from the same selected `PortEntry`.
-2. Add normal and force command text to the details panel.
-3. Add `c` to copy the normal command when the clipboard feature is enabled.
-4. If clipboard access fails, show the command in a modal instead of treating it as a fatal error.
-5. Add a way to view or copy the force-kill command without making force kill easy to trigger accidentally.
-6. Add a CLI flag or feature behavior to disable clipboard integration.
-7. Add tests for command rendering on all platforms.
-8. Add tests that clipboard failure does not break the app flow.
-
-### Done when
-
-- Command text is correct for Linux, Windows, and macOS.
-- Clipboard failure does not break the app.
-- Users can use Kickoutchi as a safer command discovery tool without granting extra permissions.
-- Details always show what command would run before any termination happens.
-
-### Do not build yet
-
-- Shell history integration.
-- Automatic command execution outside the existing confirmation flow.
-- Clipboard as a required dependency.
-
----
-
-## Phase 10 - Docker And Container Awareness
+## Phase 9 - Docker And Container Awareness
 
 **Goal:** Explain Docker-owned ports without making Docker required for normal Kickoutchi usage.
 
@@ -1252,7 +1216,7 @@ pedantic = "warn"
 
 ---
 
-## Phase 11 - Packaging, Release, And Documentation
+## Phase 10 - Packaging, Release, And Documentation
 
 **Goal:** Produce installable binaries and clear documentation so real users can install, run, and trust Kickoutchi.
 
@@ -1286,7 +1250,7 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 2. **Done after Phase 6:** run `cargo fmt --all --check` in CI.
 3. **Done after Phase 6:** run clippy on all targets in CI.
 4. **Done after Phase 6:** run tests in CI on every operating system the project supports at the time (Linux at first).
-5. **Later in Phase 11:** install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`. This is the CD/release workflow and stays separate from the CI workflow added after Phase 6.
+5. **Later in Phase 10:** install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`. This is the CD/release workflow and stays separate from the CI workflow added after Phase 6.
 6. Configure the release target triples: `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Add `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin` only when Phases 7 and 8 land.
 7. Configure archive formats so Linux produces `.tar.gz`, matching the artifact names in Option 1 (Windows `.zip` and macOS `.tar.gz` follow with their phases).
 8. Enable the `shell` installer. Enable the `powershell` installer and the Homebrew installer/formula output only when their platforms ship.
@@ -1333,11 +1297,13 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 - Unit tests for sort ordering
 - Unit tests for command rendering per OS
 - Unit tests for unsafe PID guardrails
+- Unit tests for prepared termination handle ordering before revalidation and signal delivery
 - Unit tests for config loading and CLI override precedence
 - Unit tests for non-TUI table and JSON output
 - Unit tests for protected-process matching
 - Unit tests for process-tree rendering
 - UI snapshot tests for table, details, help, and confirmation modal
+- TUI state tests for single-flight background refresh and completed refresh polling
 - Platform smoke tests for collectors behind `cfg(target_os = "...")`
 - Integration tests that run the built binary to pin script-facing CLI contracts (stderr diagnostics, `list --json` non-pollution, exit codes)
 
@@ -1350,7 +1316,7 @@ cargo test --all-features
 cargo run
 ```
 
-`--all-features` is the verification standard, which means the optional `arboard` clipboard feature is always compiled during verification. On Linux, `arboard` needs system development packages (X11/Wayland clipboard libraries), so contributors must have them installed even though clipboard support is optional at runtime.
+`--all-features` stays in the verification commands so any optional feature added later is covered automatically. The project currently defines no optional features, so this builds the same as a default build.
 
 Manual test commands:
 

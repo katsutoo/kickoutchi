@@ -1,8 +1,8 @@
-//! Keyboard input mapping for the TUI.
+//! Turning key presses into actions for the TUI.
 //!
-//! This module deliberately returns small actions instead of mutating `App`
-//! directly. That keeps crossterm details out of the state machine and makes
-//! the key contract easy to test without a terminal.
+//! On purpose, this hands back small `Action`s instead of poking `App` directly.
+//! That keeps crossterm out of the state machine and makes the key contract easy
+//! to test without ever opening a terminal.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -33,13 +33,13 @@ pub(crate) enum Action {
     Noop,
 }
 
-/// Map a key event to an app action.
+/// Turn a key event into an app action.
 ///
 /// `filter_active` lets a single `Esc` outside search mode clear an applied
-/// filter instead of quitting: a user who set a filter, pressed Enter to finish
-/// editing, then reflexively hits Esc should lose the filter, not the whole
-/// session. Esc only quits once there is no modal to close and no filter to
-/// clear. Precedence is fixed: modal first, then filter, then quit.
+/// filter instead of quitting: someone who set a filter, hit Enter to finish
+/// editing, then reflexively jabs Esc should lose the filter, not the whole
+/// session. Esc only quits once there's no modal to close and no filter left to
+/// clear. The order is fixed: modal first, then filter, then quit.
 pub(crate) fn action_for_key(
     key: KeyEvent,
     modal: Modal,
@@ -120,9 +120,9 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Most cases do not depend on an active filter; the Esc-clears-filter test
-    /// below passes `filter_active` explicitly. Keeping the common case in one
-    /// helper avoids two confusable trailing bools at every call site.
+    /// Most cases don't care about an active filter; the Esc-clears-filter test
+    /// below passes `filter_active` itself. Funnelling the common case through one
+    /// helper keeps two easily-confused trailing bools out of every call site.
     fn act(code: KeyCode, modal: Modal, search_mode: bool) -> Action {
         action_for_key(key(code), modal, search_mode, false)
     }
@@ -226,9 +226,9 @@ mod tests {
 
     #[test]
     fn esc_clears_an_applied_filter_before_quitting() {
-        // Search editing is finished (search_mode false) but a filter is still
-        // applied: Esc must clear the filter, not quit. A second Esc, with no
-        // filter left, quits. An open modal still wins over both.
+        // Search editing is done (search_mode false) but a filter is still on:
+        // Esc has to clear the filter, not quit. A second Esc, nothing left to
+        // clear, quits. An open modal still beats both.
         assert_eq!(
             action_for_key(key(KeyCode::Esc), Modal::None, false, true),
             Action::CancelSearch

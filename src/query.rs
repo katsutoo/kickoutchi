@@ -1,16 +1,17 @@
-//! Shared filtering and sorting for CLI and TUI views.
+//! The shared filter-and-sort engine behind both the CLI and TUI views.
 //!
-//! The collector owns what rows exist; this module only decides which confirmed
-//! rows are visible for a user query and in what order. It never invents rows.
+//! The collector decides which rows exist; this module only picks which of those
+//! confirmed rows are visible for a given query, and in what order. It never
+//! conjures a row out of thin air.
 
 use thiserror::Error;
 
 use crate::model::{BindScope, PortEntry, Protocol, SortMode, sort_entries};
 
-/// Maximum search text accepted from the TUI or CLI.
+/// Longest search text we'll take from the TUI or CLI.
 ///
-/// Filtering happens on every keypress in the TUI. A small fixed cap keeps that
-/// work bounded while still being far longer than a useful terminal query.
+/// In the TUI, filtering runs on every keypress, so a small fixed cap keeps that
+/// work bounded — and it's still way longer than any query you'd actually type.
 pub(crate) const FILTER_TEXT_MAX_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -379,9 +380,9 @@ mod tests {
 
     #[test]
     fn filter_text_over_the_byte_cap_is_rejected() {
-        // The TUI caps input in `append_search_char`, so this bound is only
-        // reachable through CLI `--filter`. The cap lives here, so the test
-        // pins it here; the CLI maps the error to exit 2.
+        // The TUI already caps input in `append_search_char`, so the only way to
+        // actually hit this bound is via CLI `--filter`. The cap lives here, so
+        // the test pins it here too; the CLI turns the error into exit 2.
         let rows = vec![entry(3000, "node")];
         let too_long = "a".repeat(FILTER_TEXT_MAX_BYTES + 1);
 

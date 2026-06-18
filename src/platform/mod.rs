@@ -1,4 +1,4 @@
-//! Platform-specific collectors.
+//! Home of the platform-specific collectors (Linux today).
 
 use crate::model::{ProcessContext, RelatedProcessHint};
 

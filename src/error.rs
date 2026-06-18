@@ -1,4 +1,4 @@
-//! Application-level error types.
+//! The error types the app actually deals with.
 
 use std::io;
 
@@ -6,20 +6,21 @@ use thiserror::Error;
 
 /// Top-level error for the TUI path of the Kickoutchi binary.
 ///
-/// This surfaces only terminal/IO failures, the one error class that is fatal
-/// to the TUI run loop. Config errors have their own type
-/// (`config::ConfigError`, handled before the TUI starts), and collector and
-/// process-termination failures are operational rather than fatal: they are
-/// shown in the status line (last collector error, kill outcome) instead of
-/// being propagated here.
+/// This only covers terminal/IO failures — the one kind of error that's truly
+/// fatal to the TUI loop. Config errors have their own type
+/// (`config::ConfigError`, handled before the TUI even starts), and collector
+/// and termination failures are operational, not fatal: those show up in the
+/// status line (last collector error, kill outcome) instead of bubbling all the
+/// way up here.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
-    /// Entering raw mode / the alternate screen, drawing a frame, or reading
-    /// input failed. Restore failures are not propagated here; they are logged
-    /// best-effort because they surface in `Drop` and the panic hook.
+    /// Something in the terminal dance failed: entering raw mode / the alternate
+    /// screen, drawing a frame, or reading input. Restore failures don't come
+    /// through here — those get logged best-effort, since they happen in `Drop`
+    /// and the panic hook.
     #[error("terminal I/O failed: {0}")]
     Terminal(#[from] io::Error),
 }
 
-/// Result alias for fallible application paths.
+/// Shorthand `Result` for the fallible app paths.
 pub(crate) type AppResult<T> = Result<T, AppError>;
