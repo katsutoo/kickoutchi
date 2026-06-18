@@ -30,6 +30,7 @@ const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
 // the top of the file, well within this cap, so the limit can never truncate the
 // field the collector needs.
 const MAX_STATUS_BYTES: u64 = 8 * 1024;
+const MAX_STAT_BYTES: u64 = 4 * 1024;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
@@ -488,8 +489,10 @@ fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
     let owner_uid = read_process_status(&process_dir.join("status"))
         .ok()
         .and_then(|status| status.owner_uid);
+    let process_start_time_ticks = read_process_start_time_ticks(&process_dir.join("stat")).ok();
     ProcessContext {
         owner_uid,
+        process_start_time_ticks,
         children: collect_child_processes_from(proc_root, pid),
     }
 }
@@ -573,6 +576,27 @@ fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
     parse_process_status(&text)
 }
 
+fn read_process_start_time_ticks(path: &Path) -> std::io::Result<u64> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(MAX_STAT_BYTES)
+        .read_to_string(&mut text)?;
+    parse_process_start_time_ticks(&text)
+}
+
+fn parse_process_start_time_ticks(text: &str) -> std::io::Result<u64> {
+    let (_before_comm_end, after_comm_end) = text.rsplit_once(") ").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "missing process-name terminator")
+    })?;
+    let start_time = after_comm_end
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "missing process start time"))?;
+    start_time
+        .parse::<u64>()
+        .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))
+}
+
 fn parse_process_status(text: &str) -> std::io::Result<ProcessStatus> {
     let mut status = ProcessStatus::default();
     for line in text.lines() {
@@ -642,8 +666,8 @@ mod tests {
         AddressFamily, LinuxCollector, MAX_CHILD_PROCESSES, SocketParseError, SocketRecord,
         collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
         collect_related_process_hints_from, collect_socket_owners, collect_socket_records,
-        decode_cmdline, entry_from_record, parse_process_status, parse_socket_inode,
-        parse_socket_line, parse_socket_table, read_process_status,
+        decode_cmdline, entry_from_record, parse_process_start_time_ticks, parse_process_status,
+        parse_socket_inode, parse_socket_line, parse_socket_table, read_process_status,
     };
     use crate::collector::Collector;
     use crate::model::{PermissionStatus, Protocol, SocketState};
@@ -685,8 +709,22 @@ mod tests {
             format!("Name:\t{name}\nPPid:\t{parent_pid}\nUid:\t1000\t1000\t1000\t1000\n"),
         )
         .expect("test status must be written");
+        fs::write(
+            process_dir.join("stat"),
+            stat_text(pid, name, parent_pid, u64::from(pid) * 10),
+        )
+        .expect("test stat must be written");
         std::os::unix::fs::symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
             .expect("test exe symlink must be created");
+    }
+
+    fn stat_text(pid: u32, name: &str, parent_pid: u32, start_time_ticks: u64) -> String {
+        let mut fields = vec!["S".to_owned(), parent_pid.to_string()];
+        for _ in 0..17 {
+            fields.push("0".to_owned());
+        }
+        fields.push(start_time_ticks.to_string());
+        format!("{pid} ({name}) {}\n", fields.join(" "))
     }
 
     #[test]
@@ -884,6 +922,16 @@ mod tests {
     }
 
     #[test]
+    fn process_start_time_is_read_from_stat_field_22() {
+        let text = stat_text(1234, "node worker", 1, 987_654);
+
+        let start_time = parse_process_start_time_ticks(&text)
+            .expect("valid stat text must expose process start time");
+
+        assert_eq!(start_time, 987_654);
+    }
+
+    #[test]
     fn parent_pid_read_is_bounded_and_still_finds_ppid_near_the_top() {
         // `PPid` is near the top of `status`, so the byte cap on the read must
         // never hide it, even when the rest of the file is larger than the cap.
@@ -983,6 +1031,7 @@ mod tests {
         let context = collect_process_context_from(&proc_root, 100);
 
         assert_eq!(context.owner_uid, Some(1000));
+        assert_eq!(context.process_start_time_ticks, Some(1000));
         let children: Vec<(u32, Option<&str>)> = context
             .children
             .children

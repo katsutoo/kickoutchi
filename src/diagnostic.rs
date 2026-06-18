@@ -146,13 +146,20 @@ fn socket_token_mentions_port(token: &str, port_text: &str) -> bool {
         if token[after_index..]
             .chars()
             .next()
-            .is_none_or(|ch| !ch.is_ascii_digit())
+            .is_none_or(is_socket_port_terminator)
         {
             return true;
         }
         search_from = after_index;
     }
     false
+}
+
+fn is_socket_port_terminator(ch: char) -> bool {
+    matches!(
+        ch,
+        '/' | '?' | '#' | ',' | ';' | ')' | ']' | '}' | '"' | '\''
+    )
 }
 
 #[cfg(test)]
@@ -191,6 +198,8 @@ mod tests {
         assert!(!command_mentions_port("asset 3000k", 3000));
         assert!(!command_mentions_port("server --port 30000", 3000));
         assert!(!command_mentions_port("IMPORTANT=3000 node", 3000));
+        assert!(!command_mentions_port("worker duration:3000ms", 3000));
+        assert!(!command_mentions_port("worker host:3000abc", 3000));
     }
 
     #[test]

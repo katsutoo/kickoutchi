@@ -2,12 +2,16 @@
 mod linux {
     use std::fs;
     use std::net::TcpListener;
-    use std::path::PathBuf;
-    use std::process::{Child, Command, Output};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const CMDLINE_WAIT: Duration = Duration::from_secs(2);
+    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(2);
+    const HELPER_LISTENER_ENV: &str = "KICKOUTCHI_TEST_HELPER_LISTENER";
+    const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
+    const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
 
     struct ChildGuard {
         child: Child,
@@ -76,6 +80,37 @@ mod linux {
         guard
     }
 
+    fn spawn_listener_process(port: u16) -> (ChildGuard, PathBuf) {
+        let ready_file = temp_file_path("listener-ready");
+        let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+            .env(HELPER_LISTENER_ENV, "1")
+            .env(HELPER_PORT_ENV, port.to_string())
+            .env(HELPER_READY_ENV, &ready_file)
+            .args([
+                "--exact",
+                "linux::helper_tcp_listener_process",
+                "--nocapture",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("listener helper process must start");
+        let guard = ChildGuard { child };
+        wait_for_file(&ready_file);
+        (guard, ready_file)
+    }
+
+    fn temp_file_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "kickoutchi-cli-contract-{label}-{}-{unique}",
+            std::process::id(),
+        ))
+    }
+
     fn wait_for_cmdline(pid: u32, needle: &str) {
         let path = format!("/proc/{pid}/cmdline");
         let deadline = Instant::now() + CMDLINE_WAIT;
@@ -92,12 +127,68 @@ mod linux {
         }
     }
 
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + CMDLINE_WAIT;
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper process never created ready file {}",
+                path.display(),
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_child_exit(guard: &mut ChildGuard) {
+        let deadline = Instant::now() + CHILD_EXIT_WAIT;
+        loop {
+            if guard
+                .child
+                .try_wait()
+                .expect("child exit status must be readable")
+                .is_some()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper process did not exit after SIGTERM",
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn stdout(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     fn stderr(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn helper_tcp_listener_process() {
+        if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
+            return;
+        }
+
+        let port = std::env::var(HELPER_PORT_ENV)
+            .expect("helper port must be set")
+            .parse::<u16>()
+            .expect("helper port must be a u16");
+        let ready_file = PathBuf::from(
+            std::env::var_os(HELPER_READY_ENV).expect("helper ready path must be set"),
+        );
+        let _listener = TcpListener::bind(("127.0.0.1", port))
+            .expect("helper listener must bind the requested port");
+        fs::write(ready_file, b"ready").expect("helper ready file must be written");
+
+        loop {
+            thread::sleep(Duration::from_mins(1));
+        }
     }
 
     #[test]
@@ -127,5 +218,29 @@ mod linux {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(stdout(&output), "[]\n");
         assert_eq!(stderr(&output), "");
+    }
+
+    #[test]
+    fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
+        let port = unused_local_port();
+        let port_text = port.to_string();
+        let (mut helper, ready_file) = spawn_listener_process(port);
+        let pid_text = helper.id().to_string();
+
+        let before = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(before.status.code(), Some(0));
+        assert!(stdout(&before).contains(port_text.as_str()));
+        assert!(stdout(&before).contains(pid_text.as_str()));
+
+        let killed = kickoutchi(&["kill", "--pid", pid_text.as_str(), "--yes"]);
+        assert_eq!(killed.status.code(), Some(0));
+        assert!(stderr(&killed).contains("sent SIGTERM"));
+        wait_for_child_exit(&mut helper);
+
+        let after = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(after.status.code(), Some(3));
+        assert!(stdout(&after).contains("no open ports match the filter"));
+
+        let _ = fs::remove_file(ready_file);
     }
 }

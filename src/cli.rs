@@ -686,7 +686,10 @@ mod tests {
     }
 
     fn no_context(_: u32) -> ProcessContext {
-        ProcessContext::default()
+        ProcessContext {
+            process_start_time_ticks: Some(55),
+            ..ProcessContext::default()
+        }
     }
 
     #[test]

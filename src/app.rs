@@ -444,12 +444,29 @@ impl App {
     }
 
     fn execute_kill_confirmation(&mut self) {
+        self.execute_kill_confirmation_with(
+            collector::collect_ports,
+            platform::collect_process_context,
+            process::terminate_pid,
+        );
+    }
+
+    fn execute_kill_confirmation_with<CollectPorts, CollectContext, Terminate>(
+        &mut self,
+        mut collect_ports: CollectPorts,
+        mut collect_context: CollectContext,
+        mut terminate: Terminate,
+    ) where
+        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        CollectContext: FnMut(u32) -> ProcessContext,
+        Terminate: FnMut(u32, KillMode) -> TerminationOutcome,
+    {
         let Some(confirmation) = self.kill_confirmation.take() else {
             return;
         };
         self.modal = Modal::None;
 
-        let mut fresh_rows = match collector::collect_ports() {
+        let mut fresh_rows = match collect_ports() {
             Ok(rows) => rows,
             Err(error) => {
                 self.latest_error = Some(error.to_string());
@@ -460,7 +477,12 @@ impl App {
             }
         };
         mark_protected(&mut fresh_rows, &self.protected_processes);
-        let target = match process::revalidate_confirmed_target(&confirmation.target, &fresh_rows) {
+        let fresh_context = collect_context(confirmation.target.pid);
+        let target = match process::revalidate_confirmed_target(
+            &confirmation.target,
+            &fresh_rows,
+            Some(&fresh_context),
+        ) {
             Ok(target) => target,
             Err(outcome) => {
                 self.kill_status = Some(termination_status_line(
@@ -473,13 +495,13 @@ impl App {
             }
         };
 
-        let outcome = process::terminate_pid(target.pid, confirmation.mode);
+        let outcome = terminate(target.pid, confirmation.mode);
         self.kill_status = Some(termination_status_line(
             &target,
             confirmation.mode,
             &outcome,
         ));
-        self.refresh();
+        self.finish_refresh_attempt(collect_ports(), Instant::now());
     }
 
     fn apply_successful_snapshot(&mut self, mut rows: Vec<PortEntry>, now: Instant) {
@@ -640,8 +662,10 @@ mod tests {
     use super::{App, Modal};
     use crate::config::Config;
     use crate::input::Action;
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
-    use crate::process::{ConfirmationRequirement, KillMode};
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState, SortMode,
+    };
+    use crate::process::{ConfirmationRequirement, KillMode, TerminationOutcome};
 
     fn entry(port: u16, name: Option<&str>) -> PortEntry {
         PortEntry {
@@ -695,6 +719,21 @@ mod tests {
             ..Config::default()
         };
         App::from_rows(rows, &config)
+    }
+
+    fn context(start_time_ticks: u64) -> ProcessContext {
+        ProcessContext {
+            process_start_time_ticks: Some(start_time_ticks),
+            ..ProcessContext::default()
+        }
+    }
+
+    fn set_confirmation_start_time(app: &mut App, start_time_ticks: u64) {
+        app.kill_confirmation
+            .as_mut()
+            .expect("confirmation must be open")
+            .target
+            .process_start_time_ticks = Some(start_time_ticks);
     }
 
     #[test]
@@ -888,6 +927,67 @@ mod tests {
                 Duration::from_secs(1),
             ),
             Duration::from_secs(1),
+        );
+    }
+
+    #[test]
+    fn confirmed_kill_revalidates_signals_and_refreshes_rows() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        app.apply_action(Action::RequestTerminate);
+        set_confirmation_start_time(&mut app, 55);
+        let fresh_before_signal = vec![entry(3000, Some("node"))];
+        let fresh_after_signal = Vec::new();
+        let mut collect_calls = 0;
+        let mut terminated = None;
+
+        app.execute_kill_confirmation_with(
+            || {
+                collect_calls += 1;
+                if collect_calls == 1 {
+                    Ok(fresh_before_signal.clone())
+                } else {
+                    Ok(fresh_after_signal.clone())
+                }
+            },
+            |_| context(55),
+            |pid, mode| {
+                terminated = Some((pid, mode));
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(terminated, Some((3000, KillMode::Terminate)));
+        assert_eq!(collect_calls, 2);
+        assert_eq!(app.rows().len(), 0);
+        assert_eq!(app.modal(), Modal::None);
+        assert!(
+            app.kill_status()
+                .is_some_and(|status| status.contains("sent SIGTERM")),
+        );
+    }
+
+    #[test]
+    fn confirmed_kill_refuses_stale_process_identity_without_signalling() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        app.apply_action(Action::RequestTerminate);
+        set_confirmation_start_time(&mut app, 55);
+        let fresh_rows = vec![entry(3000, Some("node"))];
+        let mut terminated = false;
+
+        app.execute_kill_confirmation_with(
+            || Ok(fresh_rows.clone()),
+            |_| context(99),
+            |_pid, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert!(!terminated);
+        assert_eq!(app.rows().len(), 1);
+        assert!(
+            app.kill_status()
+                .is_some_and(|status| status.contains("no longer owns")),
         );
     }
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Safe termination now carries an internal Linux process-start identity from
+  `/proc/<pid>/stat` through confirmation and pre-signal revalidation. The raw
+  tick value is not rendered or serialized, but it lets Kickoutchi refuse a kill
+  if PID reuse is detected before the signal boundary.
 - Post-Phase-6 internal cleanup, no external behavior change: collapsed the
   duplicate `KillTarget` constructor into a single `from_entries`, switched the
   confirmation modal's force-mode check from a signal-label string comparison to
@@ -48,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Termination confirmations now warn when a target is classified as a
+  system/service process, not only when it is on the protected-process list.
+- Pre-signal revalidation now reports ownership unavailable if any confirmed
+  target port becomes visible without a readable PID, including mixed cases where
+  another confirmed port still has the original PID.
+- No-match related-process diagnostics no longer treat colon-shaped incidental
+  tokens such as `duration:3000ms` or `host:3000abc` as socket evidence.
 - `kill --port` now refuses inherited/shared listening sockets instead of
   signaling one arbitrary owner and reporting success while another process keeps
   the port open. The Linux collector emits one row per PID referencing the same
@@ -94,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Linux CLI contract coverage now includes a real `SIGTERM` path: a controlled
+  helper process binds a TCP listener, `kickoutchi kill --pid --yes` terminates
+  it, and a follow-up list confirms the port disappears.
+- TUI confirmed-kill execution is now covered with injected collection/context/
+  termination seams, including successful refresh and stale process-identity
+  refusal without sending a signal.
 - GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
   Rust toolchain to check formatting, strict Clippy, and the full test suite.
   Release/CD automation remains deferred to the Phase 11 `cargo-dist` workflow.
