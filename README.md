@@ -45,11 +45,11 @@ cd kickoutchi
 No install needed while you're poking around:
 
 ```sh
-cargo run --locked                                 # open the TUI
-cargo run --locked --bin kick -- list              # list ports
-cargo run --locked --bin kick -- list --port 3000  # one port
-cargo run --locked --bin kick -- list --json       # for scripts
-cargo run --locked --bin kick -- kill --port 3000  # kick it out
+cargo run                                 # open the TUI
+cargo run --bin kick -- list              # list ports
+cargo run --bin kick -- list --port 3000  # one port
+cargo run --bin kick -- list --json       # for scripts
+cargo run --bin kick -- kill --port 3000  # kick it out
 ```
 
 Kickoutchi always asks before it kicks anything out. Keep `--yes` in your pocket
