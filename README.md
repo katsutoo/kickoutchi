@@ -17,6 +17,20 @@ kick it out safely.
 
 ## Install Rust
 
+### With mise
+
+If you use `mise`, this is the easiest way to get the repository-ready Rust
+toolchain:
+
+```sh
+mise install
+```
+
+That reads `mise.toml` and installs the pinned Rust version for this project.
+After that, you can run the Cargo commands below from the repository root.
+
+If you do not use `mise`, install Rust manually for your platform.
+
 ### Windows
 
 In PowerShell:
@@ -57,6 +71,9 @@ If you already have the repository, just `cd` into it.
 
 ## Run Locally Without Installing
 
+Use this path while developing or testing the project from source. You do not
+need `cargo install` for these commands.
+
 Open the TUI:
 
 ```sh
@@ -92,8 +109,10 @@ until you are intentionally scripting a known-safe target.
 
 ## Install Locally
 
-Install the two local binaries, `kickoutchi` and `kick`, into Cargo's bin
-directory:
+Use this path when you want `kickoutchi` and `kick` available as normal shell
+commands outside the repository. This is optional for development.
+
+Install the two local binaries into Cargo's bin directory:
 
 ```sh
 cargo install --path . --locked
