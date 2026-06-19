@@ -25,7 +25,7 @@ use crate::process::{
 use crate::protection::mark_protected;
 use crate::query::{self, QueryOptions};
 
-/// Stable exit codes — the script-facing contract from PROJECT.md.
+/// Stable exit codes — the script-facing contract.
 ///
 /// All in one place so scripts can count on the numbers never drifting. Every
 /// variant really is constructed somewhere on the CLI exit path, so don't reach
@@ -307,7 +307,7 @@ where
     // safety warnings — before the confirmation branch, so it shows on the
     // `--yes` path too. Skipping the prompt must not also swallow the
     // "system/service process", "owned by another uid", partial-metadata, or
-    // "has children" warnings: those are safety notices PROJECT.md requires, and
+    // "has children" warnings: those are required safety notices, and
     // `--yes` opts out of being *asked*, not of being *told*.
     print_kill_banner(&target, mode);
 

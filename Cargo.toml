@@ -48,10 +48,10 @@ tracing-subscriber = "0.3.23"
 # in the shared model/config/CLI foundation.
 dirs = "6.0.0"
 
-# A couple of stack-table crates aren't here yet on purpose: windows-sys waits
-# for the Windows collector (Phase 7), and sysinfo only shows up if we actually
-# need cross-platform process metadata. We pull them in when they're first used,
-# so `--all-features` stays buildable on every host.
+# A couple of cross-platform crates aren't here yet on purpose: windows-sys waits
+# for the Windows collector, and sysinfo only shows up if we actually need
+# cross-platform process metadata. We pull them in when they're first used, so
+# `--all-features` stays buildable on every host.
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Termination uses the OS signal API directly for SIGTERM/SIGKILL instead of

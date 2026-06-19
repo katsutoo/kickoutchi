@@ -183,8 +183,7 @@ mod tests {
             .collect()
             .expect("fake collection cannot fail");
 
-        // Port 3000 has to be here: PROJECT.md's "done when" examples and the
-        // CLI filter tests both lean on it.
+        // Port 3000 has to be here: examples and CLI filter tests both lean on it.
         assert!(entries.iter().any(|entry| entry.local_port == 3000));
         // At least one row where all the metadata is withheld.
         assert!(
@@ -193,7 +192,7 @@ mod tests {
                 .any(|entry| entry.pid.is_none() && entry.permission == PermissionStatus::Partial)
         );
         // And one half-withheld row: PID and name readable, executable path
-        // hidden (the "someone else's process" shape from PROJECT.md).
+        // hidden (the "someone else's process" shape the UI must explain).
         assert!(entries.iter().any(|entry| {
             entry.pid.is_some()
                 && entry.executable_path.is_none()

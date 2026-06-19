@@ -56,15 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket-shaped, reducing per-keypress allocations in search mode.
 - Removed the unused direct `anyhow` dependency from `Cargo.toml`; typed module
   errors remain the current error boundary.
-- Roadmap update: no-match port related-process diagnostics moved from Phase 4
-  to Phase 5, with stricter rules that keep the main table limited to
-  OS-confirmed sockets, preserve CLI exit codes, avoid polluting JSON output,
-  and require port-shaped matchers instead of raw substring matching.
+- No-match port related-process diagnostics now use stricter rules that keep the
+  main table limited to OS-confirmed sockets, preserve CLI exit codes, avoid
+  polluting JSON output, and require port-shaped matchers instead of raw
+  substring matching.
 - `protected_processes` in the config file now extends the built-in defaults
   instead of replacing them, with exact-match de-duplication. Adding `redis`
   no longer silently removes protection from `systemd`, `postgres`, and the
   other defaults; this matches the documented "can be extended in config"
-  behavior from PROJECT.md.
+  behavior.
 - Internal restructure: shared application code moved from `src/main.rs` to
   `src/lib.rs` (public surface: a single `kickoutchi::run()`), with thin
   binary wrappers in `src/bin/kickoutchi.rs` and `src/bin/kick.rs`. Behavior
@@ -130,7 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI `list` now prints `no open ports visible` when `hide_system_processes`
   suppresses every collected row, instead of implying the machine has no open
   ports at all.
-- TUI help modal title now reads `Kickoutchi` instead of `Kickoutchi Phase 4`.
+- TUI help modal title now reads `Kickoutchi` instead of an outdated
+  phase-specific title.
 - TUI status bar, borders, titles, and muted text now use terminal-default or
   bold-reversed styles instead of fixed dark-gray/black combinations, so the
   interface remains readable in both light and dark terminal themes.
@@ -162,13 +163,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal without sending a signal.
 - GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
   Rust toolchain to check formatting, strict Clippy, and the full test suite.
-  Release/CD automation remains deferred to the Phase 10 `cargo-dist` workflow.
+  Release/CD automation remains deferred to the dedicated `cargo-dist` workflow.
 - CLI contract integration tests now exercise script-facing `list` behavior with
   the real binary: human no-match diagnostics go to stderr, `list --json` stays
   unpolluted, and explicit no-match filters exit `3`. The helper process uses
   `sh`, so the suite needs no Python (or any other interpreter) on PATH.
 
-- Safe termination MVP (Phase 6): Linux `kill` now sends real `SIGTERM` or
+- Safe termination MVP: Linux `kill` now sends real `SIGTERM` or
   `SIGKILL` through a small `libc` boundary instead of shelling out, with typed
   outcomes for success, permission denied, already exited, cancelled, protected
   process, stale confirmed target, unsafe PID, and unknown failure. Real signal
@@ -188,13 +189,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processes require typing the PID or process name, child/owner/permission
   warnings are shown when available, and the table refreshes immediately after a
   kill attempt.
-- Phase 6 tests cover PID guardrails, target ambiguity, confirmation decisions,
+- Safe-termination tests cover PID guardrails, target ambiguity, confirmation decisions,
   command rendering, TUI confirmation state/rendering, and CLI exit-code mapping.
 - TUI kill confirmation now lists every port owned by the target PID, gathered
   from the full snapshot so active filters cannot hide a port the signal will
   still free.
 
-- Process context and protected-process policy (Phase 5): the selected TUI row
+- Process context and protected-process policy: the selected TUI row
   now resolves direct child PIDs and child process names only when the user opens
   the details modal, shows owner UID when available, and keeps the child scan
   bounded so scrolling the table does not walk the process list.
@@ -209,7 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Diagnostic hints do not create fake table rows, do not claim ownership, do not
   change the `list --port` no-match exit code, and do not pollute `list --json`.
 
-- Filtering, sorting, and refresh (Phase 4): the TUI now supports manual
+- Filtering, sorting, and refresh: the TUI now supports manual
   refresh with `r`, automatic refresh using the configured interval, search mode
   with `/`, and sort cycling with `s`.
 - Shared query engine for CLI and TUI filtering: plain search matches visible
@@ -221,8 +222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Linux parent-process collection backing the parent filter and sort: `parent_pid`
   from `/proc/<pid>/status` and the parent name from `/proc/<ppid>/comm`, feeding
   the `parent:` filter, parent sorting, the details-panel parent line, and PID-1
-  child hiding. Pulled forward from Phase 5 so the Phase 4 parent filter and sort
-  operate on real data instead of always-empty fields.
+  child hiding. Implemented alongside filtering and sorting so the parent filter
+  and sort operate on real data instead of always-empty fields.
 - TUI refresh state now keeps the last successful snapshot separate from the
   latest collector error, so a failed refresh reports the error without erasing
   the last good table.
@@ -235,7 +236,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PID 0/1, direct PID-1 children, and known OS process names without hiding
   protected app processes such as `postgres` by default.
 
-- Linux native collector (Phase 3): on Linux, `kickoutchi`/`kick` now reads
+- Linux native collector: on Linux, `kickoutchi`/`kick` now reads
   `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, and `/proc/net/udp6`
   directly, keeps TCP `LISTEN` sockets and bound UDP sockets, decodes IPv4 and
   IPv6 local addresses, extracts socket inodes, and maps them to owning PIDs by
@@ -244,11 +245,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executable path, and command line from `/proc/<pid>/comm`, `/proc/<pid>/exe`,
   and `/proc/<pid>/cmdline`; restricted or raced metadata keeps the port row and
   marks it partial instead of dropping it.
-- Deterministic Phase 3 tests for `/proc/net` parsing, TCP state filtering, UDP
+- Deterministic Linux collector tests for `/proc/net` parsing, TCP state filtering, UDP
   bound rows, IPv4/IPv6 decoding, malformed rows, socket inode parsing,
   command-line decoding, and partial metadata behavior.
 
-- Static TUI skeleton (Phase 2): the bare `kickoutchi`/`kick` command now opens
+- Static TUI skeleton: the bare `kickoutchi`/`kick` command now opens
   a full fake-data TUI with a header, the open-ports table, a selected-row
   details panel, and a status bar showing row count, refresh age, sort mode,
   and filter state.
@@ -270,7 +271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `default-run` keeping `cargo run` on the canonical binary. The help usage
   line follows the invoked name; `--version` reports the canonical name.
 
-- Shared domain model (Phase 1): `PortEntry` with the full
+- Shared domain model: `PortEntry` with the full
   protocol/address/port/state/process/parent/permission shape, plus the
   `Protocol`, `SocketState`, `Platform`, `PermissionStatus`, and `SortMode`
   vocabulary shared by the CLI, TUI, and future collectors.
@@ -294,8 +295,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Table and JSON output layer; missing metadata renders as `-` in tables and
   `null` in JSON, and the JSON field/enum shape is pinned by tests.
 - Cargo manifest metadata (`description`, `license`, `repository`, `authors`,
-  `readme`) required for later `cargo publish`/`cargo-dist` phases.
-- Project foundation (Phase 0): Rust 1.95.0 pinned via `mise.toml`, edition
+  `readme`) required for later `cargo publish`/`cargo-dist` release work.
+- Project foundation: Rust 1.95.0 pinned via `mise.toml`, edition
   2024, and strict lints (`warnings = "deny"`, `clippy::pedantic`).
 - Core dependency set: ratatui, crossterm, clap, serde, serde_json, toml,
   thiserror, anyhow, tracing, and tracing-subscriber.

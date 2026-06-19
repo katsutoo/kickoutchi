@@ -71,7 +71,7 @@ impl Default for Config {
             default_sort: SortMode::Port,
             hide_system_processes: false,
             confirm_force_kill: true,
-            // Defaults from PROJECT.md: the stuff whose accidental death takes
+            // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
         }

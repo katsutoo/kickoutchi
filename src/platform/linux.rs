@@ -355,8 +355,7 @@ fn collect_socket_owners(
     // arbitrary PID — and then `kill --port` would signal one process while the
     // others happily keep the port open. Correctness wins over the fd walks we'd
     // save. If this scan ever becomes the refresh bottleneck on a huge host, the
-    // fix is netlink `sock_diag` (see PROJECT.md), not a correctness-breaking
-    // early stop.
+    // fix is netlink `sock_diag`, not a correctness-breaking early stop.
     let mut owners = HashMap::with_capacity(target_inodes.len());
     for pid in pids {
         collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners);

@@ -123,8 +123,8 @@ pub(crate) struct PortEntry {
     /// Reserved, and effectively always empty on real rows: the Linux collector
     /// never populates this. Per-row child enumeration would mean walking the whole
     /// process table on every refresh, so the selected row's children are resolved
-    /// lazily into the [`ProcessContext`] `children` field instead (see the
-    /// PROJECT.md collection note). The field stays only because it's part of the
+    /// lazily into the [`ProcessContext`] `children` field instead. The field stays
+    /// only because it's part of the
     /// stable `list --json` shape and the fake fixture fills it — real child data
     /// does not flow through here.
     pub(crate) child_pids: Vec<u32>,
