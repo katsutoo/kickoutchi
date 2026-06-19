@@ -1,4 +1,4 @@
-# kickoutchi
+# Kickoutchi ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
 **"What are you doing in my swamp?!"** — but for whatever's squatting on your
 local ports.
