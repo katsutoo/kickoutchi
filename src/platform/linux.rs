@@ -23,6 +23,13 @@ use crate::model::{
 
 const PROC_ROOT: &str = "/proc";
 const TCP_LISTEN_STATE: &str = "0A";
+// `/proc/net/{tcp,udp}{,6}` is one row per socket and read on every refresh, so
+// it's bounded like every other /proc read here. The cap is deliberately generous
+// (~100k sockets), but a socket table is the one /proc file we must not silently
+// truncate: dropping bytes drops whole socket rows, i.e. real open ports. So
+// `read_bounded_text` fails closed past this cap — the scan surfaces a clear
+// error instead of a short, misleading table.
+const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CMDLINE_BYTES: usize = 16 * 1024;
 const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
 // `/proc/<pid>/status` is kernel-generated and small, but we read it on every
@@ -182,7 +189,7 @@ fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, Collect
 }
 
 fn read_socket_table(path: &Path, optional: bool) -> Result<Option<String>, CollectorError> {
-    match fs::read_to_string(path) {
+    match read_bounded_text(path, MAX_SOCKET_TABLE_BYTES) {
         Ok(text) => Ok(Some(text)),
         Err(source) if optional && source.kind() == ErrorKind::NotFound => Ok(None),
         Err(source) => Err(CollectorError::Read {
@@ -190,6 +197,21 @@ fn read_socket_table(path: &Path, optional: bool) -> Result<Option<String>, Coll
             source,
         }),
     }
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let limit = u64::try_from(max_bytes)
+        .expect("/proc read byte limit must fit in u64")
+        .saturating_add(1);
+    let mut text = String::new();
+    File::open(path)?.take(limit).read_to_string(&mut text)?;
+    if text.len() > max_bytes {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte read limit"),
+        ));
+    }
+    Ok(text)
 }
 
 fn parse_socket_table(
@@ -585,9 +607,17 @@ fn read_process_start_time_ticks(path: &Path) -> std::io::Result<u64> {
 }
 
 fn parse_process_start_time_ticks(text: &str) -> std::io::Result<u64> {
+    // `/proc/<pid>/stat` is `pid (comm) state ...`, and comm is an unescaped task
+    // name that can itself contain `)` and even `) `. Every field after comm is a
+    // single char or an integer and holds no parens, so the *last* `") "` in the
+    // line is always the real comm terminator. Splitting from the right is what
+    // keeps this robust against a process named e.g. `ev) il`; a first/left split
+    // would be fooled by a paren inside comm.
     let (_before_comm_end, after_comm_end) = text.rsplit_once(") ").ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "missing process-name terminator")
     })?;
+    // Once comm is stripped the fields are 1-indexed from `state` (field 3), so
+    // start time (field 22) is the 20th token here — nth(19), zero-indexed.
     let start_time = after_comm_end
         .split_whitespace()
         .nth(19)
@@ -667,7 +697,8 @@ mod tests {
         collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
         collect_related_process_hints_from, collect_socket_owners, collect_socket_records,
         decode_cmdline, entry_from_record, parse_process_start_time_ticks, parse_process_status,
-        parse_socket_inode, parse_socket_line, parse_socket_table, read_process_status,
+        parse_socket_inode, parse_socket_line, parse_socket_table, read_bounded_text,
+        read_process_status,
     };
     use crate::collector::Collector;
     use crate::model::{PermissionStatus, Protocol, SocketState};
@@ -876,6 +907,20 @@ mod tests {
     }
 
     #[test]
+    fn bounded_text_reader_rejects_oversized_proc_files() {
+        let proc_root = temp_proc_root("bounded-text");
+        let path = proc_root.join("net").join("huge");
+        fs::write(&path, "abcd").expect("test file must be written");
+
+        let text = read_bounded_text(&path, 4).expect("file at the cap is accepted");
+        assert_eq!(text, "abcd");
+
+        let error = read_bounded_text(&path, 3).expect_err("over-cap file must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn socket_inode_is_extracted_from_fd_symlink_targets() {
         assert_eq!(
             parse_socket_inode(Path::new("socket:[12345]")),
@@ -927,6 +972,20 @@ mod tests {
 
         let start_time = parse_process_start_time_ticks(&text)
             .expect("valid stat text must expose process start time");
+
+        assert_eq!(start_time, 987_654);
+    }
+
+    #[test]
+    fn process_start_time_survives_parens_in_comm() {
+        // comm is an unescaped task name that can contain `) `; the right-split in
+        // parse_process_start_time_ticks must still land on the real terminator
+        // rather than a paren inside the name. A first/left split would read the
+        // paren in `ev) il` as the terminator and parse the wrong field.
+        let text = stat_text(1234, "ev) il", 1, 987_654);
+
+        let start_time =
+            parse_process_start_time_ticks(&text).expect("paren-laden comm must still parse");
 
         assert_eq!(start_time, 987_654);
     }

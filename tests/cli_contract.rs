@@ -12,6 +12,11 @@ mod linux {
     const HELPER_LISTENER_ENV: &str = "KICKOUTCHI_TEST_HELPER_LISTENER";
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
+    // Port 0 never hosts a real listening socket (the kernel reads it as "assign an
+    // ephemeral port"), so `list --port 0` deterministically finds no confirmed
+    // socket — exactly the no-match condition these diagnostics exercise — with no
+    // free-port hunting and no bind/release race.
+    const DIAGNOSTIC_TEST_PORT: u16 = 0;
 
     struct ChildGuard {
         child: Child,
@@ -54,14 +59,6 @@ mod linux {
         path
     }
 
-    fn unused_local_port() -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port must bind");
-        listener
-            .local_addr()
-            .expect("bound listener must have a local address")
-            .port()
-    }
-
     fn spawn_related_process(port: u16) -> ChildGuard {
         let port_text = port.to_string();
         // A dependency-free stand-in for "a process that names this port on its
@@ -80,11 +77,11 @@ mod linux {
         guard
     }
 
-    fn spawn_listener_process(port: u16) -> (ChildGuard, PathBuf) {
+    fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
         let ready_file = temp_file_path("listener-ready");
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_LISTENER_ENV, "1")
-            .env(HELPER_PORT_ENV, port.to_string())
+            .env(HELPER_PORT_ENV, "0")
             .env(HELPER_READY_ENV, &ready_file)
             .args([
                 "--exact",
@@ -97,7 +94,11 @@ mod linux {
             .expect("listener helper process must start");
         let guard = ChildGuard { child };
         wait_for_file(&ready_file);
-        (guard, ready_file)
+        let port = fs::read_to_string(&ready_file)
+            .expect("helper ready file must contain the bound port")
+            .parse::<u16>()
+            .expect("helper bound port must be a u16");
+        (guard, port, ready_file)
     }
 
     fn temp_file_path(label: &str) -> PathBuf {
@@ -182,9 +183,15 @@ mod linux {
         let ready_file = PathBuf::from(
             std::env::var_os(HELPER_READY_ENV).expect("helper ready path must be set"),
         );
-        let _listener = TcpListener::bind(("127.0.0.1", port))
+        let listener = TcpListener::bind(("127.0.0.1", port))
             .expect("helper listener must bind the requested port");
-        fs::write(ready_file, b"ready").expect("helper ready file must be written");
+        let bound_port = listener
+            .local_addr()
+            .expect("helper listener must have a local address")
+            .port();
+        let ready_tmp = ready_file.with_extension("tmp");
+        fs::write(&ready_tmp, bound_port.to_string()).expect("helper ready file must be written");
+        fs::rename(&ready_tmp, &ready_file).expect("helper ready file must be published");
 
         loop {
             thread::sleep(Duration::from_mins(1));
@@ -193,7 +200,7 @@ mod linux {
 
     #[test]
     fn human_list_no_match_prints_diagnostic_to_stderr() {
-        let port = unused_local_port();
+        let port = DIAGNOSTIC_TEST_PORT;
         let port_text = port.to_string();
         let _helper = spawn_related_process(port);
 
@@ -209,7 +216,7 @@ mod linux {
 
     #[test]
     fn json_list_no_match_keeps_diagnostic_out_of_stdout_and_stderr() {
-        let port = unused_local_port();
+        let port = DIAGNOSTIC_TEST_PORT;
         let port_text = port.to_string();
         let _helper = spawn_related_process(port);
 
@@ -222,9 +229,8 @@ mod linux {
 
     #[test]
     fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
-        let port = unused_local_port();
+        let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
-        let (mut helper, ready_file) = spawn_listener_process(port);
         let pid_text = helper.id().to_string();
 
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
@@ -234,7 +240,19 @@ mod linux {
 
         let killed = kickoutchi(&["kill", "--pid", pid_text.as_str(), "--yes"]);
         assert_eq!(killed.status.code(), Some(0));
-        assert!(stderr(&killed).contains("sent SIGTERM"));
+        let killed_stderr = stderr(&killed);
+        assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
+        // The target banner (identity + equivalent command) prints even on the
+        // `--yes` path, so a scripted kill still leaves the safety context — and
+        // any warning lines — on stderr instead of signalling silently.
+        assert!(
+            killed_stderr.contains(&format!("Terminate PID {pid_text}")),
+            "{killed_stderr}"
+        );
+        assert!(
+            killed_stderr.contains(&format!("Command: kill {pid_text}")),
+            "{killed_stderr}"
+        );
         wait_for_child_exit(&mut helper);
 
         let after = kickoutchi(&["list", "--port", port_text.as_str()]);

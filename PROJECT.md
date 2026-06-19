@@ -101,14 +101,27 @@ kickoutchi
 
 Recommended for contributors.
 
-The project should use `mise` to pin the Rust toolchain and keep contributor environments consistent.
+The project should use `mise` to pin the Rust toolchain and keep contributor environments consistent. `mise.toml` also defines local task aliases for the standard verification commands, so contributors do not have to remember the full Cargo invocations.
 
 ```sh
 git clone https://github.com/nuggocto/kickoutchi.git
 cd kickoutchi
 mise trust
 mise install
+mise run check
 cargo run --release
+```
+
+Common local tasks:
+
+```sh
+mise run fmt
+mise run fmt-check
+mise run clippy
+mise run test
+mise run check
+mise run tui
+mise run list
 ```
 
 To install the locally built binary:
@@ -1310,10 +1323,17 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 Verification commands:
 
 ```sh
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo run
+mise run check
+mise run tui
+```
+
+Equivalent raw Cargo commands:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo run --locked
 ```
 
 `--all-features` stays in the verification commands so any optional feature added later is covered automatically. The project currently defines no optional features, so this builds the same as a default build.

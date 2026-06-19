@@ -201,7 +201,7 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
 fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
     let line = Line::from(vec![
         Span::styled("Kickoutchi", theme.title()),
-        Span::raw("   r refresh  / search  s sort  x kill  ? help  q quit"),
+        Span::raw("   r refresh  / search  s sort  x/X kill  ? help  q quit"),
     ]);
     let header = Paragraph::new(line)
         .alignment(Alignment::Center)
@@ -335,6 +335,8 @@ mod tests {
         let text = render_text(&app, 100, 30);
 
         assert!(text.contains("Kickoutchi"), "{text}");
+        // The force-kill key is advertised on the main screen, not just in help.
+        assert!(text.contains("x/X kill"), "{text}");
         assert!(text.contains("Open Ports"), "{text}");
         assert!(text.contains("3000"), "{text}");
         assert!(text.contains("node"), "{text}");

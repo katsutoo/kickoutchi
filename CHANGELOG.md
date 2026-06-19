@@ -30,10 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate `KillTarget` constructor into a single `from_entries`, switched the
   confirmation modal's force-mode check from a signal-label string comparison to
   `KillMode` equality, and narrowed `current_user_id` to private.
-- The `KillTarget` "at least one row" invariant is now a release assertion
-  instead of a debug-only one, so a future caller that builds a kill target from
-  no rows fails fast on the termination path instead of carrying a degenerate,
-  port-less target forward.
+- Comment accuracy, no behavior change: `PortEntry.child_pids` is now documented
+  as a reserved field that stays empty on real rows (the Linux collector never
+  fills it; selected-row children live in `ProcessContext`, and it remains only
+  for the `list --json` shape and the fake fixture); the already-exited TUI kill
+  test no longer describes the removed "refreshed snapshot" status wording; and
+  `parse_process_start_time_ticks` now explains why it right-splits on `") "` so
+  an unescaped `)` inside `comm` cannot be mistaken for the field terminator.
+- The `KillTarget` construction invariants are now release assertions instead of
+  debug-only ones: the target must contain at least one row, and every row's PID
+  must match the target PID. A future caller that builds a kill target from no
+  rows, or from rows owned by another PID, now fails fast on the termination path
+  instead of carrying a degenerate, port-less, or mis-targeted target forward.
 - Linux collector owner resolution now only records owners for socket inodes
   found in the collected `/proc/net/*` rows. It keeps every PID that references a
   target socket inode, so forked or inherited listening sockets are represented
@@ -65,12 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CLI `kill --yes` now prints the target banner — identity, ports, equivalent
+  command, and any safety warnings (system/service process, ownership by another
+  uid, partial metadata, child processes) — to stderr before signalling, instead
+  of showing them only on the interactive confirmation path. `--yes` opts out of
+  the prompt, not the warnings; the protected-process and unsafe-PID gates are
+  unchanged, and stdout and exit codes are untouched so scripts are unaffected.
+- TUI kill status lines now report only the signal outcome instead of also
+  claiming a refreshed snapshot before the post-kill re-collect has run. The freed
+  port still drops from the table via the best-effort refresh, but a failed
+  re-collect surfaces as the usual error line rather than a status that overstates
+  a refresh that did not happen.
+- TUI header now lists `x/X kill` so the force-kill key is discoverable from the
+  main screen, matching the input handling and the help modal.
 - TUI termination now re-collects the port snapshot when a target exits between
-  confirmation and `pidfd_open`. The `already exited; refreshed snapshot` status
-  line promised a refresh, but the prepare-error path returned without
-  re-collecting, leaving the freed port on the table for up to one refresh
+  confirmation and `pidfd_open`. The prepare-error already-exited path returned
+  without re-collecting, leaving the freed port on the table for up to one refresh
   interval. Other prepare failures (permission denied, an old kernel) leave the
-  process running, so their messages never claimed a refresh and stay correct.
+  process running, so the table is already current for them.
 - Termination confirmations now warn when a target is classified as a
   system/service process, not only when it is on the protected-process list.
 - Pre-signal revalidation now reports ownership unavailable if any confirmed
@@ -129,6 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mise.toml` now includes local task aliases for formatting, strict Clippy,
+  tests, the combined CI-equivalent check, and common `run`/`list` commands.
+- Linux `/proc/<pid>/stat` start-time parsing is now tested for a `comm` that
+  contains `) `, pinning the right-split that keeps the parse robust against
+  unescaped parentheses in the process name.
 - Linux CLI contract coverage now includes a real `SIGTERM` path: a controlled
   helper process binds a TCP listener, `kickoutchi kill --pid --yes` terminates
   it, and a follow-up list confirms the port disappears.

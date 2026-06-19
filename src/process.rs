@@ -127,7 +127,11 @@ impl KillTarget {
 
         for entry in entries {
             saw_entry = true;
-            debug_assert_eq!(entry.pid, Some(pid));
+            assert_eq!(
+                entry.pid,
+                Some(pid),
+                "kill target row PID must match target PID",
+            );
             if process_name.is_none() {
                 process_name.clone_from(&entry.process_name);
             }
@@ -623,6 +627,15 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("system/service process")),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "kill target row PID must match target PID")]
+    fn kill_target_rejects_rows_for_other_pids() {
+        let mut row = entry(3000, Protocol::Tcp);
+        row.pid = Some(999);
+
+        let _ = KillTarget::from_entries(18422, [&row], Some(&context(55)));
     }
 
     #[test]

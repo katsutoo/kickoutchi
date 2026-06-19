@@ -303,6 +303,14 @@ where
         }
     };
 
+    // Print the target banner — identity, ports, equivalent command, and any
+    // safety warnings — before the confirmation branch, so it shows on the
+    // `--yes` path too. Skipping the prompt must not also swallow the
+    // "system/service process", "owned by another uid", partial-metadata, or
+    // "has children" warnings: those are safety notices PROJECT.md requires, and
+    // `--yes` opts out of being *asked*, not of being *told*.
+    print_kill_banner(&target, mode);
+
     if let Some(requirement) = requirement {
         let confirmed = match prompt(&target, mode, requirement) {
             Ok(confirmed) => confirmed,
@@ -535,11 +543,7 @@ fn print_target_error(error: KillTargetError) -> ExitReason {
     }
 }
 
-fn prompt_confirmation(
-    target: &KillTarget,
-    mode: KillMode,
-    requirement: ConfirmationRequirement,
-) -> std::io::Result<bool> {
+fn print_kill_banner(target: &KillTarget, mode: KillMode) {
     eprintln!("{} {}", mode.action_label(), target.identity());
     eprintln!("Ports: {}", target.ports_text());
     eprintln!(
@@ -552,7 +556,13 @@ fn prompt_confirmation(
     for warning in target.warning_lines() {
         eprintln!("Warning: {warning}.");
     }
+}
 
+fn prompt_confirmation(
+    target: &KillTarget,
+    _mode: KillMode,
+    requirement: ConfirmationRequirement,
+) -> std::io::Result<bool> {
     match requirement {
         ConfirmationRequirement::Yes => print!("Type y to confirm, or press Enter to cancel: "),
         ConfirmationRequirement::ForceWord => print!("Type force to confirm SIGKILL: "),

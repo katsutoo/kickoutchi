@@ -60,7 +60,7 @@ fn panel_lines(
 ) -> Vec<Line<'static>> {
     let warning_or_permission = if entry.protected {
         Line::styled(
-            "Warning: protected process, stronger confirmation required later.",
+            "Warning: protected process, stronger confirmation required before termination.",
             theme.protected(),
         )
     } else {

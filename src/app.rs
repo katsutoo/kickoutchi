@@ -558,10 +558,12 @@ impl App {
                     &outcome,
                 ));
                 // A target that exited before we could open its pidfd is gone for
-                // good, so re-collect to drop its freed row and make the "already
-                // exited; refreshed snapshot" status line actually true. The other
-                // prepare failures leave the process running and their messages
-                // never promise a refresh, so the table is already current.
+                // good, so re-collect to drop its freed row from the table. The
+                // refresh is best-effort: the status reports only that the target
+                // already exited, and the table (or the standard error line on a
+                // failed re-collect) speaks for the snapshot rather than the status
+                // claiming a refresh that may not have happened. Other prepare
+                // failures leave the process running, so there's nothing to drop.
                 if matches!(outcome, TerminationOutcome::AlreadyExited) {
                     self.finish_refresh_attempt(collect_ports(), Instant::now());
                 }
@@ -604,6 +606,10 @@ impl App {
             confirmation.mode,
             &outcome,
         ));
+        // Best-effort post-kill refresh so the freed port drops from the table.
+        // The status reports only the signal result; a failed re-collect shows up
+        // as the standard error line rather than letting the status overclaim a
+        // refresh that did not run.
         self.finish_refresh_attempt(collect_ports(), Instant::now());
     }
 
@@ -706,11 +712,9 @@ fn termination_status_line(
     outcome: &TerminationOutcome,
 ) -> String {
     match outcome {
-        TerminationOutcome::Success => format!(
-            "sent {} to {}; refreshed snapshot",
-            mode.signal_label(),
-            target.identity(),
-        ),
+        TerminationOutcome::Success => {
+            format!("sent {} to {}", mode.signal_label(), target.identity())
+        }
         TerminationOutcome::PermissionDenied => format!(
             "permission denied sending {} to {}; {}",
             mode.signal_label(),
@@ -723,7 +727,10 @@ fn termination_status_line(
             mode.signal_label(),
         ),
         TerminationOutcome::AlreadyExited => {
-            format!("{} already exited; refreshed snapshot", target.identity())
+            format!(
+                "{} already exited before the signal was sent",
+                target.identity()
+            )
         }
         TerminationOutcome::Cancelled => "kill cancelled".to_owned(),
         TerminationOutcome::ProtectedProcess => format!(
@@ -1108,8 +1115,9 @@ mod tests {
     #[test]
     fn prepare_already_exited_refreshes_snapshot_so_freed_port_drops() {
         // The target exits between confirmation and pidfd_open, so prepare reports
-        // AlreadyExited before any signal is attempted. The status line promises a
-        // refreshed snapshot, so the freed port must actually drop from the table.
+        // AlreadyExited before any signal is attempted. The status only says the
+        // target already exited; the best-effort re-collect is what drops the freed
+        // row, so verify that re-collect actually runs.
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
         app.apply_action(Action::RequestTerminate);
         let fresh_after_exit: Vec<PortEntry> = Vec::new();
@@ -1131,8 +1139,8 @@ mod tests {
 
         // Prepare failed, so no signal was ever attempted...
         assert!(!terminated);
-        // ...but the post-kill refresh still ran once and dropped the freed port,
-        // so the "already exited; refreshed snapshot" status stays truthful.
+        // ...but the best-effort post-kill refresh still ran once and dropped the
+        // freed port from the table.
         assert_eq!(collect_calls, 1);
         assert_eq!(app.rows().len(), 0);
         assert_eq!(app.modal(), Modal::None);

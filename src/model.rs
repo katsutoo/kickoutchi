@@ -120,9 +120,13 @@ pub(crate) struct PortEntry {
     pub(crate) command_line: Option<String>,
     pub(crate) parent_pid: Option<u32>,
     pub(crate) parent_process_name: Option<String>,
-    /// Filled in lazily, and only for the selected row. Empty doesn't mean "no
-    /// children" — it can just mean "haven't asked yet" (see the PROJECT.md
-    /// collection note).
+    /// Reserved, and effectively always empty on real rows: the Linux collector
+    /// never populates this. Per-row child enumeration would mean walking the whole
+    /// process table on every refresh, so the selected row's children are resolved
+    /// lazily into the [`ProcessContext`] `children` field instead (see the
+    /// PROJECT.md collection note). The field stays only because it's part of the
+    /// stable `list --json` shape and the fake fixture fills it — real child data
+    /// does not flow through here.
     pub(crate) child_pids: Vec<u32>,
     pub(crate) protected: bool,
     pub(crate) platform: Platform,
