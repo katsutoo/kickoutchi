@@ -12,11 +12,14 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, TerminateProcess,
+    PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, Protocol};
@@ -56,12 +59,8 @@ impl KillMode {
         }
     }
 
-    pub(crate) fn action_label_for(self, platform: Platform) -> &'static str {
-        if self.uses_forceful_delivery(platform) {
-            "Force-kill"
-        } else {
-            self.action_label()
-        }
+    pub(crate) fn action_label_for(self, _platform: Platform) -> &'static str {
+        self.action_label()
     }
 
     pub(crate) fn signal_label(self) -> &'static str {
@@ -78,20 +77,19 @@ impl KillMode {
         }
     }
 
-    pub(crate) fn uses_forceful_delivery(self, platform: Platform) -> bool {
-        self == Self::Force || platform == Platform::Windows
-    }
-
     pub(crate) fn force_warning(self, platform: Platform) -> Option<&'static str> {
-        if !self.uses_forceful_delivery(platform) {
-            return None;
-        }
-        Some(match platform {
-            Platform::Linux | Platform::Macos => {
-                "SIGKILL is immediate; prefer normal termination first."
+        match (platform, self) {
+            (Platform::Linux | Platform::Macos, Self::Force) => {
+                Some("SIGKILL is immediate; prefer normal termination first.")
             }
-            Platform::Windows => "TerminateProcess is immediate; prefer normal termination first.",
-        })
+            (Platform::Windows, Self::Terminate) => Some(
+                "Windows termination uses TerminateProcess, which is immediate; close the app normally first when possible.",
+            ),
+            (Platform::Windows, Self::Force) => Some(
+                "TerminateProcess is immediate; use force only when normal termination did not work.",
+            ),
+            (Platform::Linux | Platform::Macos, Self::Terminate) => None,
+        }
     }
 }
 
@@ -106,6 +104,8 @@ pub(crate) enum ConfirmationRequirement {
 pub(crate) enum UnsafePidReason {
     Zero,
     One,
+    #[cfg(windows)]
+    WindowsSystem,
     CurrentProcess,
 }
 
@@ -114,6 +114,8 @@ impl UnsafePidReason {
         match self {
             Self::Zero => "PID 0 is a process-group target, not one process",
             Self::One => "PID 1 is the init/system process",
+            #[cfg(windows)]
+            Self::WindowsSystem => "PID 4 is the Windows System process",
             Self::CurrentProcess => "Kickoutchi cannot terminate itself",
         }
     }
@@ -333,7 +335,7 @@ impl From<&PortEntry> for KillTargetPort {
 
 pub(crate) fn confirmation_requirement(
     protected: bool,
-    platform: Platform,
+    _platform: Platform,
     mode: KillMode,
     yes: bool,
     confirm_force_kill: bool,
@@ -349,7 +351,7 @@ pub(crate) fn confirmation_requirement(
         return Ok(None);
     }
 
-    if mode.uses_forceful_delivery(platform) && confirm_force_kill {
+    if mode == KillMode::Force && confirm_force_kill {
         Ok(Some(ConfirmationRequirement::ForceWord))
     } else {
         Ok(Some(ConfirmationRequirement::Yes))
@@ -366,13 +368,16 @@ pub(crate) fn confirmation_input_matches(
         ConfirmationRequirement::Yes => {
             trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
         }
-        ConfirmationRequirement::ForceWord => trimmed == "force",
+        ConfirmationRequirement::ForceWord => trimmed.eq_ignore_ascii_case("force"),
         ConfirmationRequirement::ProtectedProcess => {
             trimmed == target.pid.to_string()
                 || target
                     .process_name
                     .as_deref()
-                    .is_some_and(|name| trimmed == name)
+                    .is_some_and(|name| match target.platform {
+                        Platform::Windows => trimmed.eq_ignore_ascii_case(name),
+                        Platform::Linux | Platform::Macos => trimmed == name,
+                    })
         }
     }
 }
@@ -460,12 +465,20 @@ pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
     // process group, not a single process), 1 (init — the load-bearing ogre;
     // pull it out and the whole swamp comes down), and our own PID (Kickoutchi
     // doesn't get to kick itself out of its own swamp).
-    match pid {
-        0 => Some(UnsafePidReason::Zero),
-        1 => Some(UnsafePidReason::One),
-        pid if pid == std::process::id() => Some(UnsafePidReason::CurrentProcess),
-        _ => None,
+    if pid == 0 {
+        return Some(UnsafePidReason::Zero);
     }
+    if pid == 1 {
+        return Some(UnsafePidReason::One);
+    }
+    #[cfg(windows)]
+    if pid == 4 {
+        return Some(UnsafePidReason::WindowsSystem);
+    }
+    if pid == std::process::id() {
+        return Some(UnsafePidReason::CurrentProcess);
+    }
+    None
 }
 
 pub(crate) fn prepare_termination(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
@@ -619,7 +632,7 @@ fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> Ter
         )
     };
     if result != 0 {
-        return TerminationOutcome::Success;
+        return wait_for_windows_process_exit(handle);
     }
 
     let error = std::io::Error::last_os_error();
@@ -631,6 +644,38 @@ fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> Ter
 
 #[cfg(windows)]
 const WINDOWS_TERMINATE_EXIT_CODE: u32 = 1;
+#[cfg(windows)]
+const WINDOWS_TERMINATE_WAIT_MS: u32 = 5_000;
+
+#[cfg(windows)]
+fn wait_for_windows_process_exit(handle: &TerminationHandle) -> TerminationOutcome {
+    let result = unsafe {
+        // SAFETY: the process handle is owned by `TerminationHandle` and was
+        // opened with PROCESS_SYNCHRONIZE during preparation. Waiting does not
+        // transfer ownership or write Rust-managed memory.
+        WaitForSingleObject(
+            handle.process_handle.as_raw_handle(),
+            WINDOWS_TERMINATE_WAIT_MS,
+        )
+    };
+    match result {
+        WAIT_OBJECT_0 => TerminationOutcome::Success,
+        WAIT_TIMEOUT => match windows_exit_code(handle) {
+            Ok(code) if code != windows_still_active_exit_code() => TerminationOutcome::Success,
+            Ok(_) => TerminationOutcome::UnknownFailure(format!(
+                "process did not exit within {WINDOWS_TERMINATE_WAIT_MS}ms after TerminateProcess"
+            )),
+            Err(outcome) => outcome,
+        },
+        WAIT_FAILED => {
+            let error = std::io::Error::last_os_error();
+            windows_api_outcome("WaitForSingleObject", &error)
+        }
+        other => TerminationOutcome::UnknownFailure(format!(
+            "WaitForSingleObject returned unexpected status {other}"
+        )),
+    }
+}
 
 #[cfg(windows)]
 fn windows_exit_code(handle: &TerminationHandle) -> Result<u32, TerminationOutcome> {
@@ -825,10 +870,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_termination_is_forceful_for_confirmation_policy() {
+    fn windows_termination_warns_but_normal_confirmation_stays_simple() {
         assert_eq!(
             confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, true),
-            Ok(Some(ConfirmationRequirement::ForceWord)),
+            Ok(Some(ConfirmationRequirement::Yes)),
         );
         assert_eq!(
             confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, false),
@@ -840,7 +885,7 @@ mod tests {
         );
         assert_eq!(
             KillMode::Terminate.action_label_for(Platform::Windows),
-            "Force-kill",
+            "Terminate",
         );
         assert!(
             KillMode::Terminate
@@ -873,6 +918,11 @@ mod tests {
             ConfirmationRequirement::ForceWord,
         ));
         assert!(confirmation_input_matches(
+            "FORCE",
+            &target,
+            ConfirmationRequirement::ForceWord,
+        ));
+        assert!(confirmation_input_matches(
             "18422",
             &target,
             ConfirmationRequirement::ProtectedProcess,
@@ -887,12 +937,23 @@ mod tests {
             &target,
             ConfirmationRequirement::ProtectedProcess,
         ));
+
+        let mut windows_row = entry(3000, Protocol::Tcp);
+        windows_row.platform = Platform::Windows;
+        let windows_target = KillTarget::from_entries(18422, [&windows_row], Some(&context(55)));
+        assert!(confirmation_input_matches(
+            "NODE",
+            &windows_target,
+            ConfirmationRequirement::ProtectedProcess,
+        ));
     }
 
     #[test]
     fn unsafe_pid_guardrails_block_documented_targets() {
         assert_eq!(unsafe_pid_reason(0), Some(UnsafePidReason::Zero));
         assert_eq!(unsafe_pid_reason(1), Some(UnsafePidReason::One));
+        #[cfg(windows)]
+        assert_eq!(unsafe_pid_reason(4), Some(UnsafePidReason::WindowsSystem));
         assert_eq!(
             unsafe_pid_reason(std::process::id()),
             Some(UnsafePidReason::CurrentProcess),

@@ -220,6 +220,13 @@ impl PortEntry {
     /// it. And a protected app like `postgres` doesn't count as a system process
     /// just because it's protected — those are two different ideas.
     pub(crate) fn is_system_process(&self) -> bool {
+        match self.platform {
+            Platform::Windows => self.is_windows_system_process(),
+            Platform::Linux | Platform::Macos => self.is_unix_system_process(),
+        }
+    }
+
+    fn is_unix_system_process(&self) -> bool {
         if self.pid.is_some_and(|pid| pid <= 1) || self.parent_pid == Some(1) {
             return true;
         }
@@ -231,7 +238,42 @@ impl PortEntry {
             )
         })
     }
+
+    fn is_windows_system_process(&self) -> bool {
+        if self.pid.is_some_and(|pid| pid <= 4) {
+            return true;
+        }
+        if self
+            .parent_process_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("services.exe"))
+        {
+            return true;
+        }
+
+        self.process_name.as_deref().is_some_and(|name| {
+            WINDOWS_SYSTEM_PROCESS_NAMES
+                .iter()
+                .any(|system_name| system_name.eq_ignore_ascii_case(name))
+        })
+    }
 }
+
+const WINDOWS_SYSTEM_PROCESS_NAMES: [&str; 13] = [
+    "System",
+    "Registry",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "winlogon.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+    "spoolsv.exe",
+    "explorer.exe",
+];
 
 /// The table sort orders, shared by the CLI and the TUI.
 /// Read straight from the config file (`default_sort = "port"`).
@@ -509,6 +551,24 @@ mod tests {
         row.parent_pid = None;
         row.process_name = Some("systemd".to_owned());
         assert!(row.is_system_process());
+    }
+
+    #[test]
+    fn windows_system_process_classification_covers_core_services() {
+        let mut row = entry(445, Some(4), Some("System"));
+        row.platform = Platform::Windows;
+        assert!(row.is_system_process());
+
+        row.pid = Some(20_000);
+        row.process_name = Some("SVCHOST.EXE".to_owned());
+        assert!(row.is_system_process());
+
+        row.process_name = Some("vendor-service.exe".to_owned());
+        row.parent_process_name = Some("services.exe".to_owned());
+        assert!(row.is_system_process());
+
+        row.parent_process_name = Some("explorer.exe".to_owned());
+        assert!(!row.is_system_process());
     }
 
     #[test]

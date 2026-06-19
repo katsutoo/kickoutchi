@@ -40,6 +40,7 @@ const MAX_STATUS_BYTES: u64 = 8 * 1024;
 const MAX_STAT_BYTES: u64 = 4 * 1024;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
+const MAX_PROCESS_ANCESTORS: usize = 64;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
@@ -556,10 +557,11 @@ fn collect_related_process_hints_from(proc_root: &Path, port: u16) -> Vec<Relate
         return Vec::new();
     };
     let current_pid = std::process::id();
+    let excluded_pids = process_ancestor_pids_from(proc_root, current_pid);
     let mut hints = Vec::new();
 
     for pid in pids {
-        if pid == current_pid {
+        if excluded_pids.contains(&pid) {
             continue;
         }
         let process_dir = proc_root.join(pid.to_string());
@@ -583,6 +585,25 @@ fn collect_related_process_hints_from(proc_root: &Path, port: u16) -> Vec<Relate
     }
 
     hints
+}
+
+fn process_ancestor_pids_from(proc_root: &Path, pid: u32) -> HashSet<u32> {
+    let mut ancestors = HashSet::from([pid]);
+    let mut current = pid;
+    for _ in 0..MAX_PROCESS_ANCESTORS {
+        let process_dir = proc_root.join(current.to_string());
+        let Some(parent_pid) = read_process_status(&process_dir.join("status"))
+            .ok()
+            .and_then(|status| status.parent_pid)
+        else {
+            break;
+        };
+        if !ancestors.insert(parent_pid) {
+            break;
+        }
+        current = parent_pid;
+    }
+    ancestors
 }
 
 fn read_process_name(process_dir: &Path) -> std::io::Result<Option<String>> {
@@ -1144,6 +1165,12 @@ mod tests {
             b"kickoutchi\0list\0--port\x003000\0",
         )
         .expect("self cmdline must be written");
+        write_process(&proc_root, 1, "cargo", 0);
+        fs::write(
+            proc_root.join("1").join("cmdline"),
+            b"cargo\0run\0--\0list\0--port\x003000\0",
+        )
+        .expect("ancestor cmdline must be written");
 
         let hints = collect_related_process_hints_from(&proc_root, 3000);
 

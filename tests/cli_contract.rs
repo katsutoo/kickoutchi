@@ -262,3 +262,227 @@ mod linux {
         let _ = fs::remove_file(ready_file);
     }
 }
+
+#[cfg(windows)]
+mod windows {
+    use std::fs;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Output, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const HELPER_LISTENER_ENV: &str = "KICKOUTCHI_TEST_HELPER_LISTENER";
+    const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
+    const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
+    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(5);
+    const HELPER_READY_WAIT: Duration = Duration::from_secs(5);
+
+    struct ChildGuard {
+        child: Child,
+    }
+
+    impl ChildGuard {
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn kickoutchi(args: &[&str]) -> Output {
+        kickoutchi_with_stdin(args, None)
+    }
+
+    fn kickoutchi_with_stdin(args: &[&str], stdin: Option<&str>) -> Output {
+        let config_home = isolated_config_home();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
+        command
+            .env("APPDATA", &config_home)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().expect("kickoutchi binary must run");
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin must be piped")
+                .write_all(input.as_bytes())
+                .expect("confirmation input must be written");
+        }
+        let output = child
+            .wait_with_output()
+            .expect("kickoutchi output must be collected");
+        let _ = fs::remove_dir_all(config_home);
+        output
+    }
+
+    fn isolated_config_home() -> PathBuf {
+        let unique = unique_suffix();
+        let path = std::env::temp_dir().join(format!(
+            "kickoutchi-cli-contract-windows-config-{}-{unique}",
+            std::process::id(),
+        ));
+        fs::create_dir_all(&path).expect("isolated config directory must be created");
+        path
+    }
+
+    fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
+        let ready_file = temp_file_path("listener-ready");
+        let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+            .env(HELPER_LISTENER_ENV, "1")
+            .env(HELPER_PORT_ENV, "0")
+            .env(HELPER_READY_ENV, &ready_file)
+            .args([
+                "--exact",
+                "windows::helper_tcp_listener_process",
+                "--nocapture",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("listener helper process must start");
+        let guard = ChildGuard { child };
+        wait_for_file(&ready_file);
+        let port = fs::read_to_string(&ready_file)
+            .expect("helper ready file must contain the bound port")
+            .parse::<u16>()
+            .expect("helper bound port must be a u16");
+        (guard, port, ready_file)
+    }
+
+    fn temp_file_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kickoutchi-cli-contract-windows-{label}-{}-{}",
+            std::process::id(),
+            unique_suffix(),
+        ))
+    }
+
+    fn unique_suffix() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos()
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + HELPER_READY_WAIT;
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper process never created ready file {}",
+                path.display(),
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_child_exit(guard: &mut ChildGuard) {
+        let deadline = Instant::now() + CHILD_EXIT_WAIT;
+        loop {
+            if guard
+                .child
+                .try_wait()
+                .expect("child exit status must be readable")
+                .is_some()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper process did not exit after TerminateProcess",
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stdout(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn stderr(output: &Output) -> String {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn helper_tcp_listener_process() {
+        if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
+            return;
+        }
+
+        let port = std::env::var(HELPER_PORT_ENV)
+            .expect("helper port must be set")
+            .parse::<u16>()
+            .expect("helper port must be a u16");
+        let ready_file = PathBuf::from(
+            std::env::var_os(HELPER_READY_ENV).expect("helper ready path must be set"),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .expect("helper listener must bind the requested port");
+        let bound_port = listener
+            .local_addr()
+            .expect("helper listener must have a local address")
+            .port();
+        let ready_tmp = ready_file.with_extension("tmp");
+        fs::write(&ready_tmp, bound_port.to_string()).expect("helper ready file must be written");
+        fs::rename(&ready_tmp, &ready_file).expect("helper ready file must be published");
+
+        loop {
+            thread::sleep(Duration::from_mins(1));
+        }
+    }
+
+    #[test]
+    fn windows_interactive_normal_kill_accepts_y_and_port_disappears() {
+        let (mut helper, port, ready_file) = spawn_listener_process();
+        let port_text = port.to_string();
+        let pid_text = helper.id().to_string();
+
+        let before = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(before.status.code(), Some(0));
+        assert!(stdout(&before).contains(port_text.as_str()));
+        assert!(stdout(&before).contains(pid_text.as_str()));
+
+        let killed = kickoutchi_with_stdin(&["kill", "--pid", pid_text.as_str()], Some("y\n"));
+        assert_eq!(killed.status.code(), Some(0));
+        let killed_stderr = stderr(&killed);
+        assert!(
+            killed_stderr.contains(&format!("Terminate PID {pid_text}")),
+            "{killed_stderr}",
+        );
+        assert!(
+            killed_stderr.contains(&format!("Command: taskkill /F /PID {pid_text}")),
+            "{killed_stderr}",
+        );
+        assert!(
+            killed_stderr.contains("sent TerminateProcess"),
+            "{killed_stderr}"
+        );
+        assert!(
+            killed_stderr.contains("confirmed target ports are no longer visible"),
+            "{killed_stderr}",
+        );
+        wait_for_child_exit(&mut helper);
+
+        let after = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(after.status.code(), Some(3));
+        assert!(stdout(&after).contains("no open ports match the filter"));
+        assert!(!stderr(&after).contains("Possible related process"));
+
+        let _ = fs::remove_file(ready_file);
+    }
+}

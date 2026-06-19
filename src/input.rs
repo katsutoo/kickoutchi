@@ -71,8 +71,21 @@ pub(crate) fn action_for_key(
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::CycleSort,
-        KeyCode::Char('x') => Action::RequestTerminate,
-        KeyCode::Char('X') => Action::RequestForceKill,
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'x')
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::RequestForceKill
+        }
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'x')
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::RequestTerminate
+        }
         KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
         KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
         KeyCode::Enter => Action::OpenDetails,
@@ -118,6 +131,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     /// Most cases don't care about an active filter; the Esc-clears-filter test
@@ -185,8 +202,30 @@ mod tests {
             Action::RequestTerminate,
         );
         assert_eq!(
-            act(KeyCode::Char('X'), Modal::None, false),
+            action_for_key(
+                modified_key(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                Modal::None,
+                false,
+                false,
+            ),
             Action::RequestForceKill,
+        );
+    }
+
+    #[test]
+    fn caps_lock_x_stays_on_the_normal_termination_path() {
+        assert_eq!(
+            act(KeyCode::Char('X'), Modal::None, false),
+            Action::RequestTerminate,
+        );
+        assert_eq!(
+            action_for_key(
+                modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                Modal::None,
+                false,
+                false,
+            ),
+            Action::Noop,
         );
     }
 

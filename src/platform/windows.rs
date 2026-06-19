@@ -6,7 +6,7 @@
 //! selected kill target gets one extra handle open for a high-resolution creation
 //! time marker, because PID reuse is where the dragon lives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -39,6 +39,7 @@ const MAX_IPHELPER_TABLE_BYTES: u32 = 16 * 1024 * 1024;
 const TABLE_READ_ATTEMPTS: usize = 3;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
+const MAX_PROCESS_ANCESTORS: usize = 64;
 
 pub(crate) struct WindowsCollector;
 
@@ -153,6 +154,25 @@ impl ProcessSnapshot {
             truncated,
         }
     }
+
+    fn ancestor_pids(&self, pid: u32) -> HashSet<u32> {
+        let mut ancestors = HashSet::from([pid]);
+        let mut current = pid;
+        for _ in 0..MAX_PROCESS_ANCESTORS {
+            let Some(parent_pid) = self
+                .processes
+                .get(&current)
+                .and_then(|metadata| metadata.parent_pid)
+            else {
+                break;
+            };
+            if !ancestors.insert(parent_pid) {
+                break;
+            }
+            current = parent_pid;
+        }
+        ancestors
+    }
 }
 
 pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
@@ -207,15 +227,14 @@ fn filetime_to_u64(filetime: FILETIME) -> u64 {
 
 pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint> {
     let current_pid = std::process::id();
-    let mut rows = ProcessSnapshot::collect()
-        .processes
-        .into_iter()
-        .collect::<Vec<_>>();
+    let processes = ProcessSnapshot::collect();
+    let excluded_pids = processes.ancestor_pids(current_pid);
+    let mut rows = processes.processes.into_iter().collect::<Vec<_>>();
     rows.sort_by_key(|(pid, _metadata)| *pid);
 
     let mut hints = Vec::new();
     for (pid, metadata) in rows {
-        if pid == current_pid {
+        if excluded_pids.contains(&pid) {
             continue;
         }
         let Some(command_line) = metadata.command_line else {
@@ -587,6 +606,43 @@ mod tests {
             )]),
             children_by_parent: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn process_snapshot_tracks_current_process_ancestors() {
+        let snapshot = ProcessSnapshot {
+            processes: HashMap::from([
+                (
+                    10,
+                    ProcessMetadata {
+                        parent_pid: Some(5),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+                (
+                    5,
+                    ProcessMetadata {
+                        parent_pid: Some(1),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+                (
+                    1,
+                    ProcessMetadata {
+                        parent_pid: Some(1),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+            ]),
+            children_by_parent: HashMap::new(),
+        };
+
+        let ancestors = snapshot.ancestor_pids(10);
+
+        assert!(ancestors.contains(&10));
+        assert!(ancestors.contains(&5));
+        assert!(ancestors.contains(&1));
+        assert_eq!(ancestors.len(), 3);
     }
 
     #[test]

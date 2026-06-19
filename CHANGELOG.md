@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Windows TUI/CLI termination now separates user intent from the underlying
+  delivery mechanism: lowercase `x` / non-`--force` is a normal termination
+  request with `y` confirmation, while uppercase `X` / `--force` keeps the
+  stronger typed `force` confirmation. Windows still delivers both through
+  `TerminateProcess` because Kickoutchi does not have a reliable graceful
+  process-handle equivalent; the confirmation copy and project notes now state
+  that plainly instead of making lowercase `x` look like an accidental force key.
+- The Windows protected-process defaults now include core Windows process names
+  such as `System`, `svchost.exe`, `services.exe`, `lsass.exe`, `wininit.exe`,
+  and Docker/Postgres `.exe` variants. The system/service classifier also treats
+  PID 4, known Windows OS process names, and children of `services.exe` as
+  system/service rows for warning and optional hiding.
+- CLI kill now performs a best-effort post-kill port refresh after a successful
+  termination and reports whether the confirmed target ports are still visible,
+  instead of only telling the user to refresh manually.
+
 - Linux termination now opens a pidfd before the mandatory pre-signal
   revalidation and sends `SIGTERM`/`SIGKILL` through `pidfd_send_signal` instead
   of raw `kill(pid, signal)`. This keeps the signal tied to the prepared process
@@ -72,6 +88,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests no longer run twice, and the duplicate-target Cargo warning is gone.
 
 ### Fixed
+
+- Windows TUI Caps Lock behavior no longer turns an intended lowercase `x` into
+  force-kill. The force-kill key now requires an explicit Shift-modified `X`, so
+  a Caps Lock uppercase `X` stays on the normal termination path.
+- Typed force confirmation now accepts `force` case-insensitively, so `FORCE`
+  does not trap users who entered the confirmation prompt with Caps Lock enabled.
+- Protected-process confirmation now matches process names case-insensitively on
+  Windows, matching Windows protected-name policy.
+- Windows termination now waits briefly for a successful `TerminateProcess` call
+  to complete before reporting success, reducing stale post-kill refreshes where
+  a port can still appear immediately after the kill request.
+- No-match related-process diagnostics now skip Kickoutchi's current process and
+  its ancestors, avoiding false hints for the parent PowerShell/cargo command
+  that launched `kick list --port <PORT>`.
 
 - CLI `kill --yes` now prints the target banner — identity, ports, equivalent
   command, and any safety warnings (system/service process, ownership by another
@@ -149,6 +179,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Windows CLI contract coverage now starts a real local TCP listener, verifies
+  `list --port` sees it, confirms `kill --pid` interactively with `y`, waits for
+  the helper to exit, and verifies the port disappears. This complements the
+  existing Windows unit coverage for IP Helper row normalization and Windows
+  termination error mapping.
 
 - `mise.toml` now includes local task aliases for formatting, strict Clippy,
   tests, the combined CI-equivalent check, and common `run`/`list` commands.

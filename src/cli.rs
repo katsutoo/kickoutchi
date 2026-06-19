@@ -351,7 +351,35 @@ where
 
     let outcome = terminate(&handle, mode);
     print_termination_outcome(&target, mode, &outcome);
+    if outcome == TerminationOutcome::Success {
+        print_post_kill_refresh_status(&target, &mut collectors.collect_ports);
+    }
     exit_reason_for_outcome(&outcome)
+}
+
+fn print_post_kill_refresh_status<CollectPorts>(
+    target: &KillTarget,
+    collect_ports: &mut CollectPorts,
+) where
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    match collect_ports() {
+        Ok(entries) => {
+            let still_visible = entries
+                .iter()
+                .any(|entry| target.ports.contains(&process::KillTargetPort::from(entry)));
+            if still_visible {
+                eprintln!(
+                    "warning: one or more confirmed ports are still visible after termination; another process may own them or shutdown may still be completing",
+                );
+            } else {
+                eprintln!("confirmed target ports are no longer visible");
+            }
+        }
+        Err(error) => eprintln!(
+            "warning: collecting ports after termination failed; refresh manually to verify the port disappeared: {error}",
+        ),
+    }
 }
 
 fn revalidate_cli_target<CollectContext, CollectPorts>(
@@ -569,20 +597,20 @@ fn prompt_confirmation(
     requirement: ConfirmationRequirement,
 ) -> std::io::Result<bool> {
     match requirement {
-        ConfirmationRequirement::Yes => print!("Type y to confirm, or press Enter to cancel: "),
+        ConfirmationRequirement::Yes => eprint!("Type y to confirm, or press Enter to cancel: "),
         ConfirmationRequirement::ForceWord => {
-            print!(
+            eprint!(
                 "Type force to confirm {}: ",
                 mode.delivery_label(target.platform)
             );
         }
-        ConfirmationRequirement::ProtectedProcess => print!(
+        ConfirmationRequirement::ProtectedProcess => eprint!(
             "Protected process: type PID {} or process name {} to confirm: ",
             target.pid,
             target.process_name_or_unknown(),
         ),
     }
-    std::io::stdout().flush()?;
+    std::io::stderr().flush()?;
 
     let answer = read_confirmation_line(CONFIRMATION_INPUT_MAX_BYTES)?;
     Ok(process::confirmation_input_matches(
@@ -614,10 +642,7 @@ fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
 fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
     let delivery = mode.delivery_label(target.platform);
     match outcome {
-        TerminationOutcome::Success => eprintln!(
-            "sent {delivery} to {}; refresh to verify the port disappeared",
-            target.identity(),
-        ),
+        TerminationOutcome::Success => eprintln!("sent {delivery} to {}", target.identity()),
         TerminationOutcome::PermissionDenied => eprintln!(
             "error: permission denied sending {delivery} to {}; {}",
             target.identity(),

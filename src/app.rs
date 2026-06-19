@@ -976,6 +976,21 @@ mod tests {
     }
 
     #[test]
+    fn windows_terminate_key_uses_yes_confirmation() {
+        let mut row = entry(3000, Some("node.exe"));
+        row.platform = Platform::Windows;
+        let mut app = app_with_rows(vec![row]);
+
+        app.apply_action(Action::RequestTerminate);
+
+        let confirmation = app
+            .kill_confirmation()
+            .expect("windows termination request opens confirmation");
+        assert_eq!(confirmation.mode, KillMode::Terminate);
+        assert_eq!(confirmation.requirement, ConfirmationRequirement::Yes);
+    }
+
+    #[test]
     fn protected_process_uses_stronger_confirmation() {
         let mut app = app_with_rows(vec![entry(5432, Some("postgres"))]);
 

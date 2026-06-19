@@ -385,9 +385,23 @@ Default protected process names:
 
 ```txt
 docker
+docker.exe
+dockerd.exe
+Docker Desktop.exe
+com.docker.backend.exe
 postgres
+postgres.exe
 systemd
+System
+smss.exe
+csrss.exe
+wininit.exe
+services.exe
+lsass.exe
+svchost.exe
+winlogon.exe
 explorer.exe
+dwm.exe
 WindowServer
 ```
 
@@ -533,9 +547,11 @@ Platform commands shown in UI:
 |---|---|---|
 | Linux | `kill <PID>` | `kill -9 <PID>` |
 | macOS | `kill <PID>` | `kill -9 <PID>` |
-| Windows | `taskkill /PID <PID>` | `taskkill /F /PID <PID>` |
+| Windows | `taskkill /F /PID <PID>` | `taskkill /F /PID <PID>` |
 
 Implementation should use platform APIs where reasonable, but the UI should show the equivalent command so users understand what will happen.
+
+Windows note: Kickoutchi's current Windows implementation uses a prepared process handle plus `TerminateProcess`, so both `x` and `X` have the same OS delivery and the equivalent command includes `/F`. The keys still differ in user intent and confirmation strength: `x` is the normal termination request and asks for `y`; `X` is an explicit force-kill request and asks for typed `force` when `confirm_force_kill` is enabled. The confirmation warning names `TerminateProcess` so users understand that Windows delivery is immediate.
 
 Safety rules:
 
@@ -1101,7 +1117,7 @@ pedantic = "warn"
 
 ## Phase 7 - Windows Native Collector And Termination
 
-**Status: Optional, deferred until there is motivation to support Windows.** Linux is the primary supported platform and Kickoutchi is considered complete without this phase. (WSL2 dev-server ports are already covered by the Linux build, since WSL2 is Linux.)
+**Status: Implemented.** Linux remains the primary supported platform, but the Windows native collector and process-handle termination path are now built and covered by Windows CI. (WSL2 dev-server ports are still covered by the Linux build, since WSL2 is Linux.)
 
 **Goal:** Bring the same core behavior to Windows using Windows APIs instead of parsing `netstat`.
 
@@ -1111,21 +1127,21 @@ pedantic = "warn"
 
 ### Build steps
 
-1. Create `platform/windows.rs` behind `cfg(windows)`.
-2. Wrap `GetExtendedTcpTable` for TCP rows with owner PID.
-3. Wrap `GetExtendedUdpTable` for UDP rows with owner PID.
-4. Normalize IPv4 TCP and UDP rows into `PortEntry`.
-5. Normalize IPv6 TCP and UDP rows into `PortEntry`.
-6. Filter TCP rows to `LISTEN`.
-7. Treat UDP rows as bound sockets.
-8. Resolve process name, executable path, and command line with `sysinfo` or Windows process APIs.
-9. Handle access-denied process metadata as partial rows.
-10. Implement normal terminate with the Windows process API or equivalent safe wrapper.
-11. Implement force kill with the Windows process API or equivalent safe wrapper.
-12. Render Windows command equivalents as `taskkill /PID <PID>` and `taskkill /F /PID <PID>`.
-13. Verify that protected-process matching is case-insensitive on Windows.
-14. Add Windows-only smoke tests behind `cfg(windows)`.
-15. Add CI coverage for `cargo check`, tests, and clippy on Windows.
+1. **Done in Phase 7:** create `platform/windows.rs` behind `cfg(windows)`.
+2. **Done in Phase 7:** wrap `GetExtendedTcpTable` for TCP rows with owner PID.
+3. **Done in Phase 7:** wrap `GetExtendedUdpTable` for UDP rows with owner PID.
+4. **Done in Phase 7:** normalize IPv4 TCP and UDP rows into `PortEntry`.
+5. **Done in Phase 7:** normalize IPv6 TCP and UDP rows into `PortEntry`.
+6. **Done in Phase 7:** filter TCP rows to `LISTEN`.
+7. **Done in Phase 7:** treat UDP rows as bound sockets.
+8. **Done in Phase 7:** resolve process name, executable path, and command line with `sysinfo` where permissions allow it.
+9. **Done in Phase 7:** handle access-denied process metadata as partial rows.
+10. **Done in Phase 7:** implement the normal termination request with a prepared Windows process handle and `TerminateProcess`, with `y` confirmation and a warning that Windows delivery is immediate.
+11. **Done in Phase 7:** implement force kill with the same prepared process-handle delivery, but keep the stronger typed `force` confirmation for explicit force requests.
+12. **Done in Phase 7:** render Windows command equivalents as `taskkill /F /PID <PID>` for both paths because both use `TerminateProcess`.
+13. **Done in Phase 7:** verify that protected-process matching is case-insensitive on Windows.
+14. **Done in Phase 7:** add Windows-only smoke tests behind `cfg(windows)` for real list and interactive kill behavior.
+15. **Done in Phase 7:** add CI coverage for formatting, tests, and clippy on Windows.
 
 ### Done when
 
@@ -1133,8 +1149,8 @@ pedantic = "warn"
 - A local dev server appears with the correct PID.
 - UDP rows render as bound sockets.
 - Access-denied rows are displayed clearly.
-- Normal termination works for a user-owned process.
-- Force kill uses the stronger confirmation path.
+- Normal termination request works for a user-owned process and accepts `y` confirmation.
+- Force kill uses the stronger typed `force` confirmation path.
 - Windows CI passes.
 
 ### Do not build yet
@@ -1319,6 +1335,7 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 - TUI state tests for single-flight background refresh and completed refresh polling
 - Platform smoke tests for collectors behind `cfg(target_os = "...")`
 - Integration tests that run the built binary to pin script-facing CLI contracts (stderr diagnostics, `list --json` non-pollution, exit codes)
+- Windows integration tests that run the built binary against a real local TCP listener and verify interactive `kill --pid` removes the port
 
 Verification commands:
 

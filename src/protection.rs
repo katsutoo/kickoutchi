@@ -7,11 +7,25 @@
 
 use crate::model::{Platform, PortEntry};
 
-const DEFAULT_PROTECTED_PROCESS_NAMES: [&str; 5] = [
+const DEFAULT_PROTECTED_PROCESS_NAMES: [&str; 19] = [
     "docker",
+    "docker.exe",
+    "dockerd.exe",
+    "Docker Desktop.exe",
+    "com.docker.backend.exe",
     "postgres",
+    "postgres.exe",
     "systemd",
+    "System",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "winlogon.exe",
     "explorer.exe",
+    "dwm.exe",
     "WindowServer",
 ];
 
@@ -81,8 +95,12 @@ mod tests {
     fn defaults_cover_documented_safety_names() {
         let defaults = default_protected_processes();
         assert!(defaults.contains(&"docker".to_owned()));
+        assert!(defaults.contains(&"dockerd.exe".to_owned()));
         assert!(defaults.contains(&"postgres".to_owned()));
+        assert!(defaults.contains(&"postgres.exe".to_owned()));
         assert!(defaults.contains(&"systemd".to_owned()));
+        assert!(defaults.contains(&"svchost.exe".to_owned()));
+        assert!(defaults.contains(&"lsass.exe".to_owned()));
         assert!(defaults.contains(&"explorer.exe".to_owned()));
         assert!(defaults.contains(&"WindowServer".to_owned()));
     }
