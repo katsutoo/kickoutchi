@@ -10,8 +10,9 @@ pub(crate) fn render_kill_command(platform: Platform, pid: u32, mode: KillMode) 
     match (platform, mode) {
         (Platform::Linux | Platform::Macos, KillMode::Terminate) => format!("kill {pid}"),
         (Platform::Linux | Platform::Macos, KillMode::Force) => format!("kill -9 {pid}"),
-        (Platform::Windows, KillMode::Terminate) => format!("taskkill /PID {pid}"),
-        (Platform::Windows, KillMode::Force) => format!("taskkill /F /PID {pid}"),
+        (Platform::Windows, KillMode::Terminate | KillMode::Force) => {
+            format!("taskkill /F /PID {pid}")
+        }
     }
 }
 
@@ -33,7 +34,7 @@ mod tests {
         );
         assert_eq!(
             render_kill_command(Platform::Windows, 18422, KillMode::Terminate),
-            "taskkill /PID 18422",
+            "taskkill /F /PID 18422",
         );
         assert_eq!(
             render_kill_command(Platform::Windows, 18422, KillMode::Force),

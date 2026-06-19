@@ -510,10 +510,10 @@ fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
     let owner_uid = read_process_status(&process_dir.join("status"))
         .ok()
         .and_then(|status| status.owner_uid);
-    let process_start_time_ticks = read_process_start_time_ticks(&process_dir.join("stat")).ok();
+    let process_start_time_marker = read_process_start_time_ticks(&process_dir.join("stat")).ok();
     ProcessContext {
         owner_uid,
-        process_start_time_ticks,
+        process_start_time_marker,
         children: collect_child_processes_from(proc_root, pid),
     }
 }
@@ -1089,7 +1089,7 @@ mod tests {
         let context = collect_process_context_from(&proc_root, 100);
 
         assert_eq!(context.owner_uid, Some(1000));
-        assert_eq!(context.process_start_time_ticks, Some(1000));
+        assert_eq!(context.process_start_time_marker, Some(1000));
         let children: Vec<(u32, Option<&str>)> = context
             .children
             .children

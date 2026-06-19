@@ -141,11 +141,11 @@ pub(crate) struct PortEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ProcessContext {
     pub(crate) owner_uid: Option<u32>,
-    /// Raw start-time tick from Linux `/proc/<pid>/stat`, used purely as a
-    /// kill-target identity guard. We never render or serialize it: turning ticks
-    /// into a real timestamp needs clock context we don't bother with, but the raw
-    /// number is plenty to catch PID reuse before we fire off a signal.
-    pub(crate) process_start_time_ticks: Option<u64>,
+    /// Platform-specific process start marker, used purely as a kill-target
+    /// identity guard. We never render or serialize it: it only exists so a PID
+    /// that wanders off and comes back wearing another process's face gets caught
+    /// before the boot hits the swamp water.
+    pub(crate) process_start_time_marker: Option<u64>,
     pub(crate) children: ChildProcessSnapshot,
 }
 

@@ -432,6 +432,7 @@ impl App {
         // never "kills without asking".
         let requirement = match process::confirmation_requirement(
             target.protected,
+            target.platform,
             mode,
             false,
             self.force_kill_confirmation.confirm_force_kill(),
@@ -505,9 +506,12 @@ impl App {
         if let Some(confirmation) = self.kill_confirmation.as_mut() {
             confirmation.error = Some(match confirmation.requirement {
                 ConfirmationRequirement::Yes => "press y to confirm or Esc to cancel".to_owned(),
-                ConfirmationRequirement::ForceWord => {
-                    "type force and press Enter to confirm SIGKILL".to_owned()
-                }
+                ConfirmationRequirement::ForceWord => format!(
+                    "type force and press Enter to confirm {}",
+                    confirmation
+                        .mode
+                        .delivery_label(confirmation.target.platform),
+                ),
                 ConfirmationRequirement::ProtectedProcess => format!(
                     "type PID {} or process name {} to confirm",
                     confirmation.target.pid,
@@ -576,7 +580,7 @@ impl App {
             Err(error) => {
                 self.latest_error = Some(error.to_string());
                 self.kill_status = Some(format!(
-                    "collecting ports before kill failed; no signal was sent: {error}",
+                    "collecting ports before kill failed; no termination was sent: {error}",
                 ));
                 return;
             }
@@ -711,24 +715,23 @@ fn termination_status_line(
     mode: KillMode,
     outcome: &TerminationOutcome,
 ) -> String {
+    let delivery = mode.delivery_label(target.platform);
     match outcome {
         TerminationOutcome::Success => {
-            format!("sent {} to {}", mode.signal_label(), target.identity())
+            format!("sent {delivery} to {}", target.identity())
         }
         TerminationOutcome::PermissionDenied => format!(
-            "permission denied sending {} to {}; {}",
-            mode.signal_label(),
+            "permission denied sending {delivery} to {}; {}",
             target.identity(),
-            process::PERMISSION_DENIED_SANDBOX_HINT,
+            process::permission_denied_hint(target.platform),
         ),
         TerminationOutcome::OwnershipUnavailable => format!(
-            "ownership for {} became unavailable before {}; no signal was sent",
+            "ownership for {} became unavailable before {delivery}; no termination was sent",
             target.identity(),
-            mode.signal_label(),
         ),
         TerminationOutcome::AlreadyExited => {
             format!(
-                "{} already exited before the signal was sent",
+                "{} already exited before termination was sent",
                 target.identity()
             )
         }
@@ -738,15 +741,14 @@ fn termination_status_line(
             target.identity(),
         ),
         TerminationOutcome::TargetChanged => format!(
-            "{} no longer owns the confirmed port target; no signal was sent",
+            "{} no longer owns the confirmed port target; no termination was sent",
             target.identity(),
         ),
         TerminationOutcome::UnsafePid(reason) => {
             format!("unsafe PID blocked: {}", reason.message())
         }
         TerminationOutcome::UnknownFailure(error) => format!(
-            "sending {} to {} failed: {error}",
-            mode.signal_label(),
+            "sending {delivery} to {} failed: {error}",
             target.identity(),
         ),
     }
@@ -842,7 +844,7 @@ mod tests {
 
     fn context(start_time_ticks: u64) -> ProcessContext {
         ProcessContext {
-            process_start_time_ticks: Some(start_time_ticks),
+            process_start_time_marker: Some(start_time_ticks),
             ..ProcessContext::default()
         }
     }
@@ -852,7 +854,7 @@ mod tests {
             .as_mut()
             .expect("confirmation must be open")
             .target
-            .process_start_time_ticks = Some(start_time_ticks);
+            .process_start_time_marker = Some(start_time_ticks);
     }
 
     #[test]

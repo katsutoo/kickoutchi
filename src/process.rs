@@ -1,13 +1,23 @@
 //! The "are we really doing this?" brain, plus the actual signal delivery.
 //!
 //! This is the safety-critical side of termination: target snapshots,
-//! confirmation rules, PID guardrails, and the tiny Linux pidfd FFI path that
-//! sends SIGTERM/SIGKILL. The UI and CLI decide *when* to ask the user; this
-//! module decides what's actually safe to run. When in doubt, it says no.
+//! confirmation rules, PID guardrails, and the tiny OS FFI paths that send the
+//! final stop request. The UI and CLI decide *when* to ask the user; this module
+//! decides what's actually safe to run. When in doubt, it says no.
 
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, TerminateProcess,
+};
 
 use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, Protocol};
 
@@ -21,6 +31,16 @@ pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 /// errno. We can't tell the two apart at this layer, so the message names both.
 pub(crate) const PERMISSION_DENIED_SANDBOX_HINT: &str =
     "a sandbox or seccomp policy blocking the pidfd syscalls can also cause this";
+
+pub(crate) fn permission_denied_hint(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Linux => PERMISSION_DENIED_SANDBOX_HINT,
+        Platform::Windows => {
+            "try an elevated terminal; protected or higher-integrity processes can also reject TerminateProcess"
+        }
+        Platform::Macos => "try again with sufficient privileges",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillMode {
@@ -36,11 +56,42 @@ impl KillMode {
         }
     }
 
+    pub(crate) fn action_label_for(self, platform: Platform) -> &'static str {
+        if self.uses_forceful_delivery(platform) {
+            "Force-kill"
+        } else {
+            self.action_label()
+        }
+    }
+
     pub(crate) fn signal_label(self) -> &'static str {
         match self {
             Self::Terminate => "SIGTERM",
             Self::Force => "SIGKILL",
         }
+    }
+
+    pub(crate) fn delivery_label(self, platform: Platform) -> &'static str {
+        match platform {
+            Platform::Linux | Platform::Macos => self.signal_label(),
+            Platform::Windows => "TerminateProcess",
+        }
+    }
+
+    pub(crate) fn uses_forceful_delivery(self, platform: Platform) -> bool {
+        self == Self::Force || platform == Platform::Windows
+    }
+
+    pub(crate) fn force_warning(self, platform: Platform) -> Option<&'static str> {
+        if !self.uses_forceful_delivery(platform) {
+            return None;
+        }
+        Some(match platform {
+            Platform::Linux | Platform::Macos => {
+                "SIGKILL is immediate; prefer normal termination first."
+            }
+            Platform::Windows => "TerminateProcess is immediate; prefer normal termination first.",
+        })
     }
 }
 
@@ -86,7 +137,9 @@ pub(crate) struct TerminationHandle {
     pid: u32,
     #[cfg(target_os = "linux")]
     pidfd: OwnedFd,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    process_handle: OwnedHandle,
+    #[cfg(not(any(target_os = "linux", windows)))]
     _unsupported: (),
 }
 
@@ -106,7 +159,7 @@ pub(crate) struct KillTarget {
     pub(crate) system_process: bool,
     pub(crate) ports: Vec<KillTargetPort>,
     pub(crate) owner_uid: Option<u32>,
-    pub(crate) process_start_time_ticks: Option<u64>,
+    pub(crate) process_start_time_marker: Option<u64>,
     pub(crate) child_count: usize,
     pub(crate) children_truncated: bool,
 }
@@ -170,7 +223,8 @@ impl KillTarget {
             system_process,
             ports,
             owner_uid: context.and_then(|context| context.owner_uid),
-            process_start_time_ticks: context.and_then(|context| context.process_start_time_ticks),
+            process_start_time_marker: context
+                .and_then(|context| context.process_start_time_marker),
             child_count: child_snapshot.map_or(0, |snapshot| snapshot.children.len()),
             children_truncated: child_snapshot.is_some_and(|snapshot| snapshot.truncated),
         }
@@ -211,7 +265,10 @@ impl KillTarget {
             warnings.push("system/service process; verify this is safe to terminate".to_owned());
         }
 
+        #[cfg(target_os = "linux")]
         let mut owner_warning_added = false;
+        #[cfg(not(target_os = "linux"))]
+        let owner_warning_added = false;
         #[cfg(target_os = "linux")]
         if let Some(owner_uid) = self.owner_uid {
             let current_uid = current_user_id();
@@ -276,6 +333,7 @@ impl From<&PortEntry> for KillTargetPort {
 
 pub(crate) fn confirmation_requirement(
     protected: bool,
+    platform: Platform,
     mode: KillMode,
     yes: bool,
     confirm_force_kill: bool,
@@ -291,7 +349,7 @@ pub(crate) fn confirmation_requirement(
         return Ok(None);
     }
 
-    if mode == KillMode::Force && confirm_force_kill {
+    if mode.uses_forceful_delivery(platform) && confirm_force_kill {
         Ok(Some(ConfirmationRequirement::ForceWord))
     } else {
         Ok(Some(ConfirmationRequirement::Yes))
@@ -335,11 +393,11 @@ pub(crate) fn target_still_matches_confirmation(
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         match (
-            confirmed.process_start_time_ticks,
-            fresh.process_start_time_ticks,
+            confirmed.process_start_time_marker,
+            fresh.process_start_time_marker,
         ) {
             (Some(confirmed_start), Some(fresh_start)) if confirmed_start == fresh_start => {}
             _ => return false,
@@ -517,7 +575,103 @@ fn outcome_from_errno(operation: &str, error: &std::io::Error) -> TerminationOut
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
+    let desired_access =
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+    let handle = unsafe {
+        // SAFETY: OpenProcess takes a PID and access mask by value. We request no
+        // inherited handle, and no Rust-managed memory crosses this swamp gate.
+        OpenProcess(desired_access, 0, pid)
+    };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        return Err(windows_api_outcome("OpenProcess", &error));
+    }
+
+    let process_handle = unsafe {
+        // SAFETY: OpenProcess returned a non-null owned process handle. OwnedHandle
+        // closes it exactly once, so the ogre does not leave handle crumbs behind.
+        OwnedHandle::from_raw_handle(handle)
+    };
+    Ok(TerminationHandle {
+        pid,
+        process_handle,
+    })
+}
+
+#[cfg(windows)]
+fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
+    match windows_exit_code(handle) {
+        Ok(code) if code != windows_still_active_exit_code() => {
+            return TerminationOutcome::AlreadyExited;
+        }
+        Ok(_) => {}
+        Err(outcome) => return outcome,
+    }
+
+    let result = unsafe {
+        // SAFETY: the handle is the still-owned process handle opened during
+        // preparation. Windows has one hard stop here; both UI modes use it.
+        TerminateProcess(
+            handle.process_handle.as_raw_handle(),
+            WINDOWS_TERMINATE_EXIT_CODE,
+        )
+    };
+    if result != 0 {
+        return TerminationOutcome::Success;
+    }
+
+    let error = std::io::Error::last_os_error();
+    if matches!(windows_exit_code(handle), Ok(code) if code != windows_still_active_exit_code()) {
+        return TerminationOutcome::AlreadyExited;
+    }
+    windows_api_outcome("TerminateProcess", &error)
+}
+
+#[cfg(windows)]
+const WINDOWS_TERMINATE_EXIT_CODE: u32 = 1;
+
+#[cfg(windows)]
+fn windows_exit_code(handle: &TerminationHandle) -> Result<u32, TerminationOutcome> {
+    let mut exit_code = 0_u32;
+    let result = unsafe {
+        // SAFETY: the pointer is valid for one u32 write and the process handle is
+        // owned by `TerminationHandle` for this whole call.
+        GetExitCodeProcess(handle.process_handle.as_raw_handle(), &raw mut exit_code)
+    };
+    if result == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(windows_api_outcome("GetExitCodeProcess", &error));
+    }
+    Ok(exit_code)
+}
+
+#[cfg(windows)]
+fn windows_still_active_exit_code() -> u32 {
+    u32::try_from(STILL_ACTIVE).expect("STILL_ACTIVE must fit in a process exit code")
+}
+
+#[cfg(windows)]
+fn windows_api_outcome(operation: &str, error: &std::io::Error) -> TerminationOutcome {
+    match windows_error_code(error) {
+        Some(ERROR_INVALID_PARAMETER) => TerminationOutcome::AlreadyExited,
+        Some(ERROR_ACCESS_DENIED) => TerminationOutcome::PermissionDenied,
+        _ if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            TerminationOutcome::PermissionDenied
+        }
+        _ => TerminationOutcome::UnknownFailure(format!("{operation} failed: {error}")),
+    }
+}
+
+#[cfg(windows)]
+fn windows_error_code(error: &std::io::Error) -> Option<u32> {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
     Ok(TerminationHandle {
         pid,
@@ -525,7 +679,7 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn terminate_handle_platform(_handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
     TerminationOutcome::UnknownFailure(
         "termination is only implemented for the Linux collector".to_owned(),
@@ -541,10 +695,14 @@ mod tests {
         confirmation_input_matches, confirmation_requirement, revalidate_confirmed_target,
         target_still_matches_confirmation, unsafe_pid_reason,
     };
+    #[cfg(windows)]
+    use super::{windows_api_outcome, windows_still_active_exit_code};
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
         Protocol, SocketState,
     };
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
 
     fn entry(port: u16, protocol: Protocol) -> PortEntry {
         PortEntry {
@@ -571,7 +729,7 @@ mod tests {
     fn context(start_time_ticks: u64) -> ProcessContext {
         ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_ticks: Some(start_time_ticks),
+            process_start_time_marker: Some(start_time_ticks),
             children: ChildProcessSnapshot::default(),
         }
     }
@@ -585,7 +743,7 @@ mod tests {
         ];
         let context = ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_ticks: Some(55),
+            process_start_time_marker: Some(55),
             children: ChildProcessSnapshot {
                 children: vec![ChildProcess {
                     pid: 18423,
@@ -641,28 +799,53 @@ mod tests {
     #[test]
     fn confirmation_requirements_keep_yes_from_bypassing_protected_processes() {
         assert_eq!(
-            confirmation_requirement(false, KillMode::Terminate, true, true),
+            confirmation_requirement(false, Platform::Linux, KillMode::Terminate, true, true),
             Ok(None),
         );
         assert_eq!(
-            confirmation_requirement(false, KillMode::Terminate, false, true),
+            confirmation_requirement(false, Platform::Linux, KillMode::Terminate, false, true),
             Ok(Some(ConfirmationRequirement::Yes)),
         );
         assert_eq!(
-            confirmation_requirement(false, KillMode::Force, false, true),
+            confirmation_requirement(false, Platform::Linux, KillMode::Force, false, true),
             Ok(Some(ConfirmationRequirement::ForceWord)),
         );
         assert_eq!(
-            confirmation_requirement(false, KillMode::Force, false, false),
+            confirmation_requirement(false, Platform::Linux, KillMode::Force, false, false),
             Ok(Some(ConfirmationRequirement::Yes)),
         );
         assert_eq!(
-            confirmation_requirement(true, KillMode::Terminate, false, true),
+            confirmation_requirement(true, Platform::Linux, KillMode::Terminate, false, true),
             Ok(Some(ConfirmationRequirement::ProtectedProcess)),
         );
         assert_eq!(
-            confirmation_requirement(true, KillMode::Terminate, true, true),
+            confirmation_requirement(true, Platform::Linux, KillMode::Terminate, true, true),
             Err(TerminationOutcome::ProtectedProcess),
+        );
+    }
+
+    #[test]
+    fn windows_termination_is_forceful_for_confirmation_policy() {
+        assert_eq!(
+            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, true),
+            Ok(Some(ConfirmationRequirement::ForceWord)),
+        );
+        assert_eq!(
+            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, false),
+            Ok(Some(ConfirmationRequirement::Yes)),
+        );
+        assert_eq!(
+            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, true, true),
+            Ok(None),
+        );
+        assert_eq!(
+            KillMode::Terminate.action_label_for(Platform::Windows),
+            "Force-kill",
+        );
+        assert!(
+            KillMode::Terminate
+                .force_warning(Platform::Windows)
+                .is_some()
         );
     }
 
@@ -830,5 +1013,31 @@ mod tests {
             revalidate_confirmed_target(&confirmed, &[protected], Some(&context(55))),
             Err(TerminationOutcome::ProtectedProcess),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_termination_maps_permission_denied_and_missing_pid_separately() {
+        let denied = std::io::Error::from_raw_os_error(
+            i32::try_from(ERROR_ACCESS_DENIED).expect("Windows error code fits i32"),
+        );
+        let missing = std::io::Error::from_raw_os_error(
+            i32::try_from(ERROR_INVALID_PARAMETER).expect("Windows error code fits i32"),
+        );
+
+        assert_eq!(
+            windows_api_outcome("OpenProcess", &denied),
+            TerminationOutcome::PermissionDenied,
+        );
+        assert_eq!(
+            windows_api_outcome("OpenProcess", &missing),
+            TerminationOutcome::AlreadyExited,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_still_active_code_matches_the_process_api_contract() {
+        assert_eq!(windows_still_active_exit_code(), 259);
     }
 }

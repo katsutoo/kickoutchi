@@ -287,7 +287,7 @@ mod tests {
         let mut row = entry();
         let context = ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_ticks: Some(55),
+            process_start_time_marker: Some(55),
             children: ChildProcessSnapshot {
                 children: vec![
                     ChildProcess {

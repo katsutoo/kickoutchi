@@ -1,9 +1,11 @@
-//! Home of the platform-specific collectors (Linux today).
+//! Home of the platform-specific collectors.
 
 use crate::model::{ProcessContext, RelatedProcessHint};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(windows)]
+pub(crate) mod windows;
 
 pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
     #[cfg(target_os = "linux")]
@@ -11,7 +13,12 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
         linux::collect_process_context(pid)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        windows::collect_process_context(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = pid;
         ProcessContext::default()
@@ -24,7 +31,12 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
         linux::collect_related_process_hints(port)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        windows::collect_related_process_hints(port)
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = port;
         Vec::new()

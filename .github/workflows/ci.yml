@@ -41,3 +41,29 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-features
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+
+      - name: Use pinned Rust toolchain
+        shell: bash
+        run: rustup default "$RUST_VERSION"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-features

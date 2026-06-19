@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::{self, App, KillConfirmation};
-use crate::process::{ConfirmationRequirement, KillMode};
+use crate::process::ConfirmationRequirement;
 
 use super::theme::Theme;
 
@@ -36,7 +36,9 @@ fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line
         Line::styled(
             format!(
                 "{} {}",
-                confirmation.mode.action_label(),
+                confirmation
+                    .mode
+                    .action_label_for(confirmation.target.platform),
                 confirmation.target.identity(),
             ),
             theme.title(),
@@ -49,11 +51,11 @@ fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line
         ),
     ];
 
-    if confirmation.mode == KillMode::Force {
-        lines.push(Line::styled(
-            "Warning: SIGKILL is immediate. Prefer normal termination first.",
-            theme.warning(),
-        ));
+    if let Some(warning) = confirmation
+        .mode
+        .force_warning(confirmation.target.platform)
+    {
+        lines.push(Line::styled(format!("Warning: {warning}"), theme.warning()));
     }
     for warning in confirmation.target.warning_lines() {
         lines.push(Line::styled(
@@ -85,7 +87,10 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
             Span::styled("y", theme.key()),
             Span::raw(format!(
                 " confirms {}. ",
-                confirmation.mode.action_label().to_ascii_lowercase(),
+                confirmation
+                    .mode
+                    .action_label_for(confirmation.target.platform)
+                    .to_ascii_lowercase(),
             )),
             Span::styled("n", theme.key()),
             Span::raw(" cancels."),
@@ -95,7 +100,12 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
             Span::styled("force", theme.key()),
             Span::raw(" and press "),
             Span::styled("Enter", theme.key()),
-            Span::raw(" to send SIGKILL."),
+            Span::raw(format!(
+                " to send {}.",
+                confirmation
+                    .mode
+                    .delivery_label(confirmation.target.platform),
+            )),
         ]),
         ConfirmationRequirement::ProtectedProcess => Line::from(vec![
             Span::raw("Protected process: type "),

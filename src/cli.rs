@@ -131,7 +131,7 @@ pub(crate) struct KillArgs {
     #[arg(long)]
     pub(crate) port: Option<u16>,
 
-    /// Force kill (SIGKILL) instead of normal termination (SIGTERM).
+    /// Force kill instead of normal termination where the platform supports a distinction.
     #[arg(long)]
     pub(crate) force: bool,
 
@@ -292,6 +292,7 @@ where
 
     let requirement = match process::confirmation_requirement(
         target.protected,
+        target.platform,
         mode,
         args.yes,
         config.confirm_force_kill,
@@ -544,14 +545,18 @@ fn print_target_error(error: KillTargetError) -> ExitReason {
 }
 
 fn print_kill_banner(target: &KillTarget, mode: KillMode) {
-    eprintln!("{} {}", mode.action_label(), target.identity());
+    eprintln!(
+        "{} {}",
+        mode.action_label_for(target.platform),
+        target.identity()
+    );
     eprintln!("Ports: {}", target.ports_text());
     eprintln!(
         "Command: {}",
         command::render_kill_command(target.platform, target.pid, mode),
     );
-    if mode == KillMode::Force {
-        eprintln!("Warning: SIGKILL is immediate; prefer normal termination first.");
+    if let Some(warning) = mode.force_warning(target.platform) {
+        eprintln!("Warning: {warning}");
     }
     for warning in target.warning_lines() {
         eprintln!("Warning: {warning}.");
@@ -560,12 +565,17 @@ fn print_kill_banner(target: &KillTarget, mode: KillMode) {
 
 fn prompt_confirmation(
     target: &KillTarget,
-    _mode: KillMode,
+    mode: KillMode,
     requirement: ConfirmationRequirement,
 ) -> std::io::Result<bool> {
     match requirement {
         ConfirmationRequirement::Yes => print!("Type y to confirm, or press Enter to cancel: "),
-        ConfirmationRequirement::ForceWord => print!("Type force to confirm SIGKILL: "),
+        ConfirmationRequirement::ForceWord => {
+            print!(
+                "Type force to confirm {}: ",
+                mode.delivery_label(target.platform)
+            );
+        }
         ConfirmationRequirement::ProtectedProcess => print!(
             "Protected process: type PID {} or process name {} to confirm: ",
             target.pid,
@@ -602,26 +612,24 @@ fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
 }
 
 fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
+    let delivery = mode.delivery_label(target.platform);
     match outcome {
         TerminationOutcome::Success => eprintln!(
-            "sent {} to {}; refresh to verify the port disappeared",
-            mode.signal_label(),
+            "sent {delivery} to {}; refresh to verify the port disappeared",
             target.identity(),
         ),
         TerminationOutcome::PermissionDenied => eprintln!(
-            "error: permission denied sending {} to {}; {}",
-            mode.signal_label(),
+            "error: permission denied sending {delivery} to {}; {}",
             target.identity(),
-            process::PERMISSION_DENIED_SANDBOX_HINT,
+            process::permission_denied_hint(target.platform),
         ),
         TerminationOutcome::OwnershipUnavailable => eprintln!(
-            "error: ownership for {} became unavailable before {}; no signal was sent",
+            "error: ownership for {} became unavailable before {delivery}; no termination was sent",
             target.identity(),
-            mode.signal_label(),
         ),
         TerminationOutcome::AlreadyExited => {
             eprintln!(
-                "{} already exited before the signal was sent",
+                "{} already exited before termination was sent",
                 target.identity()
             );
         }
@@ -631,15 +639,14 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             target.identity(),
         ),
         TerminationOutcome::TargetChanged => eprintln!(
-            "error: {} no longer owns the confirmed port target; no signal was sent",
+            "error: {} no longer owns the confirmed port target; no termination was sent",
             target.identity(),
         ),
         TerminationOutcome::UnsafePid(reason) => {
             eprintln!("error: unsafe PID blocked: {}", reason.message());
         }
         TerminationOutcome::UnknownFailure(error) => eprintln!(
-            "error: sending {} to {} failed: {error}",
-            mode.signal_label(),
+            "error: sending {delivery} to {} failed: {error}",
             target.identity(),
         ),
     }
@@ -725,7 +732,7 @@ mod tests {
 
     fn no_context(_: u32) -> ProcessContext {
         ProcessContext {
-            process_start_time_ticks: Some(55),
+            process_start_time_marker: Some(55),
             ..ProcessContext::default()
         }
     }
