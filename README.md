@@ -1,162 +1,93 @@
 # kickoutchi
 
-A clean TUI and CLI port janitor: see which process owns each open local port and
-kick it out safely.
+**"What are you doing in my swamp?!"** — but for whatever's squatting on your
+local ports.
 
-## Requirements
+A small TUI and CLI that shows which process owns each open port and lets you
+kick it out safely. Two binaries, one tool: `kickoutchi` (the full name) and
+`kick` (for daily use).
 
-- Rust 1.95.0 or newer.
-- Git, if you are cloning the repository.
-- Linux 5.3 or newer for process termination. Listing ports works on older
-  kernels too, but `kick kill` and the TUI `x` / `X` actions use `pidfd`.
-- Windows support uses native Windows APIs. If the Rust installer or build says
-  `link.exe` is missing, install Visual Studio Build Tools with the C++ build
-  tools workload.
-- macOS can build and run the app shell, but native macOS port collection is not
-  implemented yet. Use these steps to get the machine ready for the macOS port.
+## What you need
 
-## Install Rust
+- **Rust 1.95.0+** (and Git, if you're cloning).
+- **Linux 5.3+** to actually kill things — `kick kill` and the TUI `x` / `X` keys
+  ride on `pidfd`. Listing ports works on older kernels too.
+- **Windows** uses native APIs. If the build grumbles about a missing `link.exe`,
+  install the Visual Studio Build Tools "C++ build tools" workload.
+- **macOS** builds and runs the shell, but can't see real ports yet — native
+  macOS collection isn't built. Treat it as a smoke test, not a port view.
 
-### With mise
+## Get Rust
 
-If you use `mise`, this is the easiest way to get the repository-ready Rust
-toolchain:
+Inside the repo, `mise` handles it:
 
 ```sh
 mise install
 ```
 
-That reads `mise.toml` and installs the pinned Rust version for this project.
-After that, you can run the Cargo commands below from the repository root.
+No `mise`? Install Rust by hand:
 
-If you do not use `mise`, install Rust manually for your platform.
+- **Windows:** `winget install Rustlang.Rustup` (then reopen PowerShell), or grab
+  `rustup-init.exe` from [rustup.rs](https://rustup.rs/).
+- **macOS / Linux:** `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 
-### Windows
+Then check it took: `cargo --version`.
 
-In PowerShell:
-
-```powershell
-winget install Rustlang.Rustup
-```
-
-Then close and reopen PowerShell so Cargo is on `PATH`.
-
-If you do not use `winget`, install `rustup-init.exe` from
-[rustup.rs](https://rustup.rs/).
-
-### macOS and Linux
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then restart your shell or run the command printed by the installer to load
-Cargo into `PATH`.
-
-Check that Rust is ready:
-
-```sh
-rustc --version
-cargo --version
-```
-
-## Get The Code
+## Get the code
 
 ```sh
 git clone https://github.com/nuggocto/kickoutchi.git
 cd kickoutchi
 ```
 
-If you already have the repository, just `cd` into it.
+## Run it from source
 
-## Run Locally Without Installing
-
-Use this path while developing or testing the project from source. You do not
-need `cargo install` for these commands.
-
-Open the TUI:
+No install needed while you're poking around:
 
 ```sh
-cargo run --locked
+cargo run --locked                                 # open the TUI
+cargo run --locked --bin kick -- list              # list ports
+cargo run --locked --bin kick -- list --port 3000  # one port
+cargo run --locked --bin kick -- list --json       # for scripts
+cargo run --locked --bin kick -- kill --port 3000  # kick it out
 ```
 
-List ports from the CLI:
+Kickoutchi always asks before it kicks anything out. Keep `--yes` in your pocket
+until you're scripting a target you already trust.
 
-```sh
-cargo run --locked --bin kick -- list
-```
+## Install it for real
 
-Filter to one port:
-
-```sh
-cargo run --locked --bin kick -- list --port 3000
-```
-
-Print JSON:
-
-```sh
-cargo run --locked --bin kick -- list --json
-```
-
-Terminate the process owning a port:
-
-```sh
-cargo run --locked --bin kick -- kill --port 3000
-```
-
-Kickoutchi asks for confirmation before terminating a process. Avoid `--yes`
-until you are intentionally scripting a known-safe target.
-
-## Install Locally
-
-Use this path when you want `kickoutchi` and `kick` available as normal shell
-commands outside the repository. This is optional for development.
-
-Install the two local binaries into Cargo's bin directory:
+Want `kickoutchi` and `kick` on your `PATH` everywhere?
 
 ```sh
 cargo install --path . --locked
 ```
 
-After that, run them from any shell:
+Then, from any shell:
 
 ```sh
-kickoutchi
 kick list
-kick list --port 3000
 kick kill --port 3000
 ```
 
-Cargo installs binaries into:
+Run either name with no arguments to open the TUI. The binaries land in
+`~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows) — add that to `PATH` or
+restart your terminal if the shell can't find them.
 
-- Windows: `%USERPROFILE%\.cargo\bin`
-- macOS and Linux: `$HOME/.cargo/bin`
+## Before you push
 
-If the commands are not found after installation, add that directory to `PATH`
-or restart your terminal.
-
-## Verify Your Local Build
-
-Run the same local checks used during development:
+The same checks the swamp runs on every change:
 
 ```sh
+mise run check     # or, by hand:
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 ```
 
-If you use `mise`, the shortcut is:
+## Platform notes
 
-```sh
-mise run check
-```
-
-## Platform Notes
-
-- Windows: native port listing and process termination are implemented through
-  Windows APIs. Run PowerShell or Windows Terminal as Administrator if you need
-  to inspect or terminate higher-privilege processes.
-- macOS: setup and build commands are ready, but native macOS collection is still
-  pending. Current macOS runs should be treated as development smoke tests, not a
-  real port-owner view.
-- Linux: native `/proc` collection and `pidfd` termination are implemented.
+- **Linux:** native `/proc` collection and `pidfd` termination. The real deal.
+- **Windows:** native listing and termination via Windows APIs. Run PowerShell or
+  Windows Terminal as Administrator to reach higher-privilege processes.
+- **macOS:** builds and runs, but native collection is still pending.

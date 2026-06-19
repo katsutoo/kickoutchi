@@ -132,12 +132,13 @@ impl ProcessSnapshot {
 
     /// Direct children of `pid`, resolved on demand from the process map.
     ///
-    /// This scans `processes` once per call instead of keeping a precomputed
-    /// parent->children index. Only `collect_process_context` asks for children,
-    /// and only when the details modal opens — a rare, human-triggered action — so
-    /// the per-refresh table path never builds a child index it does not read. It
-    /// also mirrors the Linux collector, which resolves children lazily too. Self
-    /// is excluded so a process reported as its own parent never lists itself.
+    /// No standing guest list of every ogre's offspring: this scans `processes`
+    /// once per call instead of maintaining a precomputed parent->children index.
+    /// Only `collect_process_context` asks for children, and only when the details
+    /// modal opens — a rare, human-triggered action — so the per-refresh table path
+    /// never builds a child index it does not read. It mirrors the Linux collector,
+    /// which resolves children lazily too. Self is excluded, because no resident of
+    /// the swamp gets to show up as its own kid.
     fn children(&self, pid: u32) -> ChildProcessSnapshot {
         let mut children = self
             .processes
