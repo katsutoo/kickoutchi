@@ -1,6 +1,6 @@
 # Kickoutchi ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
-**"What are you doing in my swamp?!"** — but for whatever's squatting on your
+**"What are you doing in my swamp?!"** • but for whatever's squatting on your
 local ports.
 
 A small TUI and CLI that shows which process owns each open port and lets you
@@ -10,12 +10,12 @@ kick it out safely. Two binaries, one tool: `kickoutchi` (the full name) and
 ## What you need
 
 - **Rust 1.95.0+** (and Git, if you're cloning).
-- **Linux 5.3+** to actually kill things — `kick kill` and the TUI `x` / `X` keys
+- **Linux 5.3+** to actually kill things • `kick kill` and the TUI `x` / `X` keys
   ride on `pidfd`. Listing ports works on older kernels too.
 - **Windows** uses native APIs. If the build grumbles about a missing `link.exe`,
   install the Visual Studio Build Tools "C++ build tools" workload.
-- **macOS** builds and runs the shell, but can't see real ports yet — native
-  macOS collection isn't built. Treat it as a smoke test, not a port view.
+- **macOS** builds and runs the shell, but can't see real ports yet • native
+  macOS collection isn't built. Treat it as a test, not a port view, yet.
 
 ## Get Rust
 
@@ -71,7 +71,7 @@ kick kill --port 3000
 ```
 
 Run either name with no arguments to open the TUI. The binaries land in
-`~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows) — add that to `PATH` or
+`~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows) • add that to `PATH` or
 restart your terminal if the shell can't find them.
 
 ## Before you push
