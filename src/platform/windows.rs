@@ -76,7 +76,6 @@ struct ProcessMetadata {
 #[derive(Debug, Default)]
 struct ProcessSnapshot {
     processes: HashMap<u32, ProcessMetadata>,
-    children_by_parent: HashMap<u32, Vec<ChildProcess>>,
 }
 
 impl ProcessSnapshot {
@@ -118,22 +117,10 @@ impl ProcessSnapshot {
             .filter_map(|(pid, metadata)| Some((*pid, metadata.process_name.clone()?)))
             .collect::<HashMap<_, _>>();
 
-        for (pid, metadata) in &mut snapshot.processes {
+        for metadata in snapshot.processes.values_mut() {
             if let Some(parent_pid) = metadata.parent_pid {
                 metadata.parent_process_name = names.get(&parent_pid).cloned();
-                snapshot
-                    .children_by_parent
-                    .entry(parent_pid)
-                    .or_default()
-                    .push(ChildProcess {
-                        pid: *pid,
-                        process_name: metadata.process_name.clone(),
-                    });
             }
-        }
-
-        for children in snapshot.children_by_parent.values_mut() {
-            children.sort_by_key(|child| child.pid);
         }
 
         snapshot
@@ -143,14 +130,30 @@ impl ProcessSnapshot {
         self.processes.get(&pid)
     }
 
+    /// Direct children of `pid`, resolved on demand from the process map.
+    ///
+    /// This scans `processes` once per call instead of keeping a precomputed
+    /// parent->children index. Only `collect_process_context` asks for children,
+    /// and only when the details modal opens — a rare, human-triggered action — so
+    /// the per-refresh table path never builds a child index it does not read. It
+    /// also mirrors the Linux collector, which resolves children lazily too. Self
+    /// is excluded so a process reported as its own parent never lists itself.
     fn children(&self, pid: u32) -> ChildProcessSnapshot {
-        let Some(children) = self.children_by_parent.get(&pid) else {
-            return ChildProcessSnapshot::default();
-        };
+        let mut children = self
+            .processes
+            .iter()
+            .filter(|&(&child_pid, metadata)| child_pid != pid && metadata.parent_pid == Some(pid))
+            .map(|(&child_pid, metadata)| ChildProcess {
+                pid: child_pid,
+                process_name: metadata.process_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        children.sort_by_key(|child| child.pid);
 
         let truncated = children.len() > MAX_CHILD_PROCESSES;
+        children.truncate(MAX_CHILD_PROCESSES);
         ChildProcessSnapshot {
-            children: children.iter().take(MAX_CHILD_PROCESSES).cloned().collect(),
+            children,
             truncated,
         }
     }
@@ -577,9 +580,9 @@ fn windows_api_error(operation: &'static str, code: u32) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessMetadata, ProcessSnapshot, SocketRecord, command_line_from_os_strings, decode_port,
-        encode_port_for_tests, entry_from_record, filetime_to_u64, tcp4_record, tcp6_record,
-        udp4_record, udp6_record,
+        MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord,
+        command_line_from_os_strings, decode_port, encode_port_for_tests, entry_from_record,
+        filetime_to_u64, tcp4_record, tcp6_record, udp4_record, udp6_record,
     };
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
     use std::collections::HashMap;
@@ -604,7 +607,6 @@ mod tests {
                     partial: false,
                 },
             )]),
-            children_by_parent: HashMap::new(),
         }
     }
 
@@ -634,7 +636,6 @@ mod tests {
                     },
                 ),
             ]),
-            children_by_parent: HashMap::new(),
         };
 
         let ancestors = snapshot.ancestor_pids(10);
@@ -643,6 +644,81 @@ mod tests {
         assert!(ancestors.contains(&5));
         assert!(ancestors.contains(&1));
         assert_eq!(ancestors.len(), 3);
+    }
+
+    #[test]
+    fn children_are_resolved_on_demand_sorted_and_self_excluded() {
+        let snapshot = ProcessSnapshot {
+            processes: HashMap::from([
+                // Self-parented: must not show up as its own child.
+                (
+                    100,
+                    ProcessMetadata {
+                        parent_pid: Some(100),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+                // Two real children, inserted out of PID order to pin the sort.
+                (
+                    102,
+                    ProcessMetadata {
+                        process_name: Some("worker-b".to_owned()),
+                        parent_pid: Some(100),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+                (
+                    101,
+                    ProcessMetadata {
+                        process_name: Some("worker-a".to_owned()),
+                        parent_pid: Some(100),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+                // Unrelated parent: must be filtered out.
+                (
+                    200,
+                    ProcessMetadata {
+                        parent_pid: Some(1),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+            ]),
+        };
+
+        let children = snapshot.children(100);
+
+        let listed: Vec<(u32, Option<&str>)> = children
+            .children
+            .iter()
+            .map(|child| (child.pid, child.process_name.as_deref()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![(101, Some("worker-a")), (102, Some("worker-b"))]
+        );
+        assert!(!children.truncated);
+    }
+
+    #[test]
+    fn children_resolution_is_bounded() {
+        let mut processes = HashMap::from([(100, ProcessMetadata::default())]);
+        let max = u32::try_from(MAX_CHILD_PROCESSES).expect("child cap fits u32 test PIDs");
+        for offset in 0..=max {
+            processes.insert(
+                1_000 + offset,
+                ProcessMetadata {
+                    parent_pid: Some(100),
+                    ..ProcessMetadata::default()
+                },
+            );
+        }
+        let snapshot = ProcessSnapshot { processes };
+
+        let children = snapshot.children(100);
+
+        assert_eq!(children.children.len(), MAX_CHILD_PROCESSES);
+        assert!(children.truncated);
     }
 
     #[test]
