@@ -1,9 +1,8 @@
 //! The collector contract, plus the fake data we lean on for tests.
 //!
-//! The trait pins down what every platform collector (Linux today, maybe
-//! Windows/macOS later) has to provide. The CLI and TUI talk to that contract,
-//! so swapping fake data for the real thing never ripples out into the output
-//! layer.
+//! The trait pins down what every platform collector (Linux and Windows today,
+//! macOS later) has to provide. The CLI and TUI talk to that contract, so adding
+//! or swapping collectors never ripples out into the output layer.
 
 #[cfg(any(test, not(any(target_os = "linux", windows))))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

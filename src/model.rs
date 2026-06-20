@@ -54,11 +54,11 @@ impl SocketState {
 
 /// Which OS a row came from. Carried per-row so kill-command rendering can show
 /// the right command without re-sniffing the OS. All three variants exist now
-/// because they're part of the JSON contract; `Windows`/`Macos` just sit unused
-/// until their native collectors actually get built.
+/// because they're part of the JSON contract; `Macos` stays ready for the
+/// deferred native collector.
 #[allow(
     dead_code,
-    reason = "windows/macos are contract variants until their collectors land"
+    reason = "macos is a contract variant until its collector lands"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

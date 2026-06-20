@@ -10,9 +10,7 @@ use super::theme::Theme;
 pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
     let lines = vec![
         Line::styled("Kickoutchi", theme.title()),
-        Line::raw(
-            "Real Linux ports with refresh, search filters, sortable rows, and process context.",
-        ),
+        Line::raw("Native ports with refresh, search filters, sortable rows, and process context."),
         Line::raw(""),
         key_line("r", "refresh ports now", theme),
         key_line("/", "edit search/filter text", theme),
