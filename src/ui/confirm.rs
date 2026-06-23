@@ -6,9 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::{self, App, KillConfirmation};
+use crate::display::sanitize;
 use crate::process::ConfirmationRequirement;
 
-use super::theme::Theme;
+use super::{field, theme::Theme};
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let lines = app.kill_confirmation().map_or_else(
@@ -43,10 +44,13 @@ fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line
             ),
             theme.title(),
         ),
-        field("Ports", confirmation.target.ports_text(), theme),
+        field("Ports", sanitize(&confirmation.target.ports_text()), theme),
         field(
             "Command",
-            app::kill_command_text(&confirmation.target, confirmation.mode),
+            sanitize(&app::kill_command_text(
+                &confirmation.target,
+                confirmation.mode,
+            )),
             theme,
         ),
     ];
@@ -59,7 +63,7 @@ fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line
     }
     for warning in confirmation.target.warning_lines() {
         lines.push(Line::styled(
-            format!("Warning: {warning}."),
+            format!("Warning: {}.", sanitize(&warning)),
             theme.warning(),
         ));
     }
@@ -112,7 +116,7 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
             Span::styled(confirmation.target.pid.to_string(), theme.key()),
             Span::raw(" or "),
             Span::styled(
-                confirmation.target.process_name_or_unknown().to_owned(),
+                sanitize(confirmation.target.process_name_or_unknown()),
                 theme.key(),
             ),
             Span::raw(" and press "),
@@ -120,13 +124,6 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
             Span::raw("."),
         ]),
     }
-}
-
-fn field(label: &'static str, value: String, theme: Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), theme.label()),
-        Span::raw(value),
-    ])
 }
 
 #[cfg(test)]

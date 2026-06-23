@@ -36,8 +36,16 @@ mod linux {
     }
 
     fn kickoutchi(args: &[&str]) -> Output {
+        run_binary(env!("CARGO_BIN_EXE_kickoutchi"), args)
+    }
+
+    fn kick(args: &[&str]) -> Output {
+        run_binary(env!("CARGO_BIN_EXE_kick"), args)
+    }
+
+    fn run_binary(path: &str, args: &[&str]) -> Output {
         let config_home = isolated_config_home();
-        let output = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let output = Command::new(path)
             .env("XDG_CONFIG_HOME", &config_home)
             .args(args)
             .output()
@@ -260,6 +268,40 @@ mod linux {
         assert!(stdout(&after).contains("no open ports match the filter"));
 
         let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn short_kick_binary_matches_canonical_help_and_version() {
+        let help = kick(&["--help"]);
+        assert!(help.status.success(), "kick --help must exit 0");
+        let help_text = stdout(&help);
+        assert!(
+            help_text.contains("Usage: kick "),
+            "kick --help must show the short binary name; got:\n{help_text}"
+        );
+        assert!(
+            help_text.contains("list  Print open ports and exit"),
+            "kick --help must list subcommands; got:\n{help_text}"
+        );
+
+        let version = kick(&["--version"]);
+        assert!(version.status.success(), "kick --version must exit 0");
+        let version_text = stdout(&version);
+        assert!(
+            version_text.contains("kickoutchi"),
+            "kick --version must report the canonical kickoutchi name; got:\n{version_text}"
+        );
+
+        let list = kick(&["list", "--json"]);
+        assert!(
+            list.status.success(),
+            "kick list --json must exit 0; stderr:\n{}",
+            stderr(&list)
+        );
+        assert!(
+            stdout(&list).starts_with('['),
+            "kick list --json must print a JSON array"
+        );
     }
 }
 

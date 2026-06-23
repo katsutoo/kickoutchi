@@ -13,6 +13,7 @@ mod collector;
 mod command;
 mod config;
 mod diagnostic;
+mod display;
 mod error;
 mod input;
 mod model;

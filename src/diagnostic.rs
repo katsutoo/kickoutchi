@@ -111,6 +111,12 @@ fn is_port_flag(token: &str) -> bool {
     token == "--port" || token == "-p"
 }
 
+// Deliberately a singleton, not a general "command then bare number" rule.
+// `python -m http.server 3000` is the one common case where the port is a bare
+// positional argument with no flag. Generalizing to "any command followed by a
+// number" would re-admit exactly the weak incidental matches (`--timeout 3000`,
+// version numbers) the strict matcher exists to reject, so add entries here only
+// for specific tools with the same bare-positional-port shape.
 fn is_port_positional_command(token: &str) -> bool {
     token == "http.server"
 }

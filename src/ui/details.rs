@@ -6,9 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::display::sanitize;
 use crate::model::{ChildProcessSnapshot, PermissionStatus, PortEntry, ProcessContext};
 
-use super::theme::Theme;
+use super::{field, theme::Theme};
 
 const MISSING: &str = "-";
 const PANEL_LINES_MAX: usize = 7;
@@ -73,7 +74,7 @@ fn panel_lines(
             format!(
                 "{} | Process: {}",
                 optional_u32(entry.pid),
-                optional_str(entry.process_name.as_deref())
+                sanitize_optional_str(entry.process_name.as_deref())
             ),
             theme,
         ),
@@ -94,7 +95,7 @@ fn panel_lines(
         field("Path", path_text(entry), theme),
         field(
             "Command",
-            optional_str(entry.command_line.as_deref()),
+            sanitize_optional_str(entry.command_line.as_deref()),
             theme,
         ),
         warning_or_permission,
@@ -117,7 +118,7 @@ fn modal_lines(
         field("PID", optional_u32(entry.pid), theme),
         field(
             "Process",
-            optional_str(entry.process_name.as_deref()),
+            sanitize_optional_str(entry.process_name.as_deref()),
             theme,
         ),
         field("Parent", parent_text(entry), theme),
@@ -136,7 +137,7 @@ fn modal_lines(
     lines.push(field("Path", path_text(entry), theme));
     lines.push(field(
         "Command",
-        optional_str(entry.command_line.as_deref()),
+        sanitize_optional_str(entry.command_line.as_deref()),
         theme,
     ));
 
@@ -147,32 +148,25 @@ fn empty_lines(theme: Theme) -> Vec<Line<'static>> {
     vec![Line::styled("No open ports to show.", theme.muted())]
 }
 
-fn field(label: &'static str, value: String, theme: Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), theme.label()),
-        Span::raw(value),
-    ])
-}
-
 fn optional_u32(value: Option<u32>) -> String {
     value.map_or_else(|| MISSING.to_owned(), |value| value.to_string())
 }
 
-fn optional_str(value: Option<&str>) -> String {
-    value.map_or_else(|| MISSING.to_owned(), str::to_owned)
+fn path_text(entry: &PortEntry) -> String {
+    entry.executable_path.as_ref().map_or_else(
+        || MISSING.to_owned(),
+        |path| sanitize(&path.display().to_string()),
+    )
 }
 
-fn path_text(entry: &PortEntry) -> String {
-    entry
-        .executable_path
-        .as_ref()
-        .map_or_else(|| MISSING.to_owned(), |path| path.display().to_string())
+fn sanitize_optional_str(value: Option<&str>) -> String {
+    value.map_or_else(|| MISSING.to_owned(), sanitize)
 }
 
 fn parent_text(entry: &PortEntry) -> String {
     match (entry.parent_process_name.as_deref(), entry.parent_pid) {
-        (Some(name), Some(pid)) => format!("{name} (PID {pid})"),
-        (Some(name), None) => name.to_owned(),
+        (Some(name), Some(pid)) => format!("{} (PID {pid})", sanitize(name)),
+        (Some(name), None) => sanitize(name),
         (None, Some(pid)) => format!("PID {pid}"),
         (None, None) => MISSING.to_owned(),
     }
@@ -199,7 +193,10 @@ fn children_snapshot_text(snapshot: &ChildProcessSnapshot) -> String {
         .iter()
         .take(CHILDREN_DISPLAY_MAX)
         .map(|child| {
-            let name = child.process_name.as_deref().unwrap_or("<unknown>");
+            let name = child
+                .process_name
+                .as_deref()
+                .map_or_else(|| "<unknown>".to_owned(), sanitize);
             format!("PID {} ({name})", child.pid)
         })
         .collect::<Vec<_>>()

@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::widgets::{Block, Row, Table, TableState};
 
 use crate::app::App;
+use crate::display::sanitize;
 use crate::model::{PermissionStatus, PortEntry};
 
 use super::theme::Theme;
@@ -73,6 +74,6 @@ fn pid_text(entry: &PortEntry) -> String {
 fn process_text(entry: &PortEntry) -> String {
     entry
         .process_name
-        .clone()
-        .unwrap_or_else(|| MISSING.to_owned())
+        .as_deref()
+        .map_or_else(|| MISSING.to_owned(), sanitize)
 }

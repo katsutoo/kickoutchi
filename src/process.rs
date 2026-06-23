@@ -22,6 +22,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
+use crate::display::sanitize;
 use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, Protocol};
 
 pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
@@ -233,8 +234,11 @@ impl KillTarget {
     }
 
     pub(crate) fn identity(&self) -> String {
-        let name = self.process_name.as_deref().unwrap_or("<unknown>");
-        format!("PID {} ({name})", self.pid)
+        format!(
+            "PID {} ({})",
+            self.pid,
+            sanitize(self.process_name.as_deref().unwrap_or("<unknown>"))
+        )
     }
 
     pub(crate) fn process_name_or_unknown(&self) -> &str {
@@ -375,8 +379,8 @@ pub(crate) fn confirmation_input_matches(
                     .process_name
                     .as_deref()
                     .is_some_and(|name| match target.platform {
-                        Platform::Windows => trimmed.eq_ignore_ascii_case(name),
-                        Platform::Linux | Platform::Macos => trimmed == name,
+                        Platform::Windows => trimmed.eq_ignore_ascii_case(&sanitize(name)),
+                        Platform::Linux | Platform::Macos => trimmed == sanitize(name),
                     })
         }
     }
@@ -615,12 +619,8 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
 
 #[cfg(windows)]
 fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
-    match windows_exit_code(handle) {
-        Ok(code) if code != windows_still_active_exit_code() => {
-            return TerminationOutcome::AlreadyExited;
-        }
-        Ok(_) => {}
-        Err(outcome) => return outcome,
+    if !windows_process_is_alive(handle) {
+        return TerminationOutcome::AlreadyExited;
     }
 
     let result = unsafe {
@@ -636,7 +636,7 @@ fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> Ter
     }
 
     let error = std::io::Error::last_os_error();
-    if matches!(windows_exit_code(handle), Ok(code) if code != windows_still_active_exit_code()) {
+    if !windows_process_is_alive(handle) {
         return TerminationOutcome::AlreadyExited;
     }
     windows_api_outcome("TerminateProcess", &error)
@@ -661,8 +661,10 @@ fn wait_for_windows_process_exit(handle: &TerminationHandle) -> TerminationOutco
     match result {
         WAIT_OBJECT_0 => TerminationOutcome::Success,
         WAIT_TIMEOUT => match windows_exit_code(handle) {
-            Ok(code) if code != windows_still_active_exit_code() => TerminationOutcome::Success,
-            Ok(_) => TerminationOutcome::UnknownFailure(format!(
+            Ok(Some(code)) => TerminationOutcome::UnknownFailure(format!(
+                "process did not exit within {WINDOWS_TERMINATE_WAIT_MS}ms after TerminateProcess; exit code {code}"
+            )),
+            Ok(None) => TerminationOutcome::UnknownFailure(format!(
                 "process did not exit within {WINDOWS_TERMINATE_WAIT_MS}ms after TerminateProcess"
             )),
             Err(outcome) => outcome,
@@ -678,7 +680,46 @@ fn wait_for_windows_process_exit(handle: &TerminationHandle) -> TerminationOutco
 }
 
 #[cfg(windows)]
-fn windows_exit_code(handle: &TerminationHandle) -> Result<u32, TerminationOutcome> {
+fn windows_process_is_alive(handle: &TerminationHandle) -> bool {
+    match windows_wait_status(handle, 0) {
+        Ok(WAIT_OBJECT_0) => false,
+        Ok(WAIT_TIMEOUT) => true,
+        Ok(_) => {
+            // An unexpected wait status is not enough to conclude the process is
+            // dead; fall back to asking for the exit code, and treat any real code
+            // as "not alive".
+            matches!(windows_exit_code(handle), Ok(Some(_)))
+        }
+        Err(_) => {
+            // If we can't even ask, keep the conservative live assumption and let
+            // the actual termination call report the real error.
+            true
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_wait_status(
+    handle: &TerminationHandle,
+    milliseconds: u32,
+) -> Result<u32, TerminationOutcome> {
+    let result = unsafe {
+        // SAFETY: the process handle is owned by `TerminationHandle` and was
+        // opened with PROCESS_SYNCHRONIZE during preparation.
+        WaitForSingleObject(handle.process_handle.as_raw_handle(), milliseconds)
+    };
+    match result {
+        WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(result),
+        WAIT_FAILED => Err(windows_api_outcome(
+            "WaitForSingleObject",
+            &std::io::Error::last_os_error(),
+        )),
+        other => Ok(other),
+    }
+}
+
+#[cfg(windows)]
+fn windows_exit_code(handle: &TerminationHandle) -> Result<Option<u32>, TerminationOutcome> {
     let mut exit_code = 0_u32;
     let result = unsafe {
         // SAFETY: the pointer is valid for one u32 write and the process handle is
@@ -689,7 +730,11 @@ fn windows_exit_code(handle: &TerminationHandle) -> Result<u32, TerminationOutco
         let error = std::io::Error::last_os_error();
         return Err(windows_api_outcome("GetExitCodeProcess", &error));
     }
-    Ok(exit_code)
+    if exit_code == windows_still_active_exit_code() {
+        Ok(None)
+    } else {
+        Ok(Some(exit_code))
+    }
 }
 
 #[cfg(windows)]
@@ -1099,6 +1144,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_still_active_code_matches_the_process_api_contract() {
+        // The sentinel is pinned here so a Windows API behavior change can't
+        // silently change `windows_exit_code`'s meaning of "still alive".
         assert_eq!(windows_still_active_exit_code(), 259);
     }
 }

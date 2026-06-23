@@ -4,6 +4,7 @@
 //! the data came from. That's exactly what lets real collectors swap in for the
 //! fake one without anyone touching this file.
 
+use crate::display::sanitize;
 use crate::model::PortEntry;
 
 const COLUMN_COUNT: usize = 6;
@@ -57,8 +58,8 @@ fn row_cells(entry: &PortEntry) -> [String; COLUMN_COUNT] {
             .map_or_else(|| MISSING.to_owned(), |pid| pid.to_string()),
         entry
             .process_name
-            .clone()
-            .unwrap_or_else(|| MISSING.to_owned()),
+            .as_deref()
+            .map_or_else(|| MISSING.to_owned(), sanitize),
         entry.state.label().to_owned(),
     ]
 }

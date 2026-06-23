@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows termination liveness check now uses `WaitForSingleObject(handle, 0)`
+  instead of comparing `GetExitCodeProcess` against `STILL_ACTIVE`, removing
+  the ambiguity where exit code 259 was indistinguishable from "still running".
+
+- Protected-process confirmation now compares user input against the
+  sanitized process name, so what the prompt displays is exactly what the
+  user must type (PID fallback still works).
+
 - Windows TUI Caps Lock behavior no longer turns an intended lowercase `x` into
   force-kill. The force-kill key now requires an explicit Shift-modified `X`, so
   a Caps Lock uppercase `X` stays on the normal termination path.
@@ -179,6 +187,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Human-display sanitizer that strips control characters, newlines, and ANSI
+  escape sequences from OS-provided process metadata before rendering it in
+  CLI table output, TUI table/details/confirm modals, kill banners, and
+  confirmation prompts. JSON output stays raw and structured.
+
+- Short `kick` binary integration test verifying that `--help` reports
+  `Usage: kick`, `--version` reports the canonical `kickoutchi` name, and
+  `list --json` prints valid JSON.
 
 - Windows CLI contract coverage now starts a real local TCP listener, verifies
   `list --port` sees it, confirms `kill --pid` interactively with `y`, waits for

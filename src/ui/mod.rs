@@ -284,6 +284,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
+/// A `Label: value` line, shared by the details panel, the details modal, and
+/// the kill-confirmation modal so those panels stay visually consistent. It
+/// lives here in the parent module instead of being copied into each submodule:
+/// one definition means the label styling and the `: ` separator can never drift
+/// between panels that are meant to look the same.
+fn field(label: &'static str, value: String, theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), theme.label()),
+        Span::raw(value),
+    ])
+}
+
 fn format_age(duration: Option<Duration>) -> String {
     let Some(duration) = duration else {
         return "never".to_owned();

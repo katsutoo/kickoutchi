@@ -15,6 +15,7 @@ use crate::collector;
 use crate::command;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
 use crate::diagnostic;
+use crate::display::sanitize;
 use crate::model::{PortEntry, ProcessContext, SortMode};
 use crate::output;
 use crate::platform;
@@ -530,7 +531,7 @@ fn candidate_labels(rows: &[&PortEntry]) -> Vec<String> {
         .iter()
         .filter_map(|entry| {
             let pid = entry.pid?;
-            let name = entry.process_name.as_deref().unwrap_or("<unknown>");
+            let name = sanitize(entry.process_name.as_deref().unwrap_or("<unknown>"));
             Some(format!(
                 "PID {pid} ({name}) {} {}:{}",
                 entry.protocol.label(),
@@ -578,16 +579,20 @@ fn print_kill_banner(target: &KillTarget, mode: KillMode) {
         mode.action_label_for(target.platform),
         target.identity()
     );
-    eprintln!("Ports: {}", target.ports_text());
+    eprintln!("Ports: {}", sanitize(&target.ports_text()));
     eprintln!(
         "Command: {}",
-        command::render_kill_command(target.platform, target.pid, mode),
+        sanitize(&command::render_kill_command(
+            target.platform,
+            target.pid,
+            mode
+        )),
     );
     if let Some(warning) = mode.force_warning(target.platform) {
-        eprintln!("Warning: {warning}");
+        eprintln!("Warning: {}", sanitize(warning));
     }
     for warning in target.warning_lines() {
-        eprintln!("Warning: {warning}.");
+        eprintln!("Warning: {}.", sanitize(&warning));
     }
 }
 
@@ -607,7 +612,7 @@ fn prompt_confirmation(
         ConfirmationRequirement::ProtectedProcess => eprint!(
             "Protected process: type PID {} or process name {} to confirm: ",
             target.pid,
-            target.process_name_or_unknown(),
+            sanitize(target.process_name_or_unknown()),
         ),
     }
     std::io::stderr().flush()?;
@@ -671,8 +676,9 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             eprintln!("error: unsafe PID blocked: {}", reason.message());
         }
         TerminationOutcome::UnknownFailure(error) => eprintln!(
-            "error: sending {delivery} to {} failed: {error}",
+            "error: sending {delivery} to {} failed: {}",
             target.identity(),
+            sanitize(error),
         ),
     }
 }
