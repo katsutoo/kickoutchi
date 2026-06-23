@@ -682,19 +682,15 @@ fn wait_for_windows_process_exit(handle: &TerminationHandle) -> TerminationOutco
 #[cfg(windows)]
 fn windows_process_is_alive(handle: &TerminationHandle) -> bool {
     match windows_wait_status(handle, 0) {
+        // Signaled: the process has already exited.
         Ok(WAIT_OBJECT_0) => false,
-        Ok(WAIT_TIMEOUT) => true,
-        Ok(_) => {
-            // An unexpected wait status is not enough to conclude the process is
-            // dead; fall back to asking for the exit code, and treat any real code
-            // as "not alive".
-            matches!(windows_exit_code(handle), Ok(Some(_)))
-        }
-        Err(_) => {
-            // If we can't even ask, keep the conservative live assumption and let
-            // the actual termination call report the real error.
-            true
-        }
+        // WAIT_TIMEOUT is a definitive "still running"; an Err means we couldn't
+        // even ask, so we keep the conservative live assumption and let the real
+        // termination call surface the error. Both cases mean "treat as alive".
+        Ok(WAIT_TIMEOUT) | Err(_) => true,
+        // Any other wait status is unexpected, so fall back to the exit code and
+        // treat a real code as "not alive".
+        Ok(_) => matches!(windows_exit_code(handle), Ok(Some(_))),
     }
 }
 

@@ -13,6 +13,15 @@ run = "cargo fmt --all --check"
 description = "Run strict Clippy"
 run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 
+# Local Linux clippy never compiles `#[cfg(windows)]` bodies, so Windows-only
+# lints (e.g. in platform/windows.rs or the Windows arms of process.rs) stay
+# invisible until the Windows CI job runs. The x86_64-pc-windows-gnu target
+# lints the same gated code from Linux. Kept out of `check` on purpose: it pulls
+# in a Windows compile, so run it before pushing changes that touch cfg(windows).
+[tasks.clippy-windows]
+description = "Run strict Clippy against the cfg(windows) code from Linux"
+run = "cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings"
+
 [tasks.test]
 description = "Run the full test suite"
 run = "cargo test --locked --all-features"
