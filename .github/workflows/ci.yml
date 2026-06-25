@@ -67,3 +67,27 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-features
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+
+      - name: Use pinned Rust toolchain
+        run: rustup default "$RUST_VERSION"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-features

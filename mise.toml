@@ -22,6 +22,23 @@ run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 description = "Run strict Clippy against the cfg(windows) code from Linux"
 run = "cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings"
 
+# Local Linux checks never compile `#[cfg(target_os = "macos")]` bodies. These
+# Darwin targets lint/check the native macOS collector and signal path from
+# Linux before the macOS CI job gets a chance to run them for real.
+[tasks.check-macos]
+description = "Check cfg(target_os = macos) code from Linux"
+run = [
+  "cargo check --locked --target x86_64-apple-darwin --all-targets --all-features",
+  "cargo check --locked --target aarch64-apple-darwin --all-targets --all-features",
+]
+
+[tasks.clippy-macos]
+description = "Run strict Clippy against cfg(target_os = macos) code from Linux"
+run = [
+  "cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings",
+  "cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings",
+]
+
 [tasks.test]
 description = "Run the full test suite"
 run = "cargo test --locked --all-features"

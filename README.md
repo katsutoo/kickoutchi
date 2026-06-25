@@ -14,8 +14,8 @@ kick it out safely. Two binaries, one tool: `kickoutchi` (the full name) and
   ride on `pidfd`. Listing ports works on older kernels too.
 - **Windows** uses native APIs. If the build grumbles about a missing `link.exe`,
   install the Visual Studio Build Tools "C++ build tools" workload.
-- **macOS** builds and runs the shell, but can't see real ports yet • native
-  macOS collection isn't built. Treat it as a test, not a port view, yet.
+- **macOS** uses native `libproc` / `sysctl` APIs for listing and Unix signals
+  for termination. Run with sufficient privileges to see protected processes.
 
 ## Get Rust
 
@@ -90,4 +90,5 @@ cargo test --locked --all-features
 - **Linux:** native `/proc` collection and `pidfd` termination. The real deal.
 - **Windows:** native listing and termination via Windows APIs. Run PowerShell or
   Windows Terminal as Administrator to reach higher-privilege processes.
-- **macOS:** builds and runs, but native collection is still pending.
+- **macOS:** native listing through `libproc` and termination through `SIGTERM` /
+  `SIGKILL`. No `lsof` dependency in the default path.

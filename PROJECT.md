@@ -435,7 +435,7 @@ UI behavior:
 - Details panel shows parent process
 - Details modal can show child processes
 - Kill confirmation should mention if the selected PID has children
-- Later, add an option to terminate a process tree, but do not make tree-kill the default
+- Later, add an explicit process-tree termination option (Phase 11), but do not make tree-kill the default
 
 Collection note: child context is resolved lazily only when the user asks for details on the selected row. Building the full child map for every row would mean walking the whole process table on every refresh, and doing that work on every selection move would make table navigation depend on process-table size. The side details panel may say child context is not loaded yet; the details modal loads and shows it.
 
@@ -789,6 +789,7 @@ setup
 -> macOS collector
 -> optional Docker awareness
 -> packaging and release
+-> optional explicit process-tree termination
 ```
 
 Phase 9 is intentionally optional for the first public release. Docker awareness is useful, but the core product is complete when native port collection and safe termination work reliably on all target platforms.
@@ -1109,7 +1110,7 @@ pedantic = "warn"
 
 ### Do not build yet
 
-- Tree-kill by default.
+- Process-tree termination; if added later, it must be explicit and not the default.
 - Killing remote processes.
 - Background daemon behavior.
 
@@ -1163,7 +1164,7 @@ pedantic = "warn"
 
 ## Phase 8 - macOS Native Collector And Termination
 
-**Status: Optional, deferred until there is motivation to support macOS.** It needs a Mac to build and test, and has the most awkward native APIs of the three platforms. Kickoutchi is considered complete without this phase.
+**Status: Implemented; needs runtime validation on a real Mac or macOS CI run.** macOS has the most awkward native APIs of the three platforms, so the implementation keeps all Darwin FFI inside `platform/macos.rs` and leaves `lsof` out of the default path.
 
 **Goal:** Bring the same core behavior to macOS using native process/socket APIs by default.
 
@@ -1173,22 +1174,22 @@ pedantic = "warn"
 
 ### Build steps
 
-1. Create `platform/macos.rs` behind `cfg(target_os = "macos")`.
-2. Add a small macOS-only FFI layer for the needed `libproc` and `sysctl` calls.
-3. Enumerate processes with `sysctl` or `libproc`.
-4. Use `proc_pidinfo` with `PROC_PIDLISTFDS` to list file descriptors for each PID.
-5. Use `proc_pidfdinfo` to inspect socket file descriptors.
-6. Identify TCP sockets in listen state.
-7. Identify UDP sockets bound to a local address and port.
-8. Resolve process name with `proc_name`.
-9. Resolve executable path with `proc_pidpath` when permitted.
-10. Return partial rows when metadata is restricted.
-11. Implement normal terminate with Unix `SIGTERM`.
-12. Implement force kill with Unix `SIGKILL`.
-13. Render macOS command equivalents as `kill <PID>` and `kill -9 <PID>`.
-14. Add optional `lsof` fallback behind an explicit config option or feature flag.
-15. Add macOS-only smoke tests behind `cfg(target_os = "macos")`.
-16. Add CI coverage for `cargo check`, tests, and clippy on macOS.
+1. **Done in Phase 8:** create `platform/macos.rs` behind `cfg(target_os = "macos")`.
+2. **Done in Phase 8:** add a small macOS-only FFI layer for the needed `libproc` and `sysctl` calls.
+3. **Done in Phase 8:** enumerate processes with `libproc`.
+4. **Done in Phase 8:** use `proc_pidinfo` with `PROC_PIDLISTFDS` to list file descriptors for each PID.
+5. **Done in Phase 8:** use `proc_pidfdinfo` to inspect socket file descriptors.
+6. **Done in Phase 8:** identify TCP sockets in listen state.
+7. **Done in Phase 8:** identify UDP sockets bound to a local address and port.
+8. **Done in Phase 8:** resolve process name with `proc_name`.
+9. **Done in Phase 8:** resolve executable path with `proc_pidpath` when permitted.
+10. **Done in Phase 8:** return partial rows when metadata is restricted.
+11. **Done in Phase 8:** implement normal terminate with Unix `SIGTERM`.
+12. **Done in Phase 8:** implement force kill with Unix `SIGKILL`.
+13. **Done in Phase 8:** render macOS command equivalents as `kill <PID>` and `kill -9 <PID>`.
+14. **Not built in Phase 8:** optional `lsof` fallback remains a future explicit debug/fallback path, never the default collector.
+15. **Done in Phase 8:** add macOS-only smoke tests behind `cfg(target_os = "macos")`.
+16. **Done in Phase 8:** add CI coverage for formatting, tests, and clippy on macOS.
 
 ### Done when
 
@@ -1198,13 +1199,13 @@ pedantic = "warn"
 - No `lsof` dependency is needed for the default collector.
 - Normal termination works for a user-owned process.
 - Force kill uses the stronger confirmation path.
-- macOS CI passes.
+- macOS CI is configured and passes before release.
 
 ### Do not build yet
 
 - macOS notarized installers.
 - Advanced codesigning flows.
-- Tree-kill defaults.
+- Process-tree termination; if added later, it must be explicit and not the default.
 
 ---
 
@@ -1249,7 +1250,7 @@ pedantic = "warn"
 
 **Goal:** Produce installable binaries and clear documentation so real users can install, run, and trust Kickoutchi.
 
-**Why this is last:** Packaging should happen after the behavior is stable enough that install instructions, release artifacts, and checksums will not churn constantly.
+**Why this comes after core behavior:** Packaging should happen after the behavior is stable enough that install instructions, release artifacts, and checksums will not churn constantly. Optional power-user features can still come later without blocking the first public release.
 
 **Expected result:** A pushed version tag drives a `cargo-dist`-generated release that publishes working Linux binaries (x86_64 and aarch64) with per-artifact checksums and a ready-to-use shell installer, and the README explains every supported install path. Windows and macOS artifacts are added to the same pipeline only if the optional Phases 7 and 8 are built — the release setup must not require platforms whose collectors do not exist, because the crate cannot compile for them.
 
@@ -1318,6 +1319,51 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 
 ---
 
+## Phase 11 - Explicit Process-Tree Termination
+
+**Status: Optional, post-release safety feature.** The default kill behavior must remain single-process termination. Process-tree termination is useful for stubborn dev-server families, but it increases the blast radius enough to deserve its own focused phase.
+
+**Goal:** Add an explicit way to terminate a selected process and its direct/descendant children after showing the full tree impact and requiring stronger confirmation.
+
+**Why this comes after release:** The core promise is already satisfied by safe single-process termination. Tree-kill changes the safety model: one action can affect many PIDs, some children may be unrelated, and process-tree semantics differ by platform. Ship the stable janitor first; add the bigger hammer only when it can be audited and tested properly.
+
+**Expected result:** A user can choose a separate tree-termination action, review exactly which processes would be targeted, confirm with a stronger typed prompt, and see the affected ports disappear after refresh. Pressing `x`, `X`, `kick kill --pid`, or `kick kill --port` still targets only the selected/confirmed PID unless a dedicated tree flag or key is used.
+
+### Build steps
+
+1. Add an explicit CLI flag for tree termination, such as `kickoutchi kill --pid <PID> --tree`; do not change existing `kill` defaults.
+2. Add an explicit TUI action/key for tree termination; do not reuse `x` or `X` for tree-kill.
+3. Build a platform-neutral process-tree target model that contains the root PID, descendants, process names, parent links, owner/context metadata when available, and a capped/truncated marker.
+4. Resolve descendants from native process data on each supported platform, with explicit caps on tree size, depth, and traversal work.
+5. Refuse tree termination when the tree cannot be bounded or when required target identity checks cannot be performed.
+6. Revalidate every targeted PID as close to signal delivery as the platform allows, including process identity/start marker where available.
+7. Require stronger confirmation, such as typing the root PID plus `tree`, before sending any signal.
+8. Show a pre-kill summary listing root process, descendant count, truncated status, ports affected, protected/system warnings, and equivalent commands.
+9. Do not let `--yes` bypass protected-process or tree-kill confirmation unless a future separate explicit override is designed and documented.
+10. Terminate children and root in a deliberate, documented order, with normal termination attempted before force where the platform supports it.
+11. Report partial success clearly: which PIDs were signalled, which failed, which already exited, and which ports remain visible after refresh.
+12. Add tests for tree construction, caps/truncation, protected/system descendants, confirmation policy, partial failure reporting, and no-default-regression on the existing single-PID kill paths.
+13. Add platform smoke tests where practical using a controlled helper that spawns a child process and owns a test port.
+
+### Done when
+
+- Existing single-process kill behavior is unchanged by default.
+- Tree termination is only reachable through an explicit tree action or flag.
+- The confirmation UI/CLI clearly lists the target tree and affected ports before any signal is sent.
+- Protected or system descendants trigger stronger warnings and cannot be bypassed by ordinary `--yes`.
+- Tree size, depth, and traversal work are bounded.
+- Partial success and permission errors are reported without hiding failed child/root terminations.
+- Tests prove the normal kill paths do not accidentally tree-kill.
+
+### Do not build yet
+
+- Making tree-kill the default behavior.
+- Killing arbitrary process groups without first resolving and displaying the tree.
+- Remote process-tree management.
+- Daemon/background process supervision.
+
+---
+
 ## Testing Strategy
 
 - Unit tests for Linux `/proc/net` parsing
@@ -1336,6 +1382,7 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 - Platform smoke tests for collectors behind `cfg(target_os = "...")`
 - Integration tests that run the built binary to pin script-facing CLI contracts (stderr diagnostics, `list --json` non-pollution, exit codes)
 - Windows integration tests that run the built binary against a real local TCP listener and verify interactive `kill --pid` removes the port
+- macOS integration tests that run the built binary against a real local TCP listener and verify interactive `kill --pid` removes the port
 
 Verification commands:
 

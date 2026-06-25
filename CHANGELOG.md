@@ -188,6 +188,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native macOS support: `kickoutchi`/`kick` now lists TCP listeners and bound UDP
+  sockets through `libproc` / `sysctl`, enriches rows with process metadata when
+  available, uses start-time-guarded single-PID `SIGTERM` / `SIGKILL`
+  termination, and renders macOS equivalent commands as `kill <PID>` or
+  `kill -9 <PID>`. The default macOS path has no `lsof` dependency and does not
+  add process-tree termination.
+- macOS validation coverage now includes Darwin socket/procargs unit tests,
+  a macOS-only CLI listener/interactive-kill smoke test, a GitHub Actions macOS
+  job, and `mise` tasks for Linux-hosted Darwin `cargo check` / strict Clippy
+  runs on both `x86_64-apple-darwin` and `aarch64-apple-darwin`.
+
 - Human-display sanitizer that strips control characters, newlines, and ANSI
   escape sequences from OS-provided process metadata before rendering it in
   CLI table output, TUI table/details/confirm modals, kill banners, and

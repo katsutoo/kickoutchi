@@ -1,10 +1,10 @@
 //! The collector contract, plus the fake data we lean on for tests.
 //!
-//! The trait pins down what every platform collector (Linux and Windows today,
-//! macOS later) has to provide. The CLI and TUI talk to that contract, so adding
-//! or swapping collectors never ripples out into the output layer.
+//! The trait pins down what every platform collector has to provide. The CLI and
+//! TUI talk to that contract, so adding or swapping collectors never ripples out
+//! into the output layer.
 
-#[cfg(any(test, not(any(target_os = "linux", windows))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::model::PortEntry;
-#[cfg(any(test, not(any(target_os = "linux", windows))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
 
 /// What went wrong during a collection pass.
@@ -28,7 +28,7 @@ pub(crate) enum CollectorError {
         source: std::io::Error,
     },
     /// A platform API failed without a filesystem path to name.
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     #[error("{operation} failed: {detail}")]
     Platform {
         operation: &'static str,
@@ -61,7 +61,12 @@ pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
         crate::platform::windows::WindowsCollector.collect()
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::macos::MacosCollector.collect()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         FakeCollector.collect()
     }
@@ -73,10 +78,10 @@ pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
 /// The rows are hand-picked to hit every rendering path the model allows: full
 /// metadata, permission-restricted partial metadata, a default-protected process
 /// name, IPv6, and a bound UDP socket.
-#[cfg(any(test, not(any(target_os = "linux", windows))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub(crate) struct FakeCollector;
 
-#[cfg(any(test, not(any(target_os = "linux", windows))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 impl Collector for FakeCollector {
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
         Ok(fake_entries())
@@ -86,7 +91,7 @@ impl Collector for FakeCollector {
 /// The fake snapshot. Everything is hardcoded to [`Platform::Linux`] because
 /// this data is made up, not read from the host — dressing it up to match the
 /// build target would just make pretend rows look more legit than they are.
-#[cfg(any(test, not(any(target_os = "linux", windows))))]
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 fn fake_entries() -> Vec<PortEntry> {
     vec![
         // The classic dev server: full metadata, a parent, a couple of kids.

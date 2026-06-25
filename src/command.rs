@@ -33,6 +33,14 @@ mod tests {
             "kill -9 18422",
         );
         assert_eq!(
+            render_kill_command(Platform::Macos, 18422, KillMode::Terminate),
+            "kill 18422",
+        );
+        assert_eq!(
+            render_kill_command(Platform::Macos, 18422, KillMode::Force),
+            "kill -9 18422",
+        );
+        assert_eq!(
             render_kill_command(Platform::Windows, 18422, KillMode::Terminate),
             "taskkill /F /PID 18422",
         );

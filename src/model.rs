@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Transport protocol of a socket row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Protocol {
     Tcp,
@@ -54,11 +54,10 @@ impl SocketState {
 
 /// Which OS a row came from. Carried per-row so kill-command rendering can show
 /// the right command without re-sniffing the OS. All three variants exist now
-/// because they're part of the JSON contract; `Macos` stays ready for the
-/// deferred native collector.
+/// because they're part of the JSON contract.
 #[allow(
     dead_code,
-    reason = "macos is a contract variant until its collector lands"
+    reason = "non-host platform variants are constructed only for their target builds"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

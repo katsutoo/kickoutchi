@@ -4,6 +4,8 @@ use crate::model::{ProcessContext, RelatedProcessHint};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 #[cfg(windows)]
 pub(crate) mod windows;
 
@@ -18,7 +20,12 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
         windows::collect_process_context(pid)
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::collect_process_context(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         ProcessContext::default()
@@ -36,7 +43,12 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
         windows::collect_related_process_hints(port)
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::collect_related_process_hints(port)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = port;
         Vec::new()

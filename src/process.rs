@@ -142,7 +142,9 @@ pub(crate) struct TerminationHandle {
     pidfd: OwnedFd,
     #[cfg(windows)]
     process_handle: OwnedHandle,
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    process_start_time_marker: u64,
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     _unsupported: (),
 }
 
@@ -271,11 +273,11 @@ impl KillTarget {
             warnings.push("system/service process; verify this is safe to terminate".to_owned());
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut owner_warning_added = false;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let owner_warning_added = false;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(owner_uid) = self.owner_uid {
             let current_uid = current_user_id();
             if owner_uid != current_uid {
@@ -402,7 +404,7 @@ pub(crate) fn target_still_matches_confirmation(
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     {
         match (
             confirmed.process_start_time_marker,
@@ -501,11 +503,94 @@ pub(crate) fn terminate_handle(handle: &TerminationHandle, mode: KillMode) -> Te
     terminate_handle_platform(handle, mode)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_user_id() -> u32 {
     // SAFETY: geteuid takes no arguments, touches no memory, and can't fail —
     // it just hands back this process's effective UID.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
+    let platform_pid = pid_to_macos_pid(pid)?;
+    let Some(process_start_time_marker) = crate::platform::macos::process_start_time_marker(pid)
+    else {
+        return if macos_process_exists(platform_pid) {
+            Err(TerminationOutcome::OwnershipUnavailable)
+        } else {
+            Err(TerminationOutcome::AlreadyExited)
+        };
+    };
+    Ok(TerminationHandle {
+        pid,
+        process_start_time_marker,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
+    let pid = match pid_to_macos_pid(handle.pid) {
+        Ok(pid) => pid,
+        Err(outcome) => return outcome,
+    };
+
+    match crate::platform::macos::process_start_time_marker(handle.pid) {
+        Some(marker) if marker == handle.process_start_time_marker => {}
+        Some(_) => return TerminationOutcome::TargetChanged,
+        None if !macos_process_exists(pid) => return TerminationOutcome::AlreadyExited,
+        None => return TerminationOutcome::OwnershipUnavailable,
+    }
+
+    let signal = match mode {
+        KillMode::Terminate => libc::SIGTERM,
+        KillMode::Force => libc::SIGKILL,
+    };
+    let result = unsafe {
+        // SAFETY: pid was range-checked to pid_t, signal is one of the two
+        // supported constants, and kill(2) writes no Rust-managed memory.
+        libc::kill(pid, signal)
+    };
+    if result == 0 {
+        return TerminationOutcome::Success;
+    }
+
+    let error = std::io::Error::last_os_error();
+    macos_signal_outcome("kill", &error)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_to_macos_pid(pid: u32) -> Result<libc::pid_t, TerminationOutcome> {
+    libc::pid_t::try_from(pid).map_err(|_| {
+        TerminationOutcome::UnknownFailure("PID does not fit platform pid_t".to_owned())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_exists(pid: libc::pid_t) -> bool {
+    let result = unsafe {
+        // SAFETY: signal 0 performs existence/permission checking only and writes
+        // no Rust-managed memory.
+        libc::kill(pid, 0)
+    };
+    if result == 0 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    !matches!(error.raw_os_error(), Some(code) if code == libc::ESRCH)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_signal_outcome(operation: &str, error: &std::io::Error) -> TerminationOutcome {
+    match error.raw_os_error() {
+        Some(code) if code == libc::ESRCH => TerminationOutcome::AlreadyExited,
+        Some(code) if code == libc::EPERM || code == libc::EACCES => {
+            TerminationOutcome::PermissionDenied
+        }
+        _ if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            TerminationOutcome::PermissionDenied
+        }
+        _ => TerminationOutcome::UnknownFailure(format!("{operation} failed: {error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -757,7 +842,7 @@ fn windows_error_code(error: &std::io::Error) -> Option<u32> {
         .and_then(|code| u32::try_from(code).ok())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
     Ok(TerminationHandle {
         pid,
@@ -765,10 +850,10 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
     })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn terminate_handle_platform(_handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
     TerminationOutcome::UnknownFailure(
-        "termination is only implemented for the Linux collector".to_owned(),
+        "termination is only implemented for Linux, macOS, and Windows".to_owned(),
     )
 }
 
