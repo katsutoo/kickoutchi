@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Docker details enrichment now runs through a selected-row background worker, so
+  opening details on a slow Docker host no longer blocks TUI input. Docker
+  enrichment also works for partial-metadata rows with no readable process name
+  when Docker reports a matching published host port.
+
 - Windows termination liveness check now uses `WaitForSingleObject(handle, 0)`
   instead of comparing `GetExitCodeProcess` against `STILL_ACTIVE`, removing
   the ambiguity where exit code 259 was indistinguishable from "still running".
@@ -187,6 +192,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Optional Docker port-ownership enrichment in TUI details: Docker-looking or
+  metadata-hidden port owners can be matched to running containers by published
+  host port, protocol, and host address through a bounded
+  `docker container ls --filter publish=...` lookup. Details can show container
+  name/ID, Compose project/service labels, and a safer `docker stop <container>`
+  command when exactly one container matches; Docker failures remain non-fatal
+  enrichment misses.
 
 - Native macOS support: `kickoutchi`/`kick` now lists TCP listeners and bound UDP
   sockets through `libproc` / `sysctl`, enriches rows with process metadata when

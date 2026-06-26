@@ -516,6 +516,7 @@ fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
         owner_uid,
         process_start_time_marker,
         children: collect_child_processes_from(proc_root, pid),
+        docker: None,
     }
 }
 

@@ -139,6 +139,7 @@ pub(crate) fn run(config: &Config) -> AppResult<()> {
 fn event_loop(terminal: &mut Tui, app: &mut App, config: &Config, theme: Theme) -> AppResult<()> {
     loop {
         app.poll_refresh();
+        app.poll_process_context();
         terminal.draw(|frame| draw(frame, app, theme))?;
 
         let wait = std::cmp::min(

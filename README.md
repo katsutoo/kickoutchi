@@ -22,6 +22,9 @@ daily-use shortcut.
 - Lists listening TCP sockets and bound UDP sockets.
 - Shows address, port, PID, process name, parent, path, command, bind scope, and
   permission status when available.
+- Explains Docker-owned or partial-metadata ports in details when Docker CLI
+  metadata is available; Docker is optional and never required for normal port
+  listing.
 - Opens as a terminal UI when run without a command.
 - Works as a script-friendly CLI with table or JSON output.
 - Asks before termination, because Donkey may yell but Donkey does not kill

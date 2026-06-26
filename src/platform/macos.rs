@@ -252,6 +252,7 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
             .as_ref()
             .map(process_start_time_marker_from_bsd_info),
         children: collect_child_processes(pid),
+        docker: None,
     }
 }
 

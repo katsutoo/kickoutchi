@@ -905,6 +905,7 @@ mod tests {
             owner_uid: Some(1000),
             process_start_time_marker: Some(start_time_ticks),
             children: ChildProcessSnapshot::default(),
+            docker: None,
         }
     }
 
@@ -925,6 +926,7 @@ mod tests {
                 }],
                 truncated: false,
             },
+            docker: None,
         };
 
         let target = KillTarget::from_entries(18422, rows.iter(), Some(&context));

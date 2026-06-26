@@ -146,6 +146,7 @@ pub(crate) struct ProcessContext {
     /// before the boot hits the swamp water.
     pub(crate) process_start_time_marker: Option<u64>,
     pub(crate) children: ChildProcessSnapshot,
+    pub(crate) docker: Option<DockerPortContext>,
 }
 
 /// A capped list of children for one selected PID.
@@ -168,6 +169,52 @@ pub(crate) struct RelatedProcessHint {
     pub(crate) pid: u32,
     pub(crate) process_name: Option<String>,
     pub(crate) command_line: String,
+}
+
+/// Optional Docker ownership context for one selected local port.
+///
+/// This intentionally stays outside [`PortEntry`]: Docker is enrichment, not the
+/// OS-confirmed socket source of truth or the `list --json` contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerPortContext {
+    pub(crate) containers: Vec<DockerContainerPort>,
+    pub(crate) truncated: bool,
+}
+
+impl DockerPortContext {
+    pub(crate) fn single_container(&self) -> Option<&DockerContainerPort> {
+        if self.containers.len() == 1 {
+            self.containers.first()
+        } else {
+            None
+        }
+    }
+}
+
+/// One Docker container whose published host port matches the selected row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerContainerPort {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) compose_project: Option<String>,
+    pub(crate) compose_service: Option<String>,
+    pub(crate) host_port: u16,
+    pub(crate) container_port: u16,
+    pub(crate) protocol: Protocol,
+}
+
+impl DockerContainerPort {
+    pub(crate) fn stop_target(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+
+    pub(crate) fn stop_command(&self) -> String {
+        format!("docker stop {}", self.stop_target())
+    }
 }
 
 impl PortEntry {

@@ -12,8 +12,9 @@ use crate::collector;
 use crate::collector::{Collector, FakeCollector};
 use crate::command;
 use crate::config::Config;
+use crate::docker;
 use crate::input::Action;
-use crate::model::{PortEntry, ProcessContext, Protocol, SortMode};
+use crate::model::{DockerPortContext, PortEntry, ProcessContext, Protocol, SortMode};
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
@@ -23,11 +24,18 @@ use crate::protection::mark_protected;
 use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
 
 type RefreshResult = Result<Vec<PortEntry>, collector::CollectorError>;
+type ContextResult = ProcessContext;
 
 #[derive(Debug)]
 struct RefreshWorker {
     receiver: Receiver<RefreshResult>,
     stale: bool,
+}
+
+#[derive(Debug)]
+struct ContextWorker {
+    key: RowKey,
+    receiver: Receiver<ContextResult>,
 }
 
 /// Whichever modal is currently sitting over the main table.
@@ -120,6 +128,7 @@ pub(crate) struct App {
     protected_processes: Vec<String>,
     selected_context_key: Option<RowKey>,
     selected_process_context: Option<ProcessContext>,
+    context_worker: Option<ContextWorker>,
     kill_confirmation: Option<KillConfirmation>,
     kill_status: Option<String>,
     refresh_worker: Option<RefreshWorker>,
@@ -173,6 +182,7 @@ impl App {
             protected_processes: config.protected_processes.clone(),
             selected_context_key: None,
             selected_process_context: None,
+            context_worker: None,
             kill_confirmation: None,
             kill_status: None,
             refresh_worker: None,
@@ -234,6 +244,30 @@ impl App {
         self.refresh_worker = None;
         if !stale {
             self.finish_refresh_attempt(result, Instant::now());
+        }
+    }
+
+    pub(crate) fn poll_process_context(&mut self) {
+        let Some(worker) = self.context_worker.as_ref() else {
+            return;
+        };
+
+        let result = match worker.receiver.try_recv() {
+            Ok(context) => context,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.context_worker = None;
+                self.latest_error =
+                    Some("details worker exited before returning context".to_owned());
+                return;
+            }
+        };
+        let worker_key = worker.key;
+        self.context_worker = None;
+
+        if self.selected_row().map(RowKey::from) == Some(worker_key) {
+            self.selected_context_key = Some(worker_key);
+            self.selected_process_context = Some(result);
         }
     }
 
@@ -300,6 +334,13 @@ impl App {
         } else {
             None
         }
+    }
+
+    pub(crate) fn selected_process_context_loading(&self) -> bool {
+        let selected_key = self.selected_row().map(RowKey::from);
+        self.context_worker
+            .as_ref()
+            .is_some_and(|worker| Some(worker.key) == selected_key)
     }
 
     pub(crate) fn kill_confirmation(&self) -> Option<&KillConfirmation> {
@@ -629,6 +670,7 @@ impl App {
         self.all_rows = rows;
         self.last_successful_refresh = Some(now);
         self.latest_error = None;
+        self.context_worker = None;
         self.selected_context_key = None;
         self.selected_process_context = None;
         self.rebuild_visible_rows();
@@ -666,15 +708,39 @@ impl App {
 
     fn load_selected_process_context(&mut self) {
         let selected_key = self.selected_row().map(RowKey::from);
-        if self.selected_context_key == selected_key {
+        if self.selected_context_key == selected_key && self.selected_process_context.is_some() {
+            return;
+        }
+        if self
+            .context_worker
+            .as_ref()
+            .is_some_and(|worker| Some(worker.key) == selected_key)
+        {
             return;
         }
 
-        self.selected_context_key = selected_key;
-        self.selected_process_context = self
-            .selected_row()
-            .and_then(|entry| entry.pid)
-            .map(platform::collect_process_context);
+        self.selected_context_key = None;
+        self.selected_process_context = None;
+
+        let Some(entry) = self.selected_row().cloned() else {
+            self.context_worker = None;
+            return;
+        };
+        let key = RowKey::from(&entry);
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("kickoutchi-details".to_owned())
+            .spawn(move || {
+                let _ = sender.send(collect_selected_process_context(&entry));
+            }) {
+            Ok(_handle) => {
+                self.context_worker = Some(ContextWorker { key, receiver });
+            }
+            Err(error) => {
+                self.context_worker = None;
+                self.latest_error = Some(format!("starting details worker failed: {error}"));
+            }
+        }
     }
 
     fn append_search_char(&mut self, ch: char) {
@@ -708,6 +774,24 @@ impl App {
         self.sort_mode = self.sort_mode.next();
         self.rebuild_visible_rows();
     }
+}
+
+fn collect_selected_process_context(entry: &PortEntry) -> ProcessContext {
+    collect_selected_process_context_with(entry, docker::enrich_port)
+}
+
+fn collect_selected_process_context_with<EnrichDocker>(
+    entry: &PortEntry,
+    enrich_docker: EnrichDocker,
+) -> ProcessContext
+where
+    EnrichDocker: FnOnce(&PortEntry) -> Option<DockerPortContext>,
+{
+    let mut context = entry
+        .pid
+        .map_or_else(ProcessContext::default, platform::collect_process_context);
+    context.docker = enrich_docker(entry);
+    context
 }
 
 fn termination_status_line(
@@ -780,11 +864,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::{App, Modal, RefreshWorker};
+    use super::{App, ContextWorker, Modal, RefreshWorker, RowKey};
     use crate::config::Config;
     use crate::input::Action;
     use crate::model::{
-        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState, SortMode,
+        DockerContainerPort, DockerPortContext, PermissionStatus, Platform, PortEntry,
+        ProcessContext, Protocol, SocketState, SortMode,
     };
     use crate::process::{ConfirmationRequirement, KillMode, TerminationOutcome};
 
@@ -849,12 +934,56 @@ mod tests {
         }
     }
 
+    fn docker_context() -> DockerPortContext {
+        DockerPortContext {
+            containers: vec![DockerContainerPort {
+                id: "abc123".to_owned(),
+                name: "postgres-dev".to_owned(),
+                compose_project: None,
+                compose_service: None,
+                host_port: 5432,
+                container_port: 5432,
+                protocol: Protocol::Tcp,
+            }],
+            truncated: false,
+        }
+    }
+
+    fn finish_selected_context(app: &mut App, context: ProcessContext) {
+        let key = RowKey::from(app.selected_row().expect("test app has selected row"));
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(context)
+            .expect("test context result must send before polling");
+        app.context_worker = Some(ContextWorker { key, receiver });
+        app.poll_process_context();
+    }
+
     fn set_confirmation_start_time(app: &mut App, start_time_ticks: u64) {
         app.kill_confirmation
             .as_mut()
             .expect("confirmation must be open")
             .target
             .process_start_time_marker = Some(start_time_ticks);
+    }
+
+    #[test]
+    fn selected_context_can_attach_docker_metadata_without_a_pid() {
+        let row = entry_without_pid(5432);
+
+        let context =
+            super::collect_selected_process_context_with(&row, |_| Some(docker_context()));
+
+        assert_eq!(context.children.children.len(), 0);
+        assert!(context.process_start_time_marker.is_none());
+        assert_eq!(
+            context
+                .docker
+                .as_ref()
+                .and_then(DockerPortContext::single_container)
+                .map(|container| container.name.as_str()),
+            Some("postgres-dev"),
+        );
     }
 
     #[test]
@@ -901,6 +1030,10 @@ mod tests {
         assert_eq!(app.selected_process_context(), None);
         app.apply_action(Action::OpenDetails);
         assert_eq!(app.modal(), Modal::Details);
+        assert!(app.selected_process_context_loading());
+        assert_eq!(app.selected_process_context(), None);
+
+        finish_selected_context(&mut app, context(55));
         assert!(app.selected_process_context().is_some());
 
         app.apply_action(Action::CloseModal);
@@ -1268,12 +1401,18 @@ mod tests {
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
 
         app.apply_action(Action::OpenDetails);
+        assert!(app.selected_process_context_loading());
+        finish_selected_context(&mut app, context(55));
         assert!(app.selected_process_context().is_some());
 
         app.apply_successful_snapshot(vec![entry(3000, Some("node"))], Instant::now());
 
         assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
         assert_eq!(app.modal(), Modal::Details);
+        assert!(app.selected_process_context_loading());
+        assert_eq!(app.selected_process_context(), None);
+
+        finish_selected_context(&mut app, context(56));
         assert!(app.selected_process_context().is_some());
     }
 
@@ -1282,6 +1421,7 @@ mod tests {
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
 
         app.apply_action(Action::OpenDetails);
+        finish_selected_context(&mut app, context(55));
         assert!(app.selected_process_context().is_some());
         app.apply_action(Action::CloseModal);
 

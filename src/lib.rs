@@ -14,6 +14,7 @@ mod command;
 mod config;
 mod diagnostic;
 mod display;
+mod docker;
 mod error;
 mod input;
 mod model;

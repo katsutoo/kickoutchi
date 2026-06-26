@@ -440,20 +440,20 @@ Collection note: child context is resolved lazily only when the user asks for de
 
 ### Docker And Container Awareness
 
-Docker/container awareness is useful but should come after native OS collectors and safe termination are solid.
+Docker/container awareness is useful now that native OS collectors and safe termination are solid. It stays narrow: explain local Docker-owned ports, do not become a container dashboard.
 
-Example later output:
+Example details output:
 
 ```txt
 Port 5432 -> docker-proxy -> container postgres-dev
 ```
 
-Possible later behavior:
+Implemented behavior:
 
-- Detect Docker proxy processes
+- Detect Docker proxy/backend processes and partial-metadata rows that may map to a Docker-published port
 - Resolve container name and ID when Docker is available
 - Show compose project/service names when available
-- Show equivalent Docker command, such as `docker stop postgres-dev`
+- Show equivalent Docker command, such as `docker stop postgres-dev`, when exactly one container matches
 - Do not require Docker for normal Kickoutchi usage
 
 ### Linux Support
@@ -1205,24 +1205,26 @@ pedantic = "warn"
 
 ## Phase 9 - Docker And Container Awareness
 
+**Status: Implemented.** Docker support is intentionally narrow: it explains Docker-owned local ports in the selected-row details view, but it does not become a container dashboard or a lazydocker replacement. Native OS collection remains the source of truth.
+
 **Goal:** Explain Docker-owned ports without making Docker required for normal Kickoutchi usage.
 
 **Why this is optional:** Docker metadata is helpful, but native OS process detection must remain the reliable core. Kickoutchi should still be excellent on machines with no Docker installed.
 
-**Expected result:** When a port appears to be owned by Docker proxy behavior, the details panel can show the likely container, compose service, and safer Docker command.
+**Expected result:** When a port appears to be owned by Docker proxy/backend behavior, or has partial metadata with no readable process name and Docker reports a matching published host port, the details panel can show the likely container, compose service, and safer Docker command.
 
 ### Build steps
 
-1. Detect common Docker proxy process names.
-2. Detect whether Docker CLI is available.
-3. If Docker is unavailable, skip Docker enrichment silently except for debug logs.
-4. Resolve container names and IDs for published ports when possible.
-5. Resolve compose project and service labels when available.
-6. Add optional Docker metadata fields to the details view without disrupting the main table.
-7. Show equivalent Docker command, such as `docker stop postgres-dev`, when confident.
-8. Treat Docker metadata failures as enrichment failures, not collector failures.
-9. Add tests for Docker output parsing using fixtures.
-10. Add manual testing notes for Docker Desktop, Linux Docker Engine, and Compose.
+1. **Done in Phase 9:** detect common Docker proxy/backend process names, including `docker-proxy`, `dockerd`, Docker Desktop backend names, and related helper names.
+2. **Done in Phase 9:** detect whether Docker CLI is available by attempting a bounded `docker container ls --filter publish=<port>/<proto> --format json` lookup only for selected rows that already look Docker-owned or have partial metadata with no readable process name.
+3. **Done in Phase 9:** if Docker is unavailable, stopped, slow, returns an error, or emits malformed output, skip Docker enrichment silently except for debug logs.
+4. **Done in Phase 9:** resolve container names and IDs for published host ports when possible.
+5. **Done in Phase 9:** resolve Compose project and service labels from Docker's label output when available.
+6. **Done in Phase 9:** add optional Docker metadata to selected-row `ProcessContext` and the details view without changing the main table or the stable `list --json` `PortEntry` contract. Selected-row context loads in a background details worker so a slow Docker lookup does not freeze the TUI.
+7. **Done in Phase 9:** show an equivalent `docker stop <container>` command only when exactly one container matches.
+8. **Done in Phase 9:** treat Docker metadata failures as enrichment failures, not collector failures.
+9. **Done in Phase 9:** add fixture-style unit tests for Docker JSON output parsing, published-port parsing, Compose labels, protocol/address matching, malformed rows, and UI details rendering.
+10. **Done in Phase 9:** add manual testing notes for Docker Desktop, Linux Docker Engine, and Compose.
 
 ### Done when
 
@@ -1232,11 +1234,25 @@ pedantic = "warn"
 - The TUI still works on machines without Docker installed.
 - Docker support is clearly documented as optional.
 
-### Do not build yet
+### Manual validation notes
 
-- Docker as a hard dependency.
-- Container orchestration management.
-- Kubernetes support.
+Linux Docker Engine / Docker Desktop smoke path:
+
+```sh
+docker run --rm --name kickoutchi-phase9-nginx -p 127.0.0.1:18080:80 nginx:alpine
+kickoutchi
+```
+
+Then select the `18080` row and open details. The row should still be an OS-confirmed local socket, but details may add Docker context such as `kickoutchi-phase9-nginx 18080->80/tcp` and `docker stop kickoutchi-phase9-nginx`.
+
+Compose smoke path:
+
+```sh
+docker compose up -d
+kickoutchi
+```
+
+Select a published Compose-owned port and open details. When Docker labels are available, details should include the Compose project/service. If Docker is unavailable or the daemon is stopped, Kickoutchi should still list ports normally and simply omit Docker details.
 
 ---
 
