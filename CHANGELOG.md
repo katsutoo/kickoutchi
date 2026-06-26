@@ -192,8 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sockets through `libproc` / `sysctl`, enriches rows with process metadata when
   available, uses start-time-guarded single-PID `SIGTERM` / `SIGKILL`
   termination, and renders macOS equivalent commands as `kill <PID>` or
-  `kill -9 <PID>`. The default macOS path has no `lsof` dependency and does not
-  add process-tree termination.
+  `kill -9 <PID>`. The default macOS path has no `lsof` dependency.
 - macOS validation coverage now includes Darwin socket/procargs unit tests,
   a macOS-only CLI listener/interactive-kill smoke test, a GitHub Actions macOS
   job, and `mise` tasks for Linux-hosted Darwin `cargo check` / strict Clippy

@@ -302,7 +302,7 @@ impl KillTarget {
                 ""
             };
             warnings.push(format!(
-                "target has {}{suffix} direct child process(es); tree-kill is not enabled",
+                "target has {}{suffix} direct child process(es); termination targets only the confirmed PID",
                 self.child_count,
             ));
         }

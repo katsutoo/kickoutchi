@@ -435,7 +435,6 @@ UI behavior:
 - Details panel shows parent process
 - Details modal can show child processes
 - Kill confirmation should mention if the selected PID has children
-- Later, add an explicit process-tree termination option (Phase 11), but do not make tree-kill the default
 
 Collection note: child context is resolved lazily only when the user asks for details on the selected row. Building the full child map for every row would mean walking the whole process table on every refresh, and doing that work on every selection move would make table navigation depend on process-table size. The side details panel may say child context is not loaded yet; the details modal loads and shows it.
 
@@ -789,7 +788,6 @@ setup
 -> macOS collector
 -> optional Docker awareness
 -> packaging and release
--> optional explicit process-tree termination
 ```
 
 Phase 9 is intentionally optional for the first public release. Docker awareness is useful, but the core product is complete when native port collection and safe termination work reliably on all target platforms.
@@ -972,7 +970,6 @@ pedantic = "warn"
 - Windows collector.
 - macOS collector.
 - Process termination.
-- Advanced process-tree behavior.
 
 ---
 
@@ -1062,7 +1059,6 @@ pedantic = "warn"
 ### Do not build yet
 
 - Actual kill execution.
-- Process-tree termination.
 - Docker container resolution.
 
 ---
@@ -1110,7 +1106,6 @@ pedantic = "warn"
 
 ### Do not build yet
 
-- Process-tree termination; if added later, it must be explicit and not the default.
 - Killing remote processes.
 - Background daemon behavior.
 
@@ -1205,7 +1200,6 @@ pedantic = "warn"
 
 - macOS notarized installers.
 - Advanced codesigning flows.
-- Process-tree termination; if added later, it must be explicit and not the default.
 
 ---
 
@@ -1316,51 +1310,6 @@ Additional done-when items that apply only if Phases 7 and 8 are built:
 - Windows release binary works in Windows Terminal and the PowerShell installer installs it correctly.
 - macOS release binaries work on supported architectures, and `nix run` / `nix profile install` work on macOS.
 - The Homebrew formula installs the correct binary.
-
----
-
-## Phase 11 - Explicit Process-Tree Termination
-
-**Status: Optional, post-release safety feature.** The default kill behavior must remain single-process termination. Process-tree termination is useful for stubborn dev-server families, but it increases the blast radius enough to deserve its own focused phase.
-
-**Goal:** Add an explicit way to terminate a selected process and its direct/descendant children after showing the full tree impact and requiring stronger confirmation.
-
-**Why this comes after release:** The core promise is already satisfied by safe single-process termination. Tree-kill changes the safety model: one action can affect many PIDs, some children may be unrelated, and process-tree semantics differ by platform. Ship the stable janitor first; add the bigger hammer only when it can be audited and tested properly.
-
-**Expected result:** A user can choose a separate tree-termination action, review exactly which processes would be targeted, confirm with a stronger typed prompt, and see the affected ports disappear after refresh. Pressing `x`, `X`, `kick kill --pid`, or `kick kill --port` still targets only the selected/confirmed PID unless a dedicated tree flag or key is used.
-
-### Build steps
-
-1. Add an explicit CLI flag for tree termination, such as `kickoutchi kill --pid <PID> --tree`; do not change existing `kill` defaults.
-2. Add an explicit TUI action/key for tree termination; do not reuse `x` or `X` for tree-kill.
-3. Build a platform-neutral process-tree target model that contains the root PID, descendants, process names, parent links, owner/context metadata when available, and a capped/truncated marker.
-4. Resolve descendants from native process data on each supported platform, with explicit caps on tree size, depth, and traversal work.
-5. Refuse tree termination when the tree cannot be bounded or when required target identity checks cannot be performed.
-6. Revalidate every targeted PID as close to signal delivery as the platform allows, including process identity/start marker where available.
-7. Require stronger confirmation, such as typing the root PID plus `tree`, before sending any signal.
-8. Show a pre-kill summary listing root process, descendant count, truncated status, ports affected, protected/system warnings, and equivalent commands.
-9. Do not let `--yes` bypass protected-process or tree-kill confirmation unless a future separate explicit override is designed and documented.
-10. Terminate children and root in a deliberate, documented order, with normal termination attempted before force where the platform supports it.
-11. Report partial success clearly: which PIDs were signalled, which failed, which already exited, and which ports remain visible after refresh.
-12. Add tests for tree construction, caps/truncation, protected/system descendants, confirmation policy, partial failure reporting, and no-default-regression on the existing single-PID kill paths.
-13. Add platform smoke tests where practical using a controlled helper that spawns a child process and owns a test port.
-
-### Done when
-
-- Existing single-process kill behavior is unchanged by default.
-- Tree termination is only reachable through an explicit tree action or flag.
-- The confirmation UI/CLI clearly lists the target tree and affected ports before any signal is sent.
-- Protected or system descendants trigger stronger warnings and cannot be bypassed by ordinary `--yes`.
-- Tree size, depth, and traversal work are bounded.
-- Partial success and permission errors are reported without hiding failed child/root terminations.
-- Tests prove the normal kill paths do not accidentally tree-kill.
-
-### Do not build yet
-
-- Making tree-kill the default behavior.
-- Killing arbitrary process groups without first resolving and displaying the tree.
-- Remote process-tree management.
-- Daemon/background process supervision.
 
 ---
 

@@ -83,8 +83,7 @@ Running either binary with no command opens the TUI.
 - `kill --port` refuses ambiguous ports instead of guessing.
 - Protected processes require typing the PID or process name.
 - Force kill requires stronger confirmation by default.
-- Process-tree termination is not enabled; Kickoutchi only targets the confirmed
-  PID.
+- Termination targets only the confirmed PID.
 
 ## Before You Push
 
