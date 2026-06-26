@@ -1,94 +1,103 @@
 # Kickoutchi ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
-**"What are you doing in my swamp?!"** • but for whatever's squatting on your
+**"What are you doing in my swamp?!"** but for whatever is squatting on your
 local ports.
 
-A small TUI and CLI that shows which process owns each open port and lets you
-kick it out safely. Two binaries, one tool: `kickoutchi` (the full name) and
-`kick` (for daily use).
+Kickoutchi is a small TUI and CLI that shows open local TCP/UDP ports, names the
+process behind them when the OS allows it, and lets you kick stale dev servers
+out safely. Two binaries, one tool: `kickoutchi` is the full name, `kick` is the
+daily-use shortcut.
 
-## What you need
+## What You Need
 
-- **Rust 1.95.0+** (and Git, if you're cloning).
-- **Linux 5.3+** to actually kill things • `kick kill` and the TUI `x` / `X` keys
-  ride on `pidfd`. Listing ports works on older kernels too.
-- **Windows** uses native APIs. If the build grumbles about a missing `link.exe`,
-  install the Visual Studio Build Tools "C++ build tools" workload.
-- **macOS** uses native `libproc` / `sysctl` APIs for listing and Unix signals
-  for termination. Run with sufficient privileges to see protected processes.
+- **Rust 1.95.0+** to build from source.
+- **Git** if you are cloning the repository.
+- **Linux 5.3+** for safe termination through `pidfd`; listing ports works on
+  older kernels too.
+- **Windows** with the normal Rust C++ build tooling available.
+- **macOS** with normal developer tooling available.
 
-## Get Rust
+## What It Does
 
-Inside the repo, `mise` handles it:
+- Lists listening TCP sockets and bound UDP sockets.
+- Shows address, port, PID, process name, parent, path, command, bind scope, and
+  permission status when available.
+- Opens as a terminal UI when run without a command.
+- Works as a script-friendly CLI with table or JSON output.
+- Asks before termination, because Donkey may yell but Donkey does not kill
+  random swamp residents without confirmation.
+- Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
+  path.
 
-```sh
-mise install
-```
-
-No `mise`? Install Rust by hand:
-
-- **Windows:** `winget install Rustlang.Rustup` (then reopen PowerShell), or grab
-  `rustup-init.exe` from [rustup.rs](https://rustup.rs/).
-- **macOS / Linux:** `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-
-Then check it took: `cargo --version`.
-
-## Get the code
+## Get The Code
 
 ```sh
 git clone https://github.com/nuggocto/kickoutchi.git
 cd kickoutchi
 ```
 
-## Run it from source
-
-No install needed while you're poking around:
+## Run From Source
 
 ```sh
 cargo run                                 # open the TUI
 cargo run --bin kick -- list              # list ports
-cargo run --bin kick -- list --port 3000  # one port
-cargo run --bin kick -- list --json       # for scripts
-cargo run --bin kick -- kill --port 3000  # kick it out
+cargo run --bin kick -- list --port 3000  # show one port
+cargo run --bin kick -- list --json       # JSON for scripts
+cargo run --bin kick -- kill --port 3000  # ask, then kick it out
 ```
 
-Kickoutchi always asks before it kicks anything out. Keep `--yes` in your pocket
-until you're scripting a target you already trust.
+Kickoutchi always asks before it terminates anything. Use `--yes` only when you
+already trust the exact target; protected processes still require stronger
+confirmation.
 
-## Install it for real
-
-Want `kickoutchi` and `kick` on your `PATH` everywhere?
+## Install Locally
 
 ```sh
 cargo install --path . --locked
 ```
 
-Then, from any shell:
+Then use either binary name:
 
 ```sh
 kick list
 kick kill --port 3000
+kickoutchi
 ```
 
-Run either name with no arguments to open the TUI. The binaries land in
-`~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows) • add that to `PATH` or
-restart your terminal if the shell can't find them.
+Running either binary with no command opens the TUI.
 
-## Before you push
+## Platform Notes
 
-The same checks the swamp runs on every change:
+- **Linux:** native `/proc` collection. Termination uses `pidfd`, so the final
+  signal is tied to the prepared process handle instead of a recycled PID.
+- **Windows:** native IP Helper collection and process-handle termination through
+  Windows APIs. Use an elevated terminal when higher-privilege processes hide
+  metadata or reject termination.
+- **macOS:** native `libproc` / `sysctl` collection and Unix `SIGTERM` / `SIGKILL`
+  termination. macOS has no pidfd, so Kickoutchi re-checks process identity right
+  before signalling and refuses if the PID changed faces.
+
+## Safety Rules
+
+- PID `0`, PID `1`, and Kickoutchi's own PID are blocked.
+- `kill --port` refuses ambiguous ports instead of guessing.
+- Protected processes require typing the PID or process name.
+- Force kill requires stronger confirmation by default.
+- Process-tree termination is not enabled; Kickoutchi only targets the confirmed
+  PID.
+
+## Before You Push
+
+The swamp gates run these checks:
 
 ```sh
-mise run check     # or, by hand:
+mise run check
+```
+
+Or by hand:
+
+```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 ```
-
-## Platform notes
-
-- **Linux:** native `/proc` collection and `pidfd` termination. The real deal.
-- **Windows:** native listing and termination via Windows APIs. Run PowerShell or
-  Windows Terminal as Administrator to reach higher-privilege processes.
-- **macOS:** native listing through `libproc` and termination through `SIGTERM` /
-  `SIGKILL`. No `lsof` dependency in the default path.

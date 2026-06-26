@@ -687,7 +687,8 @@ fn decode_local_addr(info: &InSockinfo, family: libc::c_int) -> Option<IpAddr> {
             // active for this socket.
             info.insi_laddr.ina_6.s6_addr
         };
-        return Some(IpAddr::V6(Ipv6Addr::from(raw)));
+        let addr = Ipv6Addr::from(raw);
+        return Some(addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4));
     }
 
     None
@@ -1099,6 +1100,22 @@ mod tests {
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 5353);
         assert_eq!(record.pid, 902);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_socket_info_normalizes_to_ipv4() {
+        let mut info = zeroed_socket_fdinfo();
+        info.psi.soi_protocol = libc::IPPROTO_UDP;
+        info.psi.soi_family = libc::AF_INET6;
+        info.psi.soi_kind = super::SOCKINFO_IN;
+        info.psi.soi_proto = SocketProtocolInfo {
+            pri_in: in_sockinfo_v6(3000, Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
+        };
+
+        let record = socket_record_from_info(18422, &info).expect("mapped socket is kept");
+
+        assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(record.local_port, 3000);
     }
 
     #[test]

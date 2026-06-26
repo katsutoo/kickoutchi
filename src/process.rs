@@ -533,7 +533,14 @@ fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> Term
         Ok(pid) => pid,
         Err(outcome) => return outcome,
     };
+    let signal = match mode {
+        KillMode::Terminate => libc::SIGTERM,
+        KillMode::Force => libc::SIGKILL,
+    };
 
+    // macOS has no pidfd equivalent, so the best native guard is a final process
+    // identity read immediately before kill(2). If the PID wandered off and came
+    // back wearing another process' face, the start marker catches it here.
     match crate::platform::macos::process_start_time_marker(handle.pid) {
         Some(marker) if marker == handle.process_start_time_marker => {}
         Some(_) => return TerminationOutcome::TargetChanged,
@@ -541,10 +548,6 @@ fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> Term
         None => return TerminationOutcome::OwnershipUnavailable,
     }
 
-    let signal = match mode {
-        KillMode::Terminate => libc::SIGTERM,
-        KillMode::Force => libc::SIGKILL,
-    };
     let result = unsafe {
         // SAFETY: pid was range-checked to pid_t, signal is one of the two
         // supported constants, and kill(2) writes no Rust-managed memory.
