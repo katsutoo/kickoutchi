@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-27
+
 ### Changed
 
 - Windows TUI/CLI termination now separates user intent from the underlying
@@ -192,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard and panic hook; this closes the remaining error window during setup.
 
 ### Added
+
+- Release/distribution setup: `cargo-dist` now generates a GitHub Release
+  workflow for Linux, macOS, and Windows archives, with shell and PowerShell
+  installers, per-artifact checksums, `sha256.sum`, and `dist-manifest.json`.
+  The repository also includes a Nix flake for `nix run` / `nix profile install`
+  and Arch `kickoutchi` / `kickoutchi-bin` PKGBUILD templates.
 
 - Optional Docker port-ownership enrichment in TUI details: Docker-looking or
   metadata-hidden port owners can be matched to running containers by published
@@ -384,4 +392,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/commits/shrek
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/nuggocto/kickoutchi/releases/tag/v0.1.0

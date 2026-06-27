@@ -48,37 +48,34 @@ Users should be able to install Kickoutchi in several ways.
 
 Recommended for most users.
 
-Release artifacts for the first public release:
+Release artifacts produced by the `cargo-dist` workflow:
 
 ```txt
-kickoutchi-linux-x86_64.tar.gz
-kickoutchi-linux-aarch64.tar.gz
-SHA256SUMS
-```
-
-Added later, only if the optional Windows and macOS phases (7 and 8) are built:
-
-```txt
-kickoutchi-windows-x86_64.zip
-kickoutchi-macos-aarch64.tar.gz
-kickoutchi-macos-x86_64.tar.gz
+kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+kickoutchi-aarch64-unknown-linux-gnu.tar.xz
+kickoutchi-x86_64-apple-darwin.tar.xz
+kickoutchi-aarch64-apple-darwin.tar.xz
+kickoutchi-x86_64-pc-windows-msvc.zip
+kickoutchi-installer.sh
+kickoutchi-installer.ps1
+sha256.sum
+dist-manifest.json
 ```
 
 Linux/macOS example:
 
 ```sh
-curl -L https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-linux-x86_64.tar.gz -o kickoutchi.tar.gz
-tar -xzf kickoutchi.tar.gz
-chmod +x kickoutchi
-./kickoutchi
+curl -L https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-x86_64-unknown-linux-gnu.tar.xz -o kickoutchi.tar.xz
+tar -xf kickoutchi.tar.xz
+./kickoutchi-x86_64-unknown-linux-gnu/kickoutchi
 ```
 
 Windows example:
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-windows-x86_64.zip" -OutFile "kickoutchi.zip"
+Invoke-WebRequest -Uri "https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-x86_64-pc-windows-msvc.zip" -OutFile "kickoutchi.zip"
 Expand-Archive .\kickoutchi.zip -DestinationPath .\kickoutchi
-.\kickoutchi\kickoutchi.exe
+.\kickoutchi\kickoutchi-x86_64-pc-windows-msvc\kickoutchi.exe
 ```
 
 ### Option 2 - Install With Cargo
@@ -86,7 +83,7 @@ Expand-Archive .\kickoutchi.zip -DestinationPath .\kickoutchi
 Recommended for Rust users.
 
 ```sh
-cargo install kickoutchi
+cargo install --locked kickoutchi
 kickoutchi
 ```
 
@@ -136,14 +133,9 @@ kickoutchi
 Good distribution targets:
 
 ```sh
-# macOS/Linux through Homebrew
-brew install kickoutchi
-
-# Windows through winget
-winget install kickoutchi
-
 # Arch Linux through the AUR
 yay -S kickoutchi
+yay -S kickoutchi-bin
 
 # Nix with flakes
 nix run github:nuggocto/kickoutchi
@@ -152,15 +144,15 @@ nix run github:nuggocto/kickoutchi
 nix profile install github:nuggocto/kickoutchi
 ```
 
-Arch and Nix should be treated as first-class packaging targets because they fit Rust CLI/TUI tools well. The Homebrew formula and winget distribution depend on the optional Windows and macOS phases (7 and 8) and are not part of the first public release.
+Arch and Nix are first-class packaging targets because they fit Rust CLI/TUI tools well. The Homebrew formula and winget distribution can come after the first public release, once the release artifacts and checksums have been exercised in the generated GitHub Release flow.
 
 Arch packaging plan:
 
 - Publish `kickoutchi-bin` AUR package first, using GitHub release binaries
-- Publish `kickoutchi` AUR package later, building from source with Cargo
+- Publish `kickoutchi` AUR package after the binary package is stable, building from source with Cargo
 - Include completions and man page if added later
-- Keep `PKGBUILD` in `packaging/arch/PKGBUILD`
-- Validate with `makepkg -si` and `namcap`
+- Keep `PKGBUILD` templates under `packaging/arch/`
+- Validate with `makepkg --clean --syncdeps --install` and `namcap`
 
 Nix packaging plan:
 
@@ -1262,7 +1254,7 @@ Select a published Compose-owned port and open details. When Docker labels are a
 
 **Why this comes after core behavior:** Packaging should happen after the behavior is stable enough that install instructions, release artifacts, and checksums will not churn constantly. Optional power-user features can still come later without blocking the first public release.
 
-**Expected result:** A pushed version tag drives a `cargo-dist`-generated release that publishes working Linux binaries (x86_64 and aarch64) with per-artifact checksums and a ready-to-use shell installer, and the README explains every supported install path. Windows and macOS artifacts are added to the same pipeline only if the optional Phases 7 and 8 are built — the release setup must not require platforms whose collectors do not exist, because the crate cannot compile for them.
+**Expected result:** A pushed version tag drives a `cargo-dist`-generated release that publishes working Linux, macOS, and Windows archives with per-artifact checksums, a release-wide checksum file, generated shell/PowerShell installers, and clear README install instructions. Registry/package-manager publication remains explicit and manual so a tag cannot silently publish to crates.io, the AUR, Homebrew, or winget.
 
 ### Release tooling decision
 
@@ -1270,10 +1262,10 @@ Kickoutchi uses **`cargo-dist`** (the `dist` tool) as the release pipeline rathe
 
 Why `cargo-dist`:
 
-- It is Rust-native and reads its config straight from `Cargo.toml` (`[workspace.metadata.dist]`), so the release setup stays next to the crate metadata it already depends on.
+- It is Rust-native and keeps release config in `dist-workspace.toml`, while still reading crate metadata from `Cargo.toml`.
 - It generates the GitHub Actions release workflow, so the multi-target build matrix is maintained by the tool instead of by hand.
-- It cross-builds all target triples, archives them (`.tar.gz` for Linux/macOS, `.zip` for Windows), emits per-artifact SHA-256 checksums and a `dist-manifest.json`, and uploads everything to a GitHub Release.
-- It produces the `curl | sh` and PowerShell one-line installers and a Homebrew formula from the same config, covering most of Option 1 and the Homebrew part of Option 4 without extra scripting.
+- It cross-builds all target triples, archives them (`.tar.xz` for Linux/macOS, `.zip` for Windows), emits per-artifact SHA-256 checksums and a `dist-manifest.json`, and uploads everything to a GitHub Release.
+- It produces the `curl | sh` and PowerShell one-line installers from the same config, covering the direct GitHub Release install path without extra scripting.
 - It does not require a Zig cross-compilation toolchain, unlike GoReleaser's experimental Rust builder.
 
 What `cargo-dist` does **not** own, to avoid drift with the existing plans:
@@ -1281,51 +1273,52 @@ What `cargo-dist` does **not** own, to avoid drift with the existing plans:
 - The **Nix flake** (`flake.nix`) stays the source of truth for `nix run` / `nix profile install`; it is not generated by `cargo-dist`.
 - The **AUR `PKGBUILD`** files under `packaging/arch/` stay hand-maintained and consume the `cargo-dist` release artifacts (for `kickoutchi-bin`) or build from source (for `kickoutchi`).
 - **crates.io** publishing (`cargo publish`) remains a separate step; `cargo-dist` handles binaries and installers, not the crate registry.
+- Homebrew and winget publication are out of scope for the first release; they should consume the proven GitHub Release artifacts later.
 - macOS **codesigning and notarization** are out of scope for the first release; unsigned binaries ship with clear install notes.
 - The **landing page website** (built with Astro, deployed to Cloudflare Pages at `kickoutchi.com`) lives in its own repository and deploys separately; `cargo-dist` only produces the release binaries and installers that the site links to.
 
 ### Build steps
 
-1. **Done after Phase 6:** add GitHub Actions CI for Linux that runs on pushes and pull requests, separate from the release workflow. Extend CI to Windows and macOS only when Phases 7 and 8 land.
+1. **Done after Phase 6 and expanded later:** add GitHub Actions CI for every supported OS that runs on pushes and pull requests, separate from the release workflow.
 2. **Done after Phase 6:** run `cargo fmt --all --check` in CI.
 3. **Done after Phase 6:** run clippy on all targets in CI.
-4. **Done after Phase 6:** run tests in CI on every operating system the project supports at the time (Linux at first).
-5. **Later in Phase 10:** install and initialize `cargo-dist` with `dist init`, writing config into `[workspace.metadata.dist]` in `Cargo.toml`. This is the CD/release workflow and stays separate from the CI workflow added after Phase 6.
-6. Configure the release target triples: `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Add `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin` only when Phases 7 and 8 land.
-7. Configure archive formats so Linux produces `.tar.gz`, matching the artifact names in Option 1 (Windows `.zip` and macOS `.tar.gz` follow with their phases).
-8. Enable the `shell` installer. Enable the `powershell` installer and the Homebrew installer/formula output only when their platforms ship.
-9. Let `cargo-dist generate` produce the `.github/workflows/release.yml` workflow, and commit it; verify the plan locally with `dist plan` and `dist build`.
-10. Confirm the release publishes per-artifact SHA-256 checksums and a `dist-manifest.json` to the GitHub Release.
-11. Cut releases by pushing a version tag (for example `v0.1.0`) so the generated workflow builds, checksums, and uploads every artifact to GitHub Releases.
-12. Add `README.md` install instructions for binary download, the `cargo-dist` shell installer, Cargo install, source build, Nix, and Arch, and link to the live landing page at `kickoutchi.com`. Document the PowerShell installer, Homebrew, and winget paths only once their platforms ship.
-13. Add `LICENSE` with MIT text.
+4. **Done after Phase 6 and expanded later:** run tests in CI on every supported operating system.
+5. **Done in Phase 10:** install and initialize `cargo-dist` with `dist init`, writing release config to `dist-workspace.toml`. This is the CD/release workflow and stays separate from the regular CI workflow.
+6. **Done in Phase 10:** configure release target triples for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`, and `x86_64-apple-darwin`.
+7. **Done in Phase 10:** use the archive formats generated by `cargo-dist`: `.tar.xz` for Linux/macOS and `.zip` for Windows.
+8. **Done in Phase 10:** enable the `shell` and `powershell` installers. Defer Homebrew formula output until a tap is ready.
+9. **Done in Phase 10:** let `cargo-dist generate` produce `.github/workflows/release.yml`; verify the plan locally with `dist plan --tag v0.1.0`.
+10. **Pending first release run:** confirm the GitHub Release publishes per-artifact SHA-256 checksums, `sha256.sum`, and `dist-manifest.json`.
+11. **Manual release step:** cut releases by pushing a version tag (for example `v0.1.0`) so the generated workflow builds, checksums, and uploads every artifact to GitHub Releases.
+12. **Done in Phase 10:** add `README.md` install instructions for the GitHub Release installers, direct archives, Cargo install, source build, Nix, and Arch, and link to the live landing page at `kickoutchi.com`.
+13. **Done earlier:** add `LICENSE` with MIT text.
 14. Add shell completions and man page only if they are ready and tested.
-15. Add `flake.nix` for native Nix install and `nix run`.
-16. Add Arch `PKGBUILD` templates under `packaging/arch/`.
-17. Validate Arch packaging with `makepkg -si` and `namcap`.
-18. Publish `kickoutchi-bin` to the AUR first.
-19. Publish source-building `kickoutchi` package after the binary package is stable.
-20. Prepare crates.io metadata and publish `cargo install kickoutchi` when the crate name and README are ready.
+15. **Done in Phase 10:** add `flake.nix` for native Nix install and `nix run`.
+16. **Done in Phase 10:** add Arch `PKGBUILD` templates under `packaging/arch/`.
+17. **Manual package step:** validate Arch packaging with `makepkg --clean --syncdeps --install` and `namcap` once the release archives and final checksums exist.
+18. **Manual package step:** publish `kickoutchi-bin` to the AUR first.
+19. **Manual package step:** publish source-building `kickoutchi` after the binary package is stable.
+20. **Manual registry step:** publish to crates.io only after the dry run passes and the release notes are final.
 
 ### Done when
 
 - Pushing a version tag triggers the `cargo-dist` release workflow with no manual build steps.
-- Linux release binaries work without extra packages.
-- Releases include per-artifact SHA-256 checksums and a `dist-manifest.json`.
-- The `curl | sh` installer downloads and installs the correct Linux binary.
-- `cargo install kickoutchi` works after crates.io publication.
-- `nix run github:nuggocto/kickoutchi` works on Linux.
-- `nix profile install github:nuggocto/kickoutchi` works on Linux.
-- Arch AUR package can install with `yay -S kickoutchi-bin`.
+- Linux, macOS, and Windows release archives contain both `kickoutchi` and `kick`.
+- Releases include per-artifact SHA-256 checksums, `sha256.sum`, and `dist-manifest.json`.
+- The `curl | sh` installer downloads and installs the correct Unix binary.
+- The PowerShell installer downloads and installs the correct Windows binary.
+- `cargo install --locked kickoutchi` works after crates.io publication.
+- `nix run github:nuggocto/kickoutchi` works on Linux and macOS.
+- `nix profile install github:nuggocto/kickoutchi` works on Linux and macOS.
+- Arch AUR package can install with `yay -S kickoutchi-bin` after publication.
 - README explains permissions, safe termination, protected processes, and platform limitations.
 - README links to the live landing page at `kickoutchi.com`.
 - A new user can install Kickoutchi and complete the core flow without reading the source code.
 
-Additional done-when items that apply only if Phases 7 and 8 are built:
+Deferred done-when items for later package-manager work:
 
-- Windows release binary works in Windows Terminal and the PowerShell installer installs it correctly.
-- macOS release binaries work on supported architectures, and `nix run` / `nix profile install` work on macOS.
-- The Homebrew formula installs the correct binary.
+- The Homebrew formula installs the correct macOS/Linux binary from a maintained tap.
+- The winget manifest installs the correct Windows binary.
 
 ---
 

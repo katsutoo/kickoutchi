@@ -8,10 +8,12 @@ process behind them when the OS allows it, and lets you kick stale dev servers
 out safely. Two binaries, one tool: `kickoutchi` is the full name, `kick` is the
 daily-use shortcut.
 
+Website: <https://kickoutchi.com>
+
 ## What You Need
 
-- **Rust 1.95.0+** to build from source.
-- **Git** if you are cloning the repository.
+- **Rust 1.95.0+** to build from source or install with Cargo.
+- **Git** if you are cloning the repository or using `cargo install --git`.
 - **Linux 5.3+** for safe termination through `pidfd`; listing ports works on
   older kernels too.
 - **Windows** with the normal Rust C++ build tooling available.
@@ -31,6 +33,66 @@ daily-use shortcut.
   random swamp residents without confirmation.
 - Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
   path.
+
+## Install
+
+After the first public release, the recommended install path is the GitHub
+Release installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.sh \
+  | sh
+```
+
+Windows users can use the generated PowerShell installer:
+
+```powershell
+irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex
+```
+
+Direct archives are also attached to each GitHub Release. The first release
+targets Linux, macOS, and Windows archives built by `cargo-dist`, each with a
+matching `.sha256` file and a release-wide `sha256.sum`.
+
+Rust users can install from crates.io after publication:
+
+```sh
+cargo install --locked kickoutchi
+```
+
+Until the crate is published, install from Git:
+
+```sh
+cargo install --locked --git https://github.com/nuggocto/kickoutchi
+```
+
+Nix users can run or install the flake directly:
+
+```sh
+nix run github:nuggocto/kickoutchi
+nix run github:nuggocto/kickoutchi#kick -- list
+nix profile install github:nuggocto/kickoutchi
+```
+
+Arch users can use the AUR package after it is published:
+
+```sh
+yay -S kickoutchi-bin
+```
+
+The AUR templates live in `packaging/arch/` for maintainers who want to build or
+review the package locally before publication.
+
+Then use either binary name:
+
+```sh
+kick list
+kick kill --port 3000
+kickoutchi
+```
+
+Running either binary with no command opens the TUI.
 
 ## Get The Code
 
@@ -58,16 +120,6 @@ confirmation.
 ```sh
 cargo install --path . --locked
 ```
-
-Then use either binary name:
-
-```sh
-kick list
-kick kill --port 3000
-kickoutchi
-```
-
-Running either binary with no command opens the TUI.
 
 ## Platform Notes
 

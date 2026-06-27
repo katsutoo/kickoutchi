@@ -5,8 +5,11 @@ edition = "2024"
 description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
 license = "MIT"
 repository = "https://github.com/nuggocto/kickoutchi"
+homepage = "https://kickoutchi.com"
 authors = ["nugget <vincent@sshmoi.com>"]
 readme = "README.md"
+keywords = ["ports", "processes", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 # Two binary names are declared below; `cargo run` without --bin needs this.
 default-run = "kickoutchi"
 
@@ -69,3 +72,8 @@ warnings = "deny"
 
 [lints.clippy]
 pedantic = "warn"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
