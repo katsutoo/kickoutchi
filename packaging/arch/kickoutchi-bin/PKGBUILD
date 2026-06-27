@@ -14,10 +14,10 @@ options=("!debug")
 
 _archive_x86_64="kickoutchi-x86_64-unknown-linux-gnu.tar.xz"
 _archive_aarch64="kickoutchi-aarch64-unknown-linux-gnu.tar.xz"
-source_x86_64=("${_archive_x86_64}::${url}/releases/download/v${pkgver}/${_archive_x86_64}")
-source_aarch64=("${_archive_aarch64}::${url}/releases/download/v${pkgver}/${_archive_aarch64}")
-sha256sums_x86_64=("SKIP")
-sha256sums_aarch64=("SKIP")
+source_x86_64=("${pkgname}-${pkgver}-x86_64-unknown-linux-gnu.tar.xz::${url}/releases/download/v${pkgver}/${_archive_x86_64}")
+source_aarch64=("${pkgname}-${pkgver}-aarch64-unknown-linux-gnu.tar.xz::${url}/releases/download/v${pkgver}/${_archive_aarch64}")
+sha256sums_x86_64=("2b51f626cdd60d520547564cb975aa9f817a576f4d2ed12ff427b5132c94e068")
+sha256sums_aarch64=("1e24b425744e6ac90d84b3fa417fb82e6c3ae2e55e17b9a871414066f0efc55d")
 
 _dist_target() {
   case "${CARCH}" in

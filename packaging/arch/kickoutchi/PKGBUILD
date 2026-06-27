@@ -12,7 +12,7 @@ makedepends=("cargo")
 conflicts=("kickoutchi-bin")
 options=("!debug")
 source=("${pkgname}-${pkgver}.tar.gz::${url}/releases/download/v${pkgver}/source.tar.gz")
-sha256sums=("SKIP")
+sha256sums=("080830cb830d174a3bba700e2b68849c63a75a4ee98c859a106233d60f8b81dd")
 
 _cargo() {
   RUSTC=/usr/bin/rustc RUSTDOC=/usr/bin/rustdoc /usr/bin/cargo "$@"
