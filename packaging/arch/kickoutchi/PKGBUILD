@@ -10,8 +10,9 @@ license=("MIT")
 depends=("gcc-libs")
 makedepends=("cargo")
 conflicts=("kickoutchi-bin")
-source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=("SKIP")
+options=("!debug")
+source=("${pkgname}-${pkgver}.tar.gz::${url}/releases/download/v${pkgver}/source.tar.gz")
+sha256sums=("43e44d9892fe4394f173cadd6bf7c2e8e9f2de862cb8f7cf0d7e600b0b0caa66")
 
 prepare() {
   cd "${pkgname}-${pkgver}"

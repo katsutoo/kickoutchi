@@ -36,8 +36,9 @@ Website: <https://kickoutchi.com>
 
 ## Install
 
-After the first public release, the recommended install path is the GitHub
-Release installer:
+Pick your swamp path.
+
+Linux and macOS users can use the generated GitHub Release installer:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -45,23 +46,21 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | sh
 ```
 
-Windows users can use the generated PowerShell installer:
+Windows users get the PowerShell spell:
 
 ```powershell
 irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex
 ```
 
-Direct archives are also attached to each GitHub Release. The first release
-targets Linux, macOS, and Windows archives built by `cargo-dist`, each with a
-matching `.sha256` file and a release-wide `sha256.sum`.
+Every release also includes direct archives for Linux, macOS, and Windows, plus
+matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
+nervous, grab the archive, check the hash, and run `kickoutchi` or `kick`.
 
-Rust users can install from crates.io after publication:
+Arch and Nix are first-class because they fit Rust CLI/TUI tools without making
+Donkey fill out paperwork all day. Homebrew and winget are not planned right now;
+macOS and Windows users should use the installers or direct archives above, I'm sorry, but you're on your own, I don't want to deal with Homebrew or winget.
 
-```sh
-cargo install --locked kickoutchi
-```
-
-Until the crate is published, install from Git:
+Rust users can install from Git:
 
 ```sh
 cargo install --locked --git https://github.com/nuggocto/kickoutchi
@@ -140,18 +139,4 @@ cargo install --path . --locked
 - Force kill requires stronger confirmation by default.
 - Termination targets only the confirmed PID.
 
-## Before You Push
-
-The swamp gates run these checks:
-
-```sh
-mise run check
-```
-
-Or by hand:
-
-```sh
-cargo fmt --all --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features
-```
+Thanks for using Kickoutchi~ ;D

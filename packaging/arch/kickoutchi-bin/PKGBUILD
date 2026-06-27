@@ -10,13 +10,14 @@ license=("MIT")
 depends=("gcc-libs")
 provides=("kickoutchi=${pkgver}")
 conflicts=("kickoutchi")
+options=("!debug")
 
 _archive_x86_64="kickoutchi-x86_64-unknown-linux-gnu.tar.xz"
 _archive_aarch64="kickoutchi-aarch64-unknown-linux-gnu.tar.xz"
 source_x86_64=("${_archive_x86_64}::${url}/releases/download/v${pkgver}/${_archive_x86_64}")
 source_aarch64=("${_archive_aarch64}::${url}/releases/download/v${pkgver}/${_archive_aarch64}")
-sha256sums_x86_64=("SKIP")
-sha256sums_aarch64=("SKIP")
+sha256sums_x86_64=("6e60f59ff222c3633d7219d1d594777d14a93eb2ad2de3c14b3d6311cd892bc8")
+sha256sums_aarch64=("fee747f65c314fea7a04f457452135acaa31a6f9f2f282a69367cfb957d7c695")
 
 _dist_target() {
   case "${CARCH}" in
