@@ -21,14 +21,23 @@ jobs:
   supply-chain:
     name: Supply Chain
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+
+      - name: Use pinned Rust toolchain
+        run: rustup default "$RUST_VERSION"
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.19.4
+
       - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v1
+        run: cargo deny check
 
   linux:
     name: Linux
