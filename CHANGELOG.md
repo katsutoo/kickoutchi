@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-27
+
+### Added
+
+- Added a `cargo-deny` policy for dependency advisories, duplicate/wildcard
+  dependency rules, allowed source registries, and dependency licenses.
+- GitHub Actions CI and the local `mise run check` task now run
+  `cargo deny check` alongside formatting, strict Clippy, and tests.
+
+### Changed
+
+- Cargo source packages now exclude local `mise.toml`, keeping local tool-trust
+  config out of published crate sources.
+
+### Fixed
+
+- The source Arch `kickoutchi` PKGBUILD now invokes `/usr/bin/cargo`,
+  `/usr/bin/rustc`, and `/usr/bin/rustdoc` directly during prepare/build/check,
+  so user tool shims cannot break `makepkg` builds or doctests.
+
 ## [0.1.0] - 2026-06-27
 
 ### Changed
@@ -392,5 +412,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nuggocto/kickoutchi/releases/tag/v0.1.0

@@ -43,12 +43,17 @@ run = [
 description = "Run the full test suite"
 run = "cargo test --locked --all-features"
 
+[tasks.deny]
+description = "Run cargo-deny policy checks"
+run = "cargo deny check"
+
 [tasks.check]
 description = "Run the local CI-equivalent checks"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --locked --all-targets --all-features -- -D warnings",
   "cargo test --locked --all-features",
+  "cargo deny check",
 ]
 
 [tasks.tui]

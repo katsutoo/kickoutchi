@@ -1,6 +1,6 @@
 [package]
 name = "kickoutchi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
 license = "MIT"
@@ -10,6 +10,7 @@ authors = ["nugget <vincent@sshmoi.com>"]
 readme = "README.md"
 keywords = ["ports", "processes", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["mise.toml"]
 # Two binary names are declared below; `cargo run` without --bin needs this.
 default-run = "kickoutchi"
 
