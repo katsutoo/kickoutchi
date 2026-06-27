@@ -1,29 +1,50 @@
-# Arch Packaging
+# AUR packaging
 
-This directory contains AUR package templates for Kickoutchi.
+Swamp packages for Arch users.
 
-## Packages
+## What lives here
 
-- `kickoutchi/PKGBUILD` builds from the GitHub source archive with Cargo.
-- `kickoutchi-bin/PKGBUILD` installs the Linux release archive produced by `cargo-dist`.
+- `kickoutchi-bin/` installs the Linux release archive from the GitHub Release.
+- `kickoutchi/` builds the same thing from the release source archive with Cargo.
 
-Both packages install the canonical `kickoutchi` binary and the short `kick`
-binary. Publish `kickoutchi-bin` first, after the matching GitHub Release exists.
+Both ship the `kickoutchi` binary and the `kick` shortcut. The `-bin` package is the quick path; the source package is for folks who want to compile their own onion layers.
 
-## Before Publishing
+## Install from the AUR
 
-Replace every `SKIP` checksum with the real release checksum before pushing to the
-AUR. The binary package should use the `.sha256` files uploaded next to the
-`cargo-dist` archives. The source package should use the GitHub source archive
-checksum for the same tag.
-
-Validate from the package directory:
+Once the packages are live:
 
 ```sh
-makepkg --clean --syncdeps --install
-namcap PKGBUILD *.pkg.tar.zst
+yay -S kickoutchi-bin
 ```
 
-`namcap` is optional for local development but required before publishing. Do not
-publish either package until the package name, installed file list, checksums, and
-license/doc paths have been checked against the final release artifacts.
+Or build the source version:
+
+```sh
+yay -S kickoutchi
+```
+
+Then:
+
+```sh
+kick --version
+kick list
+```
+
+## Maintainer notes
+
+These templates are already prepped for the current release. Only the checksums in `PKGBUILD` need updating when a new tag ships. `.SRCINFO` is generated from `PKGBUILD` and must be committed alongside it in the AUR repository.
+
+Generate `.SRCINFO` after editing a `PKGBUILD`:
+
+```sh
+makepkg --printsrcinfo > .SRCINFO
+```
+
+Build and check locally:
+
+```sh
+makepkg -C --clean --syncdeps --noconfirm -f
+PATH=/usr/bin:/bin namcap PKGBUILD *.pkg.tar.zst
+```
+
+If `namcap` fusses about `gcc-libs`, ignore it. The release binaries link `libgcc_s`, so the dependency stays.
