@@ -11,8 +11,8 @@ pkgbase = kickoutchi-bin
 	conflicts = kickoutchi
 	options = !debug
 	source_x86_64 = kickoutchi-bin-0.1.2-x86_64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v0.1.2/kickoutchi-x86_64-unknown-linux-gnu.tar.xz
-	sha256sums_x86_64 = SKIP
+	sha256sums_x86_64 = 460d3a9e6dd6d37147df328b3cd0d56a659731b21ed4f9a20c1e29cf8f02b5e4
 	source_aarch64 = kickoutchi-bin-0.1.2-aarch64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v0.1.2/kickoutchi-aarch64-unknown-linux-gnu.tar.xz
-	sha256sums_aarch64 = SKIP
+	sha256sums_aarch64 = 0ccab0805f186aca10152d6e32b26c7622563bb8e09c0e820b20ba51796f8b2f
 
 pkgname = kickoutchi-bin
