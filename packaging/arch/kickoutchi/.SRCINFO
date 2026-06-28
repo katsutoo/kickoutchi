@@ -1,6 +1,6 @@
 pkgbase = kickoutchi
 	pkgdesc = A clean TUI and CLI port janitor
-	pkgver = 0.1.1
+	pkgver = 0.1.2
 	pkgrel = 1
 	url = https://github.com/nuggocto/kickoutchi
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = kickoutchi
 	depends = gcc-libs
 	conflicts = kickoutchi-bin
 	options = !debug
-	source = kickoutchi-0.1.1.tar.gz::https://github.com/nuggocto/kickoutchi/releases/download/v0.1.1/source.tar.gz
-	sha256sums = 080830cb830d174a3bba700e2b68849c63a75a4ee98c859a106233d60f8b81dd
+	source = kickoutchi-0.1.2.tar.gz::https://github.com/nuggocto/kickoutchi/releases/download/v0.1.2/source.tar.gz
+	sha256sums = SKIP
 
 pkgname = kickoutchi

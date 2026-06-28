@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-28
+
+### Added
+
+- Release installers now include the `kickoutchi-update` helper from
+  `cargo-dist`, so installer-based Linux, macOS, and Windows users can update to
+  newer releases by running `kickoutchi-update` after installing this version or
+  newer.
+- The README now documents how installer users get the updater helper and how
+  existing `0.1.0`/`0.1.1` installs can opt in by rerunning the latest installer
+  once.
+
 ## [0.1.1] - 2026-06-27
 
 ### Added
@@ -412,6 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nuggocto/kickoutchi/releases/tag/v0.1.0

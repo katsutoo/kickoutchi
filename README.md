@@ -52,6 +52,16 @@ Windows users get the PowerShell spell:
 irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex
 ```
 
+Installer-based installs also include `kickoutchi-update`. Run it later to check
+for and install the newest GitHub Release:
+
+```sh
+kickoutchi-update
+```
+
+If you installed Kickoutchi before this updater existed, rerun the latest
+installer once to get `kickoutchi-update`; future upgrades can use the updater.
+
 Every release also includes direct archives for Linux, macOS, and Windows, plus
 matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
 nervous, grab the archive, check the hash, and run `kickoutchi` or `kick`.
