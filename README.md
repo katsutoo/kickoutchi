@@ -183,5 +183,3 @@ cargo install --path . --locked
   word, checked again against a fresh scan right before the first signal.
 - Group kill shows every member before asking, never signals a raw `-pgid`,
   and refuses outright if Kickoutchi itself sits in the target group.
-
-Thanks for using Kickoutchi~ ;D
