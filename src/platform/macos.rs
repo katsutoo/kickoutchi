@@ -392,12 +392,11 @@ impl TreeProcessOps for MacosTreeOps {
 
 /// Read one snapshot of the process table for tree planning.
 ///
-/// Fail-closed like the Linux snapshot: a process that vanished mid-scan
-/// (`ESRCH`) is skipped, but a live process whose BSD info or name cannot be
-/// read is usually a hard error — tree kill must never run against a table with
-/// holes in it, because a missing parent edge silently drops that process's
-/// whole subtree. The one exception is an unreadable PID 1: macOS CI can deny
-/// launchd's BSD info, and PID 1 cannot be a descendant of a user-selected root.
+/// Process snapshots skip rows that vanished mid-scan (`ESRCH`) and rows macOS
+/// explicitly hides from this non-root process (`EPERM`). GitHub's macOS runner
+/// exposes protected system PIDs in `proc_listallpids` but denies their BSD info;
+/// aborting on those unrelated rows would make user-owned tree/group kills and
+/// read-only inspect unusable. Other metadata failures still fail closed.
 fn collect_tree_process_infos() -> Result<Vec<TreeProcessInfo>, CollectorError> {
     let pids = process_ids()?;
 
@@ -405,7 +404,7 @@ fn collect_tree_process_infos() -> Result<Vec<TreeProcessInfo>, CollectorError> 
     for pid in pids {
         let info = match read_process_bsdinfo(pid) {
             Ok(info) => info,
-            Err(error) if should_skip_unreadable_snapshot_pid(pid, &error) => continue,
+            Err(error) if should_skip_unreadable_snapshot_error(&error) => continue,
             Err(error) => {
                 return Err(platform_error(
                     "proc_pidinfo(PROC_PIDTBSDINFO)",
@@ -431,9 +430,8 @@ fn collect_tree_process_infos() -> Result<Vec<TreeProcessInfo>, CollectorError> 
     Ok(infos)
 }
 
-fn should_skip_unreadable_snapshot_pid(pid: u32, error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ESRCH))
-        || (pid == 1 && matches!(error.raw_os_error(), Some(libc::EPERM)))
+fn should_skip_unreadable_snapshot_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM))
 }
 
 /// Pure conversion from one Darwin BSD info read to a tree snapshot row.
@@ -1342,12 +1340,13 @@ mod tests {
     }
 
     #[test]
-    fn tree_snapshot_skips_only_vanished_processes_and_unreadable_launchd() {
+    fn tree_snapshot_skips_vanished_and_system_restricted_processes() {
         let vanished = std::io::Error::from_raw_os_error(libc::ESRCH);
         let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+        let interrupted = std::io::Error::from_raw_os_error(libc::EINTR);
 
-        assert!(super::should_skip_unreadable_snapshot_pid(4242, &vanished));
-        assert!(super::should_skip_unreadable_snapshot_pid(1, &denied));
-        assert!(!super::should_skip_unreadable_snapshot_pid(4242, &denied));
+        assert!(super::should_skip_unreadable_snapshot_error(&vanished));
+        assert!(super::should_skip_unreadable_snapshot_error(&denied));
+        assert!(!super::should_skip_unreadable_snapshot_error(&interrupted));
     }
 }

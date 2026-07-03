@@ -166,6 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing start-time marker before any freeze signal is sent, even across test
   seams. The real Linux/macOS snapshots already fail closed, but the shared CLI
   safety gate now enforces the same identity contract directly.
+- macOS tree/group kills and `inspect` no longer abort when `proc_listallpids`
+  exposes protected system PIDs whose BSD info is denied to the current user;
+  those restricted rows are skipped while the selected target is still
+  revalidated before signalling.
 - CLI kill success reporting no longer races process shutdown: after a
   successful termination (single-process or tree), the post-kill port check
   now polls for up to about one second before deciding between "confirmed
