@@ -266,6 +266,42 @@ impl PortEntry {
     /// it. And a protected app like `postgres` doesn't count as a system process
     /// just because it's protected — those are two different ideas.
     pub(crate) fn is_system_process(&self) -> bool {
+        SystemProcessCheck {
+            platform: self.platform,
+            pid: self.pid,
+            parent_pid: self.parent_pid,
+            process_name: self.process_name.as_deref(),
+            parent_process_name: self.parent_process_name.as_deref(),
+        }
+        .is_system_process()
+    }
+}
+
+/// The raw process fields the shared system/service policy reads.
+///
+/// This lives outside `PortEntry` because the policy must cover more than
+/// table rows: kill-time process-tree nodes carry the same fields without
+/// being socket entries, and two copies of the policy would drift apart.
+///
+/// It is a named-fields struct instead of positional arguments on purpose:
+/// the two PIDs share a type and the two names share a type, so a swapped
+/// pair at a call site would compile fine and silently bend a safety policy.
+/// A swapped PID pair would not even show up in behavior — PID <= 1 and
+/// parent PID 1 both classify as system — so the compiler-visible field names
+/// are the guard here, not tests.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SystemProcessCheck<'a> {
+    pub(crate) platform: Platform,
+    pub(crate) pid: Option<u32>,
+    pub(crate) parent_pid: Option<u32>,
+    pub(crate) process_name: Option<&'a str>,
+    pub(crate) parent_process_name: Option<&'a str>,
+}
+
+impl SystemProcessCheck<'_> {
+    /// Best-effort system/service classification; see
+    /// `PortEntry::is_system_process` for the policy rationale.
+    pub(crate) fn is_system_process(&self) -> bool {
         match self.platform {
             Platform::Windows => self.is_windows_system_process(),
             Platform::Linux | Platform::Macos => self.is_unix_system_process(),
@@ -277,7 +313,7 @@ impl PortEntry {
             return true;
         }
 
-        self.process_name.as_deref().is_some_and(|name| {
+        self.process_name.is_some_and(|name| {
             matches!(
                 name,
                 "systemd" | "launchd" | "init" | "explorer.exe" | "WindowServer"
@@ -291,13 +327,12 @@ impl PortEntry {
         }
         if self
             .parent_process_name
-            .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case("services.exe"))
         {
             return true;
         }
 
-        self.process_name.as_deref().is_some_and(|name| {
+        self.process_name.is_some_and(|name| {
             WINDOWS_SYSTEM_PROCESS_NAMES
                 .iter()
                 .any(|system_name| system_name.eq_ignore_ascii_case(name))

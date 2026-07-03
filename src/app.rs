@@ -12,6 +12,7 @@ use crate::collector;
 use crate::collector::{Collector, FakeCollector};
 use crate::command;
 use crate::config::Config;
+use crate::display::sanitize;
 use crate::docker;
 use crate::input::Action;
 use crate::model::{DockerPortContext, PortEntry, ProcessContext, Protocol, SortMode};
@@ -22,9 +23,13 @@ use crate::process::{
 };
 use crate::protection::mark_protected;
 use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::tree;
 
 type RefreshResult = Result<Vec<PortEntry>, collector::CollectorError>;
 type ContextResult = ProcessContext;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type TreePreviewResult = Result<tree::ProcessTreeTarget, String>;
 
 #[derive(Debug)]
 struct RefreshWorker {
@@ -38,6 +43,15 @@ struct ContextWorker {
     receiver: Receiver<ContextResult>,
 }
 
+/// In-flight enumeration of the selected root's process tree, so the full
+/// process-table scan never runs on the render/input loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct TreePreviewWorker {
+    root_pid: u32,
+    receiver: Receiver<TreePreviewResult>,
+}
+
 /// Whichever modal is currently sitting over the main table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Modal {
@@ -45,6 +59,8 @@ pub(crate) enum Modal {
     Details,
     Help,
     ConfirmKill,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ConfirmTreeKill,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +100,58 @@ impl KillConfirmation {
             input: String::new(),
             error: None,
         }
+    }
+}
+
+/// Which fact the tree confirmation is currently asking the user to type.
+///
+/// A protected root walks both stages in order — its PID or name first, then
+/// the scope word — mirroring the CLI's two-step prompt so the TUI can never
+/// authorize a protected tree on less evidence than the CLI would.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeConfirmStage {
+    ProtectedRoot,
+    Word,
+}
+
+/// State of the tree-kill confirmation modal.
+///
+/// `preview` starts `None` while the background worker enumerates the process
+/// table; the modal renders a loading line until it lands. The preview is
+/// informational only — execution re-collects everything fresh under the
+/// freeze — so a slightly stale count here can never mis-target a signal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeKillConfirmation {
+    pub(crate) target: KillTarget,
+    pub(crate) mode: KillMode,
+    pub(crate) preview: Option<tree::ProcessTreeTarget>,
+    pub(crate) stage: TreeConfirmStage,
+    pub(crate) input: String,
+    pub(crate) error: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl TreeKillConfirmation {
+    fn new(target: KillTarget, mode: KillMode) -> Self {
+        let stage = if target.protected {
+            TreeConfirmStage::ProtectedRoot
+        } else {
+            TreeConfirmStage::Word
+        };
+        Self {
+            target,
+            mode,
+            preview: None,
+            stage,
+            input: String::new(),
+            error: None,
+        }
+    }
+
+    pub(crate) fn scope_word(&self) -> &'static str {
+        tree::tree_scope_word(self.mode)
     }
 }
 
@@ -130,6 +198,10 @@ pub(crate) struct App {
     selected_process_context: Option<ProcessContext>,
     context_worker: Option<ContextWorker>,
     kill_confirmation: Option<KillConfirmation>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tree_confirmation: Option<TreeKillConfirmation>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tree_preview_worker: Option<TreePreviewWorker>,
     kill_status: Option<String>,
     refresh_worker: Option<RefreshWorker>,
     last_successful_refresh: Option<Instant>,
@@ -184,6 +256,10 @@ impl App {
             selected_process_context: None,
             context_worker: None,
             kill_confirmation: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            tree_confirmation: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            tree_preview_worker: None,
             kill_status: None,
             refresh_worker: None,
             last_successful_refresh: None,
@@ -291,8 +367,22 @@ impl App {
         self.time_until_refresh_at(Instant::now(), refresh_interval)
     }
 
+    /// Whether a termination confirmation (single or tree) is on screen. Both
+    /// pause auto-refresh: the user is reading target facts, and a refresh
+    /// changing them mid-decision would be worse than a slightly stale table.
+    fn confirmation_modal_open(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            matches!(self.modal, Modal::ConfirmKill | Modal::ConfirmTreeKill)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            self.modal == Modal::ConfirmKill
+        }
+    }
+
     fn refresh_due_at(&self, now: Instant, refresh_interval: Duration) -> bool {
-        if self.modal == Modal::ConfirmKill {
+        if self.confirmation_modal_open() {
             return false;
         }
         if self.refresh_worker.is_some() {
@@ -302,7 +392,7 @@ impl App {
     }
 
     fn time_until_refresh_at(&self, now: Instant, refresh_interval: Duration) -> Duration {
-        if self.modal == Modal::ConfirmKill {
+        if self.confirmation_modal_open() {
             return refresh_interval;
         }
         if self.refresh_worker.is_some() {
@@ -400,10 +490,14 @@ impl App {
             Action::CloseModal => self.modal = Modal::None,
             Action::RequestTerminate => self.request_kill(KillMode::Terminate),
             Action::RequestForceKill => self.request_kill(KillMode::Force),
-            Action::SubmitKillConfirmation => self.submit_kill_confirmation(),
-            Action::KillInputAppend(ch) => self.append_kill_input(ch),
-            Action::KillInputBackspace => self.backspace_kill_input(),
-            Action::CancelKill => self.cancel_kill_confirmation(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Action::RequestTreeTerminate => self.request_tree_kill(KillMode::Terminate),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Action::RequestTreeForceKill => self.request_tree_kill(KillMode::Force),
+            Action::SubmitKillConfirmation => self.submit_confirmation(),
+            Action::KillInputAppend(ch) => self.append_confirmation_input(ch),
+            Action::KillInputBackspace => self.backspace_confirmation_input(),
+            Action::CancelKill => self.cancel_confirmation(),
             Action::Refresh => self.refresh(),
             Action::StartSearch => self.search_mode = true,
             Action::SearchAppend(ch) => self.append_search_char(ch),
@@ -531,6 +625,45 @@ impl App {
         confirmation.error = None;
     }
 
+    /// Route confirmation keystrokes to whichever confirmation modal is open.
+    /// The key contract is shared (Enter submits, Esc cancels, text appends),
+    /// so the split happens here rather than in the input layer.
+    fn submit_confirmation(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.modal == Modal::ConfirmTreeKill {
+            self.submit_tree_confirmation();
+            return;
+        }
+        self.submit_kill_confirmation();
+    }
+
+    fn append_confirmation_input(&mut self, ch: char) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.modal == Modal::ConfirmTreeKill {
+            self.append_tree_input(ch);
+            return;
+        }
+        self.append_kill_input(ch);
+    }
+
+    fn backspace_confirmation_input(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.modal == Modal::ConfirmTreeKill {
+            self.backspace_tree_input();
+            return;
+        }
+        self.backspace_kill_input();
+    }
+
+    fn cancel_confirmation(&mut self) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.modal == Modal::ConfirmTreeKill {
+            self.cancel_tree_confirmation();
+            return;
+        }
+        self.cancel_kill_confirmation();
+    }
+
     fn submit_kill_confirmation(&mut self) {
         let Some(confirmation) = self.kill_confirmation.as_ref() else {
             return;
@@ -556,7 +689,7 @@ impl App {
                 ConfirmationRequirement::ProtectedProcess => format!(
                     "type PID {} or process name {} to confirm",
                     confirmation.target.pid,
-                    confirmation.target.process_name_or_unknown(),
+                    sanitize(confirmation.target.process_name_or_unknown()),
                 ),
             });
         }
@@ -566,6 +699,386 @@ impl App {
         self.kill_confirmation = None;
         self.modal = Modal::None;
         self.kill_status = Some("kill cancelled".to_owned());
+    }
+
+    /// Open the tree-kill confirmation for the selected row's PID and start the
+    /// background preview enumeration.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn request_tree_kill(&mut self, mode: KillMode) {
+        self.search_mode = false;
+        self.kill_status = None;
+
+        // Drain a completed cancelled worker before deciding whether a new one
+        // can start. If it is still running, apply backpressure instead of
+        // spawning another full process-table scan.
+        self.poll_tree_preview();
+        if self.tree_preview_worker.is_some() {
+            self.kill_status = Some("tree preview is still finishing; retry shortly".to_owned());
+            return;
+        }
+
+        let Some(entry) = self.selected_row().cloned() else {
+            self.kill_status = Some("no selected process to terminate".to_owned());
+            return;
+        };
+        let Some(pid) = entry.pid else {
+            self.kill_status = Some("selected row has no PID; cannot terminate".to_owned());
+            return;
+        };
+        if let Some(reason) = process::unsafe_pid_reason(pid) {
+            self.kill_status = Some(format!("unsafe PID blocked: {}", reason.message()));
+            return;
+        }
+
+        let context = platform::collect_process_context(pid);
+        self.selected_context_key = Some(RowKey::from(&entry));
+        self.selected_process_context = Some(context.clone());
+
+        let target = KillTarget::from_entries(
+            pid,
+            self.all_rows.iter().filter(|row| row.pid == Some(pid)),
+            Some(&context),
+        );
+
+        self.tree_confirmation = Some(TreeKillConfirmation::new(target, mode));
+        self.modal = Modal::ConfirmTreeKill;
+        self.spawn_tree_preview_worker(pid, entry.platform);
+    }
+
+    /// Enumerate the tree off-thread: the full process-table scan must never
+    /// run on the render/input loop. The result is informational only —
+    /// execution re-collects everything fresh. A worker that loses a race with
+    /// cancel is drained later, and new preview requests wait for that single
+    /// worker instead of piling up full process-table scans.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_tree_preview_worker(&mut self, root_pid: u32, platform: crate::model::Platform) {
+        let protected_names = self.protected_processes.clone();
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("kickoutchi-tree-preview".to_owned())
+            .spawn(move || {
+                let _ = sender.send(collect_tree_preview(root_pid, &protected_names, platform));
+            }) {
+            Ok(_handle) => {
+                self.tree_preview_worker = Some(TreePreviewWorker { root_pid, receiver });
+            }
+            Err(error) => {
+                self.tree_preview_worker = None;
+                self.tree_confirmation = None;
+                self.modal = Modal::None;
+                self.kill_status = Some(format!("starting tree preview worker failed: {error}"));
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn poll_tree_preview(&mut self) {
+        let Some(worker) = self.tree_preview_worker.as_ref() else {
+            return;
+        };
+        let result = match worker.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("tree preview worker exited before returning".to_owned())
+            }
+        };
+        let worker_pid = worker.root_pid;
+        self.tree_preview_worker = None;
+        self.apply_tree_preview(worker_pid, result);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn apply_tree_preview(&mut self, worker_pid: u32, result: TreePreviewResult) {
+        let Some(mut confirmation) = self.tree_confirmation.take() else {
+            // Cancelled while the worker was scanning; nothing to update.
+            return;
+        };
+        if confirmation.target.pid != worker_pid {
+            // Structurally unreachable: the worker slot is replaced together
+            // with the confirmation, and `poll_tree_preview` has already
+            // cleared it — so no result for this confirmation can ever arrive
+            // again. If the invariant breaks anyway, fail closed (modal gone,
+            // status line explains) instead of stranding a loading modal that
+            // silently eats keystrokes forever.
+            debug_assert!(
+                false,
+                "tree preview worker PID does not match the open confirmation"
+            );
+            self.modal = Modal::None;
+            self.kill_status = Some(
+                "tree preview no longer matches the requested process; press t or T to retry"
+                    .to_owned(),
+            );
+            return;
+        }
+
+        match result {
+            Ok(preview) => match tree::preflight_outcome(&preview) {
+                Ok(()) => {
+                    // The port row and the tree scan are different readers: a
+                    // root whose socket row had no readable name can still be
+                    // identified as protected here. Protection is a one-way
+                    // upgrade — the stronger confirmation is forced, never
+                    // relaxed, and any input typed while loading is discarded.
+                    confirmation.input.clear();
+                    confirmation.error = None;
+                    if preview.root().is_some_and(|node| node.protected)
+                        && !confirmation.target.protected
+                    {
+                        confirmation.target.protected = true;
+                        confirmation.stage = TreeConfirmStage::ProtectedRoot;
+                    }
+                    confirmation.preview = Some(preview);
+                    self.tree_confirmation = Some(confirmation);
+                }
+                // A gate failed on data we just read: close the modal and put
+                // the refusal where kill outcomes go. Nothing was signalled.
+                Err(outcome) => {
+                    self.modal = Modal::None;
+                    self.kill_status = Some(tree_kill_status_line(
+                        &confirmation.target,
+                        confirmation.mode,
+                        &outcome,
+                    ));
+                }
+            },
+            Err(error) => {
+                self.modal = Modal::None;
+                self.kill_status = Some(format!("enumerating the process tree failed: {error}"));
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn append_tree_input(&mut self, ch: char) {
+        let Some(confirmation) = self.tree_confirmation.as_mut() else {
+            return;
+        };
+        if confirmation.preview.is_none() {
+            confirmation.error = Some(
+                "still enumerating the process tree; wait for the count before typing".to_owned(),
+            );
+            return;
+        }
+        if confirmation.input.len() + ch.len_utf8() > CONFIRMATION_INPUT_MAX_BYTES {
+            confirmation.error = Some(format!(
+                "confirmation input is capped at {CONFIRMATION_INPUT_MAX_BYTES} bytes",
+            ));
+            return;
+        }
+        confirmation.input.push(ch);
+        confirmation.error = None;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn backspace_tree_input(&mut self) {
+        let Some(confirmation) = self.tree_confirmation.as_mut() else {
+            return;
+        };
+        if confirmation.preview.is_none() {
+            return;
+        }
+        confirmation.input.pop();
+        confirmation.error = None;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cancel_tree_confirmation(&mut self) {
+        self.tree_confirmation = None;
+        self.modal = Modal::None;
+        self.kill_status = Some("tree kill cancelled".to_owned());
+    }
+
+    /// Decide what one Enter press on the tree confirmation means, without
+    /// mutating anything — separated from [`Self::submit_tree_confirmation`] so
+    /// tests can pin the whole decision table, including the Execute verdict,
+    /// without triggering a real kill.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn tree_submit_verdict(&self) -> Option<TreeSubmitVerdict> {
+        let confirmation = self.tree_confirmation.as_ref()?;
+        if confirmation.preview.is_none() {
+            return Some(TreeSubmitVerdict::Reject(
+                "still enumerating the process tree; wait for the count".to_owned(),
+            ));
+        }
+        Some(match confirmation.stage {
+            TreeConfirmStage::ProtectedRoot => {
+                if process::confirmation_input_matches(
+                    &confirmation.input,
+                    &confirmation.target,
+                    ConfirmationRequirement::ProtectedProcess,
+                ) {
+                    TreeSubmitVerdict::AdvanceToWord
+                } else {
+                    TreeSubmitVerdict::Reject(format!(
+                        "type PID {} or process name {} to confirm",
+                        confirmation.target.pid,
+                        sanitize(confirmation.target.process_name_or_unknown()),
+                    ))
+                }
+            }
+            TreeConfirmStage::Word => {
+                let word = confirmation.scope_word();
+                if tree::word_confirmation_matches(&confirmation.input, word) {
+                    TreeSubmitVerdict::Execute
+                } else {
+                    TreeSubmitVerdict::Reject(format!(
+                        "type {word} and press Enter to send {} to the tree",
+                        confirmation
+                            .mode
+                            .delivery_label(confirmation.target.platform),
+                    ))
+                }
+            }
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn submit_tree_confirmation(&mut self) {
+        let Some(verdict) = self.tree_submit_verdict() else {
+            return;
+        };
+        match verdict {
+            TreeSubmitVerdict::Execute => self.execute_tree_kill_confirmation(),
+            TreeSubmitVerdict::AdvanceToWord => {
+                if let Some(confirmation) = self.tree_confirmation.as_mut() {
+                    confirmation.stage = TreeConfirmStage::Word;
+                    confirmation.input.clear();
+                    confirmation.error = None;
+                }
+            }
+            TreeSubmitVerdict::Reject(message) => {
+                if let Some(confirmation) = self.tree_confirmation.as_mut() {
+                    confirmation.error = Some(message);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_tree_kill_confirmation(&mut self) {
+        let mut ops = host_tree_ops();
+        self.execute_tree_kill_confirmation_with(
+            collector::collect_ports,
+            platform::collect_process_context,
+            &mut ops,
+        );
+    }
+
+    /// Run the confirmed tree kill: fresh root revalidation, fresh bounded
+    /// preflight, then the freeze-first pipeline. The preview the user saw is
+    /// never trusted for execution — membership may drift between confirmation
+    /// and now, but every gate must re-pass against reality, and the root must
+    /// still be exactly the confirmed process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_tree_kill_confirmation_with<CollectPorts, CollectContext, Ops>(
+        &mut self,
+        mut collect_ports: CollectPorts,
+        mut collect_context: CollectContext,
+        ops: &mut Ops,
+    ) where
+        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        CollectContext: FnMut(u32) -> ProcessContext,
+        Ops: tree::TreeProcessOps,
+    {
+        let Some(confirmation) = self.tree_confirmation.take() else {
+            return;
+        };
+        self.tree_preview_worker = None;
+        self.modal = Modal::None;
+
+        if let Err(outcome) = tree::pin_root_before_revalidation(confirmation.target.pid, ops) {
+            self.apply_tree_pin_refusal(
+                &confirmation.target,
+                confirmation.mode,
+                &outcome,
+                &mut collect_ports,
+            );
+            return;
+        }
+
+        let mut fresh_rows = match collect_ports() {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.latest_error = Some(error.to_string());
+                self.kill_status = Some(format!(
+                    "collecting ports before tree kill failed; no termination was sent: {error}",
+                ));
+                return;
+            }
+        };
+        mark_protected(&mut fresh_rows, &self.protected_processes);
+        let fresh_context = collect_context(confirmation.target.pid);
+        let fresh_root = match process::revalidate_confirmed_target(
+            &confirmation.target,
+            &fresh_rows,
+            Some(&fresh_context),
+        ) {
+            Ok(root) => root,
+            Err(outcome) => {
+                self.kill_status = Some(termination_status_line(
+                    &confirmation.target,
+                    confirmation.mode,
+                    &outcome,
+                ));
+                self.apply_successful_snapshot(fresh_rows, Instant::now());
+                return;
+            }
+        };
+
+        if let Err(outcome) =
+            fresh_tree_gates(&fresh_root, &self.protected_processes, &confirmation, ops)
+        {
+            self.kill_status = Some(tree_kill_status_line(
+                &fresh_root,
+                confirmation.mode,
+                &outcome,
+            ));
+            if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
+                self.finish_refresh_attempt(collect_ports(), Instant::now());
+            }
+            return;
+        }
+
+        // The TUI never skips the typed-word modal, so only the protected-root
+        // fact carries into the final frozen-set policy.
+        let outcome = tree::execute_tree_kill(
+            &fresh_root,
+            confirmation.mode,
+            &self.protected_processes,
+            fresh_root.platform,
+            tree::ScopeAuthorization {
+                protected_root_confirmed: confirmation.target.protected,
+                prompt_skipped: false,
+            },
+            ops,
+        );
+        self.kill_status = Some(tree_kill_status_line(
+            &fresh_root,
+            confirmation.mode,
+            &outcome,
+        ));
+        // Best-effort post-kill refresh so freed ports drop from the table; a
+        // failed re-collect shows as the standard error line rather than the
+        // status overclaiming a refresh that did not run.
+        self.finish_refresh_attempt(collect_ports(), Instant::now());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn apply_tree_pin_refusal<CollectPorts>(
+        &mut self,
+        target: &KillTarget,
+        mode: KillMode,
+        outcome: &tree::TreeKillOutcome,
+        collect_ports: &mut CollectPorts,
+    ) where
+        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    {
+        self.kill_status = Some(tree_kill_status_line(target, mode, outcome));
+        if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
+            self.finish_refresh_attempt(collect_ports(), Instant::now());
+        }
     }
 
     fn execute_kill_confirmation(&mut self) {
@@ -773,6 +1286,170 @@ impl App {
     fn cycle_sort(&mut self) {
         self.sort_mode = self.sort_mode.next();
         self.rebuild_visible_rows();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn tree_confirmation(&self) -> Option<&TreeKillConfirmation> {
+        self.tree_confirmation.as_ref()
+    }
+
+    /// Deliver a tree preview result as if the background worker had returned
+    /// it, so render and state tests never wait on a real process-table scan.
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn finish_tree_preview_for_test(&mut self, result: TreePreviewResult) {
+        let pid = self
+            .tree_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.target.pid)
+            .expect("a tree confirmation must be open");
+        self.tree_preview_worker = None;
+        self.apply_tree_preview(pid, result);
+    }
+}
+
+/// What one Enter press on the tree confirmation should do, decided against an
+/// immutable view of the state so the follow-up mutation cannot fight the
+/// borrow checker inside one match.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeSubmitVerdict {
+    Execute,
+    AdvanceToWord,
+    Reject(String),
+}
+
+/// Build the platform's real tree ops. One place, so the worker thread and the
+/// execution path can never disagree about which implementation the host uses.
+#[cfg(target_os = "linux")]
+fn host_tree_ops() -> crate::platform::linux::LinuxTreeOps {
+    crate::platform::linux::LinuxTreeOps::new()
+}
+
+#[cfg(target_os = "macos")]
+fn host_tree_ops() -> crate::platform::macos::MacosTreeOps {
+    crate::platform::macos::MacosTreeOps::new()
+}
+
+/// One preview enumeration, run on the worker thread.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_tree_preview(
+    root_pid: u32,
+    protected_names: &[String],
+    platform: crate::model::Platform,
+) -> TreePreviewResult {
+    use crate::tree::TreeProcessOps;
+
+    let mut ops = host_tree_ops();
+    let snapshot = ops.snapshot()?;
+    tree::plan_process_tree(
+        root_pid,
+        &snapshot,
+        protected_names,
+        platform,
+        tree::MAX_TREE_PROCESSES,
+    )
+    .map_err(|tree::TreePlanError::RootMissing| {
+        "root process is no longer running; nothing to terminate".to_owned()
+    })
+}
+
+/// Fresh pre-freeze gates for the TUI execution path: re-plan the tree from a
+/// fresh snapshot and re-run the preflight and root-protection rules, mapped
+/// into the shared outcome vocabulary.
+///
+/// `confirmation.target.protected` is true only when the protected-root stage
+/// was actually walked (set at request time or upgraded by the preview); a
+/// root the fresh scan newly classifies as protected — e.g. one that exec'd
+/// into a protected name with the same PID and start marker — must refuse
+/// here rather than ride a plain word confirmation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fresh_tree_gates<Ops: tree::TreeProcessOps>(
+    fresh_root: &KillTarget,
+    protected_processes: &[String],
+    confirmation: &TreeKillConfirmation,
+    ops: &mut Ops,
+) -> Result<(), tree::TreeKillOutcome> {
+    let snapshot = ops
+        .snapshot()
+        .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
+    let fresh_preview = tree::plan_process_tree(
+        fresh_root.pid,
+        &snapshot,
+        protected_processes,
+        fresh_root.platform,
+        tree::MAX_TREE_PROCESSES,
+    )
+    .map_err(|tree::TreePlanError::RootMissing| tree::TreeKillOutcome::RootAlreadyExited)?;
+    tree::preflight_outcome(&fresh_preview)?;
+    tree::root_protection_outcome(&fresh_preview, confirmation.target.protected)?;
+    Ok(())
+}
+
+/// Status-bar wording for tree outcomes, mirroring the CLI's stderr wording so
+/// the two surfaces describe the same outcome the same way.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_kill_status_line(
+    root: &KillTarget,
+    mode: KillMode,
+    outcome: &tree::TreeKillOutcome,
+) -> String {
+    use crate::display::sanitize;
+    use crate::tree::TreeKillOutcome;
+
+    let delivery = mode.delivery_label(root.platform);
+    match outcome {
+        TreeKillOutcome::Completed(report) if report.denied.is_empty() => format!(
+            "sent {delivery} to {} process(es) in the tree rooted at {}",
+            report.total,
+            root.identity(),
+        ),
+        TreeKillOutcome::Completed(report) => format!(
+            "sent {delivery} to {} of {} tree process(es); permission denied for PID(s): {}",
+            report.delivered,
+            report.total,
+            tree::format_pid_list(&report.denied),
+        ),
+        TreeKillOutcome::RootAlreadyExited => format!(
+            "{} already exited before termination was sent",
+            root.identity(),
+        ),
+        TreeKillOutcome::PermissionDenied { pid } => format!(
+            "permission denied stopping PID {pid}; the tree was thawed and no termination was sent",
+        ),
+        TreeKillOutcome::TargetChanged { pid } => format!(
+            "process tree identity changed at PID {pid}; it was thawed and no termination was sent",
+        ),
+        TreeKillOutcome::Truncated { limit } => {
+            format!("process tree exceeds {limit} processes; refusing to kill a partial tree")
+        }
+        TreeKillOutcome::SweepPassLimit { limit } => format!(
+            "process tree did not converge after {limit} freeze passes; it was thawed and no termination was sent",
+        ),
+        TreeKillOutcome::UnsafePid { pid, reason } => format!(
+            "unsafe PID {pid} in tree: {}; no termination was sent",
+            reason.message(),
+        ),
+        TreeKillOutcome::ProtectedDescendant { pid, name } => format!(
+            "protected process PID {pid} ({}) in tree; no termination was sent",
+            sanitize(name.as_deref().unwrap_or("<unknown>")),
+        ),
+        TreeKillOutcome::ProtectedRoot { pid, name } => format!(
+            "protected root PID {pid} ({}) requires PID/name confirmation; no termination was sent",
+            sanitize(name.as_deref().unwrap_or("<unknown>")),
+        ),
+        TreeKillOutcome::FreshConfirmationRequired => {
+            "process tree changed after --yes; no termination was sent".to_owned()
+        }
+        TreeKillOutcome::OwnershipUnavailable { pid } => format!(
+            "ownership for PID {pid} became unavailable before {delivery}; no termination was sent",
+        ),
+        TreeKillOutcome::PartialMetadata { pid } => format!(
+            "process metadata for PID {pid} was incomplete during tree verification; it was thawed and no termination was sent",
+        ),
+        TreeKillOutcome::SnapshotFailed(error) => format!(
+            "enumerating the process tree during termination failed: {}; no termination was sent",
+            sanitize(error),
+        ),
     }
 }
 
@@ -1529,5 +2206,465 @@ mod tests {
         let app = app_with_rows(vec![entry(5432, Some("postgres"))]);
 
         assert!(app.rows()[0].protected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod tree_kill {
+        use super::{App, Modal, app_with_rows, context, entry, mpsc};
+        use crate::app::{TreeConfirmStage, TreePreviewWorker, TreeSubmitVerdict};
+        use crate::input::Action;
+        use crate::model::Platform;
+        use crate::process::KillMode;
+        use crate::tree::{
+            ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult, plan_process_tree,
+        };
+        use std::time::{Duration, Instant};
+
+        fn tree_info(pid: u32, parent: Option<u32>, name: &str, marker: u64) -> TreeProcessInfo {
+            TreeProcessInfo {
+                pid,
+                parent_pid: parent,
+                process_name: Some(name.to_owned()),
+                start_time_marker: Some(marker),
+                owner_uid: None,
+                process_group: None,
+            }
+        }
+
+        fn preview_of(infos: &[TreeProcessInfo], root_pid: u32) -> ProcessTreeTarget {
+            plan_process_tree(
+                root_pid,
+                infos,
+                &["postgres".to_owned()],
+                Platform::Linux,
+                256,
+            )
+            .expect("test preview root must exist")
+        }
+
+        /// Scripted process table plus recorded signal calls, standing in for
+        /// the real platform ops during execution tests.
+        struct FakeTreeOps {
+            snapshot: Vec<TreeProcessInfo>,
+            stops: Vec<u32>,
+            delivered: Vec<u32>,
+        }
+
+        impl FakeTreeOps {
+            fn new(snapshot: Vec<TreeProcessInfo>) -> Self {
+                Self {
+                    snapshot,
+                    stops: Vec::new(),
+                    delivered: Vec::new(),
+                }
+            }
+        }
+
+        impl TreeProcessOps for FakeTreeOps {
+            fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
+                Ok(self.snapshot.clone())
+            }
+
+            fn stop(&mut self, pid: u32) -> TreeSignalResult {
+                self.stops.push(pid);
+                TreeSignalResult::Delivered
+            }
+
+            fn cont(&mut self, _pid: u32) {}
+
+            fn prepare_delivery(
+                &mut self,
+                _pid: u32,
+                _verified_start_marker: Option<u64>,
+            ) -> TreeSignalResult {
+                TreeSignalResult::Delivered
+            }
+
+            fn deliver(&mut self, pid: u32, _mode: KillMode) -> TreeSignalResult {
+                self.delivered.push(pid);
+                TreeSignalResult::Delivered
+            }
+        }
+
+        fn set_tree_confirmation_start_time(app: &mut App, start_time_ticks: u64) {
+            app.tree_confirmation
+                .as_mut()
+                .expect("tree confirmation must be open")
+                .target
+                .process_start_time_marker = Some(start_time_ticks);
+        }
+
+        #[test]
+        fn tree_request_opens_loading_modal_then_preview_populates_it() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+            app.apply_action(Action::RequestTreeTerminate);
+
+            assert_eq!(app.modal(), Modal::ConfirmTreeKill);
+            let confirmation = app
+                .tree_confirmation()
+                .expect("tree request opens a confirmation");
+            assert_eq!(confirmation.target.pid, 3000);
+            assert_eq!(confirmation.mode, KillMode::Terminate);
+            assert_eq!(confirmation.stage, TreeConfirmStage::Word);
+            assert!(confirmation.preview.is_none(), "preview starts loading");
+
+            let infos = vec![
+                tree_info(3000, Some(1), "node", 55),
+                tree_info(3001, Some(3000), "worker", 56),
+            ];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+
+            let confirmation = app.tree_confirmation().expect("confirmation stays open");
+            assert_eq!(
+                confirmation.preview.as_ref().map(ProcessTreeTarget::len),
+                Some(2),
+            );
+        }
+
+        #[test]
+        fn submit_while_preview_is_loading_rejects_without_executing() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            for ch in "tree".chars() {
+                app.apply_action(Action::KillInputAppend(ch));
+            }
+
+            app.apply_action(Action::SubmitKillConfirmation);
+
+            let confirmation = app.tree_confirmation().expect("confirmation stays open");
+            assert!(
+                confirmation.input.is_empty(),
+                "typing while the preview loads must not pre-arm execution",
+            );
+            assert!(
+                confirmation
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("still enumerating")),
+                "{:?}",
+                confirmation.error,
+            );
+            assert_eq!(app.modal(), Modal::ConfirmTreeKill);
+
+            let infos = vec![tree_info(3000, Some(1), "node", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+            let confirmation = app.tree_confirmation().expect("confirmation stays open");
+            assert!(confirmation.input.is_empty());
+            assert!(confirmation.error.is_none());
+            assert!(matches!(
+                app.tree_submit_verdict(),
+                Some(TreeSubmitVerdict::Reject(_)),
+            ));
+        }
+
+        #[test]
+        fn preflight_refusal_from_preview_closes_modal_with_status() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+
+            // The enumerated tree carries a protected descendant, so the gate
+            // fires before any confirmation input is possible.
+            let infos = vec![
+                tree_info(3000, Some(1), "node", 55),
+                tree_info(3001, Some(3000), "postgres", 56),
+            ];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("protected process PID 3001")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn preview_failure_closes_modal_with_status() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+
+            app.finish_tree_preview_for_test(Err("scan failed".to_owned()));
+
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("scan failed")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn submit_verdict_covers_the_whole_decision_table() {
+            let mut app = app_with_rows(vec![entry(5432, Some("postgres"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            let infos = vec![tree_info(5432, Some(500), "postgres", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 5432)));
+
+            // Protected root: wrong input rejects, the name advances to the
+            // word stage, and only the word executes.
+            let confirmation = app.tree_confirmation().expect("confirmation open");
+            assert_eq!(confirmation.stage, TreeConfirmStage::ProtectedRoot);
+
+            for ch in "nope".chars() {
+                app.apply_action(Action::KillInputAppend(ch));
+            }
+            assert!(matches!(
+                app.tree_submit_verdict(),
+                Some(TreeSubmitVerdict::Reject(_)),
+            ));
+
+            let mut app2 = app;
+            {
+                let confirmation = app2.tree_confirmation.as_mut().expect("open");
+                confirmation.input = "postgres".to_owned();
+            }
+            assert_eq!(
+                app2.tree_submit_verdict(),
+                Some(TreeSubmitVerdict::AdvanceToWord),
+            );
+            app2.apply_action(Action::SubmitKillConfirmation);
+            let confirmation = app2.tree_confirmation().expect("still open");
+            assert_eq!(confirmation.stage, TreeConfirmStage::Word);
+            assert!(confirmation.input.is_empty(), "input clears between stages");
+
+            {
+                let confirmation = app2.tree_confirmation.as_mut().expect("open");
+                confirmation.input = "TREE".to_owned();
+            }
+            assert_eq!(app2.tree_submit_verdict(), Some(TreeSubmitVerdict::Execute));
+        }
+
+        #[test]
+        fn preview_discovering_a_protected_root_forces_the_protected_stage() {
+            // The selected socket row has no readable process name, so the
+            // port-row policy cannot mark the root protected — but the tree
+            // snapshot reads the name and it is on the protected list. The
+            // confirmation must upgrade to the protected stage instead of
+            // accepting the bare scope word.
+            let mut app = app_with_rows(vec![entry(3000, None)]);
+            app.apply_action(Action::RequestTreeTerminate);
+            let confirmation = app.tree_confirmation().expect("confirmation opens");
+            assert_eq!(confirmation.stage, TreeConfirmStage::Word);
+
+            let infos = vec![tree_info(3000, Some(500), "postgres", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+
+            let confirmation = app.tree_confirmation().expect("confirmation stays open");
+            assert_eq!(
+                confirmation.stage,
+                TreeConfirmStage::ProtectedRoot,
+                "a root the tree scan classifies as protected must require the protected confirmation",
+            );
+            assert!(confirmation.target.protected);
+            assert!(confirmation.input.is_empty());
+        }
+
+        #[test]
+        fn execute_refuses_root_that_fresh_scan_classifies_as_protected() {
+            // Between confirmation and execution the root execs into a
+            // protected name: exec changes the name but not the PID, parent, or
+            // start marker, so identity revalidation passes when the confirmed
+            // name was unreadable. The fresh-scan root protection guard must
+            // refuse, without a single signal.
+            let mut app = app_with_rows(vec![entry(3000, None)]);
+            app.apply_action(Action::RequestTreeTerminate);
+            set_tree_confirmation_start_time(&mut app, 55);
+            let clean = vec![tree_info(3000, Some(500), "node", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&clean, 3000)));
+
+            let execed = vec![tree_info(3000, Some(500), "postgres", 55)];
+            let fresh_rows = vec![entry(3000, None)];
+            let mut ops = FakeTreeOps::new(execed);
+
+            app.execute_tree_kill_confirmation_with(
+                || Ok(fresh_rows.clone()),
+                |_| context(55),
+                &mut ops,
+            );
+
+            assert!(ops.stops.is_empty(), "refusal must precede any stop");
+            assert!(ops.delivered.is_empty(), "no signal may be sent");
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("protected root")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn cancel_discards_confirmation_and_late_preview_results() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            let (sender, receiver) = mpsc::channel();
+            app.tree_preview_worker = Some(TreePreviewWorker {
+                root_pid: 3000,
+                receiver,
+            });
+
+            app.apply_action(Action::CancelKill);
+
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            assert_eq!(app.kill_status(), Some("tree kill cancelled"));
+            assert!(
+                app.tree_preview_worker.is_some(),
+                "cancel keeps the one worker so it can be drained instead of replaced",
+            );
+
+            // A worker result landing after the cancel must not reopen anything.
+            let infos = vec![tree_info(3000, Some(1), "node", 55)];
+            sender
+                .send(Ok(preview_of(&infos, 3000)))
+                .expect("test preview result must send");
+            app.poll_tree_preview();
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            assert!(app.tree_preview_worker.is_none());
+        }
+
+        #[test]
+        fn tree_request_waits_for_cancelled_preview_worker_to_finish() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            let (_sender, receiver) = mpsc::channel();
+            app.tree_preview_worker = Some(TreePreviewWorker {
+                root_pid: 3000,
+                receiver,
+            });
+
+            app.apply_action(Action::RequestTreeTerminate);
+
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("still finishing")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn auto_refresh_pauses_while_tree_confirmation_is_open() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+
+            assert!(!app.refresh_due_at(
+                Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(1),
+            ));
+            assert_eq!(
+                app.time_until_refresh_at(
+                    Instant::now() + Duration::from_secs(10),
+                    Duration::from_secs(1),
+                ),
+                Duration::from_secs(1),
+            );
+        }
+
+        #[test]
+        fn execute_revalidates_root_and_refuses_identity_drift_without_signals() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            set_tree_confirmation_start_time(&mut app, 55);
+            let infos = vec![tree_info(3000, Some(1), "node", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+            let fresh_rows = vec![entry(3000, Some("node"))];
+            let mut ops = FakeTreeOps::new(infos);
+
+            // The fresh context reports a different start marker: a reused PID.
+            app.execute_tree_kill_confirmation_with(
+                || Ok(fresh_rows.clone()),
+                |_| context(99),
+                &mut ops,
+            );
+
+            assert!(ops.stops.is_empty(), "no process may be stopped");
+            assert!(ops.delivered.is_empty(), "no signal may be sent");
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("no longer owns")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn execute_runs_fresh_preflight_and_refuses_new_protected_descendant() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            set_tree_confirmation_start_time(&mut app, 55);
+            let clean = vec![tree_info(3000, Some(1), "node", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&clean, 3000)));
+
+            // Between confirmation and execution, a protected child appeared.
+            let grown = vec![
+                tree_info(3000, Some(1), "node", 55),
+                tree_info(3001, Some(3000), "postgres", 56),
+            ];
+            let fresh_rows = vec![entry(3000, Some("node"))];
+            let mut ops = FakeTreeOps::new(grown);
+
+            app.execute_tree_kill_confirmation_with(
+                || Ok(fresh_rows.clone()),
+                |_| context(55),
+                &mut ops,
+            );
+
+            assert!(ops.stops.is_empty(), "refusal must precede any stop");
+            assert!(ops.delivered.is_empty());
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("protected process PID 3001")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn execute_happy_path_kills_leaves_first_and_refreshes_rows() {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            set_tree_confirmation_start_time(&mut app, 55);
+            let infos = vec![
+                tree_info(3000, Some(1), "node", 55),
+                tree_info(3001, Some(3000), "worker", 56),
+            ];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+            let fresh_rows = vec![entry(3000, Some("node"))];
+            let mut collect_calls = 0;
+            let mut ops = FakeTreeOps::new(infos);
+
+            app.execute_tree_kill_confirmation_with(
+                || {
+                    collect_calls += 1;
+                    if collect_calls == 1 {
+                        Ok(fresh_rows.clone())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                },
+                |_| context(55),
+                &mut ops,
+            );
+
+            assert_eq!(app.modal(), Modal::None);
+            assert!(app.tree_confirmation().is_none());
+            // Leaves first, root last.
+            assert_eq!(ops.delivered, vec![3001, 3000]);
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("sent SIGTERM to 2 process(es)")),
+                "{:?}",
+                app.kill_status(),
+            );
+            // The post-kill refresh applied the freed table.
+            assert_eq!(app.rows().len(), 0);
+        }
     }
 }

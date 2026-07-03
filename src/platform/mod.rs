@@ -54,3 +54,17 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
         Vec::new()
     }
 }
+
+/// Best-effort command line for one PID, for the read-only inspect view.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::process_command_line(pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_command_line(pid)
+    }
+}

@@ -32,7 +32,11 @@ kick list
 
 ## Maintainer notes
 
-These templates are already prepped for the current release. Only the checksums in `PKGBUILD` need updating when a new tag ships. `.SRCINFO` is generated from `PKGBUILD` and must be committed alongside it in the AUR repository.
+When a new tag ships, update `pkgver` and the checksums in `PKGBUILD` only after the `cargo-dist` GitHub Release assets exist. Do not use placeholder checksums or `SKIP` for the AUR package metadata.
+
+For the 1.0.0 release, these packages are preparation-only until AUR account creation is available again. Keep the package metadata tied to the last real release assets until `cargo-dist` has published the `v1.0.0` source archive and Linux binary archives. Only after those assets exist should `pkgver`, `source`, checksums, and `.SRCINFO` move to `1.0.0`; publishing to AUR still waits until account creation is open again.
+
+The required update order is: run/publish the release with `cargo-dist`, download or read the generated checksums from the release assets, update `pkgver`/`source`/`provides`/`sha256sums`, regenerate `.SRCINFO`, then build locally.
 
 Generate `.SRCINFO` after editing a `PKGBUILD`:
 

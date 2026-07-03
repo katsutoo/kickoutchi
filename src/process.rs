@@ -262,52 +262,136 @@ impl KillTarget {
         self.child_count > 0 || self.children_truncated
     }
 
-    pub(crate) fn warning_lines(&self) -> Vec<String> {
+    /// The typed warnings attached to this target. Policy gates (for example
+    /// the `--yes` all-clear check) match on these kinds; display surfaces
+    /// render them through [`KillWarning::text`] via [`Self::warning_lines`],
+    /// so the gate and the prose can never drift apart.
+    pub(crate) fn warnings(&self) -> Vec<KillWarning> {
         let mut warnings = Vec::new();
 
         if self.protected {
-            warnings.push("protected process; stronger confirmation is required".to_owned());
+            warnings.push(KillWarning::Protected);
         }
 
         if self.system_process {
-            warnings.push("system/service process; verify this is safe to terminate".to_owned());
+            warnings.push(KillWarning::SystemProcess);
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let mut owner_warning_added = false;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let owner_warning_added = false;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(owner_uid) = self.owner_uid {
+        let owner_mismatch = self.owner_uid.and_then(|owner_uid| {
             let current_uid = current_user_id();
-            if owner_uid != current_uid {
-                warnings.push(format!(
-                    "target is owned by uid {owner_uid}, current effective uid is {current_uid}",
-                ));
-                owner_warning_added = true;
-            }
+            (owner_uid != current_uid).then_some(KillWarning::OwnerMismatch {
+                owner_uid,
+                current_uid,
+            })
+        });
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let owner_mismatch: Option<KillWarning> = None;
+
+        let owner_mismatch_reported = owner_mismatch.is_some();
+        if let Some(warning) = owner_mismatch {
+            warnings.push(warning);
         }
 
-        if !owner_warning_added && self.permission == PermissionStatus::Partial {
-            warnings.push(
-                "process metadata is partial; termination may fail with permission denied"
-                    .to_owned(),
-            );
+        if !owner_mismatch_reported && self.permission == PermissionStatus::Partial {
+            warnings.push(KillWarning::PartialMetadata);
         }
 
         if self.has_children() {
-            let suffix = if self.children_truncated {
-                " or more"
-            } else {
-                ""
-            };
-            warnings.push(format!(
-                "target has {}{suffix} direct child process(es); termination targets only the confirmed PID",
-                self.child_count,
-            ));
+            warnings.push(KillWarning::HasChildren {
+                child_count: self.child_count,
+                children_truncated: self.children_truncated,
+            });
         }
 
         warnings
+    }
+
+    pub(crate) fn warning_lines(&self) -> Vec<String> {
+        self.warnings().iter().map(KillWarning::text).collect()
+    }
+}
+
+/// One warning attached to a kill target, typed so policy can match on the
+/// kind instead of on banner prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KillWarning {
+    Protected,
+    SystemProcess,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    OwnerMismatch {
+        owner_uid: u32,
+        current_uid: u32,
+    },
+    PartialMetadata,
+    HasChildren {
+        child_count: usize,
+        children_truncated: bool,
+    },
+}
+
+impl KillWarning {
+    /// The single-kill banner wording. Tree and group surfaces rewrite the
+    /// process-scope suffix through [`tree_scope_warning_text`].
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Protected => "protected process; stronger confirmation is required".to_owned(),
+            Self::SystemProcess => {
+                "system/service process; verify this is safe to terminate".to_owned()
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::OwnerMismatch {
+                owner_uid,
+                current_uid,
+            } => format!(
+                "target is owned by uid {owner_uid}, current effective uid is {current_uid}",
+            ),
+            Self::PartialMetadata => {
+                "process metadata is partial; termination may fail with permission denied"
+                    .to_owned()
+            }
+            Self::HasChildren {
+                child_count,
+                children_truncated,
+            } => {
+                let suffix = if *children_truncated { " or more" } else { "" };
+                format!(
+                    "target has {child_count}{suffix} direct child process(es); termination targets only the confirmed PID",
+                )
+            }
+        }
+    }
+}
+
+/// Rewrite a single-kill warning line for tree scope.
+///
+/// `KillTarget::warning_lines` tells single-kill users that children survive
+/// ("termination targets only the confirmed PID") — under `--tree` that exact
+/// sentence would be false, so the tree surfaces (CLI banner and TUI modal)
+/// route every root warning through here. It lives beside `warning_lines` so
+/// the suffix it strips and the text that produces it cannot drift apart.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn tree_scope_warning_text(warning: &str) -> String {
+    scoped_warning_text(
+        warning,
+        "tree kill targets the bounded descendant tree shown above",
+    )
+}
+
+/// Rewrite a single-kill warning line for group scope; see
+/// [`tree_scope_warning_text`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn group_scope_warning_text(warning: &str) -> String {
+    scoped_warning_text(warning, "group kill targets every group member shown above")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn scoped_warning_text(warning: &str, scope_clause: &str) -> String {
+    const PROCESS_SCOPE_SUFFIX: &str = "; termination targets only the confirmed PID";
+    if let Some(prefix) = warning.strip_suffix(PROCESS_SCOPE_SUFFIX) {
+        format!("{prefix}; {scope_clause}")
+    } else {
+        warning.to_owned()
     }
 }
 
@@ -503,8 +587,21 @@ pub(crate) fn terminate_handle(handle: &TerminationHandle, mode: KillMode) -> Te
     terminate_handle_platform(handle, mode)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct TreeDeliveryHandle {
+    pid: u32,
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl TreeDeliveryHandle {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn current_user_id() -> u32 {
+pub(crate) fn current_user_id() -> u32 {
     // SAFETY: geteuid takes no arguments, touches no memory, and can't fail —
     // it just hands back this process's effective UID.
     unsafe { libc::geteuid() }
@@ -617,6 +714,11 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
     }
 
     let Ok(fd) = libc::c_int::try_from(fd) else {
+        // Unreachable in practice (kernel fds fit c_int), but if it ever fires
+        // the raw descriptor must not leak.
+        // SAFETY: fd came from a successful pidfd_open and has not been wrapped
+        // in an owner yet, so closing it here closes exactly one live fd.
+        unsafe { libc::syscall(libc::SYS_close, fd) };
         return Err(TerminationOutcome::UnknownFailure(
             "pidfd_open returned a file descriptor that does not fit c_int".to_owned(),
         ));
@@ -656,6 +758,165 @@ fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> Term
 
     let error = std::io::Error::last_os_error();
     outcome_from_errno("pidfd_send_signal", &error)
+}
+
+/// Send `SIGSTOP` to a PID for the process-tree freeze.
+///
+/// macOS has no pidfd equivalent, so the freeze path stops by PID and then
+/// immediately verifies identity while the process is stopped. Linux callers use
+/// `tree_stop_handle` instead so the root and every descendant are pinned
+/// before the first stop signal.
+#[cfg(target_os = "macos")]
+pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
+    tree_send_signal(pid, libc::SIGSTOP)
+}
+
+/// Send `SIGCONT` to a PID. Best-effort: used to resume a process before its
+/// terminating signal and to thaw the tree on any abort, so callers ignore the
+/// result — a `SIGCONT` to a process that already died is a harmless no-op.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn tree_cont(pid: u32) {
+    let _ = tree_send_signal(pid, libc::SIGCONT);
+}
+
+/// macOS delivery preparation: probe that the stopped process still exists.
+///
+/// There is no pidfd to hold on Darwin, so the reuse defense is layered
+/// instead of absolute: every member is stopped and identity-verified first (a
+/// stopped process cannot fork, exec, or exit on its own), and `MacosTreeOps`
+/// re-checks the verified start marker immediately before each raw-PID signal.
+/// The stop does not make PID reuse impossible — an external `SIGKILL` can
+/// remove a stopped process, and a running parent can reap it — it makes the
+/// window a few instructions wide. Signal `0` performs the kernel's existence
+/// and permission checks without delivering anything.
+#[cfg(target_os = "macos")]
+pub(crate) fn tree_prepare_delivery_probe(pid: u32) -> crate::tree::TreeSignalResult {
+    tree_send_signal(pid, 0)
+}
+
+/// macOS terminating delivery, by PID. Only called after the member was
+/// frozen, verified, and marker-rechecked (see `tree_prepare_delivery_probe`
+/// and `MacosTreeOps::recheck_marker` for the layered reuse defense).
+#[cfg(target_os = "macos")]
+pub(crate) fn tree_deliver_by_pid(pid: u32, mode: KillMode) -> crate::tree::TreeSignalResult {
+    let signal = match mode {
+        KillMode::Terminate => libc::SIGTERM,
+        KillMode::Force => libc::SIGKILL,
+    };
+    tree_send_signal(pid, signal)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tree_open_delivery_handle(
+    pid: u32,
+) -> Result<TreeDeliveryHandle, crate::tree::TreeSignalResult> {
+    use crate::tree::TreeSignalResult;
+
+    if unsafe_pid_reason(pid).is_some() {
+        return Err(TreeSignalResult::Denied);
+    }
+    let Ok(platform_pid) = libc::pid_t::try_from(pid) else {
+        return Err(TreeSignalResult::NotFound);
+    };
+    // SAFETY: pid has been range-checked to pid_t, flags is zero as required by
+    // pidfd_open(2), and the syscall writes no Rust-managed memory.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, platform_pid, 0) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(tree_signal_result_from_errno(&error));
+    }
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        // Unreachable in practice (kernel fds fit c_int), but if it ever fires
+        // the raw descriptor must not leak.
+        // SAFETY: fd came from a successful pidfd_open and has not been wrapped
+        // in an owner yet, so closing it here closes exactly one live fd.
+        unsafe { libc::syscall(libc::SYS_close, fd) };
+        return Err(TreeSignalResult::Denied);
+    };
+    // SAFETY: pidfd_open returned this fd successfully, so OwnedFd owns it once.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    Ok(TreeDeliveryHandle { pid, pidfd })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tree_stop_handle(handle: &TreeDeliveryHandle) -> crate::tree::TreeSignalResult {
+    tree_send_pidfd_signal(handle, libc::SIGSTOP)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tree_cont_handle(handle: &TreeDeliveryHandle) -> crate::tree::TreeSignalResult {
+    tree_send_pidfd_signal(handle, libc::SIGCONT)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn tree_deliver_handle(
+    handle: &TreeDeliveryHandle,
+    mode: KillMode,
+) -> crate::tree::TreeSignalResult {
+    let signal = match mode {
+        KillMode::Terminate => libc::SIGTERM,
+        KillMode::Force => libc::SIGKILL,
+    };
+    tree_send_pidfd_signal(handle, signal)
+}
+
+#[cfg(target_os = "linux")]
+fn tree_send_pidfd_signal(
+    handle: &TreeDeliveryHandle,
+    signal: libc::c_int,
+) -> crate::tree::TreeSignalResult {
+    // SAFETY: pidfd is an open descriptor from pidfd_open, signal is one of the
+    // fixed process-tree signals, siginfo is null by pidfd_send_signal(2)
+    // convention, and flags is zero. No Rust-managed memory is written.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        return crate::tree::TreeSignalResult::Delivered;
+    }
+    let error = std::io::Error::last_os_error();
+    tree_signal_result_from_errno(&error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_send_signal(pid: u32, signal: libc::c_int) -> crate::tree::TreeSignalResult {
+    use crate::tree::TreeSignalResult;
+
+    if unsafe_pid_reason(pid).is_some() {
+        return TreeSignalResult::Denied;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return TreeSignalResult::NotFound;
+    };
+    // SAFETY: kill(2) takes a pid and a fixed signal constant by value and writes
+    // no Rust-managed memory. Every tree member is stopped and identity-verified
+    // before it is targeted, and terminating signals additionally re-check the
+    // verified start marker just before this call (see MacosTreeOps).
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return TreeSignalResult::Delivered;
+    }
+    let error = std::io::Error::last_os_error();
+    tree_signal_result_from_errno(&error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_signal_result_from_errno(error: &std::io::Error) -> crate::tree::TreeSignalResult {
+    use crate::tree::TreeSignalResult;
+
+    match error.raw_os_error() {
+        Some(code) if code == libc::ESRCH => TreeSignalResult::NotFound,
+        // EPERM is a real permission failure; anything else is treated as a
+        // refusal too, so an unexpected errno fails closed rather than pretending
+        // the signal landed.
+        _ => TreeSignalResult::Denied,
+    }
 }
 
 #[cfg(target_os = "linux")]

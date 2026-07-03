@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-03
+
+### Added
+
+- Linux and macOS `kickoutchi kill --port <PORT> --tree` (and `--pid`,
+  `--force`) terminates the whole process tree rooted at the target, not just
+  the single port-owning process — for cleaning up dev servers, agents, and
+  runners that leave worker children behind. It is opt-in: normal `kick kill`
+  is unchanged and still signals exactly one PID.
+  - Tree kill does a fresh bounded tree count before any signal is sent, then
+    freezes before it kills: it `SIGSTOP`s the root first so it cannot spawn
+    more children, sweeps its descendants to a fixed point, and re-verifies
+    every process's identity while it is stopped (where its PID cannot be
+    recycled) before signalling. This is what lets it clean up a process that
+    is actively spawning children rather than losing the race.
+  - It signals leaves-first, root last, sending `SIGTERM` then `SIGCONT` for a
+    normal kill (or `SIGKILL` for `--force`). Any refusal after freezing —
+    identity drift, a protected descendant, an unsafe PID, or exceeding the
+    256-process cap — thaws every process it stopped and sends no termination.
+  - Interactive confirmation requires typing `tree` (or `force` for
+    `--force`); a protected root requires typing its PID or name and then the
+    tree confirmation word. `--yes` only skips the prompt for an all-clear tree,
+    cannot bypass a protected root, and is refused if the fresh execution-time
+    scan would have required warnings to be reviewed — a condition that is
+    applied once more to the final frozen member set, because a tree can grow
+    between the skip and the end of the freeze.
+  - Root protection is decided from both readers, not just the socket row: a
+    root whose port row has no readable name but whose process-table entry is
+    on the protected list still requires the protected confirmation, and
+    execution re-checks the fresh scan's root classification — a root that
+    turns out protected only at kill time (for example after an `exec` into a
+    protected name, which keeps its PID and start marker) is refused unless
+    the protected confirmation was actually completed. Both the CLI and the
+    TUI share this gate.
+  - A tree that exceeds the process cap is refused rather than partially
+    killed, so a runaway fork bomb is reported and left intact instead of half
+    signalled. The `--tree` flag exists only on Linux and macOS builds;
+    Windows has no freeze primitive, so it does not get a weaker tree kill
+    under the same name.
+  - On Linux every member is pinned with a pidfd before its first `SIGSTOP`,
+    and the same handle is used for thaw and final delivery. macOS has no
+    pidfd, so delivery is layered instead: every member is stopped and
+    identity-verified first (a stopped process cannot fork, exec, or exit on
+    its own), and the verified start marker is re-checked immediately before
+    each terminating signal, so a PID that was recycled under an external
+    `SIGKILL` is reported as exited rather than signalled.
+  - `kill --pid <PID> --tree` can start from a live parent PID even when that
+    root owns no visible port, so cases where a child owns the port but the
+    parent supervises the tree can be cleaned up from the parent. The banner
+    for such a root carries the same ownership warning as a port-owning one
+    when the process belongs to another user.
+- The TUI now has tree kill too: `t` requests tree termination of the selected
+  row's process and `T` (Shift) requests a tree force-kill, mirroring the
+  `x`/`X` convention including its Caps Lock handling. The confirmation modal
+  enumerates the tree on a background worker (the table stays responsive and
+  shows the count once the scan lands), lists the members with depth
+  indentation, shows the same warnings as the CLI banner, and requires typing
+  `tree` (or `force`); a protected root asks for its PID or name first and the
+  word second, exactly like the CLI. Execution never trusts the previewed
+  tree: it revalidates the root identity and re-runs the bounded pre-flight
+  gates against a fresh scan before the first freeze signal. The header and
+  help modal advertise the keys only on Linux/macOS builds, and the normal
+  `x`/`X` kill flow is unchanged. The modal budgets its member preview from
+  the terminal height, so the typed-word instruction, the input echo, and the
+  Esc hint stay visible even at the smallest supported size.
+
+- Linux and macOS `kickoutchi inspect --pid <PID>` / `--port <PORT>`: a
+  strictly read-only family view for picking the right root before a tree
+  kill. It shows the target with its command line, ports, and process group;
+  the ancestor chain nearest-first with command lines (so a supervisor like an
+  agent or package runner is identifiable); siblings; the bounded descendant
+  tree with per-member ports; and the process-group members with the ones
+  *outside* the descendant tree called out — exactly the processes a tree kill
+  from that target would leave alive. Protected names are marked, every
+  OS-provided string is sanitized, all sections are display-capped with honest
+  "and N more" lines, and the report ends with the matching
+  `kick kill --pid <root> --tree` command. It never signals anything: killing
+  upward stays a human decision made with the family in view.
+  - `inspect --port` follows the same resolution rules as `kill --port`
+    (refuses ambiguous multi-owner ports, reports unreadable owners as a
+    permission problem), while `inspect --pid` accepts any live PID including
+    portless supervisors — and, being read-only, even PID 1.
+  - Tree snapshots now also carry the process group ID (from `stat` on Linux
+    and `proc_bsdinfo` on macOS, read in the same pass as before). Because
+    group kill derives its membership from this field, it is read as
+    fail-closed as the start marker: a live process whose group cannot be read
+    fails the scan, and the kernel's own group `0` maps to "no targetable
+    group". The read-only inspect view renders an untargetable group as
+    unknown.
+  - When the process group has members outside the descendant tree — exactly
+    the processes a tree kill would leave alive — the inspect report's footer
+    now also offers the matching `kick kill --pid <root> --group` command.
+
+- Linux and macOS `kickoutchi kill --port <PORT> --group` (and `--pid`,
+  `--force`): terminates the target's whole POSIX process group — every
+  process sharing its group ID — instead of its parent-link tree. This is the
+  honest tool for the two cases tree scope cannot cover: survivors that
+  reparented away from the tree (double-fork daemons, orphaned workers whose
+  spawner exited) and runaway spawners whose tree outgrows the 256-process
+  tree cap. `--group` conflicts with `--tree` at parse time, exists only on
+  Linux/macOS builds like `--tree`, and leaves normal `kick kill` unchanged.
+  - Same freeze-first pipeline and refusal gates as tree kill: the confirmed
+    root is `SIGSTOP`ped first, members are swept to a fixed point, every
+    frozen member's identity is re-verified while stopped, and any refusal
+    thaws everything. Group membership is re-proven after every stop (a
+    member whose group changed under the freeze refuses the whole kill), but
+    a member whose *parent* died mid-kill is fine — reparenting does not
+    change group membership, which is the point of the scope.
+  - Normal group termination queues `SIGTERM` to every frozen member before any
+    `SIGCONT`, so parent-like group members cannot wake up and spawn survivors
+    while other members are still only frozen.
+  - It is deliberately never implemented as `kill(-pgid, ...)`: every member
+    is enumerated, frozen, verified, and signalled individually through the
+    same delivery path as tree kill (per-member pidfds on Linux), so the
+    unsafe-PID, protected-process, and identity gates apply to every PID. If
+    Kickoutchi itself sits in the target group (a plain `sh -c` script puts
+    everything in one group), the kill refuses before anything is stopped.
+  - The group cap is 512 processes — double the tree cap, because group scope
+    is the designated tool for over-cap spawner trees — and past it the kill
+    refuses rather than executing partially.
+  - Interactive confirmation requires typing `group` (or `force` for
+    `--force`) after a banner that names the group ID and lists **every**
+    member: a process group can contain unrelated commands launched from the
+    same shell, so the full blast radius is always shown. A protected root
+    requires its PID or name first; a protected member refuses the whole group.
+    `--yes` is stricter than tree scope: it only skips the prompt for a group
+    of at most 8 members with no warnings anywhere, and both the fresh
+    execution-time scan and the final frozen member set must still pass that
+    same all-clear gate (size cap included), because a group has no structural
+    tie to the confirmed target and can grow mid-freeze.
+  - Execution revalidates the root against a fresh scan and additionally
+    requires it to still sit in the confirmed group — a root that moved
+    groups between confirmation and execution would silently retarget the
+    sweep, so it refuses instead.
+
+### Changed
+
+- Cargo metadata now declares `rust-version = "1.95.0"`, matching the README,
+  `mise.toml`, and GitHub Actions, so crates.io consumers get the same
+  machine-readable MSRV as local and CI builds.
+- Nix release installs are prepared for reproducible builds with a committed
+  `flake.lock` instead of a floating `nixos-unstable` input.
+- AUR packaging notes now make the release order explicit: keep package
+  metadata pinned to the last published assets until the `v1.0.0` GitHub
+  Release exists, then update checksums and `.SRCINFO`; actual AUR publication
+  still waits for account creation to reopen.
+- Internal restructure, no behavior change: system/service process
+  classification now lives in a shared `SystemProcessCheck` fields struct in
+  the model, and `PortEntry::is_system_process` delegates to it. Kill-time
+  process-tree nodes reuse the exact same policy without duplicating it, and
+  the named fields keep the same-typed PID and name pairs from being silently
+  swapped at call sites.
+
+### Fixed
+
+- Portless `--pid --tree` and `--pid --group` root revalidation now refuses a
+  missing start-time marker before any freeze signal is sent, even across test
+  seams. The real Linux/macOS snapshots already fail closed, but the shared CLI
+  safety gate now enforces the same identity contract directly.
+- CLI kill success reporting no longer races process shutdown: after a
+  successful termination (single-process or tree), the post-kill port check
+  now polls for up to about one second before deciding between "confirmed
+  target ports are no longer visible" and the still-visible warning. `SIGTERM`
+  teardown is asynchronous, so the immediate re-collect could warn about a
+  still-visible port on perfectly successful kills; a port that genuinely
+  stays open is still reported honestly after the settle window.
+
 ## [0.1.2] - 2026-06-28
 
 ### Added
@@ -424,7 +591,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...v1.0.0
 [0.1.2]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nuggocto/kickoutchi/releases/tag/v0.1.0

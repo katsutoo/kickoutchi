@@ -17,12 +17,22 @@ mod display;
 mod docker;
 mod error;
 mod input;
+// The read-only family/group inspection view. It renders data from the tree
+// snapshot, so it exists exactly where tree kill does.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod inspect;
 mod model;
 mod output;
 mod platform;
 mod process;
 mod protection;
 mod query;
+// Process-tree kill ships on Linux and macOS. Windows has no freeze primitive
+// (no SIGSTOP equivalent), so the tree feature is gated to the platforms whose
+// safety model it can actually honor; gating also keeps the deny-warnings gate
+// happy on builds where the feature would have no caller.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod tree;
 mod ui;
 
 use std::io;

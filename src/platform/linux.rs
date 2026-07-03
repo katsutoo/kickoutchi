@@ -20,6 +20,11 @@ use crate::model::{
     ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
     Protocol, RelatedProcessHint, SocketState,
 };
+use crate::process::{
+    TreeDeliveryHandle, tree_cont, tree_cont_handle, tree_deliver_handle,
+    tree_open_delivery_handle, tree_stop_handle,
+};
+use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
 
 const PROC_ROOT: &str = "/proc";
 const TCP_LISTEN_STATE: &str = "0A";
@@ -144,6 +149,18 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
 
 pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint> {
     collect_related_process_hints_from(&PathBuf::from(PROC_ROOT), port)
+}
+
+/// Best-effort command line for one PID, for the read-only inspect view.
+/// `None` covers vanished, restricted, and kernel processes alike — inspect
+/// renders it as unknown rather than failing the report.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    let path = PathBuf::from(PROC_ROOT)
+        .join(pid.to_string())
+        .join("cmdline");
+    read_cmdline(&path)
+        .ok()
+        .and_then(|(command_line, _)| command_line)
 }
 
 fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, CollectorError> {
@@ -588,6 +605,211 @@ fn collect_related_process_hints_from(proc_root: &Path, port: u16) -> Vec<Relate
     hints
 }
 
+/// The Linux end of the process-tree I/O contract.
+///
+/// Snapshots come from a single `/proc` scan; signal delivery goes through the
+/// `process` module's `libc` boundary. Every snapshot is a fresh read, which is
+/// exactly what the freeze-first sweep relies on. The one thing held between
+/// calls is deliberate state: the per-member pidfds opened before each
+/// `SIGSTOP`, making the root and every descendant reuse-proof from the first
+/// freeze signal through final delivery and thaw.
+pub(crate) struct LinuxTreeOps {
+    proc_root: PathBuf,
+    delivery_handles: HashMap<u32, TreeDeliveryHandle>,
+}
+
+impl LinuxTreeOps {
+    pub(crate) fn new() -> Self {
+        Self {
+            proc_root: PathBuf::from(PROC_ROOT),
+            delivery_handles: HashMap::new(),
+        }
+    }
+}
+
+impl TreeProcessOps for LinuxTreeOps {
+    fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
+        collect_tree_process_infos(&self.proc_root).map_err(|error| error.to_string())
+    }
+
+    fn pin_root_for_revalidation(&mut self, pid: u32) -> TreeSignalResult {
+        // The verified marker is not known yet at pin time; the pidfd itself is
+        // the reuse proof, so nothing is lost by passing None.
+        self.prepare_delivery(pid, None)
+    }
+
+    fn stop(&mut self, pid: u32) -> TreeSignalResult {
+        let handle = match self.delivery_handles.remove(&pid) {
+            Some(handle) => handle,
+            None => match tree_open_delivery_handle(pid) {
+                Ok(handle) => handle,
+                Err(result) => return result,
+            },
+        };
+        let result = tree_stop_handle(&handle);
+        if result == TreeSignalResult::Delivered {
+            self.delivery_handles.insert(pid, handle);
+        }
+        result
+    }
+
+    fn cont(&mut self, pid: u32) {
+        if let Some(handle) = self.delivery_handles.get(&pid) {
+            let _ = tree_cont_handle(handle);
+        } else {
+            tree_cont(pid);
+        }
+    }
+
+    // The verified start marker is unused on Linux: the pidfd opened before the
+    // first stop already pins the process object, so delivery can never reach a
+    // recycled PID regardless of markers.
+    fn prepare_delivery(
+        &mut self,
+        pid: u32,
+        _verified_start_marker: Option<u64>,
+    ) -> TreeSignalResult {
+        if self.delivery_handles.contains_key(&pid) {
+            return TreeSignalResult::Delivered;
+        }
+        match tree_open_delivery_handle(pid) {
+            Ok(handle) => {
+                debug_assert_eq!(handle.pid(), pid);
+                self.delivery_handles.insert(pid, handle);
+                TreeSignalResult::Delivered
+            }
+            Err(result) => result,
+        }
+    }
+
+    fn deliver(&mut self, pid: u32, mode: crate::process::KillMode) -> TreeSignalResult {
+        let Some(handle) = self.delivery_handles.get(&pid) else {
+            return TreeSignalResult::Denied;
+        };
+        tree_deliver_handle(handle, mode)
+    }
+}
+
+/// Read one snapshot of the process table for tree planning.
+///
+/// Reuses the same bounded `/proc` readers as the socket collector, so every
+/// read here is capped exactly like the rest of the module. Fail-closed on
+/// purpose: a process that vanished mid-scan (`NotFound`) is skipped, but a
+/// live process whose name, parent, or start marker cannot be read is a hard
+/// error — tree kill must never run against a table with holes in it, because
+/// a missing parent edge silently drops that process's whole subtree.
+fn collect_tree_process_infos(proc_root: &Path) -> Result<Vec<TreeProcessInfo>, CollectorError> {
+    let pids = process_ids(proc_root).map_err(|source| CollectorError::Read {
+        path: proc_root.to_path_buf(),
+        source,
+    })?;
+
+    let mut infos = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let process_dir = proc_root.join(pid.to_string());
+        let Some(status) = read_tree_status(&process_dir.join("status"))? else {
+            continue;
+        };
+        let Some(process_name) = read_tree_process_name(&process_dir)? else {
+            continue;
+        };
+        let Some(stat) = read_tree_stat(&process_dir.join("stat"))? else {
+            continue;
+        };
+        infos.push(TreeProcessInfo {
+            pid,
+            parent_pid: status.parent_pid,
+            process_name: Some(process_name),
+            start_time_marker: Some(stat.start_time_marker),
+            owner_uid: status.owner_uid,
+            process_group: stat.process_group,
+        });
+    }
+    Ok(infos)
+}
+
+/// The two `stat` fields the tree snapshot carries, read in one pass.
+struct TreeStat {
+    start_time_marker: u64,
+    process_group: Option<u32>,
+}
+
+fn read_tree_status(path: &Path) -> Result<Option<ProcessStatus>, CollectorError> {
+    match read_process_status(path) {
+        Ok(status) => Ok(Some(status)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CollectorError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn read_tree_process_name(process_dir: &Path) -> Result<Option<String>, CollectorError> {
+    let path = process_dir.join("comm");
+    match read_process_name(process_dir) {
+        Ok(Some(name)) => Ok(Some(name)),
+        Ok(None) => Err(CollectorError::Read {
+            path,
+            source: std::io::Error::new(ErrorKind::InvalidData, "empty process name"),
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CollectorError::Read { path, source }),
+    }
+}
+
+fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
+    let text = match read_stat_text(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CollectorError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    // Both fields are kill-safety data and fail closed: group kill derives its
+    // membership from the group ID, so an unreadable group would be a silent
+    // hole in the member set, exactly like a missing start marker would be a
+    // hole in identity verification. Group 0 is the kernel's own group — never
+    // a valid target — and maps to "no targetable group" rather than an error.
+    let start_time_marker =
+        parse_process_start_time_ticks(&text).map_err(|source| CollectorError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let Some(process_group) = parse_process_group_id(&text) else {
+        return Err(CollectorError::Read {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(ErrorKind::InvalidData, "process group is unreadable"),
+        });
+    };
+    Ok(Some(TreeStat {
+        start_time_marker,
+        process_group: (process_group != 0).then_some(process_group),
+    }))
+}
+
+fn read_stat_text(path: &Path) -> std::io::Result<String> {
+    let mut text = String::new();
+    File::open(path)?
+        .take(MAX_STAT_BYTES)
+        .read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Process group ID from `/proc/<pid>/stat`: field 5 overall, so the third
+/// token after the `") "` comm terminator (state, ppid, pgrp).
+fn parse_process_group_id(text: &str) -> Option<u32> {
+    let (_before_comm_end, after_comm_end) = text.rsplit_once(") ")?;
+    after_comm_end
+        .split_whitespace()
+        .nth(2)?
+        .parse::<u32>()
+        .ok()
+}
+
 fn process_ancestor_pids_from(proc_root: &Path, pid: u32) -> HashSet<u32> {
     let mut ancestors = HashSet::from([pid]);
     let mut current = pid;
@@ -717,12 +939,12 @@ mod tests {
         AddressFamily, LinuxCollector, MAX_CHILD_PROCESSES, SocketParseError, SocketRecord,
         collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
         collect_related_process_hints_from, collect_socket_owners, collect_socket_records,
-        decode_cmdline, entry_from_record, parse_process_start_time_ticks, parse_process_status,
-        parse_socket_inode, parse_socket_line, parse_socket_table, read_bounded_text,
-        read_process_status,
+        collect_tree_process_infos, decode_cmdline, entry_from_record, parse_process_group_id,
+        parse_process_start_time_ticks, parse_process_status, parse_socket_inode,
+        parse_socket_line, parse_socket_table, read_bounded_text, read_process_status,
     };
     use crate::collector::Collector;
-    use crate::model::{PermissionStatus, Protocol, SocketState};
+    use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
 
     const HEADER: &str =
         "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
@@ -988,6 +1210,47 @@ mod tests {
     }
 
     #[test]
+    fn process_group_id_is_read_from_stat_field_5_and_fails_closed() {
+        // Field 5 (pgrp) is the third token after the comm terminator; the
+        // right-split keeps a paren-laden comm from shifting it.
+        let text = "1234 (node worker) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 0 0 987654\n";
+        assert_eq!(parse_process_group_id(text), Some(4242));
+        assert_eq!(parse_process_group_id("garbage with no comm"), None);
+
+        // Group kill derives membership from the group ID, so the snapshot
+        // read fails closed: a stat whose group token is unreadable while the
+        // start marker still parses must error the scan, and the kernel's
+        // group 0 must map to "no targetable group", never to a member edge.
+        let dir = std::env::temp_dir().join(format!(
+            "kickoutchi-tree-stat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&dir).expect("temp stat dir must be created");
+        // Derive both cases from the canonical `stat_text` shape (start marker
+        // parseable at field 22) so only the pgrp token differs per case:
+        // `stat_text` emits `... S <ppid> <pgrp=0> ...`, so its own output is
+        // the kernel case, and one targeted replace corrupts the pgrp token.
+        let corrupt = dir.join("stat-corrupt");
+        let corrupt_text = stat_text(1234, "node", 1, 987_654).replacen("S 1 0", "S 1 x", 1);
+        assert!(corrupt_text.contains("S 1 x"), "{corrupt_text}");
+        fs::write(&corrupt, corrupt_text).expect("corrupt stat must be written");
+        assert!(super::read_tree_stat(&corrupt).is_err());
+
+        let kernel = dir.join("stat-kernel");
+        fs::write(&kernel, stat_text(2, "kthreadd", 0, 987_654))
+            .expect("kernel stat must be written");
+        let stat = super::read_tree_stat(&kernel)
+            .expect("kernel stat must read")
+            .expect("kernel stat must exist");
+        assert_eq!(stat.process_group, None);
+        fs::remove_dir_all(dir).expect("temp stat dir must clean up");
+    }
+
+    #[test]
     fn process_start_time_is_read_from_stat_field_22() {
         let text = stat_text(1234, "node worker", 1, 987_654);
 
@@ -1123,6 +1386,36 @@ mod tests {
             vec![(101, Some("worker-a")), (102, Some("worker-b"))]
         );
         assert!(!context.children.truncated);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn tree_process_snapshot_reads_parent_name_and_start_marker() {
+        let proc_root = temp_proc_root("tree-snapshot");
+        write_process(&proc_root, 100, "root", 1);
+        write_process(&proc_root, 101, "child", 100);
+        write_process(&proc_root, 102, "grandchild", 101);
+
+        let infos = collect_tree_process_infos(&proc_root).expect("tree snapshot must collect");
+        let tree = crate::tree::plan_process_tree(100, &infos, &[], Platform::Linux, 256)
+            .expect("root must be present");
+        let tuples = infos
+            .iter()
+            .filter(|info| matches!(info.pid, 100..=102))
+            .map(|info| {
+                (
+                    info.pid,
+                    info.parent_pid,
+                    info.process_name.as_deref(),
+                    info.start_time_marker,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(tree.len(), 3);
+        assert!(tuples.contains(&(100, Some(1), Some("root"), Some(1000))));
+        assert!(tuples.contains(&(101, Some(100), Some("child"), Some(1010))));
+        assert!(tuples.contains(&(102, Some(101), Some("grandchild"), Some(1020))));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 

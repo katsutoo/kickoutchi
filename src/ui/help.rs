@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use super::theme::Theme;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
-    let lines = vec![
+    let mut lines = vec![
         Line::styled("Kickoutchi", theme.title()),
         Line::raw("Native ports with refresh, search filters, sortable rows, and process context."),
         Line::raw(""),
@@ -20,6 +20,15 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
         key_line("Enter", "open selected-row details", theme),
         key_line("x", "terminate selected process", theme),
         key_line("X", "force-kill selected process", theme),
+    ];
+    // Tree kill exists only on Linux/macOS builds; the help modal must not
+    // advertise keys the running binary does not have.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    lines.extend([
+        key_line("t", "terminate selected process tree", theme),
+        key_line("T", "force-kill selected process tree", theme),
+    ]);
+    lines.extend([
         key_line("?", "open this help", theme),
         key_line("Esc", "clear search, close a modal, or quit", theme),
         key_line("q", "quit", theme),
@@ -28,7 +37,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
         Line::raw("Search mode: type to filter, Enter keeps the filter, Esc clears it."),
         Line::raw("Filters: pid:18422 port:3000 proto:udp scope:public protected:true parent:node"),
         Line::raw("Press Enter to load selected-row children, owner UID, and protected warnings."),
-    ];
+    ]);
     let help = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::bordered()
             .title("Help")

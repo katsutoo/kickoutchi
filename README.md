@@ -31,6 +31,22 @@ Website: <https://kickoutchi.com>
 - Works as a script-friendly CLI with table or JSON output.
 - Asks before termination, because Donkey may yell but Donkey does not kill
   random swamp residents without confirmation.
+- Kicks out whole process trees on Linux and macOS (`kill --tree` in the CLI,
+  `t`/`T` in the TUI): the root is frozen first so it cannot spawn more
+  children, the descendants are swept to a fixed point, every member is
+  identity-verified while stopped, and only then are signals sent leaves-first.
+  Useful for dev servers, agents, and runners that leave workers behind — even
+  ones actively spawning.
+- Kicks out whole process groups too (`kill --group`, Linux and macOS): same
+  freeze-first pipeline, but membership comes from the POSIX process group
+  instead of parent links — for survivors that reparented away from the tree
+  (double-fork daemons, orphaned workers) and for spawners too big for the
+  tree cap. The confirmation lists every member, because a group can contain
+  more than you think.
+- Inspects a process family without signalling anything (`inspect --port` or
+  `--pid`, Linux and macOS): ancestors, descendants, siblings, process group
+  members, and kill hints, so you can pick the right root before using
+  `--tree` or `--group`.
 - Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
   path.
 
@@ -84,6 +100,9 @@ nix run github:nuggocto/kickoutchi#kick -- list
 nix profile install github:nuggocto/kickoutchi
 ```
 
+The flake is locked in the repository for reproducible builds; release commits
+update `flake.lock` deliberately instead of floating silently with nixpkgs.
+
 Arch users can use the AUR package after it is published:
 
 ```sh
@@ -91,7 +110,9 @@ yay -S kickoutchi-bin
 ```
 
 The AUR templates live in `packaging/arch/` for maintainers who want to build or
-review the package locally before publication.
+review the package locally before publication. For `1.0.0`, those templates stay
+prepared but pinned to the last published release assets until the GitHub Release
+exists; AUR publication waits until AUR account creation is available again.
 
 Then use either binary name:
 
@@ -118,11 +139,15 @@ cargo run --bin kick -- list              # list ports
 cargo run --bin kick -- list --port 3000  # show one port
 cargo run --bin kick -- list --json       # JSON for scripts
 cargo run --bin kick -- kill --port 3000  # ask, then kick it out
+cargo run --bin kick -- inspect --port 3000  # read-only family/group view (Linux/macOS)
+cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor (Linux/macOS)
+cargo run --bin kick -- kill --port 3000 --tree  # kick out the whole tree (Linux/macOS)
+cargo run --bin kick -- kill --port 3000 --group  # kick out the whole process group (Linux/macOS)
 ```
 
-Kickoutchi always asks before it terminates anything. Use `--yes` only when you
-already trust the exact target; protected processes still require stronger
-confirmation.
+Kickoutchi asks before it terminates anything unless you pass `--yes`. Use
+`--yes` only when you already trust the exact target; protected processes still
+require stronger confirmation.
 
 ## Install Locally
 
@@ -147,6 +172,16 @@ cargo install --path . --locked
 - `kill --port` refuses ambiguous ports instead of guessing.
 - Protected processes require typing the PID or process name.
 - Force kill requires stronger confirmation by default.
-- Termination targets only the confirmed PID.
+- Termination targets only the confirmed PID; `--tree` and `--group` are the
+  explicit opt-ins for more. They require the typed word (`tree` or `group`, or
+  `force`) unless `--yes` passes the all-clear scoped-kill gates.
+- Tree and group kills refuse anything uncertain: a set over its cap (256 for
+  trees, 512 for groups), an unsafe or protected member, unreadable process
+  metadata, or an identity that changed under it — and every refusal after
+  freezing thaws what it stopped.
+- A protected tree or group root requires its PID or name *and* the scope
+  word, checked again against a fresh scan right before the first signal.
+- Group kill shows every member before asking, never signals a raw `-pgid`,
+  and refuses outright if Kickoutchi itself sits in the target group.
 
 Thanks for using Kickoutchi~ ;D

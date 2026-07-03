@@ -140,6 +140,8 @@ fn event_loop(terminal: &mut Tui, app: &mut App, config: &Config, theme: Theme) 
     loop {
         app.poll_refresh();
         app.poll_process_context();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        app.poll_tree_preview();
         terminal.draw(|frame| draw(frame, app, theme))?;
 
         let wait = std::cmp::min(
@@ -196,13 +198,22 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
         Modal::Details => details::render_modal(frame, modal_area, app, theme),
         Modal::Help => help::render(frame, modal_area, theme),
         Modal::ConfirmKill => confirm::render(frame, modal_area, app, theme),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Modal::ConfirmTreeKill => confirm::render_tree(frame, modal_area, app, theme),
     }
 }
+
+// The header advertises only keys that exist on this build: tree kill is a
+// Linux/macOS feature, so Windows must not see a t/T hint it cannot use.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HEADER_KEY_HINTS: &str = "   r refresh  / search  s sort  x/X kill  t/T tree  ? help  q quit";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const HEADER_KEY_HINTS: &str = "   r refresh  / search  s sort  x/X kill  ? help  q quit";
 
 fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
     let line = Line::from(vec![
         Span::styled("Kickoutchi", theme.title()),
-        Span::raw("   r refresh  / search  s sort  x/X kill  ? help  q quit"),
+        Span::raw(HEADER_KEY_HINTS),
     ]);
     let header = Paragraph::new(line)
         .alignment(Alignment::Center)
@@ -372,6 +383,9 @@ mod tests {
         assert!(text.contains('x'), "{text}");
         assert!(text.contains('/'), "{text}");
         assert!(text.contains("Ctrl+C"), "{text}");
+        // Tree keys are advertised only on builds that actually bind them.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(text.contains("terminate selected process tree"), "{text}");
     }
 
     #[test]
@@ -423,5 +437,55 @@ mod tests {
 
         assert!(text.contains("Terminal too small"), "{text}");
         assert!(text.contains("Need at least 80x20"), "{text}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_confirmation_modal_renders_loading_then_preview() {
+        let config = Config::default();
+        let mut app = App::new_fake(&config);
+
+        // The header advertises the tree keys on builds that have them.
+        assert!(render_text(&app, 100, 30).contains("t/T tree"));
+
+        app.apply_action(Action::RequestTreeTerminate);
+        let text = render_text(&app, 100, 30);
+        assert!(text.contains("Confirm Tree Termination"), "{text}");
+        assert!(text.contains("Enumerating the process tree"), "{text}");
+        assert!(text.contains("Wait for the process count"), "{text}");
+        assert!(!text.contains("Type tree"), "{text}");
+
+        // The fake table's selected row is PID 18422 (node) with one child.
+        let infos = vec![
+            crate::tree::TreeProcessInfo {
+                pid: 18_422,
+                parent_pid: Some(1),
+                process_name: Some("node".to_owned()),
+                start_time_marker: Some(55),
+                owner_uid: None,
+                process_group: None,
+            },
+            crate::tree::TreeProcessInfo {
+                pid: 18_430,
+                parent_pid: Some(18_422),
+                process_name: Some("worker".to_owned()),
+                start_time_marker: Some(56),
+                owner_uid: None,
+                process_group: None,
+            },
+        ];
+        let preview =
+            crate::tree::plan_process_tree(18_422, &infos, &[], crate::model::Platform::Linux, 256)
+                .expect("preview must build");
+        app.finish_tree_preview_for_test(Ok(preview));
+
+        let text = render_text(&app, 100, 30);
+        assert!(
+            text.contains("Terminate process tree from PID 18422"),
+            "{text}"
+        );
+        assert!(text.contains("tree (2 processes)"), "{text}");
+        assert!(text.contains("PID 18430 (worker)"), "{text}");
+        assert!(text.contains("Type tree"), "{text}");
     }
 }

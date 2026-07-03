@@ -23,7 +23,7 @@
         let
           kickoutchi = pkgs.rustPlatform.buildRustPackage {
             pname = "kickoutchi";
-            version = "0.1.2";
+            version = "1.0.0";
 
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;

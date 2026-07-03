@@ -18,6 +18,10 @@ pub(crate) enum Action {
     CloseModal,
     RequestTerminate,
     RequestForceKill,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    RequestTreeTerminate,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    RequestTreeForceKill,
     SubmitKillConfirmation,
     KillInputAppend(char),
     KillInputBackspace,
@@ -57,6 +61,12 @@ pub(crate) fn action_for_key(
     if modal == Modal::ConfirmKill {
         return kill_confirmation_action_for_key(key);
     }
+    // The tree confirmation modal captures text exactly like the single-kill
+    // one; the app routes the shared actions to whichever confirmation is open.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if modal == Modal::ConfirmTreeKill {
+        return kill_confirmation_action_for_key(key);
+    }
 
     if search_mode {
         return search_action_for_key(key);
@@ -85,6 +95,26 @@ pub(crate) fn action_for_key(
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
             Action::RequestTerminate
+        }
+        // t/T mirror x/X exactly, Caps Lock handling included: only an explicit
+        // Shift makes it force, so a Caps Lock uppercase T stays on the normal
+        // tree termination path.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'t')
+                && key.modifiers.contains(KeyModifiers::SHIFT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::RequestTreeForceKill
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'t')
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::RequestTreeTerminate
         }
         KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
         KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
@@ -226,6 +256,60 @@ mod tests {
                 false,
             ),
             Action::Noop,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_keys_mirror_the_kill_keys_including_caps_lock() {
+        assert_eq!(
+            act(KeyCode::Char('t'), Modal::None, false),
+            Action::RequestTreeTerminate,
+        );
+        assert_eq!(
+            action_for_key(
+                modified_key(KeyCode::Char('T'), KeyModifiers::SHIFT),
+                Modal::None,
+                false,
+                false,
+            ),
+            Action::RequestTreeForceKill,
+        );
+        // Caps Lock uppercase T without Shift must stay on the normal tree
+        // path, exactly like x/X.
+        assert_eq!(
+            act(KeyCode::Char('T'), Modal::None, false),
+            Action::RequestTreeTerminate,
+        );
+        assert_eq!(
+            action_for_key(
+                modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                Modal::None,
+                false,
+                false,
+            ),
+            Action::Noop,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_confirmation_modal_captures_text_until_submit_or_cancel() {
+        assert_eq!(
+            act(KeyCode::Char('q'), Modal::ConfirmTreeKill, false),
+            Action::KillInputAppend('q'),
+        );
+        assert_eq!(
+            act(KeyCode::Backspace, Modal::ConfirmTreeKill, false),
+            Action::KillInputBackspace,
+        );
+        assert_eq!(
+            act(KeyCode::Enter, Modal::ConfirmTreeKill, false),
+            Action::SubmitKillConfirmation,
+        );
+        assert_eq!(
+            act(KeyCode::Esc, Modal::ConfirmTreeKill, false),
+            Action::CancelKill,
         );
     }
 
