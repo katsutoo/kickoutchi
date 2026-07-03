@@ -379,8 +379,8 @@ mod linux {
                 let listener = TcpListener::bind(("127.0.0.1", 0))
                     .expect("root tree helper listener must bind");
                 let port = listener.local_addr().expect("listener addr").port();
-                let child = Command::new("sh")
-                    .args(["-c", "sleep 300"])
+                let child = Command::new("sleep")
+                    .arg("300")
                     .spawn()
                     .expect("tree child must spawn");
                 let ready_tmp = ready_file.with_extension("tmp");
@@ -1752,8 +1752,8 @@ mod macos {
                 let listener = TcpListener::bind(("127.0.0.1", 0))
                     .expect("root tree helper listener must bind");
                 let port = listener.local_addr().expect("listener addr").port();
-                let child = Command::new("sh")
-                    .args(["-c", "sleep 300"])
+                let child = Command::new("sleep")
+                    .arg("300")
                     .spawn()
                     .expect("tree child must spawn");
                 let ready_tmp = ready_file.with_extension("tmp");
