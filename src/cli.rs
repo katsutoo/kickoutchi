@@ -929,7 +929,7 @@ enum TreeConfirmDecision {
     RefuseProtectedYes,
 }
 
-/// Facts established by the confirmation phase and needed by the fresh
+/// Facts established by confirmation and needed by the fresh
 /// execution-time gates. `skipped_prompt` is deliberately separate from
 /// `args.yes`: `--yes` can still fall back to a typed prompt when the preview has
 /// warnings, and that explicit word should not be treated as a silent skip.
@@ -1967,7 +1967,7 @@ fn print_group_kill_banner(root: &KillTarget, group: &tree::ProcessGroupTarget, 
         command.push_str(" --force");
     }
     eprintln!("Command: {}", sanitize(&command));
-    // Every member, uncapped (the planner already bounds the set): a process
+    // Every member, uncapped here (the builder already bounds the set): a process
     // group can contain unrelated commands launched from the same shell, so
     // the confirmation must show the entire blast radius.
     for node in members.preview_nodes(members.len()) {
@@ -2095,7 +2095,7 @@ where
     Ok(fresh_root)
 }
 
-/// The fresh-scan gates for a group kill: the plan must still build, the root
+/// The fresh-scan gates for a group kill: the member set must still build, the root
 /// must still sit in the confirmed group (otherwise the sweep would target a
 /// member set the user never saw), and the pre-flight and root-protection
 /// rules must re-pass.

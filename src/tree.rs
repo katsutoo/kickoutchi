@@ -167,14 +167,14 @@ pub(crate) struct ProcessTreeNode {
 /// The previewed member set: the root at depth 0 plus the rest, and whether the
 /// cap was hit while building it. Tree scope puts descendants at their real
 /// depth; group scope puts every non-root member at depth 1 because membership
-/// is flat. The final group signal phase still queues all terminating signals
+/// is flat. The final group signal step still queues all terminating signals
 /// before continuing anyone, so parent-like members cannot wake before their
 /// children have a pending termination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessTreeTarget {
     nodes: Vec<ProcessTreeNode>,
     truncated: bool,
-    /// The member cap this preview was planned under, carried so refusal
+    /// The member cap this preview was built under, carried so refusal
     /// messages always name the cap that actually applied (the tree and group
     /// caps differ).
     limit: usize,
@@ -419,7 +419,7 @@ impl ProcessGroupTarget {
 
 /// Build the group preview from a single snapshot.
 ///
-/// Pure like [`plan_process_tree`]: no signals, no freezing. Membership is one
+/// Pure like the tree preview builder: no signals, no freezing. Membership is one
 /// flat filter — every process whose group ID equals the root's — which is why
 /// group scope can cover reparented survivors a parent-link walk cannot reach.
 /// Rows whose group is `None` are provably non-members: the platforms map only
@@ -875,7 +875,7 @@ fn unfrozen_children(snapshot: &[TreeProcessInfo], frozen: &[FrozenNode]) -> Vec
 
 /// Group members are a flat filter on the group ID; depth 1 keeps them grouped
 /// before the confirmed root in display and delivery order. The group-specific
-/// final signal phase queues every terminating signal before any `SIGCONT`.
+/// final signal step queues every terminating signal before any `SIGCONT`.
 fn unfrozen_group_members(
     snapshot: &[TreeProcessInfo],
     frozen: &[FrozenNode],
@@ -1740,7 +1740,7 @@ mod tests {
 
         assert_eq!(group.members().len(), 4);
         assert!(group.members().truncated());
-        // The refusal must carry the cap the plan actually ran under, not the
+        // The refusal must carry the cap the builder actually used, not the
         // tree cap: the two scopes have different limits.
         assert_eq!(
             super::preflight_outcome(group.members()),

@@ -45,7 +45,7 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
-  # Run 'dist plan' (or host) to determine what tasks we need to do
+  # Determine the release tasks before building or publishing artifacts.
   plan:
     runs-on: "ubuntu-22.04"
     outputs:
@@ -217,7 +217,7 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
+    # Only publish when the task discovery and artifact builds succeeded (skipped is fine).
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

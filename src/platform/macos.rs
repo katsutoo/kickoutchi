@@ -390,7 +390,7 @@ impl TreeProcessOps for MacosTreeOps {
     }
 }
 
-/// Read one snapshot of the process table for tree planning.
+/// Read one snapshot of the process table for scoped tree execution.
 ///
 /// Process snapshots skip rows that vanished mid-scan (`ESRCH`) and rows macOS
 /// explicitly hides from this non-root process (`EPERM`). GitHub's macOS runner

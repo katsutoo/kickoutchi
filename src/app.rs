@@ -1353,7 +1353,7 @@ fn collect_tree_preview(
     })
 }
 
-/// Fresh pre-freeze gates for the TUI execution path: re-plan the tree from a
+/// Fresh pre-freeze gates for the TUI execution path: rebuild the tree from a
 /// fresh snapshot and re-run the preflight and root-protection rules, mapped
 /// into the shared outcome vocabulary.
 ///
@@ -1509,8 +1509,9 @@ fn termination_status_line(
             format!("unsafe PID blocked: {}", reason.message())
         }
         TerminationOutcome::UnknownFailure(error) => format!(
-            "sending {delivery} to {} failed: {error}",
+            "sending {delivery} to {} failed: {}",
             target.identity(),
+            sanitize(error),
         ),
     }
 }
@@ -1541,14 +1542,14 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::{App, ContextWorker, Modal, RefreshWorker, RowKey};
+    use super::{App, ContextWorker, Modal, RefreshWorker, RowKey, termination_status_line};
     use crate::config::Config;
     use crate::input::Action;
     use crate::model::{
         DockerContainerPort, DockerPortContext, PermissionStatus, Platform, PortEntry,
         ProcessContext, Protocol, SocketState, SortMode,
     };
-    use crate::process::{ConfirmationRequirement, KillMode, TerminationOutcome};
+    use crate::process::{ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome};
 
     fn entry(port: u16, name: Option<&str>) -> PortEntry {
         PortEntry {
@@ -1736,6 +1737,22 @@ mod tests {
         assert_eq!(confirmation.target.pid, 3000);
         assert_eq!(confirmation.mode, KillMode::Terminate);
         assert_eq!(confirmation.requirement, ConfirmationRequirement::Yes);
+    }
+
+    #[test]
+    fn unknown_failure_status_is_sanitized_for_tui() {
+        let row = entry(3000, Some("node"));
+        let target = KillTarget::from_entries(3000, [&row], None);
+
+        let status = termination_status_line(
+            &target,
+            KillMode::Terminate,
+            &TerminationOutcome::UnknownFailure("\x1b[31mboom\nnext".to_owned()),
+        );
+
+        assert!(status.contains("boom next"), "{status}");
+        assert!(!status.contains('\x1b'), "{status}");
+        assert!(!status.contains('\n'), "{status}");
     }
 
     #[test]

@@ -247,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/proc/<pid>/stat` through confirmation and pre-signal revalidation. The raw
   tick value is not rendered or serialized, but it lets Kickoutchi refuse a kill
   if PID reuse is detected before the signal boundary.
-- Post-Phase-6 internal cleanup, no external behavior change: collapsed the
+- Internal cleanup, no external behavior change: collapsed the
   duplicate `KillTarget` constructor into a single `from_entries`, switched the
   confirmation modal's force-mode check from a signal-label string comparison to
   `KillMode` equality, and narrowed `current_user_id` to private.
@@ -378,8 +378,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI `list` now prints `no open ports visible` when `hide_system_processes`
   suppresses every collected row, instead of implying the machine has no open
   ports at all.
-- TUI help modal title now reads `Kickoutchi` instead of an outdated
-  phase-specific title.
+- TUI help modal title now reads `Kickoutchi` instead of an outdated numbered
+  title.
 - TUI status bar, borders, titles, and muted text now use terminal-default or
   bold-reversed styles instead of fixed dark-gray/black combinations, so the
   interface remains readable in both light and dark terminal themes.

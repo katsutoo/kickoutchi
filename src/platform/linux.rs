@@ -690,7 +690,7 @@ impl TreeProcessOps for LinuxTreeOps {
     }
 }
 
-/// Read one snapshot of the process table for tree planning.
+/// Read one snapshot of the process table for scoped tree execution.
 ///
 /// Reuses the same bounded `/proc` readers as the socket collector, so every
 /// read here is capped exactly like the rest of the module. Fail-closed on

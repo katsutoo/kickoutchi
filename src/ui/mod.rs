@@ -26,6 +26,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::app::{App, Modal};
 use crate::config::Config;
+use crate::display::sanitize;
 use crate::error::AppResult;
 use crate::input;
 
@@ -223,9 +224,9 @@ fn render_header(frame: &mut Frame, area: Rect, theme: Theme) {
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let filter = if app.filter_text().is_empty() {
-        "none"
+        "none".to_owned()
     } else {
-        app.filter_text()
+        sanitize(app.filter_text())
     };
     let search = if app.search_mode() { "editing" } else { "idle" };
     let mut status = format!(
@@ -237,21 +238,25 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     );
 
     if let Some(error) = app.filter_error() {
-        status.push_str(" | filter error: ");
-        status.push_str(error);
+        append_status_field(&mut status, "filter error", error);
     }
 
     if let Some(error) = app.latest_error() {
-        status.push_str(" | error: ");
-        status.push_str(error);
+        append_status_field(&mut status, "error", error);
     }
 
     if let Some(kill_status) = app.kill_status() {
-        status.push_str(" | kill: ");
-        status.push_str(kill_status);
+        append_status_field(&mut status, "kill", kill_status);
     }
 
     frame.render_widget(Paragraph::new(status).style(theme.status()), area);
+}
+
+fn append_status_field(status: &mut String, label: &str, value: &str) {
+    status.push_str(" | ");
+    status.push_str(label);
+    status.push_str(": ");
+    status.push_str(&sanitize(value));
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect, theme: Theme) {
@@ -327,7 +332,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{Theme, draw};
+    use super::{Theme, append_status_field, draw};
     use crate::app::App;
     use crate::config::Config;
     use crate::input::Action;
@@ -399,6 +404,15 @@ mod tests {
 
         assert!(text.contains("filter: 3"), "{text}");
         assert!(text.contains("search: editing"), "{text}");
+    }
+
+    #[test]
+    fn status_fields_are_sanitized_before_rendering() {
+        let mut status = "Status: ok".to_owned();
+
+        append_status_field(&mut status, "kill", "\x1b[31mfailed\nagain");
+
+        assert_eq!(status, "Status: ok | kill: failed again");
     }
 
     #[test]

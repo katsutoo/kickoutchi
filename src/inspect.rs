@@ -24,7 +24,7 @@ use crate::tree::{
     MAX_TREE_PROCESSES, ProcessTreeNode, TreePlanError, TreeProcessInfo, plan_process_tree,
 };
 
-/// Display caps. The walk itself is bounded elsewhere (the tree planner caps at
+/// Display caps. The walk itself is bounded elsewhere (the tree builder caps at
 /// [`MAX_TREE_PROCESSES`], the ancestor walk at [`ANCESTOR_WALK_MAX`]); these
 /// only bound how much of the bounded data lands on the terminal, with an
 /// honest "and N more" for the rest.

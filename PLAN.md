@@ -37,8 +37,8 @@ leave behind child processes. Killing only the port-owning PID can leave workers
 bundlers, shells, or detached helpers alive. Users then end up hunting processes
 by hand or rebooting.
 
-The motivating scenario (the "Dax situation"): a buggy process that keeps
-spawning children faster than you can kill them. This is the case that forces
+The motivating scenario: a buggy process that keeps spawning children faster
+than you can kill them. This is the case that forces
 reboots, and it is also the case a naive "enumerate the tree, then kill the
 list" implementation loses: the spawner forks new children between your
 enumeration and your signals, you kill the snapshot, and the survivors respawn.
@@ -198,8 +198,8 @@ stays the reserved, empty field it is today).
 
 ## The Freeze-First Algorithm (shared Linux/macOS shape)
 
-This is the core correction for the Dax situation. Order matters; every phase
-exists to close a specific race.
+This is the core correction for the runaway-spawner case. Order matters; every
+phase exists to close a specific race.
 
 1. **Confirm and revalidate the root.** Existing rules unchanged: PID, process
    name when known, start-time marker, confirmed ports. On Linux the root pidfd
