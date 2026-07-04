@@ -694,7 +694,7 @@ impl TreeProcessOps for LinuxTreeOps {
 ///
 /// Reuses the same bounded `/proc` readers as the socket collector, so every
 /// read here is capped exactly like the rest of the module. Fail-closed on
-/// purpose: a process that vanished mid-scan (`NotFound`) is skipped, but a
+/// purpose: a process that vanished mid-scan (`NotFound`/`ESRCH`) is skipped, but a
 /// live process whose name, parent, or start marker cannot be read is a hard
 /// error — tree kill must never run against a table with holes in it, because
 /// a missing parent edge silently drops that process's whole subtree.
@@ -737,12 +737,16 @@ struct TreeStat {
 fn read_tree_status(path: &Path) -> Result<Option<ProcessStatus>, CollectorError> {
     match read_process_status(path) {
         Ok(status) => Ok(Some(status)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) if process_vanished(&error) => Ok(None),
         Err(source) => Err(CollectorError::Read {
             path: path.to_path_buf(),
             source,
         }),
     }
+}
+
+fn process_vanished(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn read_tree_process_name(process_dir: &Path) -> Result<Option<String>, CollectorError> {
@@ -753,7 +757,7 @@ fn read_tree_process_name(process_dir: &Path) -> Result<Option<String>, Collecto
             path,
             source: std::io::Error::new(ErrorKind::InvalidData, "empty process name"),
         }),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) if process_vanished(&error) => Ok(None),
         Err(source) => Err(CollectorError::Read { path, source }),
     }
 }
@@ -761,7 +765,7 @@ fn read_tree_process_name(process_dir: &Path) -> Result<Option<String>, Collecto
 fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
     let text = match read_stat_text(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if process_vanished(&error) => return Ok(None),
         Err(source) => {
             return Err(CollectorError::Read {
                 path: path.to_path_buf(),

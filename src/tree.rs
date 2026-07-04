@@ -106,9 +106,15 @@ pub(crate) enum TreeSignalResult {
 /// rows are outside the confirmed process group before skipping them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TreeSnapshotScope {
+    #[cfg(target_os = "macos")]
     Full,
-    Tree { root_pid: u32 },
-    Group { root_pid: u32, pgid: u32 },
+    Tree {
+        root_pid: u32,
+    },
+    Group {
+        root_pid: u32,
+        pgid: u32,
+    },
 }
 
 /// The injected process I/O the pipeline drives.

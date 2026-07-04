@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS scoped kills now narrow process-table snapshots to the active tree or
+  group during execution, so unrelated system `EPERM` rows do not hide real
+  target-scope safety failures while unreadable in-scope members still fail
+  closed.
+
 ## [1.0.0] - 2026-07-03
 
 ### Added
