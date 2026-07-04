@@ -11,9 +11,9 @@ and group kill are the big ogre buttons, and they must stay clearly opt-in.
 
 Status decision: Linux and macOS are done for `1.0.0`: CLI `--tree`, CLI
 `--group`, read-only `inspect`, and TUI `t`/`T` tree kill are implemented and
-verified. Windows scoped cleanup is implemented on the `windows` branch for
-`1.1.0` as CLI `--tree` plus read-only `inspect`, using the job-containment
-design below. Manual Windows QA remains the release gate.
+verified. Windows scoped cleanup is implemented on `shrek` for `1.1.0` as CLI
+`--tree` plus read-only `inspect`, using the job-containment design below.
+Manual Windows QA remains the release gate.
 
 ## Current Status
 
@@ -389,10 +389,13 @@ The design — containment instead of freezing. Unix *prevents* tree growth
 2. Run a side-effect-free preflight snapshot before touching Job Objects:
    snapshot the process table, accept parent edges only under the creation-time
    sanity rule (a child's creation time must be later than its recorded
-   parent's, or the edge is discarded as dangling), open and verify handles for
-   every candidate member, and apply the same cap, unsafe-PID, protected
-   descendant, and partial-metadata gates as Unix. This catches the obvious
-   refusal cases while the operation can still promise no side effects.
+   parent's, or the edge is discarded as dangling), and keep unverifiable parent
+   edges separate from verified ones. If an unverifiable edge points into the
+   confirmed tree, refuse as partial metadata instead of silently omitting that
+   possible descendant. Open and verify handles for every candidate member, and
+   apply the same cap, unsafe-PID, protected descendant, and partial-metadata
+   gates as Unix. This catches the obvious refusal cases while the operation can
+   still promise no side effects.
 3. The **commit boundary** is assigning the root to a Job Object. Job assignment
    is not reversible like `SIGSTOP`/`SIGCONT`: after the root is assigned,
    Kickoutchi has changed the process even if no process has been killed yet.
@@ -411,8 +414,9 @@ The design — containment instead of freezing. Unix *prevents* tree growth
    assignment an overflow is no longer a zero-side-effect refusal. At that
    point the safest behavior is to stop discovering, terminate the job members
    already under containment, individually terminate any verified unassigned
-   members that were part of the confirmed tree, and report the partial/overflow
-   state honestly.
+   members that were part of the confirmed tree, classify already-exited pinned
+   members as already exited rather than survivors, and report the
+   partial/overflow state honestly.
 6. **`TerminateJobObject`: one atomic kill** of every assignable member in the
    job, including normal children spawned after their parent joined the job.
    This removes the Unix leaves-first ordering window for job-contained members,
@@ -469,9 +473,16 @@ Verification bar for the Windows phase:
   denied after handle verification, normal child captured by the job, and a
   breakaway/non-inheriting child that escapes containment and is reported.
 - Windows CI contract tests mirroring the Linux/macOS tree tests; the helper
-  ready-file pattern is already cross-platform. Add Windows helper cases for a
-  runaway normal `CreateProcess` spawner after root assignment and an
-  incompatible-job descendant that forces the individual-handle fallback.
+  ready-file pattern is already cross-platform. Coverage now includes a normal
+  `CreateProcess` child spawned only after the root observes Job Object
+  assignment; the child records that it inherited the job and must be gone after
+  `--tree` completes.
+- A deterministic real-process incompatible-job fallback test is not required
+  for `1.1.0` CI because it depends on host nested-job and breakaway policy that
+  varies by Windows version, terminal, CI wrapper, and privilege. Keep that path
+  covered by injected seam tests plus manual Windows QA until the project has a
+  controlled Windows job-policy matrix; do not add a flaky contract test that
+  passes only on one host shape.
 - Manual QA on the real Windows machine — now available, so run it as a live
   loop during development, not only as a final gate. Cover the case that is the
   *common* dev setup, not an exotic edge: a dev server started from an editor or

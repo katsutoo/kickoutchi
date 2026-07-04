@@ -282,13 +282,30 @@ fn first_partial_metadata_pid(
     snapshot: &[TreeProcessInfo],
     preview: &ProcessTreeTarget,
 ) -> Option<u32> {
-    preview
-        .preview_nodes(preview.len())
+    let preview_nodes = preview.preview_nodes(preview.len());
+    let preview_pids = preview_nodes
         .iter()
-        .find_map(|node| {
-            let info = snapshot.iter().find(|info| info.pid == node.pid)?;
-            (info.process_name.is_none() || info.start_time_marker.is_none()).then_some(info.pid)
+        .map(|node| node.pid)
+        .collect::<HashSet<_>>();
+    for node in preview_nodes {
+        let Some(info) = snapshot.iter().find(|info| info.pid == node.pid) else {
+            continue;
+        };
+        if info.process_name.is_none() || info.start_time_marker.is_none() {
+            return Some(info.pid);
+        }
+    }
+
+    let mut unverified_children = snapshot
+        .iter()
+        .filter(|info| !preview_pids.contains(&info.pid))
+        .filter(|info| {
+            info.unverified_parent_pid
+                .is_some_and(|parent_pid| preview_pids.contains(&parent_pid))
         })
+        .collect::<Vec<_>>();
+    unverified_children.sort_by_key(|info| info.pid);
+    unverified_children.first().map(|info| info.pid)
 }
 
 fn pin_preview_members<Api: WindowsTreeApi>(
@@ -401,6 +418,9 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                 limit: MAX_TREE_PROCESSES,
             });
         }
+        if let Some(pid) = first_partial_metadata_pid(&snapshot, &preview) {
+            return Err(WindowsTreeKillOutcome::PartialMetadata { pid });
+        }
 
         let mut discovered = false;
         for node in preview.preview_nodes(preview.len()) {
@@ -412,6 +432,9 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                     limit: MAX_TREE_PROCESSES,
                 });
             }
+            let Some(info) = snapshot.iter().find(|info| info.pid == node.pid) else {
+                continue;
+            };
             if let Some(reason) = unsafe_pid_reason(node.pid) {
                 report.not_terminated.push(node.pid);
                 return Err(WindowsTreeKillOutcome::UnsafePid {
@@ -420,15 +443,16 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                 });
             }
             if node.protected {
-                report.not_terminated.push(node.pid);
-                return Err(WindowsTreeKillOutcome::ProtectedDescendant {
-                    pid: node.pid,
-                    name: node.process_name.clone(),
-                });
+                return Err(handle_protected_post_commit_child(
+                    api,
+                    job,
+                    info,
+                    node.process_name.clone(),
+                    members,
+                    assigned,
+                    report,
+                ));
             }
-            let Some(info) = snapshot.iter().find(|info| info.pid == node.pid) else {
-                continue;
-            };
             let Some(expected_marker) = info.start_time_marker else {
                 report.not_terminated.push(info.pid);
                 return Err(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid });
@@ -461,6 +485,41 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
     })
 }
 
+fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
+    api: &mut Api,
+    job: &Api::JobHandle,
+    info: &TreeProcessInfo,
+    name: Option<String>,
+    members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
+    assigned: &mut HashSet<u32>,
+    report: &mut WindowsTreeKillReport,
+) -> WindowsTreeKillOutcome {
+    let Some(expected_marker) = info.start_time_marker else {
+        report.not_terminated.push(info.pid);
+        return WindowsTreeKillOutcome::PartialMetadata { pid: info.pid };
+    };
+    match open_verified_process(api, info, expected_marker) {
+        Ok(mut process) => match api.process_in_job(job, &process.handle) {
+            Ok(true) => {
+                process.status = PinnedProcessStatus::AssignedToJob;
+                assigned.insert(info.pid);
+                members.insert(info.pid, process);
+            }
+            Ok(false) | Err(_) => report.not_terminated.push(info.pid),
+        },
+        Err(OpenVerifiedError::NotFound) => report.already_exited += 1,
+        Err(
+            OpenVerifiedError::PermissionDenied
+            | OpenVerifiedError::PartialMetadata
+            | OpenVerifiedError::Other(_),
+        ) => report.not_terminated.push(info.pid),
+    }
+    WindowsTreeKillOutcome::ProtectedDescendant {
+        pid: info.pid,
+        name,
+    }
+}
+
 fn assign_or_fallback<Api: WindowsTreeApi>(
     api: &mut Api,
     job: &Api::JobHandle,
@@ -488,6 +547,14 @@ fn assign_or_fallback<Api: WindowsTreeApi>(
             report.already_exited += 1;
         }
         Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
+            if matches!(
+                api.wait_process_exit(&process.handle),
+                WindowsWaitResult::Exited
+            ) {
+                process.status = PinnedProcessStatus::AlreadyExited;
+                report.already_exited += 1;
+                return;
+            }
             report.containment_partial = true;
             match api.terminate_process(&process.handle) {
                 Ok(()) => {
@@ -499,8 +566,16 @@ fn assign_or_fallback<Api: WindowsTreeApi>(
                     report.already_exited += 1;
                 }
                 Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
-                    process.status = PinnedProcessStatus::NotTerminated;
-                    report.not_terminated.push(pid);
+                    if matches!(
+                        api.wait_process_exit(&process.handle),
+                        WindowsWaitResult::Exited
+                    ) {
+                        process.status = PinnedProcessStatus::AlreadyExited;
+                        report.already_exited += 1;
+                    } else {
+                        process.status = PinnedProcessStatus::NotTerminated;
+                        report.not_terminated.push(pid);
+                    }
                 }
             }
         }
@@ -805,7 +880,7 @@ mod tests {
     use crate::model::{PermissionStatus, Platform};
     use crate::process::KillTarget;
     use crate::tree::TreeProcessInfo;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Event {
@@ -822,8 +897,12 @@ mod tests {
         markers: HashMap<u32, u64>,
         events: Vec<Event>,
         deny_assign: HashSet<u32>,
+        deny_terminate: HashSet<u32>,
         fail_root_assign: bool,
         already_in_job: HashSet<u32>,
+        terminated_processes: HashSet<u32>,
+        wait_results: HashMap<u32, VecDeque<WindowsWaitResult>>,
+        job_terminated: bool,
     }
 
     impl FakeApi {
@@ -895,6 +974,7 @@ mod tests {
 
         fn terminate_job(&mut self, _job: &Self::JobHandle) -> Result<(), String> {
             self.events.push(Event::TerminateJob);
+            self.job_terminated = true;
             Ok(())
         }
 
@@ -903,11 +983,26 @@ mod tests {
             process: &Self::ProcessHandle,
         ) -> Result<(), WindowsApiError> {
             self.events.push(Event::TerminateProcess(*process));
+            if self.deny_terminate.contains(process) {
+                return Err(WindowsApiError::Other(
+                    "member ignored termination".to_owned(),
+                ));
+            }
+            self.terminated_processes.insert(*process);
             Ok(())
         }
 
-        fn wait_process_exit(&mut self, _process: &Self::ProcessHandle) -> WindowsWaitResult {
-            WindowsWaitResult::Exited
+        fn wait_process_exit(&mut self, process: &Self::ProcessHandle) -> WindowsWaitResult {
+            if let Some(results) = self.wait_results.get_mut(process)
+                && let Some(result) = results.pop_front()
+            {
+                return result;
+            }
+            if self.job_terminated || self.terminated_processes.contains(process) {
+                WindowsWaitResult::Exited
+            } else {
+                WindowsWaitResult::StillRunning
+            }
         }
     }
 
@@ -915,6 +1010,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid,
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(format!("p{pid}")),
             start_time_marker: Some(marker),
@@ -991,6 +1087,47 @@ mod tests {
     }
 
     #[test]
+    fn exited_member_after_assign_failure_is_not_reported_alive() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
+        api.deny_assign.insert(101);
+        api.wait_results
+            .insert(101, VecDeque::from([WindowsWaitResult::Exited]));
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert_eq!(report.already_exited, 1);
+        assert_eq!(report.fallback_terminated, 0);
+        assert!(report.not_terminated.is_empty());
+        assert!(!report.containment_partial);
+        assert!(!api.events.contains(&Event::TerminateProcess(101)));
+    }
+
+    #[test]
+    fn exited_member_after_failed_fallback_is_not_reported_alive() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
+        api.deny_assign.insert(101);
+        api.deny_terminate.insert(101);
+        api.wait_results.insert(
+            101,
+            VecDeque::from([WindowsWaitResult::StillRunning, WindowsWaitResult::Exited]),
+        );
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert_eq!(report.already_exited, 1);
+        assert_eq!(report.fallback_terminated, 0);
+        assert!(report.not_terminated.is_empty());
+        assert!(report.containment_partial);
+        assert!(api.events.contains(&Event::TerminateProcess(101)));
+    }
+
+    #[test]
     fn already_contained_late_child_does_not_need_fallback() {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
@@ -1030,10 +1167,51 @@ mod tests {
     }
 
     #[test]
+    fn protected_late_child_already_in_job_is_not_reported_alive() {
+        let first = vec![info(100, None, 100)];
+        let second = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let mut api = FakeApi::new(vec![first, second]);
+        api.already_in_job.insert(101);
+
+        let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert!(report.containment_partial);
+        assert!(report.not_terminated.is_empty());
+        assert_eq!(report.job_terminated, 2);
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::ProtectedDescendant {
+                pid: 101,
+                name: Some("p101".to_owned()),
+            })
+        );
+        assert!(api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
     fn partial_metadata_refuses_before_job_creation() {
         let mut partial = info(101, Some(100), 101);
         partial.start_time_marker = None;
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), partial]]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        assert_eq!(
+            outcome,
+            WindowsTreeKillOutcome::PartialMetadata { pid: 101 }
+        );
+        assert!(api.events.is_empty());
+    }
+
+    #[test]
+    fn unverified_parent_edge_into_preview_refuses_before_job_creation() {
+        let mut partial_child = info(101, None, 101);
+        partial_child.start_time_marker = None;
+        partial_child.unverified_parent_pid = Some(100);
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100), partial_child]]);
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 

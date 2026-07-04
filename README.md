@@ -190,11 +190,14 @@ cargo install --path . --locked
   after freezing thaws what it stopped.
 - Windows tree kill refuses cleanly before Job Object commit when preflight sees
   an unsafe PID, protected descendant, incomplete metadata, identity drift, or an
-  over-cap tree. After the root is assigned to the Job Object, failures are
-  reported as partial containment, fallback termination, or not-terminated PIDs;
-  they are never hidden as full success. The preview is an observed tree, not a
-  complete future blast radius: Windows may also terminate newly spawned
-  job-contained children that were not visible before confirmation.
+  over-cap tree. If Windows reports a parent link into the confirmed tree but the
+  creation-time metadata needed to sanity-check that edge is missing, Kickoutchi
+  refuses as incomplete metadata rather than omitting a possible descendant.
+  After the root is assigned to the Job Object, failures are reported as partial
+  containment, fallback termination, or not-terminated PIDs; they are never
+  hidden as full success. The preview is an observed tree, not a complete future
+  blast radius: Windows may also terminate newly spawned job-contained children
+  that were not visible before confirmation.
 - A protected tree or group root requires its PID or name *and* the scope
   word, checked again against a fresh scan right before scoped execution.
 - Group kill shows every member before asking, never signals a raw `-pgid`,

@@ -1222,22 +1222,24 @@ mod windows {
     use std::fs;
     use std::io::Write;
     use std::net::TcpListener;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+        GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
     };
 
     const HELPER_LISTENER_ENV: &str = "KICKOUTCHI_TEST_HELPER_LISTENER";
     const HELPER_TREE_ENV: &str = "KICKOUTCHI_TEST_HELPER_TREE";
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
+    const HELPER_LATE_ENV: &str = "KICKOUTCHI_TEST_HELPER_LATE";
     const CHILD_EXIT_WAIT: Duration = Duration::from_secs(5);
     const HELPER_READY_WAIT: Duration = Duration::from_secs(5);
     /// How long a parked helper may outlive its test before self-destructing.
@@ -1362,6 +1364,27 @@ mod windows {
         (guard, port, child_pid, ready_file)
     }
 
+    fn spawn_late_spawner_tree() -> (ChildGuard, u16, PathBuf, PathBuf) {
+        let ready_file = temp_file_path("late-tree-ready");
+        let late_file = temp_file_path("late-tree-child");
+        let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+            .env(HELPER_TREE_ENV, "spawn-after-job")
+            .env(HELPER_READY_ENV, &ready_file)
+            .env(HELPER_LATE_ENV, &late_file)
+            .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("late-spawner tree helper must start");
+        let guard = ChildGuard { child };
+        wait_for_file(&ready_file);
+        let port = fs::read_to_string(&ready_file)
+            .expect("late-spawner ready file must be readable")
+            .parse::<u16>()
+            .expect("late-spawner helper port must be a u16");
+        (guard, port, late_file, ready_file)
+    }
+
     fn temp_file_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "kickoutchi-cli-contract-windows-{label}-{}-{}",
@@ -1432,6 +1455,31 @@ mod windows {
             assert!(Instant::now() < deadline, "PID {pid} did not exit");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn publish_file(path: &Path, contents: impl AsRef<str>) {
+        let ready_tmp = path.with_extension("tmp");
+        fs::write(&ready_tmp, contents.as_ref()).expect("helper file must be written");
+        fs::rename(&ready_tmp, path).expect("helper file must publish atomically");
+    }
+
+    fn current_process_in_any_job() -> bool {
+        let handle = unsafe {
+            // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+            GetCurrentProcess()
+        };
+        process_handle_in_any_job(handle)
+    }
+
+    fn process_handle_in_any_job(handle: RawHandle) -> bool {
+        let mut in_job = 0;
+        let result = unsafe {
+            // SAFETY: handle is a process handle or pseudo-handle, the null job
+            // handle asks Windows whether the process is in any job, and `in_job`
+            // is valid for the single BOOL write.
+            IsProcessInJob(handle, std::ptr::null_mut(), &raw mut in_job)
+        };
+        result != 0 && in_job != 0
     }
 
     fn pid_exists(pid: u32) -> bool {
@@ -1525,6 +1573,38 @@ mod windows {
 
         match mode.as_ref() {
             "park-child" => park_bounded(),
+            "spawn-after-job" => {
+                let late_file = PathBuf::from(
+                    std::env::var_os(HELPER_LATE_ENV).expect("late child path must be set"),
+                );
+                let listener = TcpListener::bind(("127.0.0.1", 0))
+                    .expect("late-spawner helper listener must bind");
+                let port = listener.local_addr().expect("listener addr").port();
+                publish_file(&ready_file, port.to_string());
+
+                let deadline = Instant::now() + HELPER_PARK_MAX;
+                while Instant::now() < deadline {
+                    if current_process_in_any_job() {
+                        let child = Command::new(
+                            std::env::current_exe().expect("test binary path must resolve"),
+                        )
+                        .env(HELPER_TREE_ENV, "park-child")
+                        .env(HELPER_READY_ENV, &ready_file)
+                        .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("post-job child must spawn");
+                        let child_pid = child.id();
+                        let child_in_job = process_handle_in_any_job(child.as_raw_handle());
+                        publish_file(&late_file, format!("{child_pid} {child_in_job}"));
+                        let _child_guard = ChildGuard { child };
+                        park_bounded()
+                    }
+                    thread::yield_now();
+                }
+                std::process::exit(0)
+            }
             "root-owns-port" => {
                 let listener = TcpListener::bind(("127.0.0.1", 0))
                     .expect("root tree helper listener must bind");
@@ -1684,6 +1764,48 @@ mod windows {
         let after = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(after.status.code(), Some(3));
         let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn windows_tree_kill_removes_child_spawned_after_job_assignment() {
+        let (mut helper, port, late_file, ready_file) = spawn_late_spawner_tree();
+        let port_text = port.to_string();
+        let root_pid_text = helper.id().to_string();
+
+        let before = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(before.status.code(), Some(0));
+        assert!(stdout(&before).contains(root_pid_text.as_str()));
+
+        let killed = kickoutchi_with_stdin(
+            &["kill", "--port", port_text.as_str(), "--tree"],
+            Some("tree\n"),
+        );
+
+        assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
+        wait_for_child_exit(&mut helper);
+        wait_for_file(&late_file);
+        let late = fs::read_to_string(&late_file).expect("late child record must be readable");
+        let mut parts = late.split_whitespace();
+        let late_child_pid = parts
+            .next()
+            .expect("late child record must include pid")
+            .parse::<u32>()
+            .expect("late child pid must be a u32");
+        let _late_child_cleanup = PidGuard {
+            pid: late_child_pid,
+        };
+        let inherited_job = parts
+            .next()
+            .expect("late child record must include job inheritance")
+            .parse::<bool>()
+            .expect("job inheritance marker must be a bool");
+        assert!(inherited_job, "late child did not inherit the root job");
+        wait_for_pid_gone(late_child_pid);
+
+        let after = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(after.status.code(), Some(3));
+        let _ = fs::remove_file(ready_file);
+        let _ = fs::remove_file(late_file);
     }
 
     #[test]

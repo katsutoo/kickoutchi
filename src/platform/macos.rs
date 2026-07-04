@@ -613,6 +613,7 @@ fn tree_process_info_from_bsd(
     TreeProcessInfo {
         pid,
         parent_pid: nonzero_pid(info.pbi_ppid),
+        unverified_parent_pid: None,
         parent_process_name: None,
         process_name: Some(process_name),
         start_time_marker: Some(process_start_time_marker_from_bsd_info(info)),

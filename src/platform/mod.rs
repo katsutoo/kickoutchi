@@ -55,21 +55,24 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
     }
 }
 
-/// Best-effort command line for one PID, for the read-only inspect view.
+/// Best-effort command-line reader for inspect reports.
+///
+/// Windows snapshots are relatively expensive, so the Windows reader captures
+/// one process snapshot and reuses it for every PID rendered in the same report.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+pub(crate) fn inspect_command_line_reader() -> impl FnMut(u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        linux::process_command_line(pid)
+        linux::process_command_line
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::process_command_line(pid)
+        macos::process_command_line
     }
 
     #[cfg(windows)]
     {
-        windows::process_command_line(pid)
+        windows::process_command_line_reader()
     }
 }

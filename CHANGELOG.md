@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   siblings, ports, command lines, and the matching `kick kill --pid <root> --tree`
   hint without signalling anything. Windows reports parent links only
   after creation-time sanity checks, omits the POSIX process-group section, and
-  states the native WSL2 limitation plainly.
+  states the native WSL2 limitation plainly. The Windows inspect renderer reuses
+  one process snapshot for command-line lookups within a report instead of
+  rebuilding process metadata per displayed PID.
 - Windows CLI `kickoutchi kill --port <PORT> --tree` (and `--pid`, `--force`):
   terminates the descendant tree through Job Object containment. Normal
   `kick kill` remains single-PID precise, `--group` stays Unix-only, and the
@@ -34,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     convergence failures now keep their specific reason in the report, including
     protected descendants, unsafe PIDs, cap overflows, incomplete metadata, and
     snapshot failures.
+  - Windows parent links with missing creation-time metadata now fail closed when
+    they could point into the confirmed tree, so `--tree` refuses as incomplete
+    metadata instead of silently omitting a possible descendant. Post-commit
+    reporting also distinguishes already-exited pinned members and protected
+    late children already contained by the job from real survivors.
 
 ## [1.0.1] - 2026-07-04
 

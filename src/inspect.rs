@@ -417,6 +417,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid: parent,
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(u64::from(pid)),
@@ -580,6 +581,7 @@ mod tests {
         snapshot.push(TreeProcessInfo {
             pid: 501,
             parent_pid: Some(400),
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("evil\x1b[2Jname".to_owned()),
             start_time_marker: Some(501),

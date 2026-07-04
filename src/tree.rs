@@ -81,7 +81,15 @@ pub(crate) const GROUP_YES_SKIP_MAX_PROCESSES: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeProcessInfo {
     pub(crate) pid: u32,
+    /// Parent edge accepted for tree walking. On Windows this is set only after
+    /// the creation-time sanity rule proves the recorded parent PID has not gone
+    /// dangling or been recycled.
     pub(crate) parent_pid: Option<u32>,
+    /// A recorded parent PID that could not be sanity-checked because required
+    /// creation-time metadata was missing. Tree rendering ignores this edge, but
+    /// Windows tree kill treats it as fail-closed partial metadata if the edge
+    /// could belong under the confirmed root.
+    pub(crate) unverified_parent_pid: Option<u32>,
     pub(crate) parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
     pub(crate) start_time_marker: Option<u64>,
@@ -1316,6 +1324,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid: parent,
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(marker),

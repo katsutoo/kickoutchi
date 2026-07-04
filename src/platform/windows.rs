@@ -190,10 +190,13 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
     }
 }
 
-pub(crate) fn process_command_line(pid: u32) -> Option<String> {
-    ProcessSnapshot::collect()
-        .metadata(pid)
-        .and_then(|metadata| metadata.command_line.clone())
+pub(crate) fn process_command_line_reader() -> impl FnMut(u32) -> Option<String> {
+    let processes = ProcessSnapshot::collect();
+    move |pid| {
+        processes
+            .metadata(pid)
+            .and_then(|metadata| metadata.command_line.clone())
+    }
 }
 
 pub(crate) fn collect_tree_process_infos() -> Vec<TreeProcessInfo> {
@@ -216,11 +219,13 @@ fn tree_process_infos_from_snapshot(processes: &ProcessSnapshot) -> Vec<TreeProc
         .processes
         .iter()
         .map(|(pid, metadata)| {
-            let parent_pid = accepted_parent_pid(*pid, metadata.parent_pid, &markers);
+            let parent_edge = accepted_parent_edge(*pid, metadata.parent_pid, &markers);
             TreeProcessInfo {
                 pid: *pid,
-                parent_pid,
-                parent_process_name: parent_pid
+                parent_pid: parent_edge.verified,
+                unverified_parent_pid: parent_edge.unverified,
+                parent_process_name: parent_edge
+                    .verified
                     .and_then(|parent_pid| names.get(&parent_pid).cloned()),
                 process_name: metadata.process_name.clone(),
                 start_time_marker: markers.get(pid).copied().flatten(),
@@ -233,18 +238,52 @@ fn tree_process_infos_from_snapshot(processes: &ProcessSnapshot) -> Vec<TreeProc
     rows
 }
 
-fn accepted_parent_pid(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptedParentEdge {
+    verified: Option<u32>,
+    unverified: Option<u32>,
+}
+
+fn accepted_parent_edge(
     child_pid: u32,
     parent_pid: Option<u32>,
     markers: &HashMap<u32, Option<u64>>,
-) -> Option<u32> {
-    let parent_pid = parent_pid?;
+) -> AcceptedParentEdge {
+    let Some(parent_pid) = parent_pid else {
+        return AcceptedParentEdge {
+            verified: None,
+            unverified: None,
+        };
+    };
     if parent_pid == child_pid {
-        return None;
+        return AcceptedParentEdge {
+            verified: None,
+            unverified: None,
+        };
     }
-    let child_start = markers.get(&child_pid).copied().flatten()?;
-    let parent_start = markers.get(&parent_pid).copied().flatten()?;
-    (child_start > parent_start).then_some(parent_pid)
+    let Some(child_start) = markers.get(&child_pid).copied().flatten() else {
+        return AcceptedParentEdge {
+            verified: None,
+            unverified: Some(parent_pid),
+        };
+    };
+    let Some(parent_start) = markers.get(&parent_pid).copied().flatten() else {
+        return AcceptedParentEdge {
+            verified: None,
+            unverified: Some(parent_pid),
+        };
+    };
+    if child_start > parent_start {
+        AcceptedParentEdge {
+            verified: Some(parent_pid),
+            unverified: None,
+        }
+    } else {
+        AcceptedParentEdge {
+            verified: None,
+            unverified: None,
+        }
+    }
 }
 
 pub(crate) fn process_start_time_marker(pid: u32) -> Option<u64> {
@@ -640,9 +679,9 @@ fn windows_api_error(operation: &'static str, code: u32) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord, accepted_parent_pid,
-        command_line_from_os_strings, decode_port, encode_port_for_tests, entry_from_record,
-        filetime_to_u64, tcp4_record, tcp6_record, udp4_record, udp6_record,
+        AcceptedParentEdge, MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord,
+        accepted_parent_edge, command_line_from_os_strings, decode_port, encode_port_for_tests,
+        entry_from_record, filetime_to_u64, tcp4_record, tcp6_record, udp4_record, udp6_record,
     };
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
     use std::collections::HashMap;
@@ -874,12 +913,54 @@ mod tests {
     fn parent_edges_require_child_to_start_after_parent() {
         let markers = HashMap::from([(10, Some(100)), (20, Some(200)), (30, Some(50)), (40, None)]);
 
-        assert_eq!(accepted_parent_pid(20, Some(10), &markers), Some(10));
-        assert_eq!(accepted_parent_pid(10, Some(20), &markers), None);
-        assert_eq!(accepted_parent_pid(30, Some(10), &markers), None);
-        assert_eq!(accepted_parent_pid(20, Some(99), &markers), None);
-        assert_eq!(accepted_parent_pid(40, Some(10), &markers), None);
-        assert_eq!(accepted_parent_pid(20, Some(20), &markers), None);
+        assert_eq!(
+            accepted_parent_edge(20, Some(10), &markers),
+            AcceptedParentEdge {
+                verified: Some(10),
+                unverified: None,
+            },
+        );
+        assert_eq!(
+            accepted_parent_edge(10, Some(20), &markers),
+            AcceptedParentEdge {
+                verified: None,
+                unverified: None,
+            },
+        );
+        assert_eq!(
+            accepted_parent_edge(30, Some(10), &markers),
+            AcceptedParentEdge {
+                verified: None,
+                unverified: None,
+            },
+        );
+        assert_eq!(
+            accepted_parent_edge(20, Some(20), &markers),
+            AcceptedParentEdge {
+                verified: None,
+                unverified: None,
+            },
+        );
+    }
+
+    #[test]
+    fn missing_creation_time_keeps_parent_edge_unverified() {
+        let markers = HashMap::from([(10, Some(100)), (20, Some(200)), (40, None)]);
+
+        assert_eq!(
+            accepted_parent_edge(20, Some(99), &markers),
+            AcceptedParentEdge {
+                verified: None,
+                unverified: Some(99),
+            },
+        );
+        assert_eq!(
+            accepted_parent_edge(40, Some(10), &markers),
+            AcceptedParentEdge {
+                verified: None,
+                unverified: Some(10),
+            },
+        );
     }
 
     #[test]

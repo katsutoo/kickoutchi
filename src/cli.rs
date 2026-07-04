@@ -357,13 +357,14 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
         }
     };
 
+    let command_line = platform::inspect_command_line_reader();
     match inspect::render_family_report(
         target_pid,
         &snapshot,
         entries,
         &config.protected_processes,
         TREE_HOST_PLATFORM,
-        platform::process_command_line,
+        command_line,
     ) {
         Ok(report) => {
             print!("{report}");
@@ -3532,6 +3533,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid,
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(u64::from(pid)),
@@ -3866,6 +3868,7 @@ mod tests {
             TreeProcessInfo {
                 pid: 18_423,
                 parent_pid: Some(18_422),
+                unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: None,
                 start_time_marker: Some(18_423),
@@ -3989,6 +3992,7 @@ mod tests {
         let execed_snapshot = vec![TreeProcessInfo {
             pid: 18_422,
             parent_pid: Some(500),
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("postgres".to_owned()),
             start_time_marker: Some(18_422),
@@ -4042,6 +4046,7 @@ mod tests {
         let snapshot = vec![TreeProcessInfo {
             pid: 18_422,
             parent_pid: Some(500),
+            unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("postgres".to_owned()),
             // Matches the confirmed context marker from `no_context`.

@@ -2263,6 +2263,7 @@ mod tests {
             TreeProcessInfo {
                 pid,
                 parent_pid: parent,
+                unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some(name.to_owned()),
                 start_time_marker: Some(marker),
