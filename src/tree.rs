@@ -145,7 +145,7 @@ pub(crate) enum TreeSnapshotScope {
 /// `platform/linux.rs`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) trait TreeProcessOps {
-    /// Narrow future snapshots to the scope currently being executed.
+    /// Narrow subsequent snapshots to the scope currently being executed.
     ///
     /// The default keeps platforms and tests with complete snapshots unchanged.
     fn set_snapshot_scope(&mut self, _scope: TreeSnapshotScope) {}

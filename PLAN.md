@@ -1,31 +1,31 @@
 # Kickoutchi Process Tree Plan
 
 This plan tracks Kickoutchi's scoped process cleanup work. Linux/macOS scoped
-kill shipped cleanly in `1.0.0`; the current implementation phase is Windows
-scoped cleanup, shipping as a single combined `1.1.0` release that adds Windows
-CLI `--tree` and read-only `inspect` together. `--group` stays Unix-only —
-process groups are a POSIX concept with no Windows analog.
+kill shipped cleanly in `1.0.0`; `1.1.0` adds Windows CLI `--tree` and
+read-only `inspect`. `--group` stays Unix-only because process groups are a
+POSIX concept with no Windows analog.
 
 Normal `kick kill` must stay precise: it terminates only the confirmed PID. Tree
 and group kill are the big ogre buttons, and they must stay clearly opt-in.
 
-Status decision: Linux and macOS are done for `1.0.0`: CLI `--tree`, CLI
-`--group`, read-only `inspect`, and TUI `t`/`T` tree kill are implemented and
-verified. Windows scoped cleanup is implemented on `shrek` for `1.1.0` as CLI
-`--tree` plus read-only `inspect`, using the job-containment design below.
-Manual Windows QA remains the release gate.
+Status decision: Linux, macOS, and Windows scoped cleanup are implemented and
+verified for `1.1.0`. Windows uses the job-containment design below for CLI
+`--tree` plus read-only `inspect`; normal single-PID kill remains precise on
+every platform.
 
 ## Current Status
 
 - `1.0.0` Linux/macOS scoped cleanup is clear and clean: implemented, tested,
   cross-target checked, packaged, and documented.
+- `1.1.0` Windows scoped cleanup is implemented, tested, QA'd on Windows, and
+  documented.
 - Normal process kill remains unchanged and precise.
 - CLI `--tree` is Linux/macOS/Windows descendant-tree cleanup; TUI `t`/`T`
   remains Linux/macOS-only.
 - `--group` is Linux/macOS-only CLI process-group cleanup.
 - `inspect` is Linux/macOS/Windows read-only family inspection. Linux/macOS also
   render POSIX process-group sections; Windows omits them.
-- Windows scoped cleanup ships as one combined `1.1.0`: CLI `--tree` and
+- Windows scoped cleanup ships in `1.1.0`: CLI `--tree` and
   read-only `inspect`, delivered together. `--group` stays Unix-only. It must
   not copy the Unix freeze-first wording because Windows has no supported
   `SIGSTOP` equivalent.
@@ -53,14 +53,16 @@ the machine, so it can rely on none of that: it must require stronger consent,
 verify identity at every step, and use a platform-specific strategy to make
 enumeration trustworthy.
 
-### What 1.0 solves, and what it honestly does not
+### What scoped cleanup solves
 
 - `1.0.0` solves the common Linux/macOS cases: a dev server, agent, or runner
   left a bounded tree of workers behind; a worker reparented away from the
   descendant tree but stayed in the process group; or the user needs to inspect
   ancestors before choosing the right root.
-- `1.0.0` does **not** solve Windows tree/group cleanup yet. That is next.
-- `1.0.0` still refuses instead of partially killing an over-cap or
+- `1.1.0` adds the Windows equivalents that exist honestly: CLI descendant-tree
+  cleanup through Job Objects, plus read-only `inspect`. Windows still has no
+  `--group`, because there is no POSIX process group to target.
+- Scoped cleanup refuses instead of partially killing an over-cap or
   non-converging scope. Partial kills of a moving target are worse than
   refusing: they report false progress while the swamp regrows.
 
@@ -89,7 +91,7 @@ kick inspect --port 3000
 kick inspect --pid 12345
 ```
 
-Windows scoped cleanup in `1.1.0`:
+Windows scoped cleanup:
 
 ```sh
 kick kill --port 3000 --tree
@@ -108,8 +110,8 @@ kick kill --pid 12345
 
 TUI tree cleanup is implemented on Linux/macOS: `t` terminates the selected
 process tree and `T` force-kills it, mirroring `x`/`X` and preserving Caps Lock
-handling. Process-group cleanup stays CLI-only in `1.0.0` because the full
-group member list belongs in an explicit CLI banner.
+handling. Process-group cleanup stays CLI-only because the full group member
+list belongs in an explicit CLI banner.
 
 ## Safety Contract
 
@@ -130,7 +132,7 @@ containment contract in the Windows section below.
   killing a partial tree. The pre-flight count runs **before any signal is
   sent**, so a cap refusal has zero side effects.
 - Revalidate the root process (PID, name when known, start marker, confirmed
-  ports) immediately before the freeze phase, using the existing rules.
+  ports) immediately before the freeze step, using the existing rules.
 - Collect the tree fresh at execution time; the confirmation preview is
   informational only. Do not rely on the stale details-panel child snapshot.
 - Freeze before enumerating for kill: a stopped process cannot fork, and
@@ -211,7 +213,7 @@ stays the reserved, empty field it is today).
 ## The Freeze-First Algorithm (shared Linux/macOS shape)
 
 This is the core correction for the runaway-spawner case. Order matters; every
-phase exists to close a specific race.
+step exists to close a specific race.
 
 1. **Confirm and revalidate the root.** Existing rules unchanged: PID, process
    name when known, start-time marker, confirmed ports. On Linux the root pidfd
@@ -243,12 +245,12 @@ phase exists to close a specific race.
    end. On macOS there is no pidfd, but the stop-verify gate carries the same
    guarantee for descendants; only the root keeps the marker-recheck window
    accepted by the existing single-kill path.
-5. **Policy check.** Unsafe PIDs (0, 1, self, and PID 4 on a future Windows) or
+5. **Policy check.** Unsafe PIDs (0, 1, self, and Windows PID 4) or
    any protected descendant → CONT all → refuse (protected refusal uses exit
    `6` semantics). Zombie members need no special casing: signals to a zombie
    are accepted and discarded by the kernel, so stopping and signalling them is
    a harmless no-op, and they are reaped when their parent dies.
-6. **Signal phase, leaves first, root last.** Per node, apply the mode-specific
+6. **Signal delivery, leaves first, root last.** Per node, apply the mode-specific
    ordering from the Safety Contract (`SIGTERM` then `SIGCONT` for Terminate;
    `SIGKILL` alone for Force). Leaves-first means a parent that respawns
    children on child-exit is still frozen when its children die, and by the
@@ -313,18 +315,13 @@ Do not attempt Bun's private macOS `p_uniqueid` tracking. It is too much
 platform-specific surface for a user-driven kill command and the stop-verify
 gate already closes the race it would address.
 
-## Windows: The Combined `1.1.0` Phase, and the Design That Gets It There
+## Windows Job-Containment Design
 
-Windows scoped cleanup ships as one combined `1.1.0` after the `1.0.0`
-Linux/macOS release: CLI `--tree` and read-only `inspect` together, on the
-job-containment design below. It was deferred out of `1.0.0` for verification
-reasons — the tree-kill work repeatedly showed that live QA catches what tests
-do not, and the hardest-to-verify platform must not gate the release of the two
-already-verified ones. That deferral now has an end date: a real Windows machine
-is available for the interactive QA this phase needs, so `1.1.0` proceeds with
-the same "live QA before release" bar the Unix phase held itself to.
+Windows scoped cleanup ships in `1.1.0`: CLI `--tree` and read-only `inspect`
+together, on the job-containment design below. Windows QA passed on a real
+machine, matching the live-QA bar used for Linux and macOS scoped cleanup.
 
-Scope of the combined `1.1.0`:
+Windows scope:
 
 - **CLI `--tree`** — the job-containment tree kill designed below.
 - **`inspect`** — read-only, and the cheapest half to port: it needs the same
@@ -336,11 +333,9 @@ Scope of the combined `1.1.0`:
 - **`--group` stays Unix-only.** Process groups are a POSIX concept; the honest
   Windows analog *is* the Job Object, which tree kill already uses. Windows gets
   `--tree`, not `--group`.
-- **TUI `t`/`T` on Windows** is not part of `1.1.0`. Follow the Unix precedent
-  — `--group` shipped CLI-first — and keep Windows tree cleanup CLI-only to
-  bound the QA surface (the TUI adds a background worker, modal, and Caps Lock
-  handling to verify). It can follow in a later release if the CLI path proves
-  out.
+- **TUI `t`/`T` on Windows** remains unavailable. Windows tree cleanup is
+  CLI-only; the Unix TUI path still owns the background worker, modal, and Caps
+  Lock handling.
 
 Why the Unix design does not transfer directly:
 
@@ -367,7 +362,7 @@ What Windows has instead — the two primitives the design stands on:
   read the creation time through that same handle: verification and pinning
   are inherently ordered, which is the same reuse-proof delivery guarantee
   pidfd gives Linux — reached even more directly.
-- **Job Objects kill atomically and contain normal future children.** A job
+- **Job Objects kill atomically and contain normal later children.** A job
   cannot retroactively swallow an already-running tree (existing descendants
   stay outside it), but after a process is assigned, normal `CreateProcess`
   children inherit the job, and `TerminateJobObject` kills the current job
@@ -406,7 +401,7 @@ The design — containment instead of freezing. Unix *prevents* tree growth
    planning/sweeping, then assign the root first. `kill-on-close` is too
    dangerous before the operation commits: an error path or dropped handle could
    terminate the root unintentionally. Use explicit `TerminateJobObject` only
-   after the sweep reaches its commit-to-kill phase.
+   after the sweep reaches its commit-to-kill step.
 5. Sweep existing descendants to a fixed point, mirroring the Unix sweep shape
    and caps: resnapshot, accept only creation-time-sane parent edges, open and
    verify a handle per new member, and assign each assignable member to the job.
@@ -430,7 +425,7 @@ The design — containment instead of freezing. Unix *prevents* tree growth
    weaker Windows-only path per PID. If handle open or verification fails,
    report that member as not terminated.
 
-Honest limits to state in the user-facing copy when this ships:
+Honest limits to state in user-facing copy:
 
 - Hard kill only; no graceful tier exists on Windows.
 - Enumeration is observed-complete ("the sweep converged"), not
@@ -462,7 +457,7 @@ other would obscure both. The confirmation flow, policy layer (protected
 names, unsafe PIDs, `SystemProcessCheck`), banner and modal copy, and outcome
 mapping are already platform-agnostic and are reused as-is.
 
-Verification bar for the Windows phase:
+Windows verification covered:
 
 - Unit tests for the planner (parent-map building under the creation-time
   sanity rule, side-effect-free preflight refusals, explicit commit boundary,
@@ -477,24 +472,16 @@ Verification bar for the Windows phase:
   `CreateProcess` child spawned only after the root observes Job Object
   assignment; the child records that it inherited the job and must be gone after
   `--tree` completes.
-- A deterministic real-process incompatible-job fallback test is not required
-  for `1.1.0` CI because it depends on host nested-job and breakaway policy that
-  varies by Windows version, terminal, CI wrapper, and privilege. Keep that path
-  covered by injected seam tests plus manual Windows QA until the project has a
-  controlled Windows job-policy matrix; do not add a flaky contract test that
-  passes only on one host shape.
-- Manual QA on the real Windows machine — now available, so run it as a live
-  loop during development, not only as a final gate. Cover the case that is the
-  *common* dev setup, not an exotic edge: a dev server started from an editor or
-  terminal that already manages its child tree with a Job Object (e.g. the
-  VS Code integrated terminal, Windows Terminal). That is exactly the
-  already-in-a-job / nested-assignment / individual-handle-fallback path.
-  Test both `kick` launched from the *same* terminal (its own PID is inside that
-  job — watch the self-PID guard) and from a *separate* standalone terminal.
-- Open question to settle during the phase, not before: whether
-  `NtSuspendProcess` is acceptable as *optional* best-effort hardening on top
-  of the job design. Default answer is no (undocumented API in a kill path);
-  the job design must be safe without it.
+- A deterministic real-process incompatible-job fallback contract test is kept
+  out of CI because it depends on host nested-job and breakaway policy that
+  varies by Windows version, terminal, CI wrapper, and privilege. That path is
+  covered by injected seam tests plus Windows QA; do not add a flaky
+  contract test that passes only on one host shape.
+- Windows QA covered the common dev setup: a dev server started from a terminal
+  or editor that already manages children with a Job Object, plus `kick`
+  launched from the same terminal and from a separate standalone terminal.
+- `NtSuspendProcess` is not used. It is undocumented API in a kill path, and the
+  Job Object design is safe without it.
 
 At `1.1.0`, Windows behavior changes only for the explicit scoped features:
 
@@ -722,7 +709,7 @@ Integration tests on Linux (extend the existing helper-listener pattern in
 Flakiness controls:
 
 - Use helper binaries and pipes/ready-files, not sleeps, to coordinate process
-  readiness (the ready-file pattern already exists in `cli_contract.rs`).
+  startup (the ready-file pattern already exists in `cli_contract.rs`).
 - Allocate ports through the OS (`bind :0`) instead of hardcoding.
 - Helper trees must be bounded and self-terminating (children `sleep` with a
   deadline) so a failed test cannot leave a runaway tree behind.
@@ -732,7 +719,7 @@ Flakiness controls:
 
 ## QA Plan
 
-Manual QA on Linux first:
+Linux QA checklist:
 
 ```sh
 kick kill --port 3000
@@ -756,14 +743,14 @@ Observe:
 - If a survivor respawns the port, Kickoutchi reports that the port is still
   visible instead of claiming the swamp is clean.
 
-Manual QA on macOS after implementation:
+macOS QA checklist:
 
 - Repeat every Linux flow with native macOS process trees.
 - Verify PID-reuse checks with fast-exiting helper processes.
 - Verify permission-denied cases (`sudo`-owned member) produce a safe refusal
   with everything continued.
 
-Manual QA on Windows:
+Windows QA checklist:
 
 - Verify normal `kick kill` still targets only the confirmed PID.
 - Verify `kick inspect --pid <root>` and `kick inspect --port <port>` show the
@@ -800,7 +787,7 @@ Completed for `1.0.0`:
   TERM-before-CONT ordering fix.
 - Release metadata, docs, package verification, and `1.0.0` changelog.
 
-In progress — combined `1.1.0` (Windows CLI `--tree` + `inspect`, delivered together):
+Completed for `1.1.0`:
 
 - Windows `inspect` as the shared read-only foundation: the process
   snapshot (parent PID + creation-time marker under the sanity rule) that tree
@@ -813,8 +800,7 @@ In progress — combined `1.1.0` (Windows CLI `--tree` + `inspect`, delivered to
 - `--group` stays Unix-only; no Windows `--group` in `1.1.0` or later.
 - Windows docs/copy must stay honest: containment and convergence, not Unix
   freeze parity; hard-kill-only; and WSL2 processes are out of reach.
-- Manual Windows QA on the available machine is required before shipping — run
-  as a live loop, with the editor/terminal Job Object case covered explicitly.
+- Windows QA passed, including the editor/terminal Job Object case.
 - `1.1.0` is a minor bump: making previously-rejected flags valid on Windows is
   a backwards-compatible feature addition, and the Unix paths are unchanged.
 
@@ -842,8 +828,7 @@ Previously open questions, now decided:
 
 ## Recommendation
 
-Treat Linux/macOS `1.0.0` scoped cleanup as complete and maintain it with the
-same safety contract: opt-in scope, bounded scans, count before signals, freeze
-before final enumeration, verify while stopped, and thaw on every refusal. For
-`1.1.0`, finish Windows scoped cleanup on its own job-containment path (CLI
-`--tree` + `inspect`) with real Windows QA before release.
+Treat `1.1.0` scoped cleanup as complete and maintain it with the same safety
+contract: opt-in scope, bounded scans, count before signals, freeze-first on
+Linux/macOS, Job Object containment on Windows, verify identities before
+termination, and report partial outcomes honestly.

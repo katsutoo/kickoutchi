@@ -78,7 +78,7 @@ kickoutchi-update
 ```
 
 If you installed Kickoutchi before this updater existed, rerun the latest
-installer once to get `kickoutchi-update`; future upgrades can use the updater.
+installer once to get `kickoutchi-update`; later upgrades can use the updater.
 
 Every release also includes direct archives for Linux, macOS, and Windows, plus
 matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
@@ -195,7 +195,7 @@ cargo install --path . --locked
   refuses as incomplete metadata rather than omitting a possible descendant.
   After the root is assigned to the Job Object, failures are reported as partial
   containment, fallback termination, or not-terminated PIDs; they are never
-  hidden as full success. The preview is an observed tree, not a complete future
+  hidden as full success. The preview is an observed tree, not the complete
   blast radius: Windows may also terminate newly spawned job-contained children
   that were not visible before confirmation.
 - A protected tree or group root requires its PID or name *and* the scope

@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Windows `kickoutchi inspect --pid <PID>` / `--port <PORT>`: the read-only
-  family view is now available on Windows. It shows ancestors, descendants,
+  family view is available on Windows. It shows ancestors, descendants,
   siblings, ports, command lines, and the matching `kick kill --pid <root> --tree`
   hint without signalling anything. Windows reports parent links only
   after creation-time sanity checks, omits the POSIX process-group section, and
@@ -313,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an unescaped `)` inside `comm` cannot be mistaken for the field terminator.
 - The `KillTarget` construction invariants are now release assertions instead of
   debug-only ones: the target must contain at least one row, and every row's PID
-  must match the target PID. A future caller that builds a kill target from no
+  must match the target PID. Another caller that builds a kill target from no
   rows, or from rows owned by another PID, now fails fast on the termination path
   instead of carrying a degenerate, port-less, or mis-targeted target forward.
 - Linux collector owner resolution now only records owners for socket inodes
@@ -418,7 +418,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target; both still refuse to send a signal.
 - Removed the stale `#[allow(dead_code)]` from `ExitReason`; every variant is
   now constructed by the CLI exit path, so the lint suppression would have
-  hidden genuinely unreachable variants in future refactors.
+  hidden genuinely unreachable variants in later refactors.
 - TUI `Esc` no longer quits when a filter is still applied after search editing
   finished: with no modal open and a non-empty filter, `Esc` now clears the
   filter and only quits on a second press once nothing is left to clear. An open
@@ -503,7 +503,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal without sending a signal.
 - GitHub Actions CI now runs on Linux pushes and pull requests, using the pinned
   Rust toolchain to check formatting, strict Clippy, and the full test suite.
-  Release/CD automation remains deferred to the dedicated `cargo-dist` workflow.
+  Release/CD automation is handled by the dedicated `cargo-dist` workflow.
 - CLI contract integration tests now exercise script-facing `list` behavior with
   the real binary: human no-match diagnostics go to stderr, `list --json` stays
   unpolluted, and explicit no-match filters exit `3`. The helper process uses
@@ -515,7 +515,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process, stale confirmed target, unsafe PID, and unknown failure. Real signal
   delivery is Linux-only until native non-Linux collectors exist.
 - Shared kill command rendering in `command.rs` shows the equivalent user-facing
-  command (`kill <PID>`, `kill -9 <PID>`, or future platform equivalents) in both
+  command (`kill <PID>`, `kill -9 <PID>`, or platform-specific equivalents) in both
   CLI and TUI confirmation flows.
 - CLI `kickoutchi kill --pid <PID>` and `kickoutchi kill --port <PORT>` now use
   the same safety rules as the TUI: PID `0`, PID `1`, and Kickoutchi's own PID
@@ -614,7 +614,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared domain model: `PortEntry` with the full
   protocol/address/port/state/process/parent/permission shape, plus the
   `Protocol`, `SocketState`, `Platform`, `PermissionStatus`, and `SortMode`
-  vocabulary shared by the CLI, TUI, and future collectors.
+  vocabulary shared by the CLI, TUI, and additional collectors.
 - `Collector` trait with a deterministic `FakeCollector` covering full
   metadata, permission-restricted partial rows, IPv6, bound UDP, and a
   default-protected process name.
