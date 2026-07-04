@@ -31,12 +31,13 @@ Website: <https://kickoutchi.com>
 - Works as a script-friendly CLI with table or JSON output.
 - Asks before termination, because Donkey may yell but Donkey does not kill
   random swamp residents without confirmation.
-- Kicks out whole process trees on Linux and macOS (`kill --tree` in the CLI,
-  `t`/`T` in the TUI): the root is frozen first so it cannot spawn more
-  children, the descendants are swept to a fixed point, every member is
-  identity-verified while stopped, and only then are signals sent leaves-first.
-  Useful for dev servers, agents, and runners that leave workers behind — even
-  ones actively spawning.
+- Kicks out whole process trees (`kill --tree` in the CLI; `t`/`T` in the TUI
+  on Linux and macOS): Linux/macOS freeze the root first so it cannot spawn
+  more children, then sweep and signal the verified tree leaves-first. Windows
+  uses Job Object containment instead: it preflights safely, assigns the root as
+  the commit boundary, converges descendants, then hard-terminates contained
+  members. Useful for dev servers, agents, and runners that leave workers
+  behind — even ones actively spawning.
 - Kicks out whole process groups too (`kill --group`, Linux and macOS): same
   freeze-first pipeline, but membership comes from the POSIX process group
   instead of parent links — for survivors that reparented away from the tree
@@ -44,9 +45,10 @@ Website: <https://kickoutchi.com>
   tree cap. The confirmation lists every member, because a group can contain
   more than you think.
 - Inspects a process family without signalling anything (`inspect --port` or
-  `--pid`, Linux and macOS): ancestors, descendants, siblings, process group
-  members, and kill hints, so you can pick the right root before using
-  `--tree` or `--group`.
+  `--pid`): ancestors, descendants, siblings, ports, and kill hints, so you can
+  pick the right root before using `--tree` or `--group` where available.
+  Windows omits the POSIX process-group section because there is no Windows
+  process-group analog.
 - Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
   path.
 
@@ -140,9 +142,9 @@ cargo run --bin kick -- list              # list ports
 cargo run --bin kick -- list --port 3000  # show one port
 cargo run --bin kick -- list --json       # JSON for scripts
 cargo run --bin kick -- kill --port 3000  # ask, then kick it out
-cargo run --bin kick -- inspect --port 3000  # read-only family/group view (Linux/macOS)
-cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor (Linux/macOS)
-cargo run --bin kick -- kill --port 3000 --tree  # kick out the whole tree (Linux/macOS)
+cargo run --bin kick -- inspect --port 3000  # read-only family view
+cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor
+cargo run --bin kick -- kill --port 3000 --tree  # kick out the whole tree
 cargo run --bin kick -- kill --port 3000 --group  # kick out the whole process group (Linux/macOS)
 ```
 
@@ -160,27 +162,40 @@ cargo install --path . --locked
 
 - **Linux:** native `/proc` collection. Termination uses `pidfd`, so the final
   signal is tied to the prepared process handle instead of a recycled PID.
-- **Windows:** native IP Helper collection and process-handle termination through
-  Windows APIs. Use an elevated terminal when higher-privilege processes hide
-  metadata or reject termination.
+- **Windows:** native IP Helper collection, process-handle single-PID
+  termination, read-only `inspect`, and CLI `kill --tree` through Job Object
+  containment. Windows termination is hard termination (`TerminateProcess` /
+  `TerminateJobObject`); there is no graceful signal tier. Use an elevated
+  terminal when higher-privilege processes hide metadata or reject termination.
+  `--group` and the TUI `t`/`T` tree keys are not available on Windows. Native
+  Windows cannot see individual Linux processes inside WSL2; use the Linux build
+  inside WSL2 for those trees.
 - **macOS:** native `libproc` / `sysctl` collection and Unix `SIGTERM` / `SIGKILL`
   termination. macOS has no pidfd, so Kickoutchi re-checks process identity right
   before signalling and refuses if the PID changed faces.
 
 ## Safety Rules
 
-- PID `0`, PID `1`, and Kickoutchi's own PID are blocked.
+- PID `0`, PID `1`, Kickoutchi's own PID, and Windows PID `4` are blocked.
 - `kill --port` refuses ambiguous ports instead of guessing.
 - Protected processes require typing the PID or process name.
 - Force kill requires stronger confirmation by default.
 - Termination targets only the confirmed PID; `--tree` and `--group` are the
   explicit opt-ins for more. They require the typed word (`tree` or `group`, or
-  `force`) unless `--yes` passes the all-clear scoped-kill gates.
-- Tree and group kills refuse anything uncertain: a set over its cap (256 for
-  trees, 512 for groups), an unsafe or protected member, unreadable process
-  metadata, or an identity that changed under it — and every refusal after
-  freezing thaws what it stopped.
+  `force`) unless `--yes` passes the all-clear scoped-kill gates. `--group` is
+  Linux/macOS-only.
+- Linux/macOS tree and group kills refuse anything uncertain: a set over its cap
+  (256 for trees, 512 for groups), an unsafe or protected member, unreadable
+  process metadata, or an identity that changed under it — and every refusal
+  after freezing thaws what it stopped.
+- Windows tree kill refuses cleanly before Job Object commit when preflight sees
+  an unsafe PID, protected descendant, incomplete metadata, identity drift, or an
+  over-cap tree. After the root is assigned to the Job Object, failures are
+  reported as partial containment, fallback termination, or not-terminated PIDs;
+  they are never hidden as full success. The preview is an observed tree, not a
+  complete future blast radius: Windows may also terminate newly spawned
+  job-contained children that were not visible before confirmation.
 - A protected tree or group root requires its PID or name *and* the scope
-  word, checked again against a fresh scan right before the first signal.
+  word, checked again against a fresh scan right before scoped execution.
 - Group kill shows every member before asking, never signals a raw `-pgid`,
   and refuses outright if Kickoutchi itself sits in the target group.

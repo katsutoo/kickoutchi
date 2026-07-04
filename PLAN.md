@@ -1,7 +1,7 @@
 # Kickoutchi Process Tree Plan
 
 This plan tracks Kickoutchi's scoped process cleanup work. Linux/macOS scoped
-kill shipped cleanly in `1.0.0`; the next implementation phase is Windows
+kill shipped cleanly in `1.0.0`; the current implementation phase is Windows
 scoped cleanup, shipping as a single combined `1.1.0` release that adds Windows
 CLI `--tree` and read-only `inspect` together. `--group` stays Unix-only —
 process groups are a POSIX concept with no Windows analog.
@@ -11,24 +11,24 @@ and group kill are the big ogre buttons, and they must stay clearly opt-in.
 
 Status decision: Linux and macOS are done for `1.0.0`: CLI `--tree`, CLI
 `--group`, read-only `inspect`, and TUI `t`/`T` tree kill are implemented and
-verified. Windows still intentionally exposes only listing and safe
-single-process kill; Windows scoped cleanup is next, shipped as one combined
-`1.1.0` (CLI `--tree` + `inspect`) using the job-containment design below. A
-real Windows machine is now available for the interactive QA that phase
-requires, so the deferral is scheduling, not a QA-access blocker.
+verified. Windows scoped cleanup is implemented on the `windows` branch for
+`1.1.0` as CLI `--tree` plus read-only `inspect`, using the job-containment
+design below. Manual Windows QA remains the release gate.
 
 ## Current Status
 
 - `1.0.0` Linux/macOS scoped cleanup is clear and clean: implemented, tested,
   cross-target checked, packaged, and documented.
 - Normal process kill remains unchanged and precise.
-- `--tree` and TUI `t`/`T` are Linux/macOS-only descendant-tree cleanup.
+- CLI `--tree` is Linux/macOS/Windows descendant-tree cleanup; TUI `t`/`T`
+  remains Linux/macOS-only.
 - `--group` is Linux/macOS-only CLI process-group cleanup.
-- `inspect` is Linux/macOS-only, read-only family/group inspection.
-- Windows scoped cleanup is the next phase, shipped as one combined `1.1.0`:
-  CLI `--tree` and read-only `inspect`, delivered together. `--group` stays
-  Unix-only. It must not copy the Unix freeze-first wording because Windows has
-  no supported `SIGSTOP` equivalent.
+- `inspect` is Linux/macOS/Windows read-only family inspection. Linux/macOS also
+  render POSIX process-group sections; Windows omits them.
+- Windows scoped cleanup ships as one combined `1.1.0`: CLI `--tree` and
+  read-only `inspect`, delivered together. `--group` stays Unix-only. It must
+  not copy the Unix freeze-first wording because Windows has no supported
+  `SIGSTOP` equivalent.
 
 ## Problem
 
@@ -50,7 +50,8 @@ model is useful, but Kickoutchi is different. Bun controls the lifetime of the
 processes it spawns (it can put them in process groups it created and hold their
 handles from birth). Kickoutchi targets arbitrary processes already running on
 the machine, so it can rely on none of that: it must require stronger consent,
-verify identity at every step, and use freezing to make enumeration trustworthy.
+verify identity at every step, and use a platform-specific strategy to make
+enumeration trustworthy.
 
 ### What 1.0 solves, and what it honestly does not
 
@@ -88,6 +89,16 @@ kick inspect --port 3000
 kick inspect --pid 12345
 ```
 
+Windows scoped cleanup in `1.1.0`:
+
+```sh
+kick kill --port 3000 --tree
+kick kill --pid 12345 --tree
+kick kill --port 3000 --tree --force
+kick inspect --port 3000
+kick inspect --pid 12345
+```
+
 Default behavior remains:
 
 ```sh
@@ -102,7 +113,8 @@ group member list belongs in an explicit CLI banner.
 
 ## Safety Contract
 
-Tree kill must follow these rules:
+Linux/macOS tree kill must follow these rules. Windows follows the Job Object
+containment contract in the Windows section below.
 
 - The user must explicitly request tree scope with `--tree` or the dedicated
   TUI action.
@@ -320,16 +332,15 @@ Scope of the combined `1.1.0`:
   sends no signals, so it validates that shared enumeration foundation in a
   zero-risk context before any kill rides on top of it. The one adjustment:
   Windows has no POSIX process groups, so the report drops the "process group"
-  section (or replaces it with Job Object membership when present) rather than
-  inventing a group that does not exist.
+  section rather than inventing a group that does not exist.
 - **`--group` stays Unix-only.** Process groups are a POSIX concept; the honest
   Windows analog *is* the Job Object, which tree kill already uses. Windows gets
   `--tree`, not `--group`.
-- **TUI `t`/`T` on Windows** is an open sub-decision, not a commitment. Follow
-  the Unix precedent — `--group` shipped CLI-first — and prefer CLI `--tree`
-  first to bound the QA surface (the TUI adds a background worker, modal, and
-  Caps Lock handling to verify). It can follow in a later release if the CLI
-  path proves out.
+- **TUI `t`/`T` on Windows** is not part of `1.1.0`. Follow the Unix precedent
+  — `--group` shipped CLI-first — and keep Windows tree cleanup CLI-only to
+  bound the QA surface (the TUI adds a background worker, modal, and Caps Lock
+  handling to verify). It can follow in a later release if the CLI path proves
+  out.
 
 Why the Unix design does not transfer directly:
 
@@ -474,25 +485,19 @@ Verification bar for the Windows phase:
   of the job design. Default answer is no (undocumented API in a kill path);
   the job design must be safe without it.
 
-Until `1.1.0` ships, shipped Windows behavior stays exactly as it is in `1.0.0`:
+At `1.1.0`, Windows behavior changes only for the explicit scoped features:
 
 - Normal process kill works exactly as before.
-- The `--tree` and `--group` flags and the `inspect` subcommand do not exist on
-  Windows builds: clap rejects them as unknown arguments (exit `2`, the existing
-  usage-error code), pinned by Windows-only parse tests, and `--help` stays
-  honest per platform for free — no runtime "unsupported" branch, no new exit
-  code, no stale help text.
-- The TUI does not bind `t`/`T` and does not advertise them in the header or
-  help modal.
-
-At `1.1.0`, `--tree` and `inspect` become available on Windows (the parse tests
-that assert their exit `2` flip to assert acceptance). `--group` stays a clap
-usage error (exit `2`) permanently — it is Unix-only by design, so its
-Windows-only parse test is kept, not flipped.
+- The `--tree` flag and `inspect` subcommand exist on Windows builds, and
+  Windows-only parse tests assert acceptance.
+- `--group` stays a clap usage error (exit `2`) permanently — it is Unix-only by
+  design, so its Windows-only parse test is kept, not flipped.
+- The TUI still does not bind `t`/`T` and does not advertise them in the header
+  or help modal.
 
 ## CLI Plan
 
-Add to `KillArgs` in `src/cli.rs` (Unix builds only, per the cfg-gate above):
+Add to `KillArgs` in `src/cli.rs` (Linux/macOS/Windows CLI builds):
 
 ```rust
 #[arg(long)]
@@ -536,7 +541,8 @@ Exit behavior reuses existing codes; nothing new is added:
 - Protected refusal uses `ProtectedNeedsConfirmation` (6).
 - Cap overflow and identity-drift refusals use `Failure` (1) with messages
   that name the cap or the drifted node.
-- Windows `--tree` is a clap usage error (2) via the cfg-gate.
+- Windows `--group` is a clap usage error (2) via the cfg-gate; Windows
+  `--tree` has its own Job Object outcome mapping.
 
 ## Implemented TUI Tree Mode
 
@@ -686,7 +692,8 @@ CLI contract tests:
   the typed word.
 - `kick kill --port <port> --tree --yes` does not bypass protected tree checks.
 - `kick kill --port <port> --tree --force` uses force wording and force signal.
-- On Windows builds, `--tree` fails at argument parsing with exit `2`.
+- On Windows builds, `--tree` parses and `inspect` parses; `--group` still fails
+  at argument parsing with exit `2`.
 
 Integration tests on Linux (extend the existing helper-listener pattern in
 `tests/cli_contract.rs`):
@@ -747,9 +754,23 @@ Manual QA on macOS after implementation:
 
 Manual QA on Windows:
 
-- Verify `--tree` is rejected at argument parsing (exit 2) and does not appear
-  in `--help`.
-- Verify normal `kick kill` still works as before.
+- Verify normal `kick kill` still targets only the confirmed PID.
+- Verify `kick inspect --pid <root>` and `kick inspect --port <port>` show the
+  family read-only, omit POSIX process groups, include the Windows parent-edge
+  note and WSL2 note, and leave the helper tree alive.
+- Verify `kick kill --port <port> --tree` prints tree scope, process count,
+  Windows Job Object containment/hard-termination warning, and removes the root
+  and child after typed confirmation.
+- Verify `kick kill --pid <root> --tree` works when the root owns no port but a
+  child owns one.
+- Verify pre-commit refusals are side-effect-free where practical: unsafe PID,
+  protected descendant, incomplete metadata, permission denied, and over-cap
+  tree.
+- Verify post-commit failures report partial containment, fallback, or
+  not-terminated PIDs instead of claiming full success.
+- Verify `--group` is rejected at argument parsing (exit 2) and does not appear
+  in Windows help.
+- Verify the TUI still does not show or bind `t`/`T` on Windows.
 
 ## Rollout
 
@@ -768,9 +789,9 @@ Completed for `1.0.0`:
   TERM-before-CONT ordering fix.
 - Release metadata, docs, package verification, and `1.0.0` changelog.
 
-Next — combined `1.1.0` (Windows CLI `--tree` + `inspect`, delivered together):
+In progress — combined `1.1.0` (Windows CLI `--tree` + `inspect`, delivered together):
 
-- Windows `inspect` first as the shared read-only foundation: the process
+- Windows `inspect` as the shared read-only foundation: the process
   snapshot (parent PID + creation-time marker under the sanity rule) that tree
   kill also depends on, validated with no signals and minus the POSIX
   process-group section.
@@ -790,17 +811,19 @@ Next — combined `1.1.0` (Windows CLI `--tree` + `inspect`, delivered together)
 
 Previously open questions, now decided:
 
-1. `--tree` does **not** require `--force`. Normal tree mode sends `SIGTERM`
-   leaves-first; escalation is `--force --tree` with `SIGKILL`. Punishing the
-   graceful path would push users straight to force.
+1. `--tree` does **not** require `--force`. On Linux/macOS, normal tree mode
+   sends `SIGTERM` leaves-first; escalation is `--force --tree` with `SIGKILL`.
+   Punishing the graceful path would push users straight to force. On Windows,
+   both modes are hard termination because there is no graceful signal tier;
+   `--force` keeps the stronger confirmation/wording contract.
 2. A protected **descendant** refuses the whole tree in v1. Typing one
    protected name must not authorize killing N processes around it. A
    protected **root** uses the existing typed protected confirmation. Revisit
    after real-world use.
-3. Stop-verify (the freeze) applies to **both** modes, always. It is the
-   mechanism that makes enumeration complete and identity checks sound — not a
-   force-only escalation. The mode only changes the final signal and the CONT
-   rule.
+3. On Linux/macOS, stop-verify (the freeze) applies to **both** modes, always.
+   It is the mechanism that makes enumeration complete and identity checks sound
+   — not a force-only escalation. The mode only changes the final signal and the
+   CONT rule.
 4. The TUI collects and shows the **full bounded tree** before confirmation,
    on a background worker. Direct-children-only would understate the blast
    radius. Execution always re-collects fresh; root identity must match
@@ -810,7 +833,6 @@ Previously open questions, now decided:
 
 Treat Linux/macOS `1.0.0` scoped cleanup as complete and maintain it with the
 same safety contract: opt-in scope, bounded scans, count before signals, freeze
-before final enumeration, verify while stopped, and thaw on every refusal. The
-next product/engineering focus is Windows scoped cleanup, shipped as one
-combined `1.1.0` (CLI `--tree` + `inspect`) on its own job-containment path,
-with real Windows QA before release.
+before final enumeration, verify while stopped, and thaw on every refusal. For
+`1.1.0`, finish Windows scoped cleanup on its own job-containment path (CLI
+`--tree` + `inspect`) with real Windows QA before release.

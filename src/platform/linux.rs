@@ -719,6 +719,7 @@ fn collect_tree_process_infos(proc_root: &Path) -> Result<Vec<TreeProcessInfo>, 
         infos.push(TreeProcessInfo {
             pid,
             parent_pid: status.parent_pid,
+            parent_process_name: None,
             process_name: Some(process_name),
             start_time_marker: Some(stat.start_time_marker),
             owner_uid: status.owner_uid,

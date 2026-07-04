@@ -17,9 +17,9 @@ mod display;
 mod docker;
 mod error;
 mod input;
-// The read-only family/group inspection view. It renders data from the tree
-// snapshot, so it exists exactly where tree kill does.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// The read-only family inspection view. It renders data from the process-tree
+// snapshot; Windows omits POSIX process-group sections.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod inspect;
 mod model;
 mod output;
@@ -27,13 +27,13 @@ mod platform;
 mod process;
 mod protection;
 mod query;
-// Process-tree kill ships on Linux and macOS. Windows has no freeze primitive
-// (no SIGSTOP equivalent), so the tree feature is gated to the platforms whose
-// safety model it can actually honor; gating also keeps the deny-warnings gate
-// happy on builds where the feature would have no caller.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// Shared process-tree planning. Linux/macOS use this module's freeze-first
+// executor; Windows uses a separate Job Object containment executor.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod tree;
 mod ui;
+#[cfg(windows)]
+mod windows_tree;
 
 use std::io;
 use std::process::ExitCode;

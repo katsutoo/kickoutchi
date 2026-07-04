@@ -370,7 +370,7 @@ impl KillWarning {
 /// sentence would be false, so the tree surfaces (CLI banner and TUI modal)
 /// route every root warning through here. It lives beside `warning_lines` so
 /// the suffix it strips and the text that produces it cannot drift apart.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) fn tree_scope_warning_text(warning: &str) -> String {
     scoped_warning_text(
         warning,
@@ -385,7 +385,7 @@ pub(crate) fn group_scope_warning_text(warning: &str) -> String {
     scoped_warning_text(warning, "group kill targets every group member shown above")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn scoped_warning_text(warning: &str, scope_clause: &str) -> String {
     const PROCESS_SCOPE_SUFFIX: &str = "; termination targets only the confirmed PID";
     if let Some(prefix) = warning.strip_suffix(PROCESS_SCOPE_SUFFIX) {

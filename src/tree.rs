@@ -1,4 +1,4 @@
-//! Freeze-first process-tree and process-group termination.
+//! Process-tree planning plus the Unix freeze-first execution pipeline.
 //!
 //! Single-process kill (see `process.rs`) is precise on purpose: it signals
 //! exactly one confirmed PID. Tree kill is the big ogre button — it terminates a
@@ -14,7 +14,7 @@
 //! `kill(-pgid)`: every member is enumerated, frozen, identity-verified, and
 //! signalled individually, so the same refusal gates apply to every PID.
 //!
-//! The trick is to freeze before you count. A stopped process cannot `fork`, so
+//! On Unix, the trick is to freeze before you count. A stopped process cannot `fork`, so
 //! once the root is `SIGSTOP`ped the shape of the tree stops growing from the
 //! top, and a bounded re-scan sweep then reaches every descendant. Identity is
 //! re-checked *after* each process is stopped, where its PID can no longer be
@@ -27,10 +27,16 @@
 //! whole pipeline is exercised in tests with a fake that scripts snapshots and
 //! records the exact order of stop/continue/signal calls.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::model::{Platform, SystemProcessCheck};
-use crate::process::{KillMode, KillTarget, UnsafePidReason, current_user_id, unsafe_pid_reason};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process::KillTarget;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process::current_user_id;
+use crate::process::{KillMode, UnsafePidReason, unsafe_pid_reason};
 use crate::protection::is_protected_process_name;
 
 /// Hard cap on the number of processes a single tree kill will touch.
@@ -49,6 +55,7 @@ pub(crate) const MAX_TREE_PROCESSES: usize = 256;
 /// also respects a resource budget — on Linux every member holds one pidfd
 /// during delivery, and 512 stays comfortably under the common 1024
 /// soft file-descriptor limit.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const MAX_GROUP_PROCESSES: usize = 512;
 
 /// Cap on freeze-sweep passes. Every pass drains one snapshot completely, so a
@@ -57,12 +64,14 @@ pub(crate) const MAX_GROUP_PROCESSES: usize = 512;
 /// between snapshots. Exhausting the cap without a clean pass means the member
 /// set kept churning and could not be enumerated completely, so the kill is
 /// refused rather than run against a set we cannot vouch for.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FREEZE_PASSES: usize = 8;
 
 /// Ceiling on group size for a `--yes` prompt skip. A tiny, all-clear group is
 /// the only group kill allowed to proceed without the typed word, and the same
 /// ceiling is re-applied to the final frozen set: a group that grows past it
 /// mid-freeze no longer matches what `--yes` was allowed to skip for.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const GROUP_YES_SKIP_MAX_PROCESSES: usize = 8;
 
 /// One raw process as read from a single snapshot of the process table.
@@ -73,6 +82,7 @@ pub(crate) const GROUP_YES_SKIP_MAX_PROCESSES: usize = 8;
 pub(crate) struct TreeProcessInfo {
     pub(crate) pid: u32,
     pub(crate) parent_pid: Option<u32>,
+    pub(crate) parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
     pub(crate) start_time_marker: Option<u64>,
     /// Effective owner UID when readable. Drives the ownership warning in kill
@@ -89,6 +99,7 @@ pub(crate) struct TreeProcessInfo {
 
 /// The result of asking the OS to deliver one signal to one process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) enum TreeSignalResult {
     /// The signal was accepted by the kernel.
     Delivered,
@@ -105,6 +116,7 @@ pub(crate) enum TreeSignalResult {
 /// tree scope can walk descendants directly, and group scope can prove denied
 /// rows are outside the confirmed process group before skipping them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) enum TreeSnapshotScope {
     #[cfg(target_os = "macos")]
     Full,
@@ -123,6 +135,7 @@ pub(crate) enum TreeSnapshotScope {
 /// and a fake needs to implement all of them coherently (scripted snapshots plus
 /// a recorded call log). The real Linux implementation lives in
 /// `platform/linux.rs`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) trait TreeProcessOps {
     /// Narrow future snapshots to the scope currently being executed.
     ///
@@ -160,6 +173,7 @@ pub(crate) trait TreeProcessOps {
     fn deliver(&mut self, pid: u32, mode: KillMode) -> TreeSignalResult;
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn pin_root_before_revalidation<Ops: TreeProcessOps>(
     root_pid: u32,
     ops: &mut Ops,
@@ -181,6 +195,7 @@ pub(crate) fn pin_root_before_revalidation<Ops: TreeProcessOps>(
 pub(crate) struct ProcessTreeNode {
     pub(crate) pid: u32,
     pub(crate) parent_pid: Option<u32>,
+    pub(crate) parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
     pub(crate) owner_uid: Option<u32>,
     pub(crate) protected: bool,
@@ -212,6 +227,7 @@ pub(crate) enum TreePlanError {
 }
 
 /// Why a group preview could not be built at all.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroupPlanError {
     /// The root PID is not present in the snapshot — it exited already.
@@ -259,6 +275,7 @@ impl ProcessTreeTarget {
         self.nodes.iter().any(|node| node.process_name.is_none())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn has_owner_mismatch(&self) -> bool {
         let current_uid = current_user_id();
         self.nodes.iter().any(|node| {
@@ -271,7 +288,15 @@ impl ProcessTreeTarget {
     /// kill: system/service members, members owned by another uid, or members
     /// whose metadata we could not read.
     pub(crate) fn has_warnings(&self) -> bool {
-        self.has_system_process() || self.has_owner_mismatch() || self.has_unreadable_name()
+        let base_warnings = self.has_system_process() || self.has_unreadable_name();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            base_warnings || self.has_owner_mismatch()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            base_warnings
+        }
     }
 
     /// Nodes for the banner preview, capped, in display order (depth then PID).
@@ -294,6 +319,7 @@ pub(crate) fn tree_scope_word(mode: KillMode) -> &'static str {
 /// The word a group kill must have typed to proceed. `force` stays the force
 /// word across every scope — the word confirms deliberateness, the banner
 /// names the scope.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn group_scope_word(mode: KillMode) -> &'static str {
     match mode {
         KillMode::Force => "force",
@@ -425,12 +451,14 @@ pub(crate) fn plan_process_tree(
 
 /// The previewed process group: its ID plus the member set in the shared
 /// preview shape (root at depth 0, every other member at depth 1).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessGroupTarget {
     pgid: u32,
     members: ProcessTreeTarget,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ProcessGroupTarget {
     pub(crate) fn pgid(&self) -> u32 {
         self.pgid
@@ -449,6 +477,7 @@ impl ProcessGroupTarget {
 /// Rows whose group is `None` are provably non-members: the platforms map only
 /// the untargetable kernel group `0` to `None` and fail the scan on anything
 /// unreadable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn plan_process_group(
     root_pid: u32,
     snapshot: &[TreeProcessInfo],
@@ -499,12 +528,14 @@ fn preview_node(
     ProcessTreeNode {
         pid: info.pid,
         parent_pid: info.parent_pid,
+        parent_process_name: info.parent_process_name.clone(),
         process_name: info.process_name.clone(),
         owner_uid: info.owner_uid,
         protected: is_protected(info, protected_names, platform),
         system_process: is_system(
             info.pid,
             info.parent_pid,
+            info.parent_process_name.as_deref(),
             info.process_name.as_deref(),
             platform,
         ),
@@ -521,6 +552,7 @@ fn is_protected(info: &TreeProcessInfo, protected_names: &[String], platform: Pl
 fn is_system(
     pid: u32,
     parent_pid: Option<u32>,
+    parent_process_name: Option<&str>,
     process_name: Option<&str>,
     platform: Platform,
 ) -> bool {
@@ -532,28 +564,32 @@ fn is_system(
         pid: Some(pid),
         parent_pid,
         process_name,
-        parent_process_name: None,
+        parent_process_name,
     }
     .is_system_process()
 }
 
 /// A process the pipeline has stopped and recorded, so it can verify identity
 /// later and thaw it on abort.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FrozenNode {
     pid: u32,
     parent_pid: Option<u32>,
+    parent_process_name: Option<String>,
     process_name: Option<String>,
     owner_uid: Option<u32>,
     start_time_marker: Option<u64>,
     depth: usize,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl FrozenNode {
     fn from_info(info: &TreeProcessInfo, depth: usize) -> Self {
         Self {
             pid: info.pid,
             parent_pid: info.parent_pid,
+            parent_process_name: info.parent_process_name.clone(),
             process_name: info.process_name.clone(),
             owner_uid: info.owner_uid,
             start_time_marker: info.start_time_marker,
@@ -570,6 +606,7 @@ impl FrozenNode {
 /// proves that membership still holds. Keeping the two answers in one enum
 /// keeps the pipeline single-copy and each scope's rules auditable side by
 /// side.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepScope {
     /// Members are descendants of the frozen set, discovered over parent
@@ -582,6 +619,7 @@ enum SweepScope {
     Group { pgid: u32 },
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SweepScope {
     fn member_cap(self) -> usize {
         match self {
@@ -620,6 +658,7 @@ impl SweepScope {
 /// fork, a root can `exec` into a different name, processes can join a group.
 /// So the two facts the prompt established are re-checked where they can no
 /// longer drift — while every member is stopped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScopeAuthorization {
     /// The protected-root typed confirmation (PID or name) was completed.
@@ -637,6 +676,7 @@ pub(crate) struct ScopeAuthorization {
 }
 
 /// What a report line needs after a completed tree kill.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeKillReport {
     pub(crate) total: usize,
@@ -651,23 +691,47 @@ pub(crate) struct TreeKillReport {
 /// The outcome of the whole freeze-first execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TreeKillOutcome {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Completed(TreeKillReport),
     RootAlreadyExited,
-    PermissionDenied { pid: u32 },
-    TargetChanged { pid: u32 },
-    Truncated { limit: usize },
-    SweepPassLimit { limit: usize },
-    UnsafePid { pid: u32, reason: UnsafePidReason },
-    ProtectedDescendant { pid: u32, name: Option<String> },
-    ProtectedRoot { pid: u32, name: Option<String> },
+    PermissionDenied {
+        pid: u32,
+    },
+    TargetChanged {
+        pid: u32,
+    },
+    Truncated {
+        limit: usize,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    SweepPassLimit {
+        limit: usize,
+    },
+    UnsafePid {
+        pid: u32,
+        reason: UnsafePidReason,
+    },
+    ProtectedDescendant {
+        pid: u32,
+        name: Option<String>,
+    },
+    ProtectedRoot {
+        pid: u32,
+        name: Option<String>,
+    },
     FreshConfirmationRequired,
-    OwnershipUnavailable { pid: u32 },
-    PartialMetadata { pid: u32 },
+    OwnershipUnavailable {
+        pid: u32,
+    },
+    PartialMetadata {
+        pid: u32,
+    },
     SnapshotFailed(String),
 }
 
 /// Freeze the tree, verify it, and terminate it — root first to stop, root last
 /// to signal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn execute_tree_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
     mode: KillMode,
@@ -691,6 +755,7 @@ pub(crate) fn execute_tree_kill<Ops: TreeProcessOps>(
 /// root first to stop, last to signal. `pgid` is the group the user confirmed;
 /// the pipeline re-proves after every stop that each member (root included)
 /// still belongs to it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn execute_group_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
     pgid: u32,
@@ -718,6 +783,7 @@ pub(crate) fn execute_group_kill<Ops: TreeProcessOps>(
 /// frozen identity where PID reuse is impossible; refuse (thawing everything) on
 /// any uncertainty; then signal tree members deepest-first/root-last, or group
 /// members with every terminating signal queued before any continue.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn execute_freeze_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
     scope: SweepScope,
@@ -782,6 +848,7 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
     TreeKillOutcome::Completed(signal_tree(&mut frozen, scope, mode, ops))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_root_after_stop<Ops: TreeProcessOps>(
     root: &KillTarget,
     scope: SweepScope,
@@ -808,6 +875,7 @@ fn verify_root_after_stop<Ops: TreeProcessOps>(
 /// Strict root identity: both start markers present and equal, and the confirmed
 /// name (when known) unchanged. Mirrors the single-kill revalidation so a reused
 /// or exec'd PID is refused, not signalled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn root_identity_matches(root: &KillTarget, info: &TreeProcessInfo) -> bool {
     match (root.process_start_time_marker, info.start_time_marker) {
         (Some(confirmed), Some(fresh)) if confirmed == fresh => {}
@@ -830,6 +898,7 @@ fn root_identity_matches(root: &KillTarget, info: &TreeProcessInfo) -> bool {
 /// cannot fork: a pass whose snapshot shows nothing new proves the member set
 /// is stable, so the pass limit only bounds genuine churn between snapshots
 /// (fresh forks in tree scope, `setpgid` joins in group scope).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn freeze_sweep<Ops: TreeProcessOps>(
     frozen: &mut Vec<FrozenNode>,
     scope: SweepScope,
@@ -886,6 +955,7 @@ fn freeze_sweep<Ops: TreeProcessOps>(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unfrozen_children(snapshot: &[TreeProcessInfo], frozen: &[FrozenNode]) -> Vec<FrozenNode> {
     let frozen_depths: HashMap<u32, usize> =
         frozen.iter().map(|node| (node.pid, node.depth)).collect();
@@ -909,6 +979,7 @@ fn unfrozen_children(snapshot: &[TreeProcessInfo], frozen: &[FrozenNode]) -> Vec
 /// Group members are a flat filter on the group ID; depth 1 keeps them grouped
 /// before the confirmed root in display and delivery order. The group-specific
 /// final signal step queues every terminating signal before any `SIGCONT`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unfrozen_group_members(
     snapshot: &[TreeProcessInfo],
     frozen: &[FrozenNode],
@@ -928,6 +999,7 @@ fn unfrozen_group_members(
 /// cannot exec or exit, so its start marker and its scope relation (parent PID
 /// for trees, group ID for groups) must be unchanged. A mismatch means
 /// something impossible-if-safe happened; refuse.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_frozen_identities<Ops: TreeProcessOps>(
     frozen: &mut [FrozenNode],
     scope: SweepScope,
@@ -950,6 +1022,7 @@ fn verify_frozen_identities<Ops: TreeProcessOps>(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_delivery_handles<Ops: TreeProcessOps>(
     frozen: &[FrozenNode],
     ops: &mut Ops,
@@ -968,6 +1041,7 @@ fn prepare_delivery_handles<Ops: TreeProcessOps>(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_tree_policy(
     frozen: &[FrozenNode],
     scope: SweepScope,
@@ -1018,6 +1092,7 @@ fn check_tree_policy(
             is_system(
                 node.pid,
                 node.parent_pid,
+                node.parent_process_name.as_deref(),
                 node.process_name.as_deref(),
                 platform,
             )
@@ -1036,6 +1111,7 @@ fn check_tree_policy(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn signal_tree<Ops: TreeProcessOps>(
     frozen: &mut [FrozenNode],
     scope: SweepScope,
@@ -1084,6 +1160,7 @@ fn signal_tree<Ops: TreeProcessOps>(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn signal_group<Ops: TreeProcessOps>(
     frozen: &[FrozenNode],
     mode: KillMode,
@@ -1127,13 +1204,14 @@ fn signal_group<Ops: TreeProcessOps>(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) {
     for node in frozen.iter().rev() {
         ops.cont(node.pid);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1238,6 +1316,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid: parent,
+            parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(marker),
             owner_uid: None,

@@ -440,6 +440,7 @@ mod tests {
             crate::tree::TreeProcessInfo {
                 pid: 18422,
                 parent_pid: Some(1),
+                parent_process_name: None,
                 process_name: Some("node".to_owned()),
                 start_time_marker: Some(55),
                 owner_uid: None,
@@ -448,6 +449,7 @@ mod tests {
             crate::tree::TreeProcessInfo {
                 pid: 18430,
                 parent_pid: Some(18422),
+                parent_process_name: None,
                 process_name: Some("worker".to_owned()),
                 start_time_marker: Some(56),
                 owner_uid: None,
@@ -486,6 +488,7 @@ mod tests {
         let mut infos = vec![crate::tree::TreeProcessInfo {
             pid: 18422,
             parent_pid: Some(500),
+            parent_process_name: None,
             process_name: Some("node".to_owned()),
             start_time_marker: Some(55),
             owner_uid: None,
@@ -495,6 +498,7 @@ mod tests {
             infos.push(crate::tree::TreeProcessInfo {
                 pid,
                 parent_pid: Some(18422),
+                parent_process_name: None,
                 process_name: Some("worker".to_owned()),
                 start_time_marker: Some(u64::from(pid)),
                 owner_uid: None,

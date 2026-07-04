@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-04
+
+### Added
+
+- Windows `kickoutchi inspect --pid <PID>` / `--port <PORT>`: the read-only
+  family view is now available on Windows. It shows ancestors, descendants,
+  siblings, ports, command lines, and the matching `kick kill --pid <root> --tree`
+  hint without signalling anything. Windows reports parent links only
+  after creation-time sanity checks, omits the POSIX process-group section, and
+  states the native WSL2 limitation plainly.
+- Windows CLI `kickoutchi kill --port <PORT> --tree` (and `--pid`, `--force`):
+  terminates the descendant tree through Job Object containment. Normal
+  `kick kill` remains single-PID precise, `--group` stays Unix-only, and the
+  Windows TUI still does not bind or advertise `t`/`T` tree keys.
+  - The Windows path preflights side-effect-free before assigning the root to a
+    Job Object, treats that root assignment as the irreversible commit boundary,
+    converges descendants under containment, then uses explicit
+    `TerminateJobObject` for contained members. The root handle is verified
+    against the user-confirmed creation marker before the Job Object commit, so
+    a recycled PID cannot retarget the kill between confirmation and execution.
+  - Windows tree termination is hard termination only. Members that cannot join
+    the job after commit fall back to verified individual `TerminateProcess`
+    handles when possible, and partial containment/not-terminated results are
+    reported honestly instead of being collapsed into success. Post-commit
+    convergence failures now keep their specific reason in the report, including
+    protected descendants, unsafe PIDs, cap overflows, incomplete metadata, and
+    snapshot failures.
+
 ## [1.0.1] - 2026-07-04
 
 ### Fixed
@@ -613,7 +641,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...v1.0.0
 [0.1.2]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...v0.1.2

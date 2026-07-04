@@ -474,6 +474,7 @@ mod tests {
             crate::tree::TreeProcessInfo {
                 pid: 18_422,
                 parent_pid: Some(1),
+                parent_process_name: None,
                 process_name: Some("node".to_owned()),
                 start_time_marker: Some(55),
                 owner_uid: None,
@@ -482,6 +483,7 @@ mod tests {
             crate::tree::TreeProcessInfo {
                 pid: 18_430,
                 parent_pid: Some(18_422),
+                parent_process_name: None,
                 process_name: Some("worker".to_owned()),
                 start_time_marker: Some(56),
                 owner_uid: None,

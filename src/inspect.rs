@@ -4,9 +4,9 @@
 //! case where downward is not enough: a supervisor, agent, or runner keeps
 //! respawning the port owner, and the *right* root to kill is somewhere above
 //! it. Instead of guessing (or ever killing upward automatically), inspect
-//! shows the whole neighborhood — ancestors, descendants, siblings, and the
-//! process group — so the user can pick the real root and point tree kill at
-//! it deliberately.
+//! shows the whole neighborhood — ancestors, descendants, siblings, and, on
+//! POSIX platforms, the process group — so the user can pick the real root and
+//! point tree kill at it deliberately.
 //!
 //! Strictly read-only by design: this module renders a report string and
 //! nothing else. No signals, no handles, no confirmation flow. The only kill
@@ -116,6 +116,14 @@ where
             "To terminate the whole group instead: kick kill --pid {target_pid} --group",
         );
     }
+    if platform == Platform::Windows {
+        out.push_str(
+            "Windows note: parent links require creation-time sanity checks, so a dangling or recycled parent PID may be omitted.\n",
+        );
+        out.push_str(
+            "WSL2 note: native Windows cannot see individual Linux processes inside WSL2; run the Linux build inside WSL2 for those trees.\n",
+        );
+    }
     out.push_str("(different root? rerun inspect on an ancestor PID first)\n");
     Ok(out)
 }
@@ -144,11 +152,13 @@ fn render_target<CommandLine>(
         }
         None => out.push_str("  Ports: none visible\n"),
     }
-    match target.process_group {
-        Some(group) => {
-            let _ = writeln!(out, "  Process group: {group}");
+    if platform != Platform::Windows {
+        match target.process_group {
+            Some(group) => {
+                let _ = writeln!(out, "  Process group: {group}");
+            }
+            None => out.push_str("  Process group: unknown\n"),
         }
-        None => out.push_str("  Process group: unknown\n"),
     }
 }
 
@@ -285,6 +295,9 @@ fn render_group(
     protected_names: &[String],
     platform: Platform,
 ) -> usize {
+    if platform == Platform::Windows {
+        return 0;
+    }
     let Some(group) = target.process_group else {
         return 0;
     };
@@ -404,6 +417,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid: parent,
+            parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(u64::from(pid)),
             owner_uid: None,
@@ -515,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn windows_report_omits_posix_group_sections_and_notes_wsl2_limit() {
+        let report = render_family_report(
+            400,
+            &family_snapshot(),
+            &[port_entry(400, 3000)],
+            &[],
+            Platform::Windows,
+            |_| None,
+        )
+        .expect("target is present");
+
+        assert!(!report.contains("Process group"), "{report}");
+        assert!(!report.contains("--group"), "{report}");
+        assert!(report.contains("Windows note"), "{report}");
+        assert!(report.contains("WSL2 note"), "{report}");
+        assert!(report.contains("kick kill --pid 400 --tree"), "{report}");
+    }
+
+    #[test]
     fn report_lists_siblings_without_the_target() {
         // Inspect the runner: its sibling under the shell is vite.
         let report = render(300);
@@ -547,6 +580,7 @@ mod tests {
         snapshot.push(TreeProcessInfo {
             pid: 501,
             parent_pid: Some(400),
+            parent_process_name: None,
             process_name: Some("evil\x1b[2Jname".to_owned()),
             start_time_marker: Some(501),
             owner_uid: None,

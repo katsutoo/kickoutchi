@@ -34,6 +34,7 @@ use crate::model::{
     ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
     Protocol, RelatedProcessHint, SocketState,
 };
+use crate::tree::TreeProcessInfo;
 
 const MAX_IPHELPER_TABLE_BYTES: u32 = 16 * 1024 * 1024;
 const TABLE_READ_ATTEMPTS: usize = 3;
@@ -189,7 +190,64 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
     }
 }
 
-fn process_start_time_marker(pid: u32) -> Option<u64> {
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    ProcessSnapshot::collect()
+        .metadata(pid)
+        .and_then(|metadata| metadata.command_line.clone())
+}
+
+pub(crate) fn collect_tree_process_infos() -> Vec<TreeProcessInfo> {
+    tree_process_infos_from_snapshot(&ProcessSnapshot::collect())
+}
+
+fn tree_process_infos_from_snapshot(processes: &ProcessSnapshot) -> Vec<TreeProcessInfo> {
+    let markers = processes
+        .processes
+        .keys()
+        .map(|pid| (*pid, process_start_time_marker(*pid)))
+        .collect::<HashMap<_, _>>();
+    let names = processes
+        .processes
+        .iter()
+        .filter_map(|(pid, metadata)| Some((*pid, metadata.process_name.clone()?)))
+        .collect::<HashMap<_, _>>();
+
+    let mut rows = processes
+        .processes
+        .iter()
+        .map(|(pid, metadata)| {
+            let parent_pid = accepted_parent_pid(*pid, metadata.parent_pid, &markers);
+            TreeProcessInfo {
+                pid: *pid,
+                parent_pid,
+                parent_process_name: parent_pid
+                    .and_then(|parent_pid| names.get(&parent_pid).cloned()),
+                process_name: metadata.process_name.clone(),
+                start_time_marker: markers.get(pid).copied().flatten(),
+                owner_uid: None,
+                process_group: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|info| info.pid);
+    rows
+}
+
+fn accepted_parent_pid(
+    child_pid: u32,
+    parent_pid: Option<u32>,
+    markers: &HashMap<u32, Option<u64>>,
+) -> Option<u32> {
+    let parent_pid = parent_pid?;
+    if parent_pid == child_pid {
+        return None;
+    }
+    let child_start = markers.get(&child_pid).copied().flatten()?;
+    let parent_start = markers.get(&parent_pid).copied().flatten()?;
+    (child_start > parent_start).then_some(parent_pid)
+}
+
+pub(crate) fn process_start_time_marker(pid: u32) -> Option<u64> {
     let handle = unsafe {
         // SAFETY: OpenProcess takes only value arguments here. The returned handle
         // is checked before being wrapped for owned close-on-drop handling.
@@ -207,7 +265,7 @@ fn process_start_time_marker(pid: u32) -> Option<u64> {
     process_start_time_marker_from_handle(&process_handle)
 }
 
-fn process_start_time_marker_from_handle(handle: &OwnedHandle) -> Option<u64> {
+pub(crate) fn process_start_time_marker_from_handle(handle: &OwnedHandle) -> Option<u64> {
     let mut creation_time = FILETIME::default();
     let mut exit_time = FILETIME::default();
     let mut kernel_time = FILETIME::default();
@@ -582,7 +640,7 @@ fn windows_api_error(operation: &'static str, code: u32) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord,
+        MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord, accepted_parent_pid,
         command_line_from_os_strings, decode_port, encode_port_for_tests, entry_from_record,
         filetime_to_u64, tcp4_record, tcp6_record, udp4_record, udp6_record,
     };
@@ -810,6 +868,18 @@ mod tests {
         });
 
         assert_eq!(marker, 0x0123_4567_89AB_CDEF);
+    }
+
+    #[test]
+    fn parent_edges_require_child_to_start_after_parent() {
+        let markers = HashMap::from([(10, Some(100)), (20, Some(200)), (30, Some(50)), (40, None)]);
+
+        assert_eq!(accepted_parent_pid(20, Some(10), &markers), Some(10));
+        assert_eq!(accepted_parent_pid(10, Some(20), &markers), None);
+        assert_eq!(accepted_parent_pid(30, Some(10), &markers), None);
+        assert_eq!(accepted_parent_pid(20, Some(99), &markers), None);
+        assert_eq!(accepted_parent_pid(40, Some(10), &markers), None);
+        assert_eq!(accepted_parent_pid(20, Some(20), &markers), None);
     }
 
     #[test]

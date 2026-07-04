@@ -1222,12 +1222,20 @@ mod windows {
     use std::fs;
     use std::io::Write;
     use std::net::TcpListener;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
+    };
+
     const HELPER_LISTENER_ENV: &str = "KICKOUTCHI_TEST_HELPER_LISTENER";
+    const HELPER_TREE_ENV: &str = "KICKOUTCHI_TEST_HELPER_TREE";
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
     const CHILD_EXIT_WAIT: Duration = Duration::from_secs(5);
@@ -1249,6 +1257,16 @@ mod windows {
         fn drop(&mut self) {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+
+    struct PidGuard {
+        pid: u32,
+    }
+
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            terminate_pid(self.pid);
         }
     }
 
@@ -1317,6 +1335,33 @@ mod windows {
         (guard, port, ready_file)
     }
 
+    fn spawn_tree_process(mode: &str) -> (ChildGuard, u16, u32, PathBuf) {
+        let ready_file = temp_file_path("tree-ready");
+        let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+            .env(HELPER_TREE_ENV, mode)
+            .env(HELPER_READY_ENV, &ready_file)
+            .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("tree helper process must start");
+        let guard = ChildGuard { child };
+        wait_for_file(&ready_file);
+        let ready = fs::read_to_string(&ready_file).expect("tree ready file must be readable");
+        let mut parts = ready.split_whitespace();
+        let port = parts
+            .next()
+            .expect("ready file must contain port")
+            .parse::<u16>()
+            .expect("tree helper port must be a u16");
+        let child_pid = parts
+            .next()
+            .expect("ready file must contain child pid")
+            .parse::<u32>()
+            .expect("tree helper child pid must be a u32");
+        (guard, port, child_pid, ready_file)
+    }
+
     fn temp_file_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "kickoutchi-cli-contract-windows-{label}-{}-{}",
@@ -1378,6 +1423,62 @@ mod windows {
         }
     }
 
+    fn wait_for_pid_gone(pid: u32) {
+        let deadline = Instant::now() + CHILD_EXIT_WAIT;
+        loop {
+            if !pid_exists(pid) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "PID {pid} did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn pid_exists(pid: u32) -> bool {
+        let handle = unsafe {
+            // SAFETY: OpenProcess takes only value arguments here. The handle is
+            // checked before being wrapped for owned close-on-drop.
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return false;
+        }
+        let handle = unsafe {
+            // SAFETY: OpenProcess returned a non-null owned handle. OwnedHandle
+            // closes it once when this probe returns.
+            OwnedHandle::from_raw_handle(handle)
+        };
+        let wait = unsafe {
+            // SAFETY: handle is live and was opened with synchronize access.
+            WaitForSingleObject(handle.as_raw_handle(), 0)
+        };
+        matches!(wait, WAIT_TIMEOUT) || !matches!(wait, WAIT_OBJECT_0)
+    }
+
+    fn terminate_pid(pid: u32) {
+        let handle = unsafe {
+            // SAFETY: OpenProcess takes only value arguments here. Cleanup is
+            // best-effort and wraps any non-null handle for close-on-drop.
+            OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)
+        };
+        if handle.is_null() {
+            return;
+        }
+        let handle = unsafe {
+            // SAFETY: OpenProcess returned a non-null owned handle.
+            OwnedHandle::from_raw_handle(handle)
+        };
+        unsafe {
+            // SAFETY: handle is live and opened with terminate access.
+            TerminateProcess(handle.as_raw_handle(), 1);
+            WaitForSingleObject(handle.as_raw_handle(), 1_000);
+        }
+    }
+
     fn stdout(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
@@ -1410,6 +1511,67 @@ mod windows {
         fs::rename(&ready_tmp, &ready_file).expect("helper ready file must be published");
 
         park_bounded()
+    }
+
+    #[test]
+    fn helper_process_tree() {
+        let Some(mode) = std::env::var_os(HELPER_TREE_ENV) else {
+            return;
+        };
+        let mode = mode.to_string_lossy();
+        let ready_file = PathBuf::from(
+            std::env::var_os(HELPER_READY_ENV).expect("helper ready path must be set"),
+        );
+
+        match mode.as_ref() {
+            "park-child" => park_bounded(),
+            "root-owns-port" => {
+                let listener = TcpListener::bind(("127.0.0.1", 0))
+                    .expect("root tree helper listener must bind");
+                let port = listener.local_addr().expect("listener addr").port();
+                let child =
+                    Command::new(std::env::current_exe().expect("test binary path must resolve"))
+                        .env(HELPER_TREE_ENV, "park-child")
+                        .env(HELPER_READY_ENV, &ready_file)
+                        .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("tree child must spawn");
+                let ready_tmp = ready_file.with_extension("tmp");
+                fs::write(&ready_tmp, format!("{port} {}", child.id()))
+                    .expect("tree ready file must be written");
+                fs::rename(&ready_tmp, &ready_file).expect("tree ready file must publish");
+                let _child_guard = ChildGuard { child };
+                park_bounded()
+            }
+            "child-owns-port" => {
+                let child_ready = ready_file.with_extension("child");
+                let child =
+                    Command::new(std::env::current_exe().expect("test binary path must resolve"))
+                        .env(HELPER_LISTENER_ENV, "1")
+                        .env(HELPER_PORT_ENV, "0")
+                        .env(HELPER_READY_ENV, &child_ready)
+                        .args([
+                            "--exact",
+                            "windows::helper_tcp_listener_process",
+                            "--nocapture",
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("tree listener child must spawn");
+                wait_for_file(&child_ready);
+                let port = fs::read_to_string(&child_ready).expect("child port must be readable");
+                let ready_tmp = ready_file.with_extension("tmp");
+                fs::write(&ready_tmp, format!("{} {}", port.trim(), child.id()))
+                    .expect("tree ready file must be written");
+                fs::rename(&ready_tmp, &ready_file).expect("tree ready file must publish");
+                let _child_guard = ChildGuard { child };
+                park_bounded()
+            }
+            other => panic!("unknown tree helper mode {other}"),
+        }
     }
 
     #[test]
@@ -1449,6 +1611,108 @@ mod windows {
         assert!(stdout(&after).contains("no open ports match the filter"));
         assert!(!stderr(&after).contains("Possible related process"));
 
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn windows_inspect_shows_family_read_only_with_kill_hint() {
+        let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
+        let _child_cleanup = PidGuard { pid: child_pid };
+        let root_pid_text = helper.id().to_string();
+        let port_text = port.to_string();
+
+        let by_pid = kickoutchi(&["inspect", "--pid", root_pid_text.as_str()]);
+        assert_eq!(by_pid.status.code(), Some(0), "{}", stderr(&by_pid));
+        let out = stdout(&by_pid);
+        assert!(
+            out.contains(&format!("Target: PID {root_pid_text}")),
+            "{out}"
+        );
+        assert!(out.contains(&format!("PID {child_pid}")), "{out}");
+        assert!(out.contains(&format!("TCP 127.0.0.1:{port}")), "{out}");
+        assert!(out.contains("Windows note"), "{out}");
+        assert!(out.contains("WSL2 note"), "{out}");
+        assert!(!out.contains("Process group"), "{out}");
+        assert!(
+            out.contains(&format!("kick kill --pid {root_pid_text} --tree")),
+            "{out}",
+        );
+
+        let by_port = kickoutchi(&["inspect", "--port", port_text.as_str()]);
+        assert_eq!(by_port.status.code(), Some(0), "{}", stderr(&by_port));
+        assert!(
+            stdout(&by_port).contains(&format!("Target: PID {child_pid}")),
+            "{}",
+            stdout(&by_port),
+        );
+        assert!(pid_exists(child_pid), "inspect must not signal anything");
+
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn windows_tree_kill_by_port_removes_root_and_child() {
+        let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
+        let _child_cleanup = PidGuard { pid: child_pid };
+        let port_text = port.to_string();
+        let root_pid_text = helper.id().to_string();
+
+        let before = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(before.status.code(), Some(0));
+        assert!(stdout(&before).contains(root_pid_text.as_str()));
+
+        let killed = kickoutchi_with_stdin(
+            &["kill", "--port", port_text.as_str(), "--tree"],
+            Some("tree\n"),
+        );
+
+        assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
+        let killed_stderr = stderr(&killed);
+        assert!(killed_stderr.contains("Scope: tree"), "{killed_stderr}");
+        assert!(killed_stderr.contains("2 processes"), "{killed_stderr}");
+        assert!(
+            killed_stderr.contains("Windows Job Object"),
+            "{killed_stderr}",
+        );
+        assert!(
+            killed_stderr.contains("newly spawned job-contained children"),
+            "{killed_stderr}",
+        );
+        wait_for_child_exit(&mut helper);
+        wait_for_pid_gone(child_pid);
+
+        let after = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(after.status.code(), Some(3));
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn windows_tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
+        let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
+        let _child_cleanup = PidGuard { pid: child_pid };
+        let port_text = port.to_string();
+        let root_pid_text = helper.id().to_string();
+        let child_pid_text = child_pid.to_string();
+
+        let before = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(before.status.code(), Some(0));
+        assert!(stdout(&before).contains(child_pid_text.as_str()));
+        assert!(!stdout(&before).contains(root_pid_text.as_str()));
+
+        let killed = kickoutchi_with_stdin(
+            &["kill", "--pid", root_pid_text.as_str(), "--tree"],
+            Some("tree\n"),
+        );
+
+        assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
+        let killed_stderr = stderr(&killed);
+        assert!(killed_stderr.contains("Scope: tree"), "{killed_stderr}");
+        assert!(killed_stderr.contains("2 processes"), "{killed_stderr}");
+        wait_for_child_exit(&mut helper);
+        wait_for_pid_gone(child_pid);
+
+        let after = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(after.status.code(), Some(3));
         let _ = fs::remove_file(ready_file);
     }
 }

@@ -17,9 +17,9 @@ use crate::command;
 use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
 use crate::diagnostic;
 use crate::display::sanitize;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::inspect;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::model::{PermissionStatus, Platform, SystemProcessCheck};
 use crate::model::{PortEntry, ProcessContext, SortMode};
 use crate::output;
@@ -30,7 +30,7 @@ use crate::process::{
 };
 use crate::protection::mark_protected;
 use crate::query::{self, QueryOptions};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::tree;
 
 /// Stable exit codes — the script-facing contract.
@@ -99,14 +99,14 @@ pub(crate) enum Command {
     Kill(KillArgs),
     /// Show a process's family — ancestors, descendants, siblings, process
     /// group, and ports — read-only, to pick the right root for a tree kill.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Inspect(InspectArgs),
 }
 
 /// `inspect` takes exactly one starting point, like `kill`: a PID (which may
 /// own no port — supervisors usually don't) or a port whose owner to start
 /// from. Strictly read-only; it never signals anything.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
 pub(crate) struct InspectArgs {
@@ -174,8 +174,8 @@ pub(crate) struct KillArgs {
 
     /// Terminate the whole process tree rooted at the target, not just the one
     /// process. Opt-in; typed confirmation unless --yes passes all-clear gates.
-    /// Linux and macOS only.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Linux, macOS, and Windows CLI only.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[arg(long)]
     pub(crate) tree: bool,
 
@@ -206,7 +206,7 @@ pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
     match command {
         Command::List(args) => run_list(args, config, &entries),
         Command::Kill(args) => run_kill(args, config, &entries),
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Inspect(args) => run_inspect(args, config, &entries),
     }
 }
@@ -294,7 +294,7 @@ fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
 }
 
 fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     if args.tree {
         return run_tree_kill(args, config, entries);
     }
@@ -323,7 +323,7 @@ fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
 ///
 /// No signals, no confirmation: the strongest thing this command does is
 /// suggest a `kick kill --pid <root> --tree` for the user to run themselves.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
     let target_pid = match resolve_inspect_target(args, entries) {
         Ok(pid) => pid,
@@ -341,7 +341,12 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
     let mut ops = crate::platform::linux::LinuxTreeOps::new();
     #[cfg(target_os = "macos")]
     let mut ops = crate::platform::macos::MacosTreeOps::new();
-    let snapshot = match tree::TreeProcessOps::snapshot(&mut ops) {
+    #[cfg(windows)]
+    let snapshot = crate::platform::windows::collect_tree_process_infos();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let snapshot_result = tree::TreeProcessOps::snapshot(&mut ops);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let snapshot = match snapshot_result {
         Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!(
@@ -373,7 +378,7 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
 
 /// Pick the PID to inspect. Unlike kill resolution there is no unsafe-PID
 /// guard: reading PID 1's family is legitimate, and nothing here signals.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn resolve_inspect_target(
     args: &InspectArgs,
     entries: &[PortEntry],
@@ -901,11 +906,11 @@ fn exit_reason_for_outcome(outcome: &TerminationOutcome) -> ExitReason {
 }
 
 /// Longest child preview printed in the tree confirmation banner.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const TREE_PREVIEW_MAX: usize = 12;
 
 /// What the user must do to authorize a tree kill.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeConfirmation {
     /// Type a literal word (`tree` for terminate, `force` for force).
@@ -916,7 +921,7 @@ enum TreeConfirmation {
 }
 
 /// The confirmation gate for a tree kill, decided before the prompt is shown.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeConfirmDecision {
     /// `--yes` on an all-clear tree: proceed without a prompt.
@@ -933,7 +938,7 @@ enum TreeConfirmDecision {
 /// execution-time gates. `skipped_prompt` is deliberately separate from
 /// `args.yes`: `--yes` can still fall back to a typed prompt when the preview has
 /// warnings, and that explicit word should not be treated as a silent skip.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Clone, Copy)]
 struct ScopedConfirmationFacts {
     protected_confirmed: bool,
@@ -982,6 +987,16 @@ fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> Exi
             collect_ports: collector::collect_ports,
         },
     )
+}
+
+#[cfg(windows)]
+fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+    let mode = if args.force {
+        KillMode::Force
+    } else {
+        KillMode::Terminate
+    };
+    run_windows_tree_kill(args, config, entries, mode)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1077,11 +1092,144 @@ where
     map_tree_outcome(&fresh_root, mode, &outcome, &mut seams.collect_ports)
 }
 
+#[cfg(windows)]
+fn run_windows_tree_kill(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntry],
+    mode: KillMode,
+) -> ExitReason {
+    let snapshot = crate::platform::windows::collect_tree_process_infos();
+    let mut collect_context = platform::collect_process_context;
+    let root =
+        match resolve_scoped_kill_root(args, config, entries, &snapshot, &mut collect_context) {
+            Ok(target) => target,
+            Err(reason) => return reason,
+        };
+    let preview = match tree::plan_process_tree(
+        root.pid,
+        &snapshot,
+        &config.protected_processes,
+        root.platform,
+        tree::MAX_TREE_PROCESSES,
+    ) {
+        Ok(preview) => preview,
+        Err(tree::TreePlanError::RootMissing) => {
+            eprintln!(
+                "error: root PID {} is no longer running; nothing to terminate",
+                root.pid
+            );
+            return ExitReason::NoMatch;
+        }
+    };
+
+    if let Some(reason) = scoped_preflight_refusal(&preview, "tree") {
+        return reason;
+    }
+
+    let mut prompt = prompt_tree_confirmation;
+    let confirmation = match confirm_tree_kill(&root, &preview, mode, args.yes, &mut prompt) {
+        Ok(confirmation) => confirmation,
+        Err(reason) => return reason,
+    };
+
+    let mut collect_ports = collector::collect_ports;
+    let fresh_root = match revalidate_windows_tree_root_before_commit(
+        args,
+        config,
+        &root,
+        confirmation,
+        &mut collect_context,
+        &mut collect_ports,
+    ) {
+        Ok(root) => root,
+        Err(outcome) => {
+            return map_windows_tree_outcome(&root, mode, &outcome, &mut collect_ports);
+        }
+    };
+
+    let outcome = crate::windows_tree::execute_tree_kill(
+        &fresh_root,
+        &config.protected_processes,
+        confirmation.protected_confirmed,
+        confirmation.skipped_prompt,
+    );
+    map_windows_tree_outcome(&fresh_root, mode, &outcome, &mut collect_ports)
+}
+
+#[cfg(windows)]
+fn revalidate_windows_tree_root_before_commit<CollectContext, CollectPorts>(
+    args: &KillArgs,
+    config: &Config,
+    confirmed: &KillTarget,
+    confirmation: ScopedConfirmationFacts,
+    collect_context: &mut CollectContext,
+    collect_ports: &mut CollectPorts,
+) -> Result<KillTarget, crate::windows_tree::WindowsTreeKillOutcome>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    let fresh_root = if confirmed.ports.is_empty() {
+        let snapshot = crate::platform::windows::collect_tree_process_infos();
+        let root = revalidate_portless_tree_root(confirmed, &snapshot, &config.protected_processes)
+            .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+        windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
+        root
+    } else {
+        let root = revalidate_cli_target(args, config, confirmed, collect_context, collect_ports)
+            .map_err(|outcome| {
+            let outcome = tree_outcome_from_termination(confirmed, outcome);
+            crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(outcome)
+        })?;
+        let snapshot = crate::platform::windows::collect_tree_process_infos();
+        windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
+        root
+    };
+    Ok(fresh_root)
+}
+
+#[cfg(windows)]
+fn windows_fresh_tree_gates(
+    root: &KillTarget,
+    snapshot: &[tree::TreeProcessInfo],
+    config: &Config,
+    confirmation: ScopedConfirmationFacts,
+) -> Result<(), crate::windows_tree::WindowsTreeKillOutcome> {
+    let preview = tree::plan_process_tree(
+        root.pid,
+        snapshot,
+        &config.protected_processes,
+        root.platform,
+        tree::MAX_TREE_PROCESSES,
+    )
+    .map_err(|tree::TreePlanError::RootMissing| {
+        crate::windows_tree::WindowsTreeKillOutcome::RootAlreadyExited
+    })?;
+    tree::preflight_outcome(&preview)
+        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+    tree::root_protection_outcome(&preview, confirmation.protected_confirmed)
+        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+    fresh_tree_yes_outcome(root, &preview, confirmation)
+        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+    if let Some(pid) = preview
+        .preview_nodes(preview.len())
+        .iter()
+        .find_map(|node| {
+            let info = snapshot.iter().find(|info| info.pid == node.pid)?;
+            (info.process_name.is_none() || info.start_time_marker.is_none()).then_some(info.pid)
+        })
+    {
+        return Err(crate::windows_tree::WindowsTreeKillOutcome::PartialMetadata { pid });
+    }
+    Ok(())
+}
+
 /// Run the confirmation flow. On success, the returned bool records whether
 /// the protected-root confirmation was actually completed — the execution-time
 /// protection guard needs that fact, because a root can be classified as
 /// protected by a fresh scan even when the confirmed port row could not be.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn confirm_tree_kill<Prompt>(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
@@ -1127,7 +1275,7 @@ where
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn prompt_tree_step<Prompt>(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
@@ -1158,7 +1306,7 @@ where
 /// a `--pid` target that owns no visible port falls back to the process-table
 /// snapshot, because scoped kills legitimately start from portless
 /// supervisors. Refusals are printed here and returned as the exit reason.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn resolve_scoped_kill_root<CollectContext>(
     args: &KillArgs,
     config: &Config,
@@ -1192,7 +1340,7 @@ where
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn resolve_pid_tree_root_from_snapshot(
     pid: u32,
     snapshot: &[tree::TreeProcessInfo],
@@ -1214,8 +1362,10 @@ fn resolve_pid_tree_root_from_snapshot(
 const TREE_HOST_PLATFORM: Platform = Platform::Linux;
 #[cfg(target_os = "macos")]
 const TREE_HOST_PLATFORM: Platform = Platform::Macos;
+#[cfg(windows)]
+const TREE_HOST_PLATFORM: Platform = Platform::Windows;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn kill_target_from_tree_info(
     info: &tree::TreeProcessInfo,
     protected_names: &[String],
@@ -1228,7 +1378,7 @@ fn kill_target_from_tree_info(
         pid: Some(info.pid),
         parent_pid: info.parent_pid,
         process_name: info.process_name.as_deref(),
-        parent_process_name: None,
+        parent_process_name: info.parent_process_name.as_deref(),
     }
     .is_system_process();
     // Honest metadata status: identity fields decide partial-vs-full, and the
@@ -1314,7 +1464,7 @@ where
     Ok(fresh_root)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn fresh_tree_yes_outcome(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
@@ -1328,7 +1478,7 @@ fn fresh_tree_yes_outcome(
 
 /// Translate a single-kill revalidation refusal into the scoped-kill outcome
 /// vocabulary, so tree and group revalidation report identically.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn tree_outcome_from_termination(
     confirmed: &KillTarget,
     outcome: TerminationOutcome,
@@ -1358,7 +1508,7 @@ fn tree_outcome_from_termination(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn revalidate_portless_tree_root(
     confirmed: &KillTarget,
     snapshot: &[tree::TreeProcessInfo],
@@ -1393,7 +1543,7 @@ fn revalidate_portless_tree_root(
 /// Refuse a tree or group that fails a pre-flight rule, before any signal is
 /// sent. `scope_noun` is `"tree"` or `"group"` and only changes the wording;
 /// the gates and exit codes are identical for both scopes.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn scoped_preflight_refusal(
     preview: &tree::ProcessTreeTarget,
     scope_noun: &str,
@@ -1423,7 +1573,7 @@ fn scoped_preflight_refusal(
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn tree_confirmation(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
@@ -1449,12 +1599,12 @@ fn tree_confirmation(
     TreeConfirmDecision::PromptWord(word)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn tree_yes_skip_allowed(root: &KillTarget, preview: &tree::ProcessTreeTarget) -> bool {
     !preview.has_warnings() && !root_has_tree_yes_blocking_warning(root)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn root_has_tree_yes_blocking_warning(root: &KillTarget) -> bool {
     // The child-count notice is informational under tree scope (the tree
     // preview supersedes it); every other warning kind blocks a `--yes` skip.
@@ -1463,7 +1613,7 @@ fn root_has_tree_yes_blocking_warning(root: &KillTarget) -> bool {
         .any(|warning| !matches!(warning, process::KillWarning::HasChildren { .. }))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn print_tree_kill_banner(root: &KillTarget, preview: &tree::ProcessTreeTarget, mode: KillMode) {
     eprintln!(
         "{} process tree from {}",
@@ -1488,6 +1638,14 @@ fn print_tree_kill_banner(root: &KillTarget, preview: &tree::ProcessTreeTarget, 
     if let Some(warning) = mode.force_warning(root.platform) {
         eprintln!("Warning: {}", sanitize(warning));
     }
+    if root.platform == Platform::Windows {
+        eprintln!(
+            "Warning: Windows tree kill uses Job Object containment and hard termination; close apps normally first when possible."
+        );
+        eprintln!(
+            "Warning: Windows may also terminate newly spawned job-contained children that were not visible in this preview."
+        );
+    }
     if preview.has_system_process() {
         eprintln!(
             "Warning: tree includes system/service processes; verify this is safe to terminate."
@@ -1504,7 +1662,7 @@ fn print_tree_kill_banner(root: &KillTarget, preview: &tree::ProcessTreeTarget, 
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn prompt_tree_confirmation(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
@@ -1527,7 +1685,7 @@ fn prompt_tree_confirmation(
     Ok(tree_confirmation_matches(&answer, root, requirement))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn tree_confirmation_matches(
     input: &str,
     root: &KillTarget,
@@ -1577,6 +1735,273 @@ where
         &scope_of_target,
         collect_ports,
     )
+}
+
+#[cfg(windows)]
+fn map_windows_tree_outcome<CollectPorts>(
+    root: &KillTarget,
+    _mode: KillMode,
+    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    collect_ports: &mut CollectPorts,
+) -> ExitReason
+where
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    use crate::windows_tree::WindowsTreeKillOutcome;
+
+    match outcome {
+        WindowsTreeKillOutcome::Completed(report) => {
+            map_windows_tree_completed_outcome(root, report, collect_ports)
+        }
+        _ => map_windows_tree_refusal_outcome(root, outcome, collect_ports),
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_tree_completed_outcome<CollectPorts>(
+    root: &KillTarget,
+    report: &crate::windows_tree::WindowsTreeKillReport,
+    collect_ports: &mut CollectPorts,
+) -> ExitReason
+where
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    if !report.containment_partial && report.not_terminated.is_empty() {
+        eprintln!(
+            "terminated {} process(es) in the Windows Job Object for the tree rooted at {}",
+            report.job_terminated,
+            root.identity(),
+        );
+        print_post_kill_refresh_status(root, collect_ports);
+        return ExitReason::Success;
+    }
+
+    let fallback = if report.fallback_terminated == 0 {
+        String::new()
+    } else {
+        format!(
+            "; fallback-terminated {} verified process(es) individually",
+            report.fallback_terminated
+        )
+    };
+    let missing = if report.not_terminated.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; PID(s) not confirmed terminated: {}",
+            tree::format_pid_list(&report.not_terminated)
+        )
+    };
+    let post_commit_issue = report
+        .post_commit_issue
+        .as_ref()
+        .map_or_else(String::new, |issue| {
+            format!(
+                "; post-commit issue: {}",
+                windows_post_commit_issue_text(issue)
+            )
+        });
+    eprintln!(
+        "warning: Windows tree containment was partial for {}; job-terminated {} of {} observed process(es){}{missing}{post_commit_issue}",
+        root.identity(),
+        report.job_terminated,
+        report.total,
+        fallback,
+    );
+    if let Some(issue) = &report.post_commit_issue {
+        return windows_post_commit_issue_exit_reason(issue);
+    }
+    if report.not_terminated.is_empty() {
+        ExitReason::Failure
+    } else {
+        ExitReason::PermissionDenied
+    }
+}
+
+#[cfg(windows)]
+fn windows_post_commit_issue_text(
+    issue: &crate::windows_tree::WindowsTreePostCommitIssue,
+) -> String {
+    use crate::windows_tree::WindowsTreePostCommitIssue;
+
+    match issue {
+        WindowsTreePostCommitIssue::RootAlreadyExited => {
+            "root exited during the containment sweep".to_owned()
+        }
+        WindowsTreePostCommitIssue::PermissionDenied { pid } => {
+            format!("permission denied for PID {pid} during the containment sweep")
+        }
+        WindowsTreePostCommitIssue::TargetChanged { pid } => {
+            format!("process identity changed at PID {pid} during the containment sweep")
+        }
+        WindowsTreePostCommitIssue::Truncated { limit } => {
+            format!("tree exceeded {limit} processes after containment was committed")
+        }
+        WindowsTreePostCommitIssue::SweepPassLimit { limit } => {
+            format!("tree did not converge after {limit} containment sweeps")
+        }
+        WindowsTreePostCommitIssue::UnsafePid { pid, reason } => {
+            format!(
+                "unsafe PID {pid} appeared after commit: {}",
+                reason.message()
+            )
+        }
+        WindowsTreePostCommitIssue::ProtectedDescendant { pid, name } => format!(
+            "protected descendant PID {pid} ({}) appeared after commit",
+            sanitize(name.as_deref().unwrap_or("<unknown>"))
+        ),
+        WindowsTreePostCommitIssue::PartialMetadata { pid } => {
+            format!("process metadata for PID {pid} became incomplete during the containment sweep")
+        }
+        WindowsTreePostCommitIssue::SnapshotFailed(error) => format!(
+            "enumerating the Windows process tree failed after commit: {}",
+            sanitize(error)
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn windows_post_commit_issue_exit_reason(
+    issue: &crate::windows_tree::WindowsTreePostCommitIssue,
+) -> ExitReason {
+    use crate::windows_tree::WindowsTreePostCommitIssue;
+
+    match issue {
+        WindowsTreePostCommitIssue::ProtectedDescendant { .. } => {
+            ExitReason::ProtectedNeedsConfirmation
+        }
+        WindowsTreePostCommitIssue::PermissionDenied { .. } => ExitReason::PermissionDenied,
+        WindowsTreePostCommitIssue::RootAlreadyExited
+        | WindowsTreePostCommitIssue::TargetChanged { .. }
+        | WindowsTreePostCommitIssue::Truncated { .. }
+        | WindowsTreePostCommitIssue::SweepPassLimit { .. }
+        | WindowsTreePostCommitIssue::UnsafePid { .. }
+        | WindowsTreePostCommitIssue::PartialMetadata { .. }
+        | WindowsTreePostCommitIssue::SnapshotFailed(_) => ExitReason::Failure,
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_tree_refusal_outcome<CollectPorts>(
+    root: &KillTarget,
+    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    collect_ports: &mut CollectPorts,
+) -> ExitReason
+where
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    use crate::windows_tree::WindowsTreeKillOutcome;
+
+    match outcome {
+        WindowsTreeKillOutcome::Completed(_) => unreachable!("completed outcome handled above"),
+        WindowsTreeKillOutcome::RootAlreadyExited => {
+            eprintln!(
+                "{} already exited before containment was committed",
+                root.identity(),
+            );
+            print_post_kill_refresh_status(root, collect_ports);
+            ExitReason::NoMatch
+        }
+        WindowsTreeKillOutcome::PermissionDenied { pid } => {
+            eprintln!(
+                "error: permission denied for PID {pid}; no Windows Job Object containment was committed; {}",
+                process::permission_denied_hint(root.platform),
+            );
+            ExitReason::PermissionDenied
+        }
+        WindowsTreeKillOutcome::TargetChanged { pid } => {
+            eprintln!(
+                "error: process tree identity changed at PID {pid}; no Windows Job Object containment was committed",
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::Truncated { limit } => {
+            eprintln!(
+                "error: the Windows process tree exceeded {limit} processes before containment; refusing to commit a partial tree",
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::SweepPassLimit { limit } => {
+            eprintln!(
+                "error: the Windows process tree did not converge after {limit} containment sweeps",
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::UnsafePid { pid, reason } => {
+            eprintln!(
+                "error: unsafe PID {pid} in tree: {}; no Windows Job Object containment was committed",
+                reason.message(),
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::ProtectedDescendant { pid, name } => {
+            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
+            eprintln!(
+                "error: protected process PID {pid} ({name}) in tree; no Windows Job Object containment was committed",
+            );
+            ExitReason::ProtectedNeedsConfirmation
+        }
+        WindowsTreeKillOutcome::ProtectedRoot { pid, name } => {
+            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
+            eprintln!(
+                "error: root PID {pid} ({name}) is protected and requires PID/name confirmation before Windows containment",
+            );
+            ExitReason::ProtectedNeedsConfirmation
+        }
+        WindowsTreeKillOutcome::FreshConfirmationRequired => {
+            eprintln!(
+                "error: Windows process tree changed after --yes; rerun without --yes to review fresh warnings; no containment was committed",
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::OwnershipUnavailable { pid } => {
+            eprintln!(
+                "error: ownership for PID {pid} became unavailable before Windows containment; no termination was sent",
+            );
+            ExitReason::PermissionDenied
+        }
+        WindowsTreeKillOutcome::PartialMetadata { pid } => {
+            eprintln!(
+                "error: process metadata for PID {pid} was incomplete before Windows containment; no termination was sent",
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::SnapshotFailed(_)
+        | WindowsTreeKillOutcome::CommitFailed { .. }
+        | WindowsTreeKillOutcome::JobTerminateFailed(_) => map_windows_tree_system_failure(outcome),
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_tree_system_failure(
+    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+) -> ExitReason {
+    use crate::windows_tree::WindowsTreeKillOutcome;
+
+    match outcome {
+        WindowsTreeKillOutcome::SnapshotFailed(error) => {
+            eprintln!(
+                "error: enumerating the Windows process tree failed: {}; no termination was sent",
+                sanitize(error),
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::CommitFailed { pid, error } => {
+            eprintln!(
+                "error: assigning root PID {pid} to the Windows Job Object failed before commit: {}; no termination was sent",
+                sanitize(error),
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::JobTerminateFailed(error) => {
+            eprintln!(
+                "error: Windows Job Object containment was committed but TerminateJobObject failed: {}",
+                sanitize(error),
+            );
+            ExitReason::Failure
+        }
+        _ => unreachable!("non-system Windows tree outcome handled above"),
+    }
 }
 
 /// Shared success/partial-success wording for tree and group delivery reports.
@@ -2040,26 +2465,36 @@ fn print_group_kill_banner(root: &KillTarget, group: &tree::ProcessGroupTarget, 
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn scoped_owner_warning(preview: &tree::ProcessTreeTarget, scope_noun: &str) -> Option<String> {
-    let current_uid = process::current_user_id();
-    let mut count = 0_usize;
-    let mut first = None;
-    for node in preview.preview_nodes(preview.len()) {
-        let Some(owner_uid) = node.owner_uid else {
-            continue;
-        };
-        if owner_uid == current_uid {
-            continue;
-        }
-        count += 1;
-        first.get_or_insert((node.pid, owner_uid));
+    #[cfg(windows)]
+    {
+        let _ = preview;
+        let _ = scope_noun;
+        None
     }
 
-    let (pid, owner_uid) = first?;
-    Some(format!(
-        "{scope_noun} includes {count} process(es) owned by another uid; first is PID {pid} owned by uid {owner_uid}, current effective uid is {current_uid}"
-    ))
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let current_uid = process::current_user_id();
+        let mut count = 0_usize;
+        let mut first = None;
+        for node in preview.preview_nodes(preview.len()) {
+            let Some(owner_uid) = node.owner_uid else {
+                continue;
+            };
+            if owner_uid == current_uid {
+                continue;
+            }
+            count += 1;
+            first.get_or_insert((node.pid, owner_uid));
+        }
+
+        let (pid, owner_uid) = first?;
+        Some(format!(
+            "{scope_noun} includes {count} process(es) owned by another uid; first is PID {pid} owned by uid {owner_uid}, current effective uid is {current_uid}"
+        ))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2249,7 +2684,7 @@ mod tests {
             port: None,
             force,
             yes,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             tree: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             group: false,
@@ -2262,7 +2697,7 @@ mod tests {
             port: Some(port),
             force,
             yes,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             tree: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             group: false,
@@ -2334,22 +2769,16 @@ mod tests {
         assert!(Cli::try_parse_from(["kickoutchi", "kill", "--port", "3000", "--force"]).is_ok());
     }
 
-    /// Windows builds have no `tree` field on `KillArgs`, so clap must reject
-    /// the flag as an unknown argument (a usage error, exit 2) — the honest
-    /// per-platform surface instead of a runtime "unsupported" branch.
     #[cfg(windows)]
     #[test]
-    fn tree_flag_is_rejected_at_parse_time_on_windows() {
-        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--tree"]).is_err());
+    fn tree_flag_parses_on_windows() {
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--tree"]).is_ok());
     }
 
-    /// Windows builds have no `Inspect` variant on `Command`, so clap must
-    /// reject the subcommand as unknown (a usage error, exit 2), keeping
-    /// `--help` honest per platform — the same contract as `--tree` above.
     #[cfg(windows)]
     #[test]
-    fn inspect_subcommand_is_rejected_at_parse_time_on_windows() {
-        assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--pid", "18422"]).is_err());
+    fn inspect_subcommand_parses_on_windows() {
+        assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--pid", "18422"]).is_ok());
     }
 
     /// Same per-platform contract for `--group`: no field on Windows builds,
@@ -2358,6 +2787,43 @@ mod tests {
     #[test]
     fn group_flag_is_rejected_at_parse_time_on_windows() {
         assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--group"]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_post_commit_protected_issue_exits_with_protected_code() {
+        let root = KillTarget {
+            pid: 100,
+            process_name: Some("node.exe".to_owned()),
+            platform: Platform::Windows,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: Some(100),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let report = crate::windows_tree::WindowsTreeKillReport {
+            total: 1,
+            job_terminated: 1,
+            fallback_terminated: 0,
+            already_exited: 0,
+            not_terminated: vec![101],
+            containment_partial: true,
+            post_commit_issue: Some(
+                crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
+                    pid: 101,
+                    name: Some("lsass.exe".to_owned()),
+                },
+            ),
+        };
+        let mut collect_ports = || Ok(Vec::new());
+
+        let reason = super::map_windows_tree_completed_outcome(&root, &report, &mut collect_ports);
+
+        assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
     }
 
     /// `--tree` and `--group` are two different blast radii; asking for both
@@ -2376,7 +2842,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn inspect_requires_exactly_one_target() {
         assert!(Cli::try_parse_from(["kickoutchi", "inspect"]).is_err());
@@ -2387,7 +2853,7 @@ mod tests {
         assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--port", "3000"]).is_ok());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn inspect_resolution_mirrors_kill_port_rules_but_allows_any_pid() {
         use super::{InspectArgs, resolve_inspect_target};
@@ -3066,6 +3532,7 @@ mod tests {
         TreeProcessInfo {
             pid,
             parent_pid,
+            parent_process_name: None,
             process_name: Some(name.to_owned()),
             start_time_marker: Some(u64::from(pid)),
             owner_uid: None,
@@ -3399,6 +3866,7 @@ mod tests {
             TreeProcessInfo {
                 pid: 18_423,
                 parent_pid: Some(18_422),
+                parent_process_name: None,
                 process_name: None,
                 start_time_marker: Some(18_423),
                 owner_uid: None,
@@ -3521,6 +3989,7 @@ mod tests {
         let execed_snapshot = vec![TreeProcessInfo {
             pid: 18_422,
             parent_pid: Some(500),
+            parent_process_name: None,
             process_name: Some("postgres".to_owned()),
             start_time_marker: Some(18_422),
             owner_uid: None,
@@ -3573,6 +4042,7 @@ mod tests {
         let snapshot = vec![TreeProcessInfo {
             pid: 18_422,
             parent_pid: Some(500),
+            parent_process_name: None,
             process_name: Some("postgres".to_owned()),
             // Matches the confirmed context marker from `no_context`.
             start_time_marker: Some(55),
