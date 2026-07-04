@@ -1039,7 +1039,7 @@ fn windows_process_is_alive(handle: &TerminationHandle) -> bool {
         Ok(WAIT_TIMEOUT) | Err(_) => true,
         // Any other wait status is unexpected, so fall back to the exit code and
         // treat a real code as "not alive".
-        Ok(_) => matches!(windows_exit_code(handle), Ok(Some(_))),
+        Ok(_) => matches!(windows_exit_code(handle), Ok(None)),
     }
 }
 

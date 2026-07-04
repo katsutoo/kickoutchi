@@ -1271,6 +1271,9 @@ where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
     let fresh_root = if confirmed.ports.is_empty() {
+        ops.set_snapshot_scope(tree::TreeSnapshotScope::Tree {
+            root_pid: confirmed.pid,
+        });
         let snapshot = ops
             .snapshot()
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
@@ -1291,6 +1294,7 @@ where
     } else {
         let root = revalidate_cli_target(args, config, confirmed, collect_context, collect_ports)
             .map_err(|outcome| tree_outcome_from_termination(confirmed, outcome))?;
+        ops.set_snapshot_scope(tree::TreeSnapshotScope::Tree { root_pid: root.pid });
         let snapshot = ops
             .snapshot()
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
@@ -1575,6 +1579,43 @@ where
     )
 }
 
+/// Shared success/partial-success wording for tree and group delivery reports.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn scoped_delivery_summary(
+    delivery: &str,
+    scope_noun: &str,
+    scope_of_target: &str,
+    report: &tree::TreeKillReport,
+) -> String {
+    if report.denied.is_empty() && report.already_exited == 0 {
+        return format!(
+            "sent {delivery} to {} process(es) in {scope_of_target}",
+            report.delivered,
+        );
+    }
+
+    let exited_suffix = if report.already_exited == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {} already exited before final delivery",
+            report.already_exited
+        )
+    };
+    let denied_suffix = if report.denied.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; permission denied for PID(s): {}",
+            tree::format_pid_list(&report.denied)
+        )
+    };
+    format!(
+        "sent {delivery} to {} of {} {scope_noun} process(es){exited_suffix}{denied_suffix}",
+        report.delivered, report.total,
+    )
+}
+
 /// Print the outcome of a scoped (tree or group) kill and map it to the exit
 /// contract. One function for both scopes so a refusal can never exit with
 /// different codes depending on how the same processes were targeted;
@@ -1597,18 +1638,16 @@ where
     match outcome {
         TreeKillOutcome::Completed(report) if report.denied.is_empty() => {
             eprintln!(
-                "sent {delivery} to {} process(es) in {scope_of_target}",
-                report.total,
+                "{}",
+                scoped_delivery_summary(delivery, scope_noun, scope_of_target, report)
             );
             print_post_kill_refresh_status(root, collect_ports);
             ExitReason::Success
         }
         TreeKillOutcome::Completed(report) => {
             eprintln!(
-                "sent {delivery} to {} of {} {scope_noun} process(es); permission denied for PID(s): {}",
-                report.delivered,
-                report.total,
-                tree::format_pid_list(&report.denied),
+                "{}",
+                scoped_delivery_summary(delivery, scope_noun, scope_of_target, report)
             );
             ExitReason::PermissionDenied
         }
@@ -2076,6 +2115,10 @@ where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
     let fresh_root = if confirmed.ports.is_empty() {
+        ops.set_snapshot_scope(tree::TreeSnapshotScope::Group {
+            root_pid: confirmed.pid,
+            pgid: confirmed_group.pgid,
+        });
         let snapshot = ops
             .snapshot()
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
@@ -2086,6 +2129,10 @@ where
     } else {
         let root = revalidate_cli_target(args, config, confirmed, collect_context, collect_ports)
             .map_err(|outcome| tree_outcome_from_termination(confirmed, outcome))?;
+        ops.set_snapshot_scope(tree::TreeSnapshotScope::Group {
+            root_pid: root.pid,
+            pgid: confirmed_group.pgid,
+        });
         let snapshot = ops
             .snapshot()
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;

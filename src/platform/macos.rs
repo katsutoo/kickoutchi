@@ -11,7 +11,7 @@
     reason = "Darwin FFI structs mirror the C header names exactly"
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::{CStr, OsStr, c_void};
 use std::mem::{MaybeUninit, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -25,7 +25,9 @@ use crate::model::{
     Protocol, RelatedProcessHint, SocketState,
 };
 use crate::process::{tree_cont, tree_deliver_by_pid, tree_prepare_delivery_probe, tree_stop};
-use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
+use crate::tree::{
+    MAX_TREE_PROCESSES, TreeProcessInfo, TreeProcessOps, TreeSignalResult, TreeSnapshotScope,
+};
 
 const PID_LIST_ATTEMPTS: usize = 3;
 const FD_LIST_ATTEMPTS: usize = 3;
@@ -318,12 +320,14 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 /// it cannot be closed completely.
 pub(crate) struct MacosTreeOps {
     verified_markers: std::collections::HashMap<u32, u64>,
+    snapshot_scope: TreeSnapshotScope,
 }
 
 impl MacosTreeOps {
     pub(crate) fn new() -> Self {
         Self {
             verified_markers: std::collections::HashMap::new(),
+            snapshot_scope: TreeSnapshotScope::Full,
         }
     }
 
@@ -352,8 +356,12 @@ impl MacosTreeOps {
 }
 
 impl TreeProcessOps for MacosTreeOps {
+    fn set_snapshot_scope(&mut self, scope: TreeSnapshotScope) {
+        self.snapshot_scope = scope;
+    }
+
     fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
-        collect_tree_process_infos().map_err(|error| error.to_string())
+        collect_tree_process_infos(self.snapshot_scope).map_err(|error| error.to_string())
     }
 
     fn stop(&mut self, pid: u32) -> TreeSignalResult {
@@ -361,10 +369,11 @@ impl TreeProcessOps for MacosTreeOps {
     }
 
     fn cont(&mut self, pid: u32) {
-        if self.recheck_marker(pid).is_err() {
-            return;
+        match self.recheck_marker(pid) {
+            Ok(()) | Err(TreeSignalResult::Denied) => tree_cont(pid),
+            Err(TreeSignalResult::NotFound) => {}
+            Err(TreeSignalResult::Delivered) => unreachable!("recheck_marker never delivers"),
         }
-        tree_cont(pid);
     }
 
     fn prepare_delivery(
@@ -397,41 +406,196 @@ impl TreeProcessOps for MacosTreeOps {
 /// exposes protected system PIDs in `proc_listallpids` but denies their BSD info;
 /// aborting on those unrelated rows would make user-owned tree/group kills and
 /// read-only inspect unusable. Other metadata failures still fail closed.
-fn collect_tree_process_infos() -> Result<Vec<TreeProcessInfo>, CollectorError> {
+fn collect_tree_process_infos(
+    scope: TreeSnapshotScope,
+) -> Result<Vec<TreeProcessInfo>, CollectorError> {
+    match scope {
+        TreeSnapshotScope::Full => collect_full_tree_process_infos(),
+        TreeSnapshotScope::Tree { root_pid } => collect_scoped_tree_process_infos(root_pid),
+        TreeSnapshotScope::Group { root_pid, pgid } => {
+            collect_scoped_group_process_infos(root_pid, pgid)
+        }
+    }
+}
+
+fn collect_full_tree_process_infos() -> Result<Vec<TreeProcessInfo>, CollectorError> {
     let pids = process_ids()?;
 
     let mut infos = Vec::with_capacity(pids.len());
     for pid in pids {
-        let info = match read_process_bsdinfo(pid) {
-            Ok(info) => info,
-            Err(error) if should_skip_unreadable_snapshot_error(&error) => continue,
+        let Some(info) = read_tree_process_info(pid, true)? else {
+            continue;
+        };
+        infos.push(info);
+    }
+    Ok(infos)
+}
+
+fn collect_scoped_tree_process_infos(
+    root_pid: u32,
+) -> Result<Vec<TreeProcessInfo>, CollectorError> {
+    let mut infos = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([root_pid]);
+
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let Some(info) = read_tree_process_info(pid, false)? else {
+            continue;
+        };
+        infos.push(info);
+        if infos.len() > MAX_TREE_PROCESSES {
+            return Ok(infos);
+        }
+        for child_pid in child_process_ids(pid)? {
+            if !seen.contains(&child_pid) {
+                queue.push_back(child_pid);
+            }
+        }
+    }
+
+    Ok(infos)
+}
+
+fn collect_scoped_group_process_infos(
+    root_pid: u32,
+    pgid: u32,
+) -> Result<Vec<TreeProcessInfo>, CollectorError> {
+    let pids = process_ids()?;
+    let mut infos = Vec::new();
+
+    for pid in pids {
+        match read_process_bsdinfo(pid) {
+            Ok(info) => {
+                let row = tree_process_info_from_readable_bsd(pid, &info)?;
+                if pid == root_pid || row.process_group == Some(pgid) {
+                    infos.push(row);
+                }
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                if pid == root_pid || process_group_for_pid(pid)? == Some(pgid) {
+                    return Err(platform_error(
+                        "proc_pidinfo(PROC_PIDTBSDINFO)",
+                        format!("PID {pid}: process group member metadata is unreadable: {error}"),
+                    ));
+                }
+            }
             Err(error) => {
                 return Err(platform_error(
                     "proc_pidinfo(PROC_PIDTBSDINFO)",
                     format!("PID {pid}: {error}"),
                 ));
             }
-        };
-        // proc_name can be narrower than bsdinfo for other users' processes, so
-        // fall back to the comm carried inside the bsdinfo we already read; a
-        // readable process with no name at all fails the scan closed.
-        let Some(name) = read_process_name(pid)
-            .ok()
-            .flatten()
-            .or_else(|| process_name_from_bsd_info(&info))
-        else {
-            return Err(platform_error(
-                "proc_name",
-                format!("PID {pid}: process name is unreadable"),
-            ));
-        };
-        infos.push(tree_process_info_from_bsd(pid, &info, name));
+        }
     }
+
     Ok(infos)
+}
+
+fn read_tree_process_info(
+    pid: u32,
+    skip_restricted: bool,
+) -> Result<Option<TreeProcessInfo>, CollectorError> {
+    let info = match read_process_bsdinfo(pid) {
+        Ok(info) => info,
+        Err(error) if skip_restricted && should_skip_unreadable_snapshot_error(&error) => {
+            return Ok(None);
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        Err(error) => {
+            return Err(platform_error(
+                "proc_pidinfo(PROC_PIDTBSDINFO)",
+                format!("PID {pid}: {error}"),
+            ));
+        }
+    };
+    tree_process_info_from_readable_bsd(pid, &info).map(Some)
+}
+
+fn tree_process_info_from_readable_bsd(
+    pid: u32,
+    info: &libc::proc_bsdinfo,
+) -> Result<TreeProcessInfo, CollectorError> {
+    // proc_name can be narrower than bsdinfo for other users' processes, so
+    // fall back to the comm carried inside the bsdinfo we already read; a
+    // readable process with no name at all fails the scan closed.
+    let Some(name) = read_process_name(pid)
+        .ok()
+        .flatten()
+        .or_else(|| process_name_from_bsd_info(info))
+    else {
+        return Err(platform_error(
+            "proc_name",
+            format!("PID {pid}: process name is unreadable"),
+        ));
+    };
+    Ok(tree_process_info_from_bsd(pid, info, name))
 }
 
 fn should_skip_unreadable_snapshot_error(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM))
+}
+
+fn child_process_ids(parent_pid: u32) -> Result<Vec<u32>, CollectorError> {
+    let parent_pid = pid_to_c_int(parent_pid).map_err(|error| {
+        platform_error(
+            "proc_listchildpids",
+            format!("parent PID is invalid: {error}"),
+        )
+    })?;
+    let capacity = MAX_TREE_PROCESSES + 1;
+    let buffer_bytes = checked_buffer_len::<libc::pid_t>(capacity, "proc_listchildpids")?;
+    let mut raw_pids = vec![0 as libc::pid_t; capacity];
+    let count = unsafe {
+        // SAFETY: raw_pids owns buffer_bytes bytes and proc_listchildpids writes
+        // at most that many pid_t values into it. The count is capped at one
+        // past the tree limit; that is enough for the shared cap refusal.
+        libc::proc_listchildpids(
+            parent_pid,
+            raw_pids.as_mut_ptr().cast::<c_void>(),
+            buffer_bytes,
+        )
+    };
+    if count < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(Vec::new());
+        }
+        return Err(platform_error("proc_listchildpids", error.to_string()));
+    }
+
+    let count = usize::try_from(count).expect("non-negative child PID count must fit usize");
+    raw_pids.truncate(count.min(capacity));
+    let mut pids = raw_pids
+        .into_iter()
+        .filter_map(valid_pid)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+fn process_group_for_pid(target_pid: u32) -> Result<Option<u32>, CollectorError> {
+    let target_pid = pid_to_c_int(target_pid)
+        .map_err(|error| platform_error("getpgid", format!("PID is invalid: {error}")))?;
+    let process_group = unsafe {
+        // SAFETY: getpgid takes a PID value and writes no Rust-owned memory.
+        libc::getpgid(target_pid)
+    };
+    if process_group < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(platform_error(
+            "getpgid",
+            format!("PID {target_pid}: {error}"),
+        ));
+    }
+    Ok(valid_pid(process_group))
 }
 
 /// Pure conversion from one Darwin BSD info read to a tree snapshot row.

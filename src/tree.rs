@@ -98,6 +98,19 @@ pub(crate) enum TreeSignalResult {
     Denied,
 }
 
+/// What portion of the process table a platform snapshot should prove.
+///
+/// Linux already reads a complete `/proc` table cheaply. macOS uses this during
+/// execution to avoid unrelated `EPERM` rows from hiding real scoped members:
+/// tree scope can walk descendants directly, and group scope can prove denied
+/// rows are outside the confirmed process group before skipping them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeSnapshotScope {
+    Full,
+    Tree { root_pid: u32 },
+    Group { root_pid: u32, pgid: u32 },
+}
+
 /// The injected process I/O the pipeline drives.
 ///
 /// A trait rather than loose closures because there are four related operations
@@ -105,6 +118,11 @@ pub(crate) enum TreeSignalResult {
 /// a recorded call log). The real Linux implementation lives in
 /// `platform/linux.rs`.
 pub(crate) trait TreeProcessOps {
+    /// Narrow future snapshots to the scope currently being executed.
+    ///
+    /// The default keeps platforms and tests with complete snapshots unchanged.
+    fn set_snapshot_scope(&mut self, _scope: TreeSnapshotScope) {}
+
     /// One fresh read of the whole process table.
     fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String>;
     /// Pin the confirmed root before execution-time revalidation.
@@ -616,10 +634,11 @@ pub(crate) struct ScopeAuthorization {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeKillReport {
     pub(crate) total: usize,
+    /// Processes that accepted the terminating signal.
     pub(crate) delivered: usize,
-    /// PIDs the OS refused to signal (permission). A process that had already
-    /// exited by signal time is counted as delivered — it is gone, which is the
-    /// goal — so it never appears here.
+    /// Processes that were already gone or PID-recycled before final delivery.
+    pub(crate) already_exited: usize,
+    /// PIDs the OS refused to signal (permission).
     pub(crate) denied: Vec<u32>,
 }
 
@@ -708,6 +727,14 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
             reason,
         };
     }
+
+    ops.set_snapshot_scope(match scope {
+        SweepScope::Tree => TreeSnapshotScope::Tree { root_pid: root.pid },
+        SweepScope::Group { pgid } => TreeSnapshotScope::Group {
+            root_pid: root.pid,
+            pgid,
+        },
+    });
 
     // Stop the root before anything else: a stopped process cannot fork, so
     // this freezes the member set's growth from the confirmed process before we
@@ -1018,6 +1045,8 @@ fn signal_tree<Ops: TreeProcessOps>(
     }
 
     let total = frozen.len();
+    let mut delivered = 0;
+    let mut already_exited = 0;
     let mut denied = Vec::new();
     for node in frozen.iter() {
         let result = ops.deliver(node.pid, mode);
@@ -1028,7 +1057,8 @@ fn signal_tree<Ops: TreeProcessOps>(
             ops.cont(node.pid);
         }
         match result {
-            TreeSignalResult::Delivered | TreeSignalResult::NotFound => {}
+            TreeSignalResult::Delivered => delivered += 1,
+            TreeSignalResult::NotFound => already_exited += 1,
             TreeSignalResult::Denied => {
                 if mode == KillMode::Force {
                     // SIGKILL needs no CONT only after it succeeds. A denied
@@ -1042,7 +1072,8 @@ fn signal_tree<Ops: TreeProcessOps>(
 
     TreeKillReport {
         total,
-        delivered: total - denied.len(),
+        delivered,
+        already_exited,
         denied,
     }
 }
@@ -1053,17 +1084,20 @@ fn signal_group<Ops: TreeProcessOps>(
     ops: &mut Ops,
 ) -> TreeKillReport {
     let total = frozen.len();
+    let mut delivered = 0;
+    let mut already_exited = 0;
     let mut denied = Vec::new();
     let mut continue_after_delivery = Vec::new();
 
     for node in frozen {
         match ops.deliver(node.pid, mode) {
             TreeSignalResult::Delivered => {
+                delivered += 1;
                 if mode == KillMode::Terminate {
                     continue_after_delivery.push(node.pid);
                 }
             }
-            TreeSignalResult::NotFound => {}
+            TreeSignalResult::NotFound => already_exited += 1,
             TreeSignalResult::Denied => {
                 denied.push(node.pid);
                 continue_after_delivery.push(node.pid);
@@ -1081,7 +1115,8 @@ fn signal_group<Ops: TreeProcessOps>(
 
     TreeKillReport {
         total,
-        delivered: total - denied.len(),
+        delivered,
+        already_exited,
         denied,
     }
 }
@@ -1123,6 +1158,7 @@ mod tests {
         events: Vec<Event>,
         deny_stop: Vec<u32>,
         missing_stop: Vec<u32>,
+        missing_deliver: Vec<u32>,
         deny_deliver: Vec<u32>,
     }
 
@@ -1134,6 +1170,7 @@ mod tests {
                 events: Vec::new(),
                 deny_stop: Vec::new(),
                 missing_stop: Vec::new(),
+                missing_deliver: Vec::new(),
                 deny_deliver: Vec::new(),
             }
         }
@@ -1181,6 +1218,9 @@ mod tests {
 
         fn deliver(&mut self, pid: u32, mode: KillMode) -> TreeSignalResult {
             self.events.push(Event::Deliver(pid, mode));
+            if self.missing_deliver.contains(&pid) {
+                return TreeSignalResult::NotFound;
+            }
             if self.deny_deliver.contains(&pid) {
                 return TreeSignalResult::Denied;
             }
@@ -1626,6 +1666,34 @@ mod tests {
                 Event::Cont(100)
             ],
         );
+    }
+
+    #[test]
+    fn final_delivery_not_found_is_reported_separately_from_sent_signals() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "child", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot]);
+        ops.missing_deliver.push(101);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        let TreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completion report, got {outcome:?}");
+        };
+        assert_eq!(report.total, 2);
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.already_exited, 1);
+        assert!(report.denied.is_empty());
     }
 
     #[test]

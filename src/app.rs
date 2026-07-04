@@ -1340,6 +1340,7 @@ fn collect_tree_preview(
     use crate::tree::TreeProcessOps;
 
     let mut ops = host_tree_ops();
+    ops.set_snapshot_scope(tree::TreeSnapshotScope::Tree { root_pid });
     let snapshot = ops.snapshot()?;
     tree::plan_process_tree(
         root_pid,
@@ -1369,6 +1370,9 @@ fn fresh_tree_gates<Ops: tree::TreeProcessOps>(
     confirmation: &TreeKillConfirmation,
     ops: &mut Ops,
 ) -> Result<(), tree::TreeKillOutcome> {
+    ops.set_snapshot_scope(tree::TreeSnapshotScope::Tree {
+        root_pid: fresh_root.pid,
+    });
     let snapshot = ops
         .snapshot()
         .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
@@ -1398,17 +1402,35 @@ fn tree_kill_status_line(
 
     let delivery = mode.delivery_label(root.platform);
     match outcome {
+        TreeKillOutcome::Completed(report)
+            if report.denied.is_empty() && report.already_exited == 0 =>
+        {
+            format!(
+                "sent {delivery} to {} process(es) in the tree rooted at {}",
+                report.delivered,
+                root.identity(),
+            )
+        }
         TreeKillOutcome::Completed(report) if report.denied.is_empty() => format!(
-            "sent {delivery} to {} process(es) in the tree rooted at {}",
-            report.total,
-            root.identity(),
+            "sent {delivery} to {} of {} tree process(es); {} already exited before final delivery",
+            report.delivered, report.total, report.already_exited,
         ),
-        TreeKillOutcome::Completed(report) => format!(
-            "sent {delivery} to {} of {} tree process(es); permission denied for PID(s): {}",
-            report.delivered,
-            report.total,
-            tree::format_pid_list(&report.denied),
-        ),
+        TreeKillOutcome::Completed(report) => {
+            let exited_suffix = if report.already_exited == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {} already exited before final delivery",
+                    report.already_exited
+                )
+            };
+            format!(
+                "sent {delivery} to {} of {} tree process(es){exited_suffix}; permission denied for PID(s): {}",
+                report.delivered,
+                report.total,
+                tree::format_pid_list(&report.denied),
+            )
+        }
         TreeKillOutcome::RootAlreadyExited => format!(
             "{} already exited before termination was sent",
             root.identity(),
