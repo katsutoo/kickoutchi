@@ -110,9 +110,10 @@ yay -S kickoutchi-bin
 ```
 
 The AUR templates live in `packaging/arch/` for maintainers who want to build or
-review the package locally before publication. For `1.0.0`, those templates stay
-prepared but pinned to the last published release assets until the GitHub Release
-exists; AUR publication waits until AUR account creation is available again.
+review the package locally before publication. They are pinned to the latest
+published GitHub Release assets and checksums — bumped only after each release's
+assets exist, never against placeholders — and AUR publication waits until AUR
+account creation is available again.
 
 Then use either binary name:
 

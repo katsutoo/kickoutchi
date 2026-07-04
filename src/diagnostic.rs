@@ -5,6 +5,7 @@
 //! or claim ownership of a socket the OS didn't actually confirm. Hints, not
 //! accusations.
 
+use crate::display::sanitize;
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
@@ -76,11 +77,15 @@ pub(crate) fn diagnostic_message(port: u16, hints: &[RelatedProcessHint]) -> Opt
     let mut message =
         format!("No confirmed listening TCP or bound UDP socket found on port {port}.\n");
     for hint in hints {
-        let process = hint.process_name.as_deref().unwrap_or("<unknown>");
+        // The name is attacker-controlled (a process names itself), and this
+        // message lands on a human's terminal: sanitize it like every other
+        // display surface. The command line takes the quoted-escape path in
+        // `push_quoted_command` instead, so the name is the only raw field.
+        let process = sanitize(hint.process_name.as_deref().unwrap_or("<unknown>"));
         message.push_str("Possible related process: PID ");
         message.push_str(&hint.pid.to_string());
         message.push_str(" (");
-        message.push_str(process);
+        message.push_str(&process);
         message.push_str(") command ");
         push_quoted_command(&mut message, &hint.command_line);
         message.push_str(" references this port, but no socket was confirmed.\n");
@@ -208,6 +213,23 @@ mod tests {
         assert!(!command_mentions_port("IMPORTANT=3000 node", 3000));
         assert!(!command_mentions_port("worker duration:3000ms", 3000));
         assert!(!command_mentions_port("worker host:3000abc", 3000));
+    }
+
+    #[test]
+    fn diagnostic_message_sanitizes_hostile_process_names() {
+        // A process can name itself with terminal escape bytes (comm is
+        // attacker-controlled); the hint must reach the terminal with the
+        // escape stripped, never raw.
+        let hints = vec![RelatedProcessHint {
+            pid: 12345,
+            process_name: Some("evil\x1b[2Jname".to_owned()),
+            command_line: "node --port 3000".to_owned(),
+        }];
+
+        let message = diagnostic_message(3000, &hints).expect("hint produces a message");
+
+        assert!(!message.contains('\x1b'), "{message}");
+        assert!(message.contains("evilname"), "{message}");
     }
 
     #[test]

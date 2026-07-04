@@ -7,12 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-04
+
 ### Fixed
 
 - macOS scoped kills now narrow process-table snapshots to the active tree or
   group during execution, so unrelated system `EPERM` rows do not hide real
   target-scope safety failures while unreadable in-scope members still fail
   closed.
+- The TUI status line now sanitizes every value it renders — the active filter
+  text and the filter-error, error, and kill-status fields — so a process name
+  or error message carrying control or escape bytes cannot redraw the terminal
+  or fake output through the status bar.
+- The "no confirmed socket" port diagnostic now sanitizes the related
+  process's name before printing it. This closes the one hint path where a
+  process that named itself with terminal escape sequences could reach stderr
+  unsanitized; the quoted command line in the same message was already
+  escaped.
 
 ## [1.0.0] - 2026-07-03
 
@@ -602,7 +613,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...v1.0.0
 [0.1.2]: https://github.com/nuggocto/kickoutchi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nuggocto/kickoutchi/compare/v0.1.0...v0.1.1
