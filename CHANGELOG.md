@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-05
+
+### Fixed
+
+- Protected-process defaults now cover Linux and macOS Docker owners including
+  `dockerd`, `docker-proxy`, and `com.docker.backend`, and Linux protected-name
+  matching accounts for `/proc/<pid>/comm` truncation of long configured names.
+- CLI list and inspect output now handle broken pipes explicitly, so piping to
+  short readers exits cleanly inside the documented exit-code contract instead
+  of panicking.
+- Tree kill no longer aborts when only the frozen root is reparented by an
+  unfrozen parent exiting mid-sweep, while the frozen-set protection gate fails
+  closed if process metadata unexpectedly loses a name.
+- The TUI no longer performs selected-process metadata scans on the input path
+  before opening kill confirmations; it uses the existing background worker and
+  refuses submission until identity metadata has landed.
+- Human-facing sanitization now replaces bidi and zero-width display controls,
+  closing terminal display-spoofing gaps in names, paths, and status text.
+- Inspect tree output now renders branchy descendants in parent order instead
+  of depth-only order, so indentation matches the actual tree.
+- Docker enrichment bounds its post-timeout output drain, and Windows tree
+  fallback exit probes use zero-timeout waits instead of blocking per member.
+- Linux `/proc/net` address decoding uses native-endian words, fixing
+  big-endian Linux without changing little-endian behavior.
+
+### Changed
+
+- CI supply-chain checks now run on a schedule, GitHub Actions are pinned to
+  commit SHAs, release workflow permissions are narrowed, and warnings are
+  enforced by CI rather than the published Cargo manifest.
+- Contract tests add real-binary coverage for configured protected-process
+  refusal and UDP/IPv6 listing, avoid PID substring assertions, and use longer
+  helper deadlines for slower CI hosts.
+
 ## [1.1.0] - 2026-07-04
 
 ### Added
@@ -648,7 +682,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/nuggocto/kickoutchi/compare/v0.1.2...v1.0.0
