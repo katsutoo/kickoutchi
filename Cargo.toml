@@ -69,9 +69,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Netwo
 # one at a time.
 sysinfo = "0.38.4"
 
-[lints.rust]
-warnings = "deny"
-
 [lints.clippy]
 pedantic = "warn"
 

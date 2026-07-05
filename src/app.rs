@@ -340,10 +340,16 @@ impl App {
         };
         let worker_key = worker.key;
         self.context_worker = None;
+        let updated_target = worker_key
+            .pid
+            .and_then(|pid| self.kill_target_with_context(pid, &result));
 
         if self.selected_row().map(RowKey::from) == Some(worker_key) {
             self.selected_context_key = Some(worker_key);
-            self.selected_process_context = Some(result);
+            self.selected_process_context = Some(result.clone());
+        }
+        if let Some(target) = updated_target {
+            self.apply_context_target_to_confirmations(target);
         }
     }
 
@@ -550,14 +556,15 @@ impl App {
             return;
         }
 
-        let context = platform::collect_process_context(pid);
-        self.selected_context_key = Some(RowKey::from(&entry));
-        self.selected_process_context = Some(context.clone());
+        let context = self.selected_process_context().cloned();
+        if context.is_none() {
+            self.load_selected_process_context();
+        }
 
         let target = KillTarget::from_entries(
             pid,
             self.all_rows.iter().filter(|row| row.pid == Some(pid)),
-            Some(&context),
+            context.as_ref(),
         );
         // `yes` is always false here: the interactive TUI has no `--yes`, so the
         // shared policy can only ever hand back `Some(_)` (a confirmation to
@@ -730,14 +737,15 @@ impl App {
             return;
         }
 
-        let context = platform::collect_process_context(pid);
-        self.selected_context_key = Some(RowKey::from(&entry));
-        self.selected_process_context = Some(context.clone());
+        let context = self.selected_process_context().cloned();
+        if context.is_none() {
+            self.load_selected_process_context();
+        }
 
         let target = KillTarget::from_entries(
             pid,
             self.all_rows.iter().filter(|row| row.pid == Some(pid)),
-            Some(&context),
+            context.as_ref(),
         );
 
         self.tree_confirmation = Some(TreeKillConfirmation::new(target, mode));
@@ -985,6 +993,16 @@ impl App {
         let Some(confirmation) = self.tree_confirmation.take() else {
             return;
         };
+        if confirmation.target.process_start_time_marker.is_none()
+            && self.process_context_loading_for_pid(confirmation.target.pid)
+        {
+            self.tree_confirmation = Some(TreeKillConfirmation {
+                error: Some("still reading process metadata; retry once it finishes".to_owned()),
+                ..confirmation
+            });
+            self.modal = Modal::ConfirmTreeKill;
+            return;
+        }
         self.tree_preview_worker = None;
         self.modal = Modal::None;
 
@@ -1105,6 +1123,16 @@ impl App {
         let Some(confirmation) = self.kill_confirmation.take() else {
             return;
         };
+        if confirmation.target.process_start_time_marker.is_none()
+            && self.process_context_loading_for_pid(confirmation.target.pid)
+        {
+            self.kill_confirmation = Some(KillConfirmation {
+                error: Some("still reading process metadata; retry once it finishes".to_owned()),
+                ..confirmation
+            });
+            self.modal = Modal::ConfirmKill;
+            return;
+        }
         self.modal = Modal::None;
 
         let handle = match prepare(confirmation.target.pid) {
@@ -1253,6 +1281,38 @@ impl App {
                 self.context_worker = None;
                 self.latest_error = Some(format!("starting details worker failed: {error}"));
             }
+        }
+    }
+
+    fn process_context_loading_for_pid(&self, pid: u32) -> bool {
+        self.context_worker
+            .as_ref()
+            .is_some_and(|worker| worker.key.pid == Some(pid))
+    }
+
+    fn kill_target_with_context(&self, pid: u32, context: &ProcessContext) -> Option<KillTarget> {
+        let rows = self
+            .all_rows
+            .iter()
+            .filter(|row| row.pid == Some(pid))
+            .collect::<Vec<_>>();
+        (!rows.is_empty()).then(|| KillTarget::from_entries(pid, rows, Some(context)))
+    }
+
+    fn apply_context_target_to_confirmations(&mut self, mut target: KillTarget) {
+        if let Some(confirmation) = self.kill_confirmation.as_mut()
+            && confirmation.target.pid == target.pid
+        {
+            target.protected |= confirmation.target.protected;
+            confirmation.target = target.clone();
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(confirmation) = self.tree_confirmation.as_mut()
+            && confirmation.target.pid == target.pid
+        {
+            target.protected |= confirmation.target.protected;
+            confirmation.target = target;
         }
     }
 
@@ -1762,6 +1822,47 @@ mod tests {
     }
 
     #[test]
+    fn terminate_confirmation_gets_identity_from_background_context() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+        app.apply_action(Action::RequestTerminate);
+
+        assert!(app.selected_process_context_loading());
+        assert_eq!(
+            app.kill_confirmation()
+                .and_then(|confirmation| confirmation.target.process_start_time_marker),
+            None,
+        );
+
+        finish_selected_context(&mut app, context(55));
+
+        assert_eq!(
+            app.kill_confirmation()
+                .and_then(|confirmation| confirmation.target.process_start_time_marker),
+            Some(55),
+        );
+    }
+
+    #[test]
+    fn yes_confirmation_waits_for_process_metadata_before_executing() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+
+        app.apply_action(Action::RequestTerminate);
+        app.apply_action(Action::KillInputAppend('y'));
+
+        let confirmation = app
+            .kill_confirmation()
+            .expect("confirmation remains open while metadata loads");
+        assert_eq!(app.modal(), Modal::ConfirmKill);
+        assert!(
+            confirmation
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("still reading process metadata")),
+        );
+    }
+
+    #[test]
     fn unknown_failure_status_is_sanitized_for_tui() {
         let row = entry(3000, Some("node"));
         let target = KillTarget::from_entries(3000, [&row], None);
@@ -1986,6 +2087,7 @@ mod tests {
         // row, so verify that re-collect actually runs.
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
         app.apply_action(Action::RequestTerminate);
+        set_confirmation_start_time(&mut app, 55);
         let fresh_after_exit: Vec<PortEntry> = Vec::new();
         let mut collect_calls = 0;
         let mut terminated = false;

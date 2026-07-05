@@ -54,6 +54,7 @@ pub(crate) fn render_tree(frame: &mut Frame, area: Rect, app: &App, theme: Theme
     // Rows available inside the borders drive the preview budget, so the
     // prompt block stays visible at every supported terminal size.
     let content_rows = usize::from(area.height.saturating_sub(2));
+    let content_cols = usize::from(area.width.saturating_sub(2));
     let lines = app.tree_confirmation().map_or_else(
         || {
             vec![Line::styled(
@@ -61,7 +62,7 @@ pub(crate) fn render_tree(frame: &mut Frame, area: Rect, app: &App, theme: Theme
                 theme.muted(),
             )]
         },
-        |confirmation| tree_confirmation_lines(confirmation, theme, content_rows),
+        |confirmation| tree_confirmation_lines(confirmation, theme, content_rows, content_cols),
     );
 
     let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -79,20 +80,20 @@ fn tree_confirmation_lines(
     confirmation: &TreeKillConfirmation,
     theme: Theme,
     content_rows: usize,
+    content_cols: usize,
 ) -> Vec<Line<'static>> {
-    let preview_budget = tree_preview_budget(confirmation, content_rows);
+    let preview_budget = tree_preview_budget(confirmation, content_rows, content_cols);
     let mut lines = vec![
-        Line::styled(
-            format!(
-                "{} process tree from {}",
-                confirmation
-                    .mode
-                    .action_label_for(confirmation.target.platform),
-                confirmation.target.identity(),
+        Line::styled(tree_header_text(confirmation), theme.title()),
+        field(
+            "Ports",
+            clipped_field_value(
+                &sanitize(&confirmation.target.ports_text()),
+                "Ports",
+                content_cols,
             ),
-            theme.title(),
+            theme,
         ),
-        field("Ports", sanitize(&confirmation.target.ports_text()), theme),
     ];
 
     let preview_ready = confirmation.preview.is_some();
@@ -172,37 +173,136 @@ fn tree_confirmation_lines(
 /// blank/instruction/input/error/Esc block — and gives the preview whatever
 /// remains, clamped to `[TREE_MODAL_PREVIEW_MIN, TREE_MODAL_PREVIEW_MAX]`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tree_preview_budget(confirmation: &TreeKillConfirmation, content_rows: usize) -> usize {
+fn tree_preview_budget(
+    confirmation: &TreeKillConfirmation,
+    content_rows: usize,
+    content_cols: usize,
+) -> usize {
     let preview_overhead = match &confirmation.preview {
         // Loading state renders one placeholder line and no nodes.
-        None => 1,
+        None => wrapped_rows("Enumerating the process tree...", content_cols),
         Some(preview) => {
             // Scope line, a reserved "... and N more" row, and the
             // scoped preview warnings when they apply.
-            2 + usize::from(preview.has_system_process())
-                + usize::from(preview.has_owner_mismatch())
+            wrapped_rows(
+                &format!("Scope: tree ({} processes)", preview.len()),
+                content_cols,
+            ) + 1
+                + if preview.has_system_process() {
+                    wrapped_rows(
+                        "Warning: tree includes system/service processes; verify this is safe to terminate.",
+                        content_cols,
+                    )
+                } else {
+                    0
+                }
+                + if preview.has_owner_mismatch() {
+                    wrapped_rows(
+                        "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
+                        content_cols,
+                    )
+                } else {
+                    0
+                }
         }
     };
-    let force_warning_rows = usize::from(
-        confirmation
-            .mode
-            .force_warning(confirmation.target.platform)
-            .is_some(),
-    );
-    let target_warning_rows = confirmation.target.warning_lines().len();
-    let error_rows = usize::from(confirmation.error.is_some());
-    let input_rows = usize::from(confirmation.preview.is_some());
-    // Header + ports, then blank + instruction + optional input + blank + Esc.
-    let fixed_rows = 2
+    let force_warning_rows = confirmation
+        .mode
+        .force_warning(confirmation.target.platform)
+        .map_or(0, |warning| {
+            wrapped_rows(&format!("Warning: {warning}"), content_cols)
+        });
+    let target_warning_rows = confirmation
+        .target
+        .warning_lines()
+        .into_iter()
+        .map(|warning| {
+            wrapped_rows(
+                &format!("Warning: {}.", sanitize(&tree_scope_warning_text(&warning))),
+                content_cols,
+            )
+        })
+        .sum::<usize>();
+    let error_rows = confirmation.error.as_ref().map_or(0, |error| {
+        wrapped_rows(&format!("Error: {error}"), content_cols)
+    });
+    let input_rows = if confirmation.preview.is_some() {
+        wrapped_rows(&format!("Input: {}", confirmation.input), content_cols)
+    } else {
+        0
+    };
+    let fixed_rows = wrapped_rows(&tree_header_text(confirmation), content_cols)
+        + 1
         + preview_overhead
         + force_warning_rows
         + target_warning_rows
-        + 4
+        + 2
+        + wrapped_rows(&tree_instruction_text(confirmation), content_cols)
         + input_rows
-        + error_rows;
+        + error_rows
+        + wrapped_rows("Esc cancels.", content_cols);
     content_rows
         .saturating_sub(fixed_rows)
         .clamp(TREE_MODAL_PREVIEW_MIN, TREE_MODAL_PREVIEW_MAX)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_header_text(confirmation: &TreeKillConfirmation) -> String {
+    format!(
+        "{} process tree from {}",
+        confirmation
+            .mode
+            .action_label_for(confirmation.target.platform),
+        confirmation.target.identity(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_instruction_text(confirmation: &TreeKillConfirmation) -> String {
+    if confirmation.preview.is_none() {
+        return "Wait for the process count before typing confirmation.".to_owned();
+    }
+    match confirmation.stage {
+        TreeConfirmStage::ProtectedRoot => format!(
+            "Protected root: type {} or {}, press Enter, then confirm the tree word.",
+            confirmation.target.pid,
+            sanitize(confirmation.target.process_name_or_unknown()),
+        ),
+        TreeConfirmStage::Word => format!(
+            "Type {} and press Enter to send {} to all processes above.",
+            confirmation.scope_word(),
+            confirmation
+                .mode
+                .delivery_label(confirmation.target.platform),
+        ),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wrapped_rows(text: &str, content_cols: usize) -> usize {
+    let cols = content_cols.max(1);
+    text.chars().count().max(1).div_ceil(cols)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clipped_field_value(value: &str, label: &str, content_cols: usize) -> String {
+    let available = content_cols
+        .saturating_sub(label.chars().count() + 2)
+        .max(1);
+    clipped_chars(value, available)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clipped_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut clipped = value.chars().take(max_chars - 3).collect::<String>();
+    clipped.push_str("...");
+    clipped
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -364,6 +464,29 @@ mod tests {
         KillTarget::from_entries(18422, [&row], None)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn target_with_port_count(count: u16) -> KillTarget {
+        let rows = (0..count)
+            .map(|offset| PortEntry {
+                protocol: Protocol::Tcp,
+                local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                local_port: 3000 + offset,
+                state: SocketState::Listen,
+                pid: Some(18422),
+                process_name: Some("node".to_owned()),
+                executable_path: None,
+                command_line: None,
+                parent_pid: None,
+                parent_process_name: None,
+                child_pids: Vec::new(),
+                protected: false,
+                platform: Platform::Linux,
+                permission: PermissionStatus::Full,
+            })
+            .collect::<Vec<_>>();
+        KillTarget::from_entries(18422, rows.iter(), None)
+    }
+
     #[test]
     fn confirmation_lines_show_command_and_required_input() {
         let confirmation = KillConfirmation {
@@ -413,7 +536,7 @@ mod tests {
 
         // A tall modal: the preview budget is not the constraint here.
         let render = |confirmation: &TreeKillConfirmation| {
-            tree_confirmation_lines(confirmation, Theme::from_environment(), 40)
+            tree_confirmation_lines(confirmation, Theme::from_environment(), 40, 100)
                 .into_iter()
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>()
@@ -529,7 +652,8 @@ mod tests {
 
         // 80x20 terminal, 76% modal height = 15 rows, minus borders = 13.
         let content_rows = 13;
-        let lines = tree_confirmation_lines(&confirmation, Theme::from_environment(), content_rows);
+        let lines =
+            tree_confirmation_lines(&confirmation, Theme::from_environment(), content_rows, 78);
         assert!(
             lines.len() <= content_rows,
             "modal emits {} lines for {content_rows} rows",
@@ -547,6 +671,31 @@ mod tests {
         // The tree size stays honest even when the node list is clipped.
         assert!(text.contains("tree (21 processes)"), "{text}");
         assert!(text.contains("more"), "{text}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_confirmation_clips_long_ports_line_to_modal_width() {
+        use super::tree_confirmation_lines;
+        use crate::app::{TreeConfirmStage, TreeKillConfirmation};
+
+        let confirmation = TreeKillConfirmation {
+            target: target_with_port_count(20),
+            mode: KillMode::Terminate,
+            preview: None,
+            stage: TreeConfirmStage::Word,
+            input: String::new(),
+            error: None,
+        };
+
+        let lines = tree_confirmation_lines(&confirmation, Theme::from_environment(), 10, 32);
+        let ports = lines
+            .iter()
+            .map(ToString::to_string)
+            .find(|line| line.starts_with("Ports: "))
+            .expect("ports line is rendered");
+        assert!(ports.ends_with("..."), "{ports}");
+        assert!(ports.chars().count() <= 32, "{ports}");
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,7 @@ use tracing::debug;
 use crate::model::{DockerContainerPort, DockerPortContext, PermissionStatus, PortEntry, Protocol};
 
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
+const DOCKER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const DOCKER_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 const DOCKER_ROWS_MAX: usize = 128;
 const DOCKER_MATCHES_MAX: usize = 8;
@@ -143,13 +145,7 @@ fn docker_container_ls(port: u16, protocol: Protocol) -> Option<String> {
         }
     }
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
-            debug!(%error, "docker CLI output collection failed during port enrichment");
-            return None;
-        }
-    };
+    let output = wait_with_output_bounded(child)?;
     if !output.status.success() {
         debug!(status = %output.status, "docker CLI returned non-success status");
         return None;
@@ -166,6 +162,37 @@ fn docker_container_ls(port: u16, protocol: Protocol) -> Option<String> {
         Ok(stdout) => Some(stdout),
         Err(error) => {
             debug!(%error, "docker CLI output was not UTF-8");
+            None
+        }
+    }
+}
+
+fn wait_with_output_bounded(child: std::process::Child) -> Option<std::process::Output> {
+    let (sender, receiver) = mpsc::channel();
+    match thread::Builder::new()
+        .name("kickoutchi-docker-output".to_owned())
+        .spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        }) {
+        Ok(_handle) => {}
+        Err(error) => {
+            debug!(%error, "docker CLI output drain worker failed to start");
+            return None;
+        }
+    }
+
+    match receiver.recv_timeout(DOCKER_OUTPUT_DRAIN_TIMEOUT) {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(error)) => {
+            debug!(%error, "docker CLI output collection failed during port enrichment");
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            debug!("docker CLI output drain timed out during port enrichment");
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            debug!("docker CLI output drain worker exited before returning");
             None
         }
     }

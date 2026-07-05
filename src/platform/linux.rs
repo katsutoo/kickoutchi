@@ -319,7 +319,7 @@ fn decode_ipv4_addr(hex: &str) -> Result<Ipv4Addr, SocketParseError> {
     let raw = u32::from_str_radix(hex, 16).map_err(|_| SocketParseError::InvalidIpv4Address {
         value: hex.to_owned(),
     })?;
-    Ok(Ipv4Addr::from(raw.to_le_bytes()))
+    Ok(Ipv4Addr::from(raw.to_ne_bytes()))
 }
 
 fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
@@ -342,7 +342,7 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
             u32::from_str_radix(chunk, 16).map_err(|_| SocketParseError::InvalidIpv6Address {
                 value: hex.to_owned(),
             })?;
-        bytes[start / 2..start / 2 + 4].copy_from_slice(&word.to_le_bytes());
+        bytes[start / 2..start / 2 + 4].copy_from_slice(&word.to_ne_bytes());
     }
 
     let addr = Ipv6Addr::from(bytes);

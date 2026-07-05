@@ -30,6 +30,7 @@ use crate::tree::{
 const WINDOWS_TREE_SWEEP_PASSES: usize = 8;
 const WINDOWS_TREE_TERMINATE_EXIT_CODE: u32 = 1;
 const WINDOWS_TREE_WAIT_MS: u32 = 5_000;
+const WINDOWS_TREE_PROBE_WAIT_MS: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowsTreeKillReport {
@@ -548,7 +549,7 @@ fn assign_or_fallback<Api: WindowsTreeApi>(
         }
         Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
             if matches!(
-                api.wait_process_exit(&process.handle),
+                api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
                 WindowsWaitResult::Exited
             ) {
                 process.status = PinnedProcessStatus::AlreadyExited;
@@ -567,7 +568,7 @@ fn assign_or_fallback<Api: WindowsTreeApi>(
                 }
                 Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
                     if matches!(
-                        api.wait_process_exit(&process.handle),
+                        api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
                         WindowsWaitResult::Exited
                     ) {
                         process.status = PinnedProcessStatus::AlreadyExited;
@@ -601,7 +602,7 @@ fn finish_report<Api: WindowsTreeApi>(
             process.status,
             PinnedProcessStatus::AssignedToJob | PinnedProcessStatus::FallbackTerminated
         ) {
-            match api.wait_process_exit(&process.handle) {
+            match api.wait_process_exit(&process.handle, WINDOWS_TREE_WAIT_MS) {
                 WindowsWaitResult::Exited => {}
                 WindowsWaitResult::StillRunning | WindowsWaitResult::Failed(_) => {
                     if !report.not_terminated.contains(pid) {
@@ -697,7 +698,11 @@ trait WindowsTreeApi {
     ) -> Result<(), WindowsApiError>;
     fn terminate_job(&mut self, job: &Self::JobHandle) -> Result<(), String>;
     fn terminate_process(&mut self, process: &Self::ProcessHandle) -> Result<(), WindowsApiError>;
-    fn wait_process_exit(&mut self, process: &Self::ProcessHandle) -> WindowsWaitResult;
+    fn wait_process_exit(
+        &mut self,
+        process: &Self::ProcessHandle,
+        timeout_ms: u32,
+    ) -> WindowsWaitResult;
 }
 
 struct RealWindowsTreeApi;
@@ -831,11 +836,15 @@ impl WindowsTreeApi for RealWindowsTreeApi {
         Ok(())
     }
 
-    fn wait_process_exit(&mut self, process: &Self::ProcessHandle) -> WindowsWaitResult {
+    fn wait_process_exit(
+        &mut self,
+        process: &Self::ProcessHandle,
+        timeout_ms: u32,
+    ) -> WindowsWaitResult {
         let result = unsafe {
             // SAFETY: the process handle is live and was opened with synchronize
             // access. Waiting transfers no ownership and writes no Rust memory.
-            WaitForSingleObject(process.handle.as_raw_handle(), WINDOWS_TREE_WAIT_MS)
+            WaitForSingleObject(process.handle.as_raw_handle(), timeout_ms)
         };
         match result {
             WAIT_OBJECT_0 => WindowsWaitResult::Exited,
@@ -888,6 +897,7 @@ mod tests {
         Assign(u32),
         TerminateJob,
         TerminateProcess(u32),
+        Wait(u32, u32),
     }
 
     #[derive(Default)]
@@ -992,7 +1002,12 @@ mod tests {
             Ok(())
         }
 
-        fn wait_process_exit(&mut self, process: &Self::ProcessHandle) -> WindowsWaitResult {
+        fn wait_process_exit(
+            &mut self,
+            process: &Self::ProcessHandle,
+            timeout_ms: u32,
+        ) -> WindowsWaitResult {
+            self.events.push(Event::Wait(*process, timeout_ms));
             if let Some(results) = self.wait_results.get_mut(process)
                 && let Some(result) = results.pop_front()
             {
@@ -1103,6 +1118,7 @@ mod tests {
         assert!(report.not_terminated.is_empty());
         assert!(!report.containment_partial);
         assert!(!api.events.contains(&Event::TerminateProcess(101)));
+        assert!(api.events.contains(&Event::Wait(101, 0)));
     }
 
     #[test]

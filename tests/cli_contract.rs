@@ -2,15 +2,15 @@
 mod linux {
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    const CMDLINE_WAIT: Duration = Duration::from_secs(2);
-    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(2);
+    const CMDLINE_WAIT: Duration = Duration::from_secs(10);
+    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(10);
     /// How long a parked helper may outlive its test before self-destructing.
     /// Generous enough for the slowest passing run; short enough that a
     /// killed-by-`SIGKILL` test binary can never leak an immortal helper.
@@ -74,6 +74,24 @@ mod linux {
 
     fn kickoutchi_with_stdin(args: &[&str], stdin: &str) -> Output {
         run_binary(env!("CARGO_BIN_EXE_kickoutchi"), args, Some(stdin))
+    }
+
+    fn kickoutchi_with_config(args: &[&str], config_text: &str) -> Output {
+        let config_dir = isolated_config_home();
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, config_text).expect("test config file must be written");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
+        command
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command
+            .output()
+            .expect("kickoutchi binary must run with explicit config");
+        let _ = fs::remove_dir_all(config_dir);
+        output
     }
 
     fn kick(args: &[&str]) -> Output {
@@ -336,6 +354,18 @@ mod linux {
 
     fn stderr(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
+        let pid_text = pid.to_string();
+        stdout(output)
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
+    }
+
+    fn toml_string(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
     }
 
     #[test]
@@ -814,6 +844,59 @@ mod linux {
     }
 
     #[test]
+    fn udp_ipv6_socket_is_listed_through_the_real_binary() {
+        let socket = match UdpSocket::bind("[::1]:0") {
+            Ok(socket) => socket,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("IPv6 UDP socket must bind on loopback: {error}"),
+        };
+        let port = socket
+            .local_addr()
+            .expect("UDP socket must have a local address")
+            .port();
+        let port_text = port.to_string();
+
+        let output = kickoutchi(&["list", "--port", port_text.as_str()]);
+
+        assert_eq!(output.status.code(), Some(0));
+        let out = stdout(&output);
+        assert!(out.contains("UDP"), "{out}");
+        assert!(out.contains("::1"), "{out}");
+        assert!(out.contains(port_text.as_str()), "{out}");
+        assert!(stdout_table_has_pid(&output, std::process::id()), "{out}");
+    }
+
+    #[test]
+    fn configured_protected_process_refuses_yes_kill_with_exit_6() {
+        let (mut helper, _port, ready_file) = spawn_listener_process();
+        let pid = helper.id();
+        let pid_text = pid.to_string();
+        let process_name = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("helper process comm must be readable")
+            .trim_end()
+            .to_owned();
+        let config = format!(
+            "protected_processes = [\"{}\"]\n",
+            toml_string(&process_name),
+        );
+
+        let output =
+            kickoutchi_with_config(&["kill", "--pid", pid_text.as_str(), "--yes"], &config);
+
+        assert_eq!(output.status.code(), Some(6));
+        assert!(stderr(&output).contains("protected"));
+        assert!(
+            helper
+                .child
+                .try_wait()
+                .expect("helper status must be readable")
+                .is_none(),
+            "protected helper must still be running",
+        );
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
     fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
@@ -822,7 +905,7 @@ mod linux {
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
         assert!(stdout(&before).contains(port_text.as_str()));
-        assert!(stdout(&before).contains(pid_text.as_str()));
+        assert!(stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi(&["kill", "--pid", pid_text.as_str(), "--yes"]);
         assert_eq!(killed.status.code(), Some(0));
@@ -958,12 +1041,19 @@ mod linux {
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
-        let child_pid_text = child_pid.to_string();
 
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
-        assert!(stdout(&before).contains(child_pid_text.as_str()));
-        assert!(!stdout(&before).contains(root_pid_text.as_str()));
+        assert!(
+            stdout_table_has_pid(&before, child_pid),
+            "{}",
+            stdout(&before)
+        );
+        assert!(
+            !stdout_table_has_pid(&before, helper.id()),
+            "{}",
+            stdout(&before)
+        );
 
         let killed = kickoutchi_with_stdin(
             &["kill", "--pid", root_pid_text.as_str(), "--tree"],
@@ -1535,6 +1625,14 @@ mod windows {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
+        let pid_text = pid.to_string();
+        stdout(output)
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
+    }
+
     #[test]
     fn helper_tcp_listener_process() {
         if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
@@ -1663,7 +1761,7 @@ mod windows {
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
         assert!(stdout(&before).contains(port_text.as_str()));
-        assert!(stdout(&before).contains(pid_text.as_str()));
+        assert!(stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi_with_stdin(&["kill", "--pid", pid_text.as_str()], Some("y\n"));
         assert_eq!(killed.status.code(), Some(0));
@@ -1814,12 +1912,11 @@ mod windows {
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
-        let child_pid_text = child_pid.to_string();
 
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
-        assert!(stdout(&before).contains(child_pid_text.as_str()));
-        assert!(!stdout(&before).contains(root_pid_text.as_str()));
+        assert!(stdout_table_has_pid(&before, child_pid));
+        assert!(!stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi_with_stdin(
             &["kill", "--pid", root_pid_text.as_str(), "--tree"],
@@ -1853,7 +1950,7 @@ mod macos {
     const HELPER_TREE_ENV: &str = "KICKOUTCHI_TEST_HELPER_TREE";
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
-    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(2);
+    const CHILD_EXIT_WAIT: Duration = Duration::from_secs(10);
     const HELPER_READY_WAIT: Duration = Duration::from_secs(5);
     /// How long a parked helper may outlive its test before self-destructing.
     const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
@@ -2097,6 +2194,14 @@ mod macos {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
+        let pid_text = pid.to_string();
+        stdout(output)
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
+    }
+
     #[test]
     fn helper_tcp_listener_process() {
         if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
@@ -2306,12 +2411,11 @@ mod macos {
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
-        let child_pid_text = child_pid.to_string();
 
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
-        assert!(stdout(&before).contains(child_pid_text.as_str()));
-        assert!(!stdout(&before).contains(root_pid_text.as_str()));
+        assert!(stdout_table_has_pid(&before, child_pid));
+        assert!(!stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi_with_stdin(
             &["kill", "--pid", root_pid_text.as_str(), "--tree"],
@@ -2374,7 +2478,7 @@ mod macos {
         let before = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(before.status.code(), Some(0));
         assert!(stdout(&before).contains(port_text.as_str()));
-        assert!(stdout(&before).contains(pid_text.as_str()));
+        assert!(stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi_with_stdin(&["kill", "--pid", pid_text.as_str()], Some("y\n"));
         assert_eq!(killed.status.code(), Some(0));

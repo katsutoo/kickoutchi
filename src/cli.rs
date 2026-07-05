@@ -5,7 +5,7 @@
 //! The data flows through the same collector and model as the TUI, so the two
 //! stay in sync and this layer doesn't care which collector produced the rows.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -237,7 +237,11 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
 
     if args.json {
         match output::render_json(&visible_entries) {
-            Ok(json) => println!("{json}"),
+            Ok(json) => {
+                if let Some(reason) = write_stdout_line(&json) {
+                    return reason;
+                }
+            }
             Err(error) => {
                 eprintln!("error: rendering JSON failed: {error}");
                 return ExitReason::Failure;
@@ -251,10 +255,12 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
         } else {
             ""
         };
-        println!("no open ports{suffix}");
+        if let Some(reason) = write_stdout_line(&format!("no open ports{suffix}")) {
+            return reason;
+        }
         maybe_print_no_match_diagnostic(diagnostic_port, entries);
-    } else {
-        println!("{}", output::render_table(&visible_entries));
+    } else if let Some(reason) = write_stdout_line(&output::render_table(&visible_entries)) {
+        return reason;
     }
 
     // An empty *filtered* result exits 3, so scripts can probe occupancy
@@ -264,6 +270,33 @@ fn run_list(args: &ListArgs, config: &Config, entries: &[PortEntry]) -> ExitReas
         return ExitReason::NoMatch;
     }
     ExitReason::Success
+}
+
+fn write_stdout_line(text: &str) -> Option<ExitReason> {
+    write_stdout_with(|stdout| {
+        stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.write_all(b"\n"))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn write_stdout(text: &str) -> Option<ExitReason> {
+    write_stdout_with(|stdout| stdout.write_all(text.as_bytes()))
+}
+
+fn write_stdout_with(
+    write: impl FnOnce(&mut io::StdoutLock<'_>) -> io::Result<()>,
+) -> Option<ExitReason> {
+    let mut stdout = io::stdout().lock();
+    match write(&mut stdout).and_then(|()| stdout.flush()) {
+        Ok(()) => None,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Some(ExitReason::Success),
+        Err(error) => {
+            eprintln!("error: writing stdout failed: {error}");
+            Some(ExitReason::Failure)
+        }
+    }
 }
 
 fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntry]) {
@@ -367,7 +400,9 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
         command_line,
     ) {
         Ok(report) => {
-            print!("{report}");
+            if let Some(reason) = write_stdout(&report) {
+                return reason;
+            }
             ExitReason::Success
         }
         Err(inspect::InspectError::TargetMissing) => {

@@ -5,6 +5,8 @@ on:
     branches:
       - "**"
   pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
@@ -25,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal
@@ -46,7 +48,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
@@ -70,7 +72,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         shell: bash
@@ -96,7 +98,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy

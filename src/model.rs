@@ -313,12 +313,8 @@ impl SystemProcessCheck<'_> {
             return true;
         }
 
-        self.process_name.is_some_and(|name| {
-            matches!(
-                name,
-                "systemd" | "launchd" | "init" | "explorer.exe" | "WindowServer"
-            )
-        })
+        self.process_name
+            .is_some_and(|name| matches!(name, "systemd" | "launchd" | "init" | "WindowServer"))
     }
 
     fn is_windows_system_process(&self) -> bool {

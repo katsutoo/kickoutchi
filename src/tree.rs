@@ -652,7 +652,7 @@ impl SweepScope {
     /// Whether the fresh read still proves the frozen node's membership.
     fn relation_holds(self, node: &FrozenNode, info: &TreeProcessInfo) -> bool {
         match self {
-            Self::Tree => info.parent_pid == node.parent_pid,
+            Self::Tree => node.depth == 0 || info.parent_pid == node.parent_pid,
             Self::Group { pgid } => info.process_group == Some(pgid),
         }
     }
@@ -1063,6 +1063,9 @@ fn check_tree_policy(
                 pid: node.pid,
                 reason,
             });
+        }
+        if node.process_name.is_none() {
+            return Err(TreeKillOutcome::PartialMetadata { pid: node.pid });
         }
     }
     // A protected descendant refuses the whole tree in v1.
@@ -2344,6 +2347,35 @@ mod tests {
         assert_eq!(outcome, TreeKillOutcome::TargetChanged { pid: 101 });
         assert!(ops.delivered_pids().is_empty());
         assert!(ops.events.ends_with(&[Event::Cont(101), Event::Cont(100)]));
+    }
+
+    /// The confirmed root's parent is outside the frozen set, so it can exit and
+    /// reparent the root without changing the root's identity or tree scope.
+    #[test]
+    fn frozen_tree_root_reparenting_is_not_identity_drift() {
+        let root = root_target(100, "root", 10);
+        let before = vec![info(100, Some(250), "root", 10)];
+        let reparented = vec![info(100, Some(1), "root", 10)];
+        let mut ops = FakeOps::new(vec![
+            before.clone(), // verify root
+            before,         // sweep pass 1: no descendants
+            reparented,     // final verify: only the root's parent changed
+        ]);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        let TreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completion, got {outcome:?}");
+        };
+        assert_eq!(report.total, 1);
+        assert_eq!(ops.delivered_pids(), vec![100]);
     }
 
     /// A root confirmed without a readable name can `exec` into a protected

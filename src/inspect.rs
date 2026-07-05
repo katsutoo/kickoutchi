@@ -265,7 +265,9 @@ fn render_tree(
         String::new()
     };
     let _ = writeln!(out, "Tree ({} processes){truncation_note}:", preview.len());
-    for node in preview.preview_nodes(TREE_DISPLAY_MAX) {
+    let displayed_nodes =
+        ordered_tree_nodes(preview.preview_nodes(preview.len()), TREE_DISPLAY_MAX);
+    for node in displayed_nodes {
         let indent = "  ".repeat(node.depth + 1);
         let _ = write!(out, "{indent}{}", node_label(node));
         if let Some(ports) = ports_by_pid.get(&node.pid) {
@@ -282,6 +284,39 @@ fn render_tree(
         .iter()
         .map(|node| node.pid)
         .collect()
+}
+
+fn ordered_tree_nodes(nodes: &[ProcessTreeNode], max: usize) -> Vec<&ProcessTreeNode> {
+    let mut children_by_parent: HashMap<u32, Vec<&ProcessTreeNode>> = HashMap::new();
+    let mut root = None;
+    for node in nodes {
+        if node.depth == 0 {
+            root = Some(node);
+        } else if let Some(parent_pid) = node.parent_pid {
+            children_by_parent.entry(parent_pid).or_default().push(node);
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by_key(|node| node.pid);
+    }
+
+    let mut ordered = Vec::new();
+    let mut stack = Vec::new();
+    if let Some(root) = root {
+        stack.push(root);
+    }
+    while let Some(node) = stack.pop() {
+        if ordered.len() == max {
+            break;
+        }
+        ordered.push(node);
+        if let Some(children) = children_by_parent.get(&node.pid) {
+            for child in children.iter().rev() {
+                stack.push(*child);
+            }
+        }
+    }
+    ordered
 }
 
 /// Render the process-group section and return how many members sit outside
@@ -496,6 +531,28 @@ mod tests {
         assert!(report.contains("Tree (2 processes)"), "{report}");
         assert!(report.contains("PID 401 (worker)"), "{report}");
         assert!(report.contains("kick kill --pid 400 --tree"), "{report}");
+    }
+
+    #[test]
+    fn branchy_tree_renders_children_under_their_actual_parent() {
+        let snapshot = vec![
+            info(100, None, "root", 100),
+            info(200, Some(100), "left", 100),
+            info(250, Some(200), "left-child", 100),
+            info(300, Some(100), "right", 100),
+        ];
+
+        let report = render_family_report(100, &snapshot, &[], &[], Platform::Linux, |_| None)
+            .expect("target is present");
+
+        let left = report.find("    PID 200 (left)").expect("left child shown");
+        let left_child = report
+            .find("      PID 250 (left-child)")
+            .expect("grandchild shown");
+        let right = report
+            .find("    PID 300 (right)")
+            .expect("right child shown");
+        assert!(left < left_child && left_child < right, "{report}");
     }
 
     #[test]

@@ -7,11 +7,17 @@
 
 use crate::model::{Platform, PortEntry};
 
-const DEFAULT_PROTECTED_PROCESS_NAMES: [&str; 19] = [
+const LINUX_COMM_MAX_BYTES: usize = 15;
+
+const DEFAULT_PROTECTED_PROCESS_NAMES: [&str; 23] = [
     "docker",
     "docker.exe",
+    "dockerd",
     "dockerd.exe",
+    "docker-proxy",
+    "docker-proxy.exe",
     "Docker Desktop.exe",
+    "com.docker.backend",
     "com.docker.backend.exe",
     "postgres",
     "postgres.exe",
@@ -50,10 +56,12 @@ pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[Strin
 
 /// Platform-aware protected-name match.
 ///
-/// Unix names are exact and case-sensitive. Windows names match
-/// case-insensitively, because that's the platform convention. We never match on
-/// substrings: `postgres-backup-helper` doesn't get to ride on `postgres`'s
-/// protection by accident.
+/// Unix names are exact and case-sensitive. Linux also accepts the `/proc/comm`
+/// 15-byte truncation of a longer configured protected name, because that is all
+/// the collector can read from the kernel. Windows names match case-insensitively,
+/// because that's the platform convention. We never match on arbitrary substrings:
+/// `postgres-backup-helper` doesn't get to ride on `postgres`'s protection by
+/// accident.
 pub(crate) fn is_protected_process_name(
     platform: Platform,
     process_name: &str,
@@ -61,8 +69,24 @@ pub(crate) fn is_protected_process_name(
 ) -> bool {
     protected_names.iter().any(|protected| match platform {
         Platform::Windows => protected.eq_ignore_ascii_case(process_name),
-        Platform::Linux | Platform::Macos => protected == process_name,
+        Platform::Linux => {
+            protected == process_name
+                || (protected.len() > LINUX_COMM_MAX_BYTES
+                    && linux_comm_prefix(protected) == process_name)
+        }
+        Platform::Macos => protected == process_name,
     })
+}
+
+fn linux_comm_prefix(name: &str) -> &str {
+    if name.len() <= LINUX_COMM_MAX_BYTES {
+        return name;
+    }
+    let mut end = LINUX_COMM_MAX_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 #[cfg(test)]
@@ -95,7 +119,10 @@ mod tests {
     fn defaults_cover_documented_safety_names() {
         let defaults = default_protected_processes();
         assert!(defaults.contains(&"docker".to_owned()));
+        assert!(defaults.contains(&"dockerd".to_owned()));
         assert!(defaults.contains(&"dockerd.exe".to_owned()));
+        assert!(defaults.contains(&"docker-proxy".to_owned()));
+        assert!(defaults.contains(&"com.docker.backend".to_owned()));
         assert!(defaults.contains(&"postgres".to_owned()));
         assert!(defaults.contains(&"postgres.exe".to_owned()));
         assert!(defaults.contains(&"systemd".to_owned()));
@@ -122,6 +149,27 @@ mod tests {
         assert!(!is_protected_process_name(
             Platform::Linux,
             "postgres-backup-helper",
+            &protected
+        ));
+    }
+
+    #[test]
+    fn linux_matching_accepts_kernel_comm_truncation_for_long_configured_names() {
+        let protected = vec!["postgres-backup-helper".to_owned()];
+
+        assert!(is_protected_process_name(
+            Platform::Linux,
+            "postgres-backup",
+            &protected
+        ));
+        assert!(!is_protected_process_name(
+            Platform::Macos,
+            "postgres-backup",
+            &protected
+        ));
+        assert!(!is_protected_process_name(
+            Platform::Linux,
+            "postgres",
             &protected
         ));
     }

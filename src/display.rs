@@ -17,7 +17,9 @@ const REPLACEMENT: char = '�';
 ///   replacement character.
 /// - ANSI escape sequences are stripped so a process name can't redraw the
 ///   terminal or fake a confirmation prompt.
-/// - Everything else is preserved, including Unicode.
+/// - Bidi and zero-width formatting characters become the replacement character,
+///   so names cannot hide or reorder text in a terminal prompt.
+/// - Everything else is preserved, including visible Unicode.
 pub(crate) fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -35,7 +37,7 @@ pub(crate) fn sanitize(text: &str) -> String {
             continue;
         }
 
-        if is_control(ch) {
+        if is_control(ch) || is_display_spoofing_format(ch) {
             out.push(REPLACEMENT);
             continue;
         }
@@ -97,6 +99,19 @@ fn is_control(ch: char) -> bool {
     matches!(ch, '\x00'..='\x1f' | '\x7f' | '\u{0080}'..='\u{009f}')
 }
 
+fn is_display_spoofing_format(ch: char) -> bool {
+    matches!(
+        ch,
+        // Arabic Letter Mark, zero-width marks/joiners, bidi isolates/overrides,
+        // and byte-order/word joiners. They render invisibly or reorder text.
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize;
@@ -129,5 +144,11 @@ mod tests {
     #[test]
     fn preserves_unicode() {
         assert_eq!(sanitize("héllo 世界 🌍"), "héllo 世界 🌍");
+    }
+
+    #[test]
+    fn replaces_bidi_and_zero_width_formatting() {
+        assert_eq!(sanitize("safe\u{202e}txt"), "safe�txt");
+        assert_eq!(sanitize("zero\u{200b}width"), "zero�width");
     }
 }
