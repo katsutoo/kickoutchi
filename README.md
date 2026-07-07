@@ -84,9 +84,23 @@ Every release also includes direct archives for Linux, macOS, and Windows, plus
 matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
 nervous, grab the archive, check the hash, and run `kickoutchi` or `kick`.
 
-Arch and Nix are first-class because they fit Rust CLI/TUI tools without making
-me going crazy. Homebrew and winget are not planned right now;
-macOS and Windows users should use the installers or direct archives above, I'm sorry, but you're on your own, I don't want to deal with Homebrew or winget. (But feel free to make a PR if you want to add support for them or help me to add support for them :3)
+macOS users can install from the Homebrew tap (one formula, both `kickoutchi`
+and `kick`):
+
+```sh
+brew install nuggocto/tap/kickoutchi
+```
+
+Windows users can install from the Scoop bucket:
+
+```powershell
+scoop bucket add nuggocto https://github.com/nuggocto/scoop-bucket
+scoop install kickoutchi
+```
+
+Arch and Nix are first-class too. The Homebrew formula is generated and pushed to
+the tap on every release; the Scoop manifest lives in `packaging/scoop/` and
+auto-updates its bucket. winget is not planned right now (but a PR is welcome :3).
 
 Rust users can install from Git:
 

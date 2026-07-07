@@ -11,7 +11,13 @@ ci = "github"
 # pinned action SHAs and narrower job permissions.
 allow-dirty = ["ci"]
 # The installers to generate for each app
-installers = ["shell", "powershell"]
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap that receives the generated formula. The publish-homebrew-formula
+# job in release.yml pushes to it with HOMEBREW_TAP_TOKEN. release.yml is
+# hand-hardened (pinned SHAs, narrowed permissions), so that job is kept in sync
+# with `dist generate` by hand rather than regenerated.
+tap = "nuggocto/homebrew-tap"
+publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = true
 # Target platforms to build apps for (Rust target-triple syntax)

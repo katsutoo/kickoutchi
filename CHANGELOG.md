@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-07-07
+
+### Added
+
+- Homebrew tap publishing for releases. `cargo-dist` now generates the formula,
+  and the release workflow publishes it to `nuggocto/homebrew-tap` so macOS and
+  Linux users can install with `brew install nuggocto/tap/kickoutchi`.
+- Scoop bucket packaging for Windows. The repository now carries a seed manifest
+  and Excavator workflow under `packaging/scoop/`, with the live bucket at
+  `nuggocto/scoop-bucket` auto-updating from GitHub Release assets and their
+  `.sha256` sidecars.
+
+### Changed
+
+- Install documentation now lists Homebrew, Scoop, AUR, Nix, Cargo, installers,
+  and direct archives as supported release paths.
+- The release workflow now waits for Homebrew publishing before announcing a
+  release, keeps the tap push behind `HOMEBREW_TAP_TOKEN`, and skips unchanged
+  Homebrew commits on safe reruns.
+
 ## [1.1.1] - 2026-07-05
 
 ### Fixed
@@ -682,7 +702,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/nuggocto/kickoutchi/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/nuggocto/kickoutchi/compare/v1.0.0...v1.0.1
