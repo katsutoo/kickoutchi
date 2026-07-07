@@ -100,7 +100,9 @@ scoop install kickoutchi
 
 Arch and Nix are first-class too. The Homebrew formula is generated and pushed to
 the tap on every release; the Scoop manifest lives in `packaging/scoop/` and
-auto-updates its bucket. winget is not planned right now (but a PR is welcome :3).
+auto-updates its bucket. winget is not planned right now. Homebrew users should
+use `nuggocto/tap`; PRs for winget or Homebrew/core are welcome if someone wants
+to maintain them :3.
 
 Rust users can install from Git:
 
