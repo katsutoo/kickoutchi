@@ -1,7 +1,7 @@
 # Maintainer: nugget <vincent@sshmoi.com>
 
 pkgname=kickoutchi-bin
-pkgver=1.1.1
+pkgver=1.1.2
 pkgrel=1
 pkgdesc="A clean TUI and CLI port janitor"
 arch=("x86_64" "aarch64")
@@ -16,8 +16,8 @@ _archive_x86_64="kickoutchi-x86_64-unknown-linux-gnu.tar.xz"
 _archive_aarch64="kickoutchi-aarch64-unknown-linux-gnu.tar.xz"
 source_x86_64=("${pkgname}-${pkgver}-x86_64-unknown-linux-gnu.tar.xz::${url}/releases/download/v${pkgver}/${_archive_x86_64}")
 source_aarch64=("${pkgname}-${pkgver}-aarch64-unknown-linux-gnu.tar.xz::${url}/releases/download/v${pkgver}/${_archive_aarch64}")
-sha256sums_x86_64=("c73db26eaf0c5c5e4d78ff253271f63eaa6524e2442ba597c749a7b874d725be")
-sha256sums_aarch64=("fae9db7e358bd22a3c0e6f0d24e47ff872d4c332e96041507f2ddd2c3671196d")
+sha256sums_x86_64=("0ef1357494d3c90ff664c393e4233404c6b1d5bd8c6d742ae768a7360860b113")
+sha256sums_aarch64=("e3a916935ec7b3db4d2dc593eb1e7b53a44ee513080cbb4965dc9160633ee8eb")
 
 _dist_target() {
   case "${CARCH}" in

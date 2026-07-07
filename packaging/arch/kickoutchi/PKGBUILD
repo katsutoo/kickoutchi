@@ -1,7 +1,7 @@
 # Maintainer: nugget <vincent@sshmoi.com>
 
 pkgname=kickoutchi
-pkgver=1.1.1
+pkgver=1.1.2
 pkgrel=1
 pkgdesc="A clean TUI and CLI port janitor"
 arch=("x86_64" "aarch64")
@@ -12,7 +12,7 @@ makedepends=("cargo")
 conflicts=("kickoutchi-bin")
 options=("!debug")
 source=("${pkgname}-${pkgver}.tar.gz::${url}/releases/download/v${pkgver}/source.tar.gz")
-sha256sums=("7d6b602dd28c33ab4898fe01fb347b541eb7db6db1d7ed259f20bbf744ddc68f")
+sha256sums=("bd424c2d93500a10652756016cb3ac8ff0a8b0b07d69e9fbd9540acf8d4d0459")
 
 _cargo() {
   RUSTC=/usr/bin/rustc RUSTDOC=/usr/bin/rustdoc /usr/bin/cargo "$@"

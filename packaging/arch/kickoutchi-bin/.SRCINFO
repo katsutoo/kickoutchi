@@ -1,18 +1,18 @@
 pkgbase = kickoutchi-bin
 	pkgdesc = A clean TUI and CLI port janitor
-	pkgver = 1.1.1
+	pkgver = 1.1.2
 	pkgrel = 1
 	url = https://github.com/nuggocto/kickoutchi
 	arch = x86_64
 	arch = aarch64
 	license = MIT
 	depends = gcc-libs
-	provides = kickoutchi=1.1.1
+	provides = kickoutchi=1.1.2
 	conflicts = kickoutchi
 	options = !debug
-	source_x86_64 = kickoutchi-bin-1.1.1-x86_64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v1.1.1/kickoutchi-x86_64-unknown-linux-gnu.tar.xz
-	sha256sums_x86_64 = c73db26eaf0c5c5e4d78ff253271f63eaa6524e2442ba597c749a7b874d725be
-	source_aarch64 = kickoutchi-bin-1.1.1-aarch64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v1.1.1/kickoutchi-aarch64-unknown-linux-gnu.tar.xz
-	sha256sums_aarch64 = fae9db7e358bd22a3c0e6f0d24e47ff872d4c332e96041507f2ddd2c3671196d
+	source_x86_64 = kickoutchi-bin-1.1.2-x86_64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v1.1.2/kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+	sha256sums_x86_64 = 0ef1357494d3c90ff664c393e4233404c6b1d5bd8c6d742ae768a7360860b113
+	source_aarch64 = kickoutchi-bin-1.1.2-aarch64-unknown-linux-gnu.tar.xz::https://github.com/nuggocto/kickoutchi/releases/download/v1.1.2/kickoutchi-aarch64-unknown-linux-gnu.tar.xz
+	sha256sums_aarch64 = e3a916935ec7b3db4d2dc593eb1e7b53a44ee513080cbb4965dc9160633ee8eb
 
 pkgname = kickoutchi-bin
