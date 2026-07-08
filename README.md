@@ -67,8 +67,11 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 Windows users get the PowerShell spell:
 
 ```powershell
-irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex"
 ```
+
+`-ExecutionPolicy Bypass` is scoped to that installer process; it does not
+persistently change your user or machine execution policy.
 
 Installer-based installs also include `kickoutchi-update`. Run it later to check
 for and install the newest GitHub Release:

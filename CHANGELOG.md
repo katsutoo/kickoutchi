@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows installer documentation now uses the `cargo-dist` PowerShell command
+  with process-scoped `-ExecutionPolicy Bypass`, avoiding failures on the default
+  restricted execution policy.
+
 ## [1.1.2] - 2026-07-07
 
 ### Added
