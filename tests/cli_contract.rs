@@ -897,6 +897,32 @@ mod linux {
     }
 
     #[test]
+    fn overlong_confirmation_cannot_be_truncated_into_force() {
+        let (mut helper, _port, ready_file) = spawn_listener_process();
+        let pid_text = helper.id().to_string();
+        let input = format!("force{}\n", " ".repeat(1024));
+
+        let output =
+            kickoutchi_with_stdin(&["kill", "--pid", pid_text.as_str(), "--force"], &input);
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("confirmation input exceeds"),
+            "{}",
+            stderr(&output),
+        );
+        assert!(
+            helper
+                .child
+                .try_wait()
+                .expect("helper status must be readable")
+                .is_none(),
+            "overlong confirmation must not terminate the helper",
+        );
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
     fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();

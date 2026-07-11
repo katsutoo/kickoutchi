@@ -200,7 +200,9 @@ fn draw(frame: &mut Frame, app: &App, theme: Theme) {
         Modal::Help => help::render(frame, modal_area, theme),
         Modal::ConfirmKill => confirm::render(frame, modal_area, app, theme),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Modal::ConfirmTreeKill => confirm::render_tree(frame, modal_area, app, theme),
+        Modal::ConfirmTreeKill => {
+            confirm::render_tree(frame, centered_rect(76, 90, area), app, theme);
+        }
     }
 }
 
@@ -505,5 +507,38 @@ mod tests {
         assert!(text.contains("tree (2 processes)"), "{text}");
         assert!(text.contains("PID 18430 (worker)"), "{text}");
         assert!(text.contains("Type tree"), "{text}");
+
+        let mut crowded_infos = infos;
+        for pid in 18_431..18_451 {
+            crowded_infos.push(crate::tree::TreeProcessInfo {
+                pid,
+                parent_pid: Some(18_422),
+                unverified_parent_pid: None,
+                parent_process_name: None,
+                process_name: Some("aaaaaaaaaaa bbbbbbbbbbb ccccccccccc".to_owned()),
+                start_time_marker: Some(u64::from(pid)),
+                owner_uid: None,
+                process_group: None,
+            });
+        }
+        let preview = crate::tree::plan_process_tree(
+            18_422,
+            &crowded_infos,
+            &[],
+            crate::model::Platform::Linux,
+            256,
+        )
+        .expect("crowded preview must build");
+        app.finish_tree_preview_for_test(Ok(preview));
+        for ch in "tre".chars() {
+            app.apply_action(Action::KillInputAppend(ch));
+        }
+        app.apply_action(Action::SubmitKillConfirmation);
+
+        let text = render_text(&app, 80, 20);
+        assert!(text.contains("Type tree"), "{text}");
+        assert!(text.contains("Input: tre"), "{text}");
+        assert!(text.contains("Error: type tree"), "{text}");
+        assert!(text.contains("Esc cancels."), "{text}");
     }
 }

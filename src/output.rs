@@ -4,6 +4,8 @@
 //! the data came from. That's exactly what lets real collectors swap in for the
 //! fake one without anyone touching this file.
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::display::sanitize;
 use crate::model::PortEntry;
 
@@ -25,10 +27,13 @@ pub(crate) fn render_table(entries: &[PortEntry]) -> String {
     // Each column grows to its widest cell. The model's own types keep content
     // in check (addresses, ports, PIDs, short comm-style names), so there's no
     // need for a width cap — and command lines deliberately aren't columns here.
-    let mut widths: [usize; COLUMN_COUNT] = HEADERS.map(str::len);
+    // Widths are terminal columns, not bytes: `sanitize` keeps visible Unicode,
+    // and an accented or CJK process name occupies fewer/more columns than its
+    // byte length suggests.
+    let mut widths: [usize; COLUMN_COUNT] = HEADERS.map(UnicodeWidthStr::width);
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row.iter()) {
-            *width = (*width).max(cell.len());
+            *width = (*width).max(cell.as_str().width());
         }
     }
 
@@ -73,7 +78,7 @@ fn push_row(out: &mut String, cells: &[String; COLUMN_COUNT], widths: &[usize; C
         // Pad every column but the last — trailing spaces are just invisible
         // noise for diffs and shells.
         if index < COLUMN_COUNT - 1 {
-            for _ in cell.len()..*width {
+            for _ in cell.as_str().width()..*width {
                 out.push(' ');
             }
         }
@@ -83,6 +88,8 @@ fn push_row(out: &mut String, cells: &[String; COLUMN_COUNT], widths: &[usize; C
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use unicode_width::UnicodeWidthStr;
 
     use super::{render_json, render_table};
     use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
@@ -135,6 +142,46 @@ mod tests {
         let state_offset = lines[0].find("STATE").expect("header has STATE");
         assert_eq!(lines[1].find("LISTEN"), Some(state_offset));
         assert_eq!(lines[2].find("LISTEN"), Some(state_offset));
+    }
+
+    #[test]
+    fn table_sanitizes_hostile_process_names() {
+        // `list` output lands on real terminals, and a process names itself:
+        // the escape must be stripped by `render_table`'s own wiring, not
+        // just be strippable by `sanitize` in isolation. Deleting the
+        // `sanitize` call in `row_cells` must fail this test.
+        let table = render_table(&[entry(3000, Some(1), Some("evil\x1b[2J\nname"))]);
+
+        assert!(!table.contains('\x1b'), "{table}");
+        let lines: Vec<&str> = table.lines().collect();
+        // Header plus exactly one row: the embedded newline must not split
+        // the entry across lines and break `awk`-style consumers.
+        assert_eq!(lines.len(), 2, "{table}");
+        assert!(lines[1].contains("evil"), "{table}");
+    }
+
+    #[test]
+    fn table_columns_stay_aligned_for_wide_unicode_names() {
+        // `sanitize` keeps visible Unicode, so widths must be terminal
+        // columns, not bytes: "数据库" is 9 bytes but 6 columns, and
+        // byte-based padding would shift every later column in that row.
+        let table = render_table(&[
+            entry(80, Some(1), Some("nginx")),
+            entry(5432, Some(2), Some("数据库")),
+            entry(3000, Some(3), Some("héllo")),
+        ]);
+
+        let lines: Vec<&str> = table.lines().collect();
+        // The header is pure ASCII, so its byte offset is its column offset.
+        let header_state_columns = lines[0].find("STATE").expect("header has STATE");
+        for line in &lines[1..] {
+            let listen_start = line.find("LISTEN").expect("row has LISTEN");
+            assert_eq!(
+                line[..listen_start].width(),
+                header_state_columns,
+                "STATE column drifted: {table}",
+            );
+        }
     }
 
     #[test]

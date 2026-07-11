@@ -4,6 +4,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{self, App, KillConfirmation};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -278,10 +280,50 @@ fn tree_instruction_text(confirmation: &TreeKillConfirmation) -> String {
     }
 }
 
+/// Upper-bound row count for one logical line under the modal's
+/// `Wrap { trim: false }` word wrapping.
+///
+/// `ceil(chars / cols)` is only a lower bound: word wrapping pushes a word
+/// that does not fit onto the next row, so the columns wasted at each break
+/// can add rows — three 11-column words at 20 columns take three rows, not
+/// two. This walks the same greedy model (words fill a row until the next
+/// word no longer fits; a word wider than the modal hard-breaks), measured
+/// in terminal columns so double-width names count honestly. Where this
+/// model and the widget could disagree, the accounting rounds up: an
+/// overcount only shrinks the node preview, an undercount would push the
+/// prompt below the fold.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wrapped_rows(text: &str, content_cols: usize) -> usize {
     let cols = content_cols.max(1);
-    text.chars().count().max(1).div_ceil(cols)
+    let mut rows: usize = 1;
+    let mut used_cols: usize = 0;
+    let mut first_word = true;
+
+    for word in text.split(' ') {
+        // Every split boundary is exactly one space; it travels with the
+        // word it precedes, so runs of spaces keep their full width.
+        let separator_cols = usize::from(!first_word);
+        first_word = false;
+        let word_cols = word.width();
+        if used_cols + separator_cols + word_cols <= cols {
+            used_cols += separator_cols + word_cols;
+            continue;
+        }
+        if used_cols > 0 {
+            rows += 1;
+        }
+        if word_cols <= cols {
+            used_cols = word_cols;
+        } else {
+            // Hard break: charge full rows and treat the last one as spent,
+            // which rounds up instead of tracking the exact remainder.
+            rows += word_cols.div_ceil(cols) - 1;
+            used_cols = cols;
+        }
+    }
+
+    // The character mass is a hard floor however the breaks land.
+    rows.max(text.width().div_ceil(cols)).max(1)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -671,6 +713,25 @@ mod tests {
         // The tree size stays honest even when the node list is clipped.
         assert!(text.contains("tree (21 processes)"), "{text}");
         assert!(text.contains("more"), "{text}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn wrapped_rows_counts_word_wrap_waste_not_just_character_mass() {
+        use super::wrapped_rows;
+
+        // Three 11-column words at 20 columns: greedy word wrap fits one word
+        // per row (11 + space + 11 overflows), so the widget spends 3 rows
+        // where a plain character count claims ceil(35/20) = 2. Undercounting
+        // here is what lets the preview push the prompt below the fold.
+        assert_eq!(wrapped_rows("aaaaaaaaaaa bbbbbbbbbbb ccccccccccc", 20), 3);
+        // Double-width names occupy two columns per char.
+        assert_eq!(wrapped_rows("数据库数据库", 6), 2);
+        // A single word wider than the modal hard-breaks across rows.
+        assert_eq!(wrapped_rows(&"x".repeat(45), 20), 3);
+        // Boundary cases keep the one-row floor.
+        assert_eq!(wrapped_rows("", 20), 1);
+        assert_eq!(wrapped_rows("short", 20), 1);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

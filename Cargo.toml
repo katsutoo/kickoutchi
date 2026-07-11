@@ -1,6 +1,6 @@
 [package]
 name = "kickoutchi"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
@@ -53,7 +53,12 @@ tracing-subscriber = "0.3.23"
 # in the shared model/config/CLI foundation.
 dirs = "6.0.0"
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Terminal column widths for CLI table padding: process names keep visible
+# Unicode, and byte length misaligns columns for accented/CJK names. Already
+# in the dependency tree via ratatui, so this adds no new supply-chain weight.
+unicode-width = "0.2.2"
+
+[target.'cfg(unix)'.dependencies]
 # Unix termination uses the OS signal API directly for SIGTERM/SIGKILL instead
 # of shelling out to `kill`; the unsafe boundary is kept inside process.rs.
 # macOS collection also uses libc's libproc/sysctl bindings directly.
@@ -62,7 +67,7 @@ libc = "0.2.177"
 [target.'cfg(windows)'.dependencies]
 # Windows collection uses IP Helper directly, and termination uses process
 # handles so the signal target cannot wander off after confirmation.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Windows process metadata is intentionally snapshot-based: one refresh builds a
 # process map, and socket rows only look up into it instead of poking every PID

@@ -41,6 +41,13 @@ struct RefreshWorker {
 struct ContextWorker {
     key: RowKey,
     receiver: Receiver<ContextResult>,
+    stale: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextRequestState {
+    Idle,
+    PendingLatest,
 }
 
 /// In-flight enumeration of the selected root's process tree, so the full
@@ -197,6 +204,7 @@ pub(crate) struct App {
     selected_context_key: Option<RowKey>,
     selected_process_context: Option<ProcessContext>,
     context_worker: Option<ContextWorker>,
+    context_request_state: ContextRequestState,
     kill_confirmation: Option<KillConfirmation>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tree_confirmation: Option<TreeKillConfirmation>,
@@ -255,6 +263,7 @@ impl App {
             selected_context_key: None,
             selected_process_context: None,
             context_worker: None,
+            context_request_state: ContextRequestState::Idle,
             kill_confirmation: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tree_confirmation: None,
@@ -335,22 +344,27 @@ impl App {
                 self.context_worker = None;
                 self.latest_error =
                     Some("details worker exited before returning context".to_owned());
+                self.start_pending_process_context_request();
                 return;
             }
         };
         let worker_key = worker.key;
+        let stale = worker.stale;
         self.context_worker = None;
-        let updated_target = worker_key
-            .pid
-            .and_then(|pid| self.kill_target_with_context(pid, &result));
+        if !stale {
+            let updated_target = worker_key
+                .pid
+                .and_then(|pid| self.kill_target_with_context(pid, &result));
 
-        if self.selected_row().map(RowKey::from) == Some(worker_key) {
-            self.selected_context_key = Some(worker_key);
-            self.selected_process_context = Some(result.clone());
+            if self.selected_row().map(RowKey::from) == Some(worker_key) {
+                self.selected_context_key = Some(worker_key);
+                self.selected_process_context = Some(result.clone());
+            }
+            if let Some(target) = updated_target {
+                self.apply_context_target_to_confirmations(target);
+            }
         }
-        if let Some(target) = updated_target {
-            self.apply_context_target_to_confirmations(target);
-        }
+        self.start_pending_process_context_request();
     }
 
     fn finish_refresh_attempt(
@@ -434,9 +448,11 @@ impl App {
 
     pub(crate) fn selected_process_context_loading(&self) -> bool {
         let selected_key = self.selected_row().map(RowKey::from);
-        self.context_worker
-            .as_ref()
-            .is_some_and(|worker| Some(worker.key) == selected_key)
+        self.context_request_state == ContextRequestState::PendingLatest
+            || self
+                .context_worker
+                .as_ref()
+                .is_some_and(|worker| Some(worker.key) == selected_key)
     }
 
     pub(crate) fn kill_confirmation(&self) -> Option<&KillConfirmation> {
@@ -493,7 +509,10 @@ impl App {
             Action::MoveUp => self.select_previous(),
             Action::OpenDetails => self.open_details(),
             Action::OpenHelp => self.modal = Modal::Help,
-            Action::CloseModal => self.modal = Modal::None,
+            Action::CloseModal => {
+                self.modal = Modal::None;
+                self.context_request_state = ContextRequestState::Idle;
+            }
             Action::RequestTerminate => self.request_kill(KillMode::Terminate),
             Action::RequestForceKill => self.request_kill(KillMode::Force),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -704,6 +723,7 @@ impl App {
 
     fn cancel_kill_confirmation(&mut self) {
         self.kill_confirmation = None;
+        self.context_request_state = ContextRequestState::Idle;
         self.modal = Modal::None;
         self.kill_status = Some("kill cancelled".to_owned());
     }
@@ -894,6 +914,7 @@ impl App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn cancel_tree_confirmation(&mut self) {
         self.tree_confirmation = None;
+        self.context_request_state = ContextRequestState::Idle;
         self.modal = Modal::None;
         self.kill_status = Some("tree kill cancelled".to_owned());
     }
@@ -1211,7 +1232,10 @@ impl App {
         self.all_rows = rows;
         self.last_successful_refresh = Some(now);
         self.latest_error = None;
-        self.context_worker = None;
+        if let Some(worker) = self.context_worker.as_mut() {
+            worker.stale = true;
+        }
+        self.context_request_state = ContextRequestState::Idle;
         self.selected_context_key = None;
         self.selected_process_context = None;
         self.rebuild_visible_rows();
@@ -1250,13 +1274,20 @@ impl App {
     fn load_selected_process_context(&mut self) {
         let selected_key = self.selected_row().map(RowKey::from);
         if self.selected_context_key == selected_key && self.selected_process_context.is_some() {
+            self.context_request_state = ContextRequestState::Idle;
             return;
         }
-        if self
-            .context_worker
-            .as_ref()
-            .is_some_and(|worker| Some(worker.key) == selected_key)
-        {
+        if let Some(worker) = self.context_worker.as_ref() {
+            if Some(worker.key) == selected_key && !worker.stale {
+                return;
+            }
+            // One worker owns the process/Docker scan until its channel drains.
+            // A single boolean is the bounded latest-request queue: the current
+            // selection is read only when the worker finishes, so repeated row
+            // changes cannot accumulate entries or background threads.
+            self.context_request_state = ContextRequestState::PendingLatest;
+            self.selected_context_key = None;
+            self.selected_process_context = None;
             return;
         }
 
@@ -1264,7 +1295,7 @@ impl App {
         self.selected_process_context = None;
 
         let Some(entry) = self.selected_row().cloned() else {
-            self.context_worker = None;
+            self.context_request_state = ContextRequestState::Idle;
             return;
         };
         let key = RowKey::from(&entry);
@@ -1275,9 +1306,15 @@ impl App {
                 let _ = sender.send(collect_selected_process_context(&entry));
             }) {
             Ok(_handle) => {
-                self.context_worker = Some(ContextWorker { key, receiver });
+                self.context_request_state = ContextRequestState::Idle;
+                self.context_worker = Some(ContextWorker {
+                    key,
+                    receiver,
+                    stale: false,
+                });
             }
             Err(error) => {
+                self.context_request_state = ContextRequestState::Idle;
                 self.context_worker = None;
                 self.latest_error = Some(format!("starting details worker failed: {error}"));
             }
@@ -1288,6 +1325,16 @@ impl App {
         self.context_worker
             .as_ref()
             .is_some_and(|worker| worker.key.pid == Some(pid))
+            || (self.context_request_state == ContextRequestState::PendingLatest
+                && self.selected_row().is_some_and(|row| row.pid == Some(pid)))
+    }
+
+    fn start_pending_process_context_request(&mut self) {
+        if self.context_request_state != ContextRequestState::PendingLatest {
+            return;
+        }
+        self.context_request_state = ContextRequestState::Idle;
+        self.load_selected_process_context();
     }
 
     fn kill_target_with_context(&self, pid: u32, context: &ProcessContext) -> Option<KillTarget> {
@@ -1624,7 +1671,10 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::{App, ContextWorker, Modal, RefreshWorker, RowKey, termination_status_line};
+    use super::{
+        App, ContextRequestState, ContextWorker, Modal, RefreshWorker, RowKey,
+        termination_status_line,
+    };
     use crate::config::Config;
     use crate::input::Action;
     use crate::model::{
@@ -1715,7 +1765,11 @@ mod tests {
         sender
             .send(context)
             .expect("test context result must send before polling");
-        app.context_worker = Some(ContextWorker { key, receiver });
+        app.context_worker = Some(ContextWorker {
+            key,
+            receiver,
+            stale: false,
+        });
         app.poll_process_context();
     }
 
@@ -1804,6 +1858,47 @@ mod tests {
 
         app.apply_action(Action::Quit);
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn details_context_is_single_flight_and_latest_selection_wins() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node")), entry(5173, Some("vite"))]);
+        let first_key = RowKey::from(app.selected_row().expect("first row is selected"));
+        let (first_sender, first_receiver) = mpsc::channel();
+        app.context_worker = Some(ContextWorker {
+            key: first_key,
+            receiver: first_receiver,
+            stale: false,
+        });
+
+        app.apply_action(Action::OpenDetails);
+        app.apply_action(Action::CloseModal);
+        app.apply_action(Action::MoveDown);
+        let latest_key = RowKey::from(app.selected_row().expect("second row is selected"));
+        app.apply_action(Action::OpenDetails);
+
+        assert_eq!(
+            app.context_worker.as_ref().map(|worker| worker.key),
+            Some(first_key),
+            "the in-flight worker must not be replaced",
+        );
+        assert_eq!(
+            app.context_request_state,
+            ContextRequestState::PendingLatest,
+        );
+
+        first_sender
+            .send(context(55))
+            .expect("the first worker result must be delivered");
+        app.poll_process_context();
+
+        assert_eq!(app.selected_process_context(), None);
+        assert_eq!(app.context_request_state, ContextRequestState::Idle);
+        assert_eq!(
+            app.context_worker.as_ref().map(|worker| worker.key),
+            Some(latest_key),
+            "the newest selection starts only after the first worker drains",
+        );
     }
 
     #[test]
@@ -1923,6 +2018,34 @@ mod tests {
         assert_eq!(app.modal(), Modal::ConfirmKill);
         assert_eq!(confirmation.mode, KillMode::Force);
         assert_eq!(confirmation.requirement, ConfirmationRequirement::ForceWord);
+    }
+
+    #[test]
+    fn wrong_confirmation_word_rejects_and_keeps_the_modal_open() {
+        // The plain kill modal's whole job is "wrong word must not kill":
+        // submitting a non-matching word has to set the inline error and keep
+        // the modal (and its pending confirmation) exactly where it was —
+        // never fall through to execution.
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        app.apply_action(Action::RequestForceKill);
+        for ch in "yes".chars() {
+            app.apply_action(Action::KillInputAppend(ch));
+        }
+
+        app.apply_action(Action::SubmitKillConfirmation);
+
+        assert_eq!(app.modal(), Modal::ConfirmKill);
+        let confirmation = app
+            .kill_confirmation()
+            .expect("rejected submit must keep the confirmation pending");
+        assert_eq!(confirmation.input, "yes");
+        let error = confirmation
+            .error
+            .as_deref()
+            .expect("rejected submit sets the inline error");
+        assert!(error.contains("type force"), "{error}");
+        // No termination status: nothing was sent and nothing was attempted.
+        assert!(app.kill_status().is_none(), "{:?}", app.kill_status());
     }
 
     #[test]

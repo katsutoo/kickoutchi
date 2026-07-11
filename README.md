@@ -26,7 +26,8 @@ Website: <https://kickoutchi.com>
   permission status when available.
 - Explains Docker-owned or partial-metadata ports in details when Docker CLI
   metadata is available; Docker is optional and never required for normal port
-  listing.
+  listing. PATH-based Docker enrichment is disabled while Kickoutchi is elevated
+  so a user-writable executable search path cannot cross a privilege boundary.
 - Opens as a terminal UI when run without a command.
 - Works as a script-friendly CLI with table or JSON output.
 - Asks before termination, because Donkey may yell but Donkey does not kill
@@ -51,6 +52,14 @@ Website: <https://kickoutchi.com>
   process-group analog.
 - Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
   path.
+
+## Performance
+
+On the maintainer's Linux development machine, a local 2,000-run measurement of
+the v1.2.0 release candidate produced 10.836 ms median, 12.289 ms p95, and
+12.831 ms p99 startup latency, with 14.45 MiB peak RSS. These figures are a
+single-machine reference, not a portable guarantee; hardware, kernel, terminal,
+and the number of processes and sockets on the host all affect results.
 
 ## Install
 

@@ -6,7 +6,7 @@
 //! sees — tables, details panels, kill confirmations — should pass through here
 //! first so a funky process can't move the cursor, hide text, or fake a prompt.
 
-const REPLACEMENT: char = '�';
+pub(crate) const REPLACEMENT: char = '�';
 
 /// Make an untrusted string safe to print where humans read it.
 ///
@@ -99,7 +99,10 @@ fn is_control(ch: char) -> bool {
     matches!(ch, '\x00'..='\x1f' | '\x7f' | '\u{0080}'..='\u{009f}')
 }
 
-fn is_display_spoofing_format(ch: char) -> bool {
+/// Crate-visible so other display surfaces (the diagnostic command-line
+/// quoter) can apply the exact same spoofing-character policy without
+/// duplicating this list and letting the two drift apart.
+pub(crate) fn is_display_spoofing_format(ch: char) -> bool {
     matches!(
         ch,
         // Arabic Letter Mark, zero-width marks/joiners, bidi isolates/overrides,

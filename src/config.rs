@@ -6,6 +6,7 @@
 //! the file and the bad value, because quietly falling back to defaults would
 //! just hide the user's typo.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +26,10 @@ pub(crate) const REFRESH_INTERVAL_SECONDS_MAX: u64 = 3600;
 /// this keeps that work bounded. No real allowlist gets anywhere near it — if you
 /// hit this, the config was generated or corrupted.
 pub(crate) const PROTECTED_PROCESSES_MAX: usize = 256;
+
+/// Config is hand-written and tiny in normal use. This cap prevents files,
+/// pipes, and special devices from driving unbounded allocation or reads.
+pub(crate) const CONFIG_FILE_MAX_BYTES: usize = 64 * 1024;
 
 /// What went wrong while loading config.
 #[derive(Debug, Error)]
@@ -109,23 +114,24 @@ impl Config {
             // No config directory on this system, so there's nothing to read.
             return Ok(Self::default());
         };
-        match std::fs::read_to_string(&path) {
+        match read_config_file(&path) {
             Ok(text) => Self::parse(&text, &path),
             // We just try the read and handle the result instead of checking
             // exists() first — that check would only race file creation/removal
             // for no real benefit.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(ConfigError::Read { path, source }),
+            Err(ConfigError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
         }
     }
 
     /// Load from a file the user explicitly asked for. Any failure here — the
     /// file not existing included — is an error.
     fn load_from(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let text = read_config_file(path)?;
         Self::parse(&text, path)
     }
 
@@ -186,6 +192,37 @@ impl Config {
     }
 }
 
+fn read_config_file(path: &Path) -> Result<String, ConfigError> {
+    let file = std::fs::File::open(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    read_config_from(file, path)
+}
+
+fn read_config_from(reader: impl Read, path: &Path) -> Result<String, ConfigError> {
+    let limit = u64::try_from(CONFIG_FILE_MAX_BYTES + 1)
+        .expect("config byte limit plus sentinel must fit in u64");
+    let mut bytes = Vec::with_capacity(CONFIG_FILE_MAX_BYTES + 1);
+    reader
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > CONFIG_FILE_MAX_BYTES {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            detail: format!("file exceeds the {CONFIG_FILE_MAX_BYTES}-byte limit"),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        detail: format!("file is not valid UTF-8: {error}"),
+    })
+}
+
 /// Make sure a refresh interval from the config file is actually in range.
 fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
     if !(REFRESH_INTERVAL_SECONDS_MIN..=REFRESH_INTERVAL_SECONDS_MAX).contains(&seconds) {
@@ -200,11 +237,17 @@ fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
 /// Sanity-check the protected-process list: bounded in size, no empty names.
 /// An empty name can never match anything, so it's always a mistake worth
 /// flagging rather than dead weight we'd haul around on every refresh.
-fn validate_protected_processes(names: &[String]) -> Result<(), String> {
+///
+/// The size bound applies to the merged list, but the user only sees their
+/// own file: the message spells out the built-in share of the count so "273
+/// entries" is not a mystery to someone who wrote 250.
+fn validate_protected_processes(names: &[String], default_count: usize) -> Result<(), String> {
     if names.len() > PROTECTED_PROCESSES_MAX {
         return Err(format!(
-            "protected_processes has {} entries, the maximum is {PROTECTED_PROCESSES_MAX}",
-            names.len()
+            "protected_processes has {} entries ({} configured plus {default_count} built-in \
+             defaults), the maximum is {PROTECTED_PROCESSES_MAX}",
+            names.len(),
+            names.len() - default_count,
         ));
     }
     if names.iter().any(String::is_empty) {
@@ -222,12 +265,13 @@ fn merge_protected_processes(
     mut defaults: Vec<String>,
     configured: Vec<String>,
 ) -> Result<Vec<String>, String> {
+    let default_count = defaults.len();
     for name in configured {
         if !defaults.iter().any(|existing| existing == &name) {
             defaults.push(name);
         }
     }
-    validate_protected_processes(&defaults)?;
+    validate_protected_processes(&defaults, default_count)?;
     Ok(defaults)
 }
 
@@ -239,10 +283,13 @@ fn default_config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Config, ConfigError, PROTECTED_PROCESSES_MAX};
+    use super::{
+        CONFIG_FILE_MAX_BYTES, Config, ConfigError, PROTECTED_PROCESSES_MAX, read_config_from,
+    };
     use crate::model::SortMode;
 
     /// Tests go through `Config::parse` with a fixed fake path: the I/O above it
@@ -359,6 +406,11 @@ mod tests {
         let text = format!("protected_processes = [{}]", names.join(", "));
         let detail = invalid_detail(parse(&text));
         assert!(detail.contains("maximum"), "detail: {detail}");
+        // The bound covers defaults + configured names, but the user only
+        // sees their own file: the message must break the count down so the
+        // total is not a mystery.
+        assert!(detail.contains("configured plus"), "detail: {detail}");
+        assert!(detail.contains("built-in defaults"), "detail: {detail}");
     }
 
     #[test]
@@ -373,6 +425,41 @@ mod tests {
             "/nonexistent/kickoutchi-test/never-here.toml",
         )));
         assert!(matches!(result, Err(ConfigError::Read { .. })));
+    }
+
+    #[test]
+    fn config_reader_accepts_exact_byte_limit() {
+        let bytes = vec![b' '; CONFIG_FILE_MAX_BYTES];
+        let text = read_config_from(bytes.as_slice(), Path::new("boundary.toml"))
+            .expect("boundary-sized config must be accepted");
+        assert_eq!(text.len(), CONFIG_FILE_MAX_BYTES);
+    }
+
+    #[test]
+    fn config_reader_rejects_one_byte_over_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "kickoutchi-oversized-config-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, vec![b' '; CONFIG_FILE_MAX_BYTES + 1])
+            .expect("oversized config fixture must be written");
+
+        let detail = match Config::load(Some(&path)) {
+            Err(ConfigError::Invalid { detail, .. }) => detail,
+            other => panic!("expected oversized ConfigError::Invalid, got {other:?}"),
+        };
+        assert!(detail.contains("65536-byte limit"), "detail: {detail}");
+        fs::remove_file(path).expect("oversized config fixture must be removed");
+    }
+
+    #[test]
+    fn config_reader_stops_after_limit_plus_one_bytes() {
+        let detail = match read_config_from(std::io::repeat(b' '), Path::new("endless.toml")) {
+            Err(ConfigError::Invalid { detail, .. }) => detail,
+            other => panic!("expected oversized ConfigError::Invalid, got {other:?}"),
+        };
+        assert!(detail.contains("exceeds"), "detail: {detail}");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! or claim ownership of a socket the OS didn't actually confirm. Hints, not
 //! accusations.
 
-use crate::display::sanitize;
+use crate::display::{REPLACEMENT, is_display_spoofing_format, sanitize};
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
@@ -106,6 +106,11 @@ fn push_quoted_command(out: &mut String, command_line: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             ch if ch.is_control() => out.push(' '),
+            // `char::is_control` only covers the Cc controls; bidi overrides
+            // and zero-width characters are category Cf and would pass raw,
+            // letting a command line visually reorder this message. Same
+            // policy as `sanitize`.
+            ch if is_display_spoofing_format(ch) => out.push(REPLACEMENT),
             ch => out.push(ch),
         }
     }
@@ -230,6 +235,25 @@ mod tests {
 
         assert!(!message.contains('\x1b'), "{message}");
         assert!(message.contains("evilname"), "{message}");
+    }
+
+    #[test]
+    fn diagnostic_message_replaces_bidi_and_zero_width_in_command_lines() {
+        // The command line is attacker-controlled too, and `char::is_control`
+        // misses category-Cf characters: a U+202E override could visually
+        // reorder the surrounding diagnostic text. The quoted path must apply
+        // the same spoofing policy as `sanitize`.
+        let hints = vec![RelatedProcessHint {
+            pid: 12345,
+            process_name: Some("node".to_owned()),
+            command_line: "node \u{202e}--port 3000\u{200b}".to_owned(),
+        }];
+
+        let message = diagnostic_message(3000, &hints).expect("hint produces a message");
+
+        assert!(!message.contains('\u{202e}'), "{message}");
+        assert!(!message.contains('\u{200b}'), "{message}");
+        assert!(message.contains("--port 3000"), "{message}");
     }
 
     #[test]

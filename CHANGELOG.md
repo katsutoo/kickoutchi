@@ -7,11 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-11
+
+### Added
+
+- A clearly labeled single-machine performance reference in the README based
+  on 2,000 local runs of the v1.2.0 release candidate. The benchmark harness and
+  Python tooling remain local development artifacts and are not shipped in the
+  repository.
+
+### Changed
+
+- Windows tree-kill reports now retain normalized PID lists instead of counters
+  for Job Object delivery, verified individual fallback, and already-exited
+  members. Partial-result output names every PID and counts every observed
+  process without duplicating or losing state.
+
 ### Fixed
 
+- Release publication now waits for Linux, Windows, and macOS tests plus the
+  supply-chain policy on the exact tag SHA. Every artifact builder explicitly
+  installs and selects Rust 1.95.0, and pull requests build/package cargo-dist
+  artifacts instead of stopping at a plan.
+- Regression coverage now exercises the production config-loading, Linux
+  collector-limit, Windows snapshot, Windows failure-reporting, Docker
+  privilege, and fully rendered modal paths instead of testing disconnected
+  helpers. Locally executable release regressions were mutation-checked by
+  restoring their prior faulty behavior and confirming the relevant test fails
+  for the intended reason; Windows-only paths are compiled here and run in CI.
+- CLI confirmations now reject and drain any line past the 128-byte cap instead
+  of truncating it into a potentially valid destructive confirmation.
+- Config files now fail closed past a 64 KiB byte cap rather than allowing a
+  large file or special device to drive unbounded reads and allocation.
+- Linux collection caches process metadata once per PID and fails closed at
+  explicit aggregate file-descriptor traversal and emitted-row limits, bounding
+  shared-socket owner fanout without collapsing ambiguous ownership.
+- Windows tree parent links with equal child and parent creation timestamps are
+  now marked unverified and refused instead of silently omitted. Completion uses
+  one shared five-second deadline and reports each PID in exactly one outcome.
 - Windows installer documentation now uses the `cargo-dist` PowerShell command
   with process-scoped `-ExecutionPolicy Bypass`, avoiding failures on the default
   restricted execution policy.
+- A failed Windows `TerminateJobObject` call after containment commit now
+  returns the complete partial-action report: fallback-terminated and
+  already-exited PIDs remain visible, assigned members are explicitly marked
+  unconfirmed, prior post-commit issues are preserved, and the CLI refreshes the
+  confirmed target ports before exiting with failure.
+- TUI process-details collection is now strictly single-flight. A different-row
+  request occupies one bounded latest-request slot until the active worker
+  drains, stale refresh-era results are ignored, and closing or cancelling the
+  modal drops pending work instead of accumulating background threads and
+  Docker processes.
+- Docker enrichment now drains stdout and stderr concurrently from process
+  start, retains at most 256 KiB per stream while continuing to drain overflow,
+  and keeps the existing timeout/kill/reap behavior. Valid output larger than an
+  OS pipe buffer no longer deadlocks into a false timeout, and the wait for the
+  drain itself is bounded to 250 ms, so a grandchild that inherited the pipe
+  (Docker Desktop shims, credential helpers) cannot stall the details view
+  indefinitely. Stuck drain workers remain charged against a global cap so
+  repeated inherited pipes cannot grow the process's thread count without bound.
+- CLI table columns now align by terminal display width instead of byte
+  length, so accented and CJK process names no longer shift the PROCESS and
+  STATE columns in `list` output. Uses `unicode-width`, which was already in
+  the dependency tree via ratatui.
+- Port diagnostics now replace bidirectional-override and zero-width
+  characters inside quoted command lines, matching the policy every other
+  human-facing surface already applied; a process's command line can no longer
+  visually reorder the hint text on the terminal.
+- The tree-kill confirmation modal's preview budget now measures word-wrapped
+  rows in terminal columns rather than estimating from character counts, so
+  long unbroken process names at small modal sizes can no longer push the
+  typed-word instruction, input echo, or Esc hint below the fold. The tree modal
+  also reserves additional vertical space for wrapped warnings and validation
+  errors at the minimum supported terminal size.
+- Windows tree sweeps now report an unexpected OS error while opening a
+  late-discovered child as a snapshot failure instead of mislabeling it as
+  permission denied.
+- The protected-process list size error now breaks its count into configured
+  entries and built-in defaults, so the reported total matches something the
+  user can see in their config file.
+
+### Security
+
+- PATH-resolved Docker enrichment is now disabled while Kickoutchi is elevated,
+  preventing a user-writable executable search path from becoming privileged
+  code execution on Windows or Unix setuid/setgid/root sessions.
+- Release jobs no longer execute cargo-dist installer assets directly from the
+  network. Both v0.32.0 shell and PowerShell installers are downloaded to a
+  temporary file and verified against repository-pinned SHA-256 values on every
+  Linux, macOS, and Windows release builder before execution.
+- Release workflow scripts now receive the tag ref through environment
+  variables instead of inline `${{ }}` interpolation, closing a
+  script-injection shape that was reachable only by users who can already push
+  tags.
+- Linux `/proc` stat and status reads now fail closed past their byte caps
+  instead of silently truncating — a truncated stat line could otherwise parse
+  a prefix of the start-time identity marker as a valid but wrong value. The
+  status cap is sized so even a pathologically long `Groups:` line still fits,
+  and the `/proc` PID scan carries an explicit fail-closed cap matching the
+  macOS collector.
 
 ## [1.1.2] - 2026-07-07
 
@@ -708,7 +802,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/nuggocto/kickoutchi/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/nuggocto/kickoutchi/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nuggocto/kickoutchi/compare/v1.0.1...v1.1.0

@@ -7,6 +7,9 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Build and upload packages on pull requests so release packaging is exercised
+# before a tag can publish the same artifact graph.
+pr-run-mode = "upload"
 # release.yml is cargo-dist-generated but intentionally hardened in-repo with
 # pinned action SHAs and narrower job permissions.
 allow-dirty = ["ci"]

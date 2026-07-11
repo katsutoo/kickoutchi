@@ -17,6 +17,15 @@ name: Release
 permissions:
   contents: read
 
+env:
+  # When bumping cargo-dist, hash both versioned installer assets before updating
+  # these pins. A changed release asset must fail closed instead of being piped
+  # into a privileged release runner.
+  DIST_VERSION: "0.32.0"
+  DIST_INSTALLER_SH_SHA256: "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5"
+  DIST_INSTALLER_PS1_SHA256: "a3435e9944f1a1297add11c6a8ac1f543c14a5ea88879ee05b24ff8218d46d87"
+  RUST_VERSION: "1.95.0"
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -45,6 +54,54 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Publication is gated here rather than relying on checks from another run:
+  # every check below uses this workflow's exact github.sha.
+  verify:
+    name: Verify (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: Windows
+            runner: windows-latest
+          - name: macOS
+            runner: macos-latest
+          - name: Supply Chain
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install and select Rust 1.95.0 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install and select Rust 1.95.0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
+          rustup default $env:RUST_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
+      - name: Install cargo-deny
+        if: matrix.name == 'Supply Chain'
+        shell: bash
+        run: cargo install --locked cargo-deny --version 0.19.4
+      - name: Run tests
+        if: matrix.name != 'Supply Chain'
+        run: cargo test --locked --all-features
+      - name: Run supply-chain policy
+        if: matrix.name == 'Supply Chain'
+        run: cargo deny check
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
@@ -63,10 +120,15 @@ jobs:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: |
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" \
+            --output "$installer"
+          actual_sha256="$(shasum -a 256 "$installer" | awk '{print $1}')"
+          test "$actual_sha256" = "$DIST_INSTALLER_SH_SHA256"
+          sh "$installer"
       - name: Cache dist
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -77,9 +139,14 @@ jobs:
       # functionality based on whether this is a pull_request, and whether it's from a fork.
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
+      # The ref name reaches the shell through env rather than ${{ }} splicing:
+      # tag pushers are already trusted, but a ref name can contain `$(...)`,
+      # and env expansion cannot inject commands the way inline interpolation can.
       - id: plan
+        env:
+          PLAN_ARGS: ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist $PLAN_ARGS --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -95,6 +162,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
+      - verify
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
@@ -122,15 +190,53 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
+      - name: Require rustup in container
         if: ${{ matrix.container }}
+        shell: bash
         run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+          command -v rustup >/dev/null 2>&1 || {
+            echo "cargo-dist container must provide rustup; refusing an unverified network bootstrap" >&2
+            exit 1
+          }
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install and select Rust 1.95.0 (Unix runner)
+        if: ${{ !matrix.container && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install and select Rust 1.95.0 (Windows runner)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
+          rustup default $env:RUST_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
+      - name: Install dist (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" \
+            --output "$installer"
+          actual_sha256="$(shasum -a 256 "$installer" | awk '{print $1}')"
+          test "$actual_sha256" = "$DIST_INSTALLER_SH_SHA256"
+          sh "$installer"
+      - name: Install dist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "cargo-dist-installer.ps1"
+          $url = "https://github.com/axodotdev/cargo-dist/releases/download/v$env:DIST_VERSION/cargo-dist-installer.ps1"
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $installer
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $env:DIST_INSTALLER_PS1_SHA256) {
+            throw "cargo-dist installer checksum mismatch: $actualSha256"
+          }
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File $installer
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -142,9 +248,12 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        env:
+          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build $TAG_FLAG --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
@@ -171,6 +280,7 @@ jobs:
   build-global-artifacts:
     needs:
       - plan
+      - verify
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
     env:
@@ -181,6 +291,11 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Install and select Rust 1.95.0
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
       - name: Install cached dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -196,8 +311,11 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build $TAG_FLAG --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -217,10 +335,11 @@ jobs:
   host:
     needs:
       - plan
+      - verify
       - build-local-artifacts
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -248,8 +367,11 @@ jobs:
           merge-multiple: true
       - id: host
         shell: bash
+        env:
+          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host $TAG_FLAG --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -276,11 +398,13 @@ jobs:
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # Publish the dist-generated Homebrew formula to the tap repo. The push
   # authenticates with HOMEBREW_TAP_TOKEN (a PAT scoped to the tap repo), so this

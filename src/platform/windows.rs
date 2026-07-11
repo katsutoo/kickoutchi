@@ -204,10 +204,17 @@ pub(crate) fn collect_tree_process_infos() -> Vec<TreeProcessInfo> {
 }
 
 fn tree_process_infos_from_snapshot(processes: &ProcessSnapshot) -> Vec<TreeProcessInfo> {
+    tree_process_infos_from_snapshot_with(processes, process_start_time_marker)
+}
+
+fn tree_process_infos_from_snapshot_with(
+    processes: &ProcessSnapshot,
+    mut marker_for_pid: impl FnMut(u32) -> Option<u64>,
+) -> Vec<TreeProcessInfo> {
     let markers = processes
         .processes
         .keys()
-        .map(|pid| (*pid, process_start_time_marker(*pid)))
+        .map(|pid| (*pid, marker_for_pid(*pid)))
         .collect::<HashMap<_, _>>();
     let names = processes
         .processes
@@ -273,16 +280,19 @@ fn accepted_parent_edge(
             unverified: Some(parent_pid),
         };
     };
-    if child_start > parent_start {
-        AcceptedParentEdge {
+    match child_start.cmp(&parent_start) {
+        std::cmp::Ordering::Greater => AcceptedParentEdge {
             verified: Some(parent_pid),
             unverified: None,
-        }
-    } else {
-        AcceptedParentEdge {
+        },
+        std::cmp::Ordering::Equal => AcceptedParentEdge {
+            verified: None,
+            unverified: Some(parent_pid),
+        },
+        std::cmp::Ordering::Less => AcceptedParentEdge {
             verified: None,
             unverified: None,
-        }
+        },
     }
 }
 
@@ -681,7 +691,8 @@ mod tests {
     use super::{
         AcceptedParentEdge, MAX_CHILD_PROCESSES, ProcessMetadata, ProcessSnapshot, SocketRecord,
         accepted_parent_edge, command_line_from_os_strings, decode_port, encode_port_for_tests,
-        entry_from_record, filetime_to_u64, tcp4_record, tcp6_record, udp4_record, udp6_record,
+        entry_from_record, filetime_to_u64, tcp4_record, tcp6_record,
+        tree_process_infos_from_snapshot_with, udp4_record, udp6_record,
     };
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
     use std::collections::HashMap;
@@ -961,6 +972,28 @@ mod tests {
                 unverified: Some(10),
             },
         );
+    }
+
+    #[test]
+    fn equal_creation_times_keep_parent_edge_unverified() {
+        let snapshot = ProcessSnapshot {
+            processes: HashMap::from([
+                (10, ProcessMetadata::default()),
+                (
+                    20,
+                    ProcessMetadata {
+                        parent_pid: Some(10),
+                        ..ProcessMetadata::default()
+                    },
+                ),
+            ]),
+        };
+
+        let rows = tree_process_infos_from_snapshot_with(&snapshot, |_| Some(100));
+        let child = rows.iter().find(|row| row.pid == 20).expect("child row");
+
+        assert_eq!(child.parent_pid, None);
+        assert_eq!(child.unverified_parent_pid, Some(10));
     }
 
     #[test]

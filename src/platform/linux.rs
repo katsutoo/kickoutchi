@@ -37,33 +37,76 @@ const TCP_LISTEN_STATE: &str = "0A";
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CMDLINE_BYTES: usize = 16 * 1024;
 const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
-// `/proc/<pid>/status` is kernel-generated and small, but we read it on every
-// refresh, so we bound it like every other /proc read here. `PPid` lives near
-// the top of the file, comfortably inside this cap, so the limit can never chop
-// off the field the collector actually wants.
-const MAX_STATUS_BYTES: u64 = 8 * 1024;
-const MAX_STAT_BYTES: u64 = 4 * 1024;
+// `/proc/<pid>/status` and `/proc/<pid>/stat` are kernel-generated and read
+// on every refresh, so they are bounded like every other /proc read here —
+// and the reads fail closed past the cap rather than silently truncating,
+// because a truncated stat line could parse a *prefix* of the start-time
+// marker as a valid but wrong number: a wrong identity check on a kill path,
+// not an error. The caps leave real files no way to trip the failure: stat is
+// a fixed ~52-field line with comm capped at 16 bytes (a few hundred bytes),
+// and status stays small except for `Groups:`, which can legitimately list up
+// to NGROUPS_MAX (65536) GIDs — roughly 450 KiB — so its cap clears that with
+// room to spare. `take()` reads only what exists, so the generous cap costs
+// nothing on the ~1 KiB common case.
+const MAX_STATUS_BYTES: usize = 1024 * 1024;
+const MAX_STAT_BYTES: usize = 4 * 1024;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const MAX_PROCESS_ANCESTORS: usize = 64;
+// The kernel's own pid_max (4 M) already bounds the /proc PID scan, but the
+// bound deserves to be explicit and symmetric with the macOS collector's cap.
+// Truncating would silently drop processes — potentially real port owners —
+// so the scan fails closed past it, like the socket table above.
+const MAX_PROCESS_IDS: usize = 131_072;
+// Aggregate bounds for the two multiplicative parts of collection. One million
+// fd entries covers ordinary high-density hosts while bounding procfs traversal;
+// 262k rows allows substantial shared-socket fanout above the socket-table size.
+// Both limits fail closed because a partial owner map or row set is misleading.
+const MAX_FD_ENTRIES: usize = 1_048_576;
+const MAX_PORT_ENTRIES: usize = 262_144;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
 /// The Linux end of the collector contract.
 pub(crate) struct LinuxCollector {
     proc_root: PathBuf,
+    limits: CollectionLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CollectionLimits {
+    process_ids: usize,
+    fd_entries: usize,
+    port_entries: usize,
+}
+
+impl CollectionLimits {
+    const PRODUCTION: Self = Self {
+        process_ids: MAX_PROCESS_IDS,
+        fd_entries: MAX_FD_ENTRIES,
+        port_entries: MAX_PORT_ENTRIES,
+    };
 }
 
 impl LinuxCollector {
     pub(crate) fn new() -> Self {
         Self {
             proc_root: PathBuf::from(PROC_ROOT),
+            limits: CollectionLimits::PRODUCTION,
         }
     }
 
     #[cfg(test)]
     fn with_proc_root(proc_root: PathBuf) -> Self {
-        Self { proc_root }
+        Self {
+            proc_root,
+            limits: CollectionLimits::PRODUCTION,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_proc_root_and_limits(proc_root: PathBuf, limits: CollectionLimits) -> Self {
+        Self { proc_root, limits }
     }
 }
 
@@ -71,20 +114,20 @@ impl Collector for LinuxCollector {
     fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
         let records = collect_socket_records(&self.proc_root)?;
         let target_inodes: HashSet<u64> = records.iter().map(|record| record.inode).collect();
-        let owners = collect_socket_owners(&self.proc_root, &target_inodes)?;
+        let owners = collect_socket_owners(
+            &self.proc_root,
+            &target_inodes,
+            self.limits.process_ids,
+            self.limits.fd_entries,
+        )?;
 
-        let mut entries = Vec::with_capacity(records.len());
-        for record in records {
-            match owners.get(&record.inode) {
-                Some(pids) if !pids.is_empty() => {
-                    for pid in pids {
-                        entries.push(entry_from_record(&record, Some(*pid), &self.proc_root));
-                    }
-                }
-                _ => entries.push(entry_from_record(&record, None, &self.proc_root)),
-            }
-        }
-        Ok(entries)
+        expand_socket_records(
+            &records,
+            &owners,
+            &self.proc_root,
+            self.limits.port_entries,
+            read_process_metadata,
+        )
     }
 }
 
@@ -356,14 +399,18 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
 fn collect_socket_owners(
     proc_root: &Path,
     target_inodes: &HashSet<u64>,
+    max_process_ids: usize,
+    max_fd_entries: usize,
 ) -> Result<HashMap<u64, Vec<u32>>, CollectorError> {
     if target_inodes.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let pids = process_ids(proc_root).map_err(|source| CollectorError::Read {
-        path: proc_root.to_path_buf(),
-        source,
+    let pids = process_ids_with_limit(proc_root, max_process_ids).map_err(|source| {
+        CollectorError::Read {
+            path: proc_root.to_path_buf(),
+            source,
+        }
     })?;
 
     // Walk every PID's file descriptors, no early exit. A single listening socket
@@ -375,13 +422,25 @@ fn collect_socket_owners(
     // save. If this scan ever becomes the refresh bottleneck on a huge host, the
     // fix is netlink `sock_diag`, not a correctness-breaking early stop.
     let mut owners = HashMap::with_capacity(target_inodes.len());
+    let mut fd_entries_visited = 0;
     for pid in pids {
-        collect_pid_socket_owners(proc_root, pid, target_inodes, &mut owners);
+        collect_pid_socket_owners(
+            proc_root,
+            pid,
+            target_inodes,
+            &mut owners,
+            &mut fd_entries_visited,
+            max_fd_entries,
+        )?;
     }
     Ok(owners)
 }
 
 fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
+    process_ids_with_limit(proc_root, MAX_PROCESS_IDS)
+}
+
+fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for entry in fs::read_dir(proc_root)? {
         let Ok(entry) = entry else {
@@ -393,6 +452,12 @@ fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
+        if pids.len() >= max_process_ids {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("process list exceeds {max_process_ids} PID cap"),
+            ));
+        }
         pids.push(pid);
     }
     pids.sort_unstable();
@@ -404,14 +469,34 @@ fn collect_pid_socket_owners(
     pid: u32,
     target_inodes: &HashSet<u64>,
     owners: &mut HashMap<u64, Vec<u32>>,
-) {
+    fd_entries_visited: &mut usize,
+    max_fd_entries: usize,
+) -> Result<(), CollectorError> {
     let fd_dir = proc_root.join(pid.to_string()).join("fd");
-    let Ok(fd_entries) = fs::read_dir(fd_dir) else {
-        return;
+    let fd_entries = match fs::read_dir(&fd_dir) {
+        Ok(entries) => entries,
+        // Processes routinely vanish or deny fd access during a procfs scan.
+        Err(error) if process_vanished(&error) || error.kind() == ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(CollectorError::Read {
+                path: fd_dir,
+                source,
+            });
+        }
     };
 
     for entry in fd_entries {
+        if *fd_entries_visited >= max_fd_entries {
+            return Err(resource_cap_error(
+                &fd_dir,
+                format!("file-descriptor traversal exceeds {max_fd_entries} entry cap"),
+            ));
+        }
+        *fd_entries_visited += 1;
         let Ok(entry) = entry else {
+            // The failed directory entry still consumed traversal budget.
             continue;
         };
         let Ok(target) = fs::read_link(entry.path()) else {
@@ -428,6 +513,50 @@ fn collect_pid_socket_owners(
             pids.push(pid);
         }
     }
+    Ok(())
+}
+
+fn expand_socket_records<F>(
+    records: &[SocketRecord],
+    owners: &HashMap<u64, Vec<u32>>,
+    proc_root: &Path,
+    max_entries: usize,
+    mut read_metadata: F,
+) -> Result<Vec<PortEntry>, CollectorError>
+where
+    F: FnMut(&Path, u32) -> ProcessMetadata,
+{
+    let mut entries = Vec::with_capacity(records.len().min(max_entries));
+    let mut metadata_by_pid = HashMap::new();
+    for record in records {
+        let pids = owners.get(&record.inode).filter(|pids| !pids.is_empty());
+        let emitted_for_record = pids.map_or(1, Vec::len);
+        if entries.len().saturating_add(emitted_for_record) > max_entries {
+            return Err(resource_cap_error(
+                proc_root,
+                format!("collected port rows exceed {max_entries} entry cap"),
+            ));
+        }
+
+        if let Some(pids) = pids {
+            for &pid in pids {
+                let metadata = metadata_by_pid
+                    .entry(pid)
+                    .or_insert_with(|| read_metadata(proc_root, pid));
+                entries.push(entry_from_record(record, Some(pid), Some(metadata)));
+            }
+        } else {
+            entries.push(entry_from_record(record, None, None));
+        }
+    }
+    Ok(entries)
+}
+
+fn resource_cap_error(path: &Path, message: String) -> CollectorError {
+    CollectorError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(ErrorKind::InvalidData, message),
+    }
 }
 
 fn parse_socket_inode(target: &Path) -> Option<u64> {
@@ -438,10 +567,12 @@ fn parse_socket_inode(target: &Path) -> Option<u64> {
     inode.parse::<u64>().ok()
 }
 
-fn entry_from_record(record: &SocketRecord, pid: Option<u32>, proc_root: &Path) -> PortEntry {
-    let metadata = pid.map(|pid| read_process_metadata(proc_root, pid));
-    let permission = if pid.is_none() || metadata.as_ref().is_some_and(|metadata| metadata.partial)
-    {
+fn entry_from_record(
+    record: &SocketRecord,
+    pid: Option<u32>,
+    metadata: Option<&ProcessMetadata>,
+) -> PortEntry {
+    let permission = if pid.is_none() || metadata.is_some_and(|metadata| metadata.partial) {
         PermissionStatus::Partial
     } else {
         PermissionStatus::Full
@@ -453,19 +584,11 @@ fn entry_from_record(record: &SocketRecord, pid: Option<u32>, proc_root: &Path) 
         local_port: record.local_port,
         state: record.state,
         pid,
-        process_name: metadata
-            .as_ref()
-            .and_then(|metadata| metadata.process_name.clone()),
-        executable_path: metadata
-            .as_ref()
-            .and_then(|metadata| metadata.executable_path.clone()),
-        command_line: metadata
-            .as_ref()
-            .and_then(|metadata| metadata.command_line.clone()),
-        parent_pid: metadata.as_ref().and_then(|metadata| metadata.parent_pid),
-        parent_process_name: metadata
-            .as_ref()
-            .and_then(|metadata| metadata.parent_process_name.clone()),
+        process_name: metadata.and_then(|metadata| metadata.process_name.clone()),
+        executable_path: metadata.and_then(|metadata| metadata.executable_path.clone()),
+        command_line: metadata.and_then(|metadata| metadata.command_line.clone()),
+        parent_pid: metadata.and_then(|metadata| metadata.parent_pid),
+        parent_process_name: metadata.and_then(|metadata| metadata.parent_process_name.clone()),
         child_pids: Vec::new(),
         protected: false,
         platform: Platform::Linux,
@@ -798,11 +921,7 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
 }
 
 fn read_stat_text(path: &Path) -> std::io::Result<String> {
-    let mut text = String::new();
-    File::open(path)?
-        .take(MAX_STAT_BYTES)
-        .read_to_string(&mut text)?;
-    Ok(text)
+    read_bounded_text(path, MAX_STAT_BYTES)
 }
 
 /// Process group ID from `/proc/<pid>/stat`: field 5 overall, so the third
@@ -840,19 +959,11 @@ fn read_process_name(process_dir: &Path) -> std::io::Result<Option<String>> {
 }
 
 fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
-    let mut text = String::new();
-    File::open(path)?
-        .take(MAX_STATUS_BYTES)
-        .read_to_string(&mut text)?;
-    parse_process_status(&text)
+    parse_process_status(&read_bounded_text(path, MAX_STATUS_BYTES)?)
 }
 
 fn read_process_start_time_ticks(path: &Path) -> std::io::Result<u64> {
-    let mut text = String::new();
-    File::open(path)?
-        .take(MAX_STAT_BYTES)
-        .read_to_string(&mut text)?;
-    parse_process_start_time_ticks(&text)
+    parse_process_start_time_ticks(&read_bounded_text(path, MAX_STAT_BYTES)?)
 }
 
 fn parse_process_start_time_ticks(text: &str) -> std::io::Result<u64> {
@@ -938,16 +1049,19 @@ fn decode_cmdline(bytes: &[u8]) -> Option<String> {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::io::ErrorKind;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
 
     use super::{
-        AddressFamily, LinuxCollector, MAX_CHILD_PROCESSES, SocketParseError, SocketRecord,
-        collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
-        collect_related_process_hints_from, collect_socket_owners, collect_socket_records,
-        collect_tree_process_infos, decode_cmdline, entry_from_record, parse_process_group_id,
-        parse_process_start_time_ticks, parse_process_status, parse_socket_inode,
-        parse_socket_line, parse_socket_table, read_bounded_text, read_process_status,
+        AddressFamily, CollectionLimits, LinuxCollector, MAX_CHILD_PROCESSES, MAX_FD_ENTRIES,
+        MAX_PORT_ENTRIES, MAX_PROCESS_IDS, MAX_STATUS_BYTES, ProcessMetadata, SocketParseError,
+        SocketRecord, collect_child_processes_from, collect_pid_socket_owners,
+        collect_process_context_from, collect_related_process_hints_from, collect_socket_owners,
+        collect_socket_records, collect_tree_process_infos, decode_cmdline, entry_from_record,
+        expand_socket_records, parse_process_group_id, parse_process_start_time_ticks,
+        parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
+        read_bounded_text, read_process_status,
     };
     use crate::collector::Collector;
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
@@ -1281,20 +1395,45 @@ mod tests {
     }
 
     #[test]
-    fn parent_pid_read_is_bounded_and_still_finds_ppid_near_the_top() {
-        // `PPid` lives near the top of `status`, so the byte cap on the read must
-        // never hide it, even when the rest of the file runs well past the cap.
+    fn status_read_parses_inside_the_cap_and_fails_closed_past_it() {
+        // The cap is sized so every legitimate `status` file fits (even a
+        // pathological `Groups:` line stays under it), and past the cap the
+        // read must fail closed rather than hand the parser a silently
+        // truncated view: a partial file that still "parses" is exactly the
+        // wrong-but-valid answer the bounded-read convention exists to stop.
         let proc_root = temp_proc_root("status-cap");
         let process_dir = proc_root.join("99");
         fs::create_dir_all(&process_dir).expect("test process directory must exist");
-        let status = format!("Name:\tnode\nPPid:\t42\n{}", "Filler:\t0\n".repeat(2000));
-        fs::write(process_dir.join("status"), status).expect("test status must be written");
+        let status_path = process_dir.join("status");
 
-        let parent = read_process_status(&process_dir.join("status"))
-            .expect("status read must succeed")
+        // A large-but-legitimate file (a long Groups line) parses fine.
+        let groups = (0..60_000u32).fold(String::from("Groups:"), |mut line, gid| {
+            line.push(' ');
+            line.push_str(&gid.to_string());
+            line
+        });
+        let status = format!("Name:\tnode\nPPid:\t42\n{groups}\n");
+        assert!(status.len() < MAX_STATUS_BYTES, "fixture must fit the cap");
+        fs::write(&status_path, status).expect("test status must be written");
+        let parent = read_process_status(&status_path)
+            .expect("in-cap status read must succeed")
             .parent_pid;
-
         assert_eq!(parent, Some(42));
+
+        // Past the cap the read fails closed, PPid or not.
+        let oversized = format!(
+            "Name:\tnode\nPPid:\t42\n{}",
+            "Filler:\t0\n".repeat(MAX_STATUS_BYTES / 8),
+        );
+        assert!(
+            oversized.len() > MAX_STATUS_BYTES,
+            "fixture must exceed cap"
+        );
+        fs::write(&status_path, oversized).expect("test status must be written");
+        let error =
+            read_process_status(&status_path).expect_err("over-cap status read must fail closed");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -1311,7 +1450,10 @@ mod tests {
         let entry = entry_from_record(
             &record,
             Some(1234),
-            Path::new("/definitely-not-a-real-kickoutchi-proc-root"),
+            Some(&ProcessMetadata {
+                partial: true,
+                ..ProcessMetadata::default()
+            }),
         );
 
         assert_eq!(entry.pid, Some(1234));
@@ -1499,6 +1641,8 @@ mod tests {
         let error = collect_socket_owners(
             Path::new("/definitely-not-a-real-kickoutchi-proc-root"),
             &target_inodes,
+            MAX_PROCESS_IDS,
+            MAX_FD_ENTRIES,
         )
         .expect_err("missing proc root must fail");
 
@@ -1515,8 +1659,13 @@ mod tests {
         std::os::unix::fs::symlink("socket:[22]", fd_dir.join("1"))
             .expect("test socket symlink must be created");
 
-        let owners = collect_socket_owners(&proc_root, &HashSet::from([22]))
-            .expect("targeted owner collection must succeed");
+        let owners = collect_socket_owners(
+            &proc_root,
+            &HashSet::from([22]),
+            MAX_PROCESS_IDS,
+            MAX_FD_ENTRIES,
+        )
+        .expect("targeted owner collection must succeed");
 
         assert_eq!(owners.get(&22).map(Vec::as_slice), Some(&[1234][..]));
         assert!(!owners.contains_key(&11));
@@ -1533,8 +1682,13 @@ mod tests {
                 .expect("test socket symlink must be created");
         }
 
-        let owners = collect_socket_owners(&proc_root, &HashSet::from([44]))
-            .expect("targeted owner collection must succeed");
+        let owners = collect_socket_owners(
+            &proc_root,
+            &HashSet::from([44]),
+            MAX_PROCESS_IDS,
+            MAX_FD_ENTRIES,
+        )
+        .expect("targeted owner collection must succeed");
 
         assert_eq!(owners.get(&44).map(Vec::as_slice), Some(&[100, 101][..]));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
@@ -1552,9 +1706,183 @@ mod tests {
 
         let target_inodes = HashSet::from([44]);
         let mut owners = HashMap::new();
-        collect_pid_socket_owners(&proc_root, 1234, &target_inodes, &mut owners);
+        let mut visited = 0;
+        collect_pid_socket_owners(
+            &proc_root,
+            1234,
+            &target_inodes,
+            &mut owners,
+            &mut visited,
+            2,
+        )
+        .expect("fd traversal at the cap must succeed");
 
         assert_eq!(owners.get(&44).map(Vec::as_slice), Some(&[1234][..]));
+        assert_eq!(visited, 2);
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn pid_socket_owner_collection_fails_closed_past_fd_budget() {
+        let proc_root = temp_proc_root("fd-budget");
+        let fd_dir = proc_root.join("1234").join("fd");
+        fs::create_dir_all(&fd_dir).expect("test fd directory must be created");
+        for fd in 0..3 {
+            std::os::unix::fs::symlink("socket:[44]", fd_dir.join(fd.to_string()))
+                .expect("test socket symlink must be created");
+        }
+        let mut owners = HashMap::new();
+        let mut visited = 0;
+
+        let error = collect_pid_socket_owners(
+            &proc_root,
+            1234,
+            &HashSet::from([44]),
+            &mut owners,
+            &mut visited,
+            2,
+        )
+        .expect_err("fd traversal past the cap must fail closed");
+
+        assert_eq!(visited, 2);
+        assert!(
+            error.to_string().contains("file-descriptor traversal"),
+            "{error}"
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn collector_enforces_fd_budget_through_production_orchestration() {
+        let proc_root = temp_proc_root("collector-fd-budget");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 100, "worker", 1);
+        for fd in 0..3 {
+            std::os::unix::fs::symlink(
+                "socket:[44]",
+                proc_root.join("100/fd").join(fd.to_string()),
+            )
+            .expect("test socket symlink must be created");
+        }
+        let collector = LinuxCollector::with_proc_root_and_limits(
+            proc_root.clone(),
+            CollectionLimits {
+                fd_entries: 2,
+                ..CollectionLimits::PRODUCTION
+            },
+        );
+
+        let error = collector
+            .collect()
+            .expect_err("collector must enforce fd cap");
+
+        assert!(
+            error.to_string().contains("file-descriptor traversal"),
+            "{error}"
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn collector_enforces_row_budget_through_production_orchestration() {
+        let proc_root = temp_proc_root("collector-row-budget");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        for pid in [100, 101, 102] {
+            write_process(&proc_root, pid, "worker", 1);
+            std::os::unix::fs::symlink("socket:[44]", proc_root.join(pid.to_string()).join("fd/0"))
+                .expect("test socket symlink must be created");
+        }
+        let collector = LinuxCollector::with_proc_root_and_limits(
+            proc_root.clone(),
+            CollectionLimits {
+                port_entries: 2,
+                ..CollectionLimits::PRODUCTION
+            },
+        );
+
+        let error = collector
+            .collect()
+            .expect_err("collector must enforce row cap");
+
+        assert!(error.to_string().contains("port rows exceed"), "{error}");
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn collector_enforces_pid_budget_through_production_orchestration() {
+        let proc_root = temp_proc_root("collector-pid-budget");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        for pid in [100, 101, 102] {
+            write_process(&proc_root, pid, "worker", 1);
+        }
+        let collector = LinuxCollector::with_proc_root_and_limits(
+            proc_root.clone(),
+            CollectionLimits {
+                process_ids: 2,
+                ..CollectionLimits::PRODUCTION
+            },
+        );
+
+        let error = collector
+            .collect()
+            .expect_err("collector must enforce PID cap");
+
+        assert!(
+            error.to_string().contains("process list exceeds"),
+            "{error}"
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn production_collection_limits_match_the_documented_policy() {
+        assert_eq!(CollectionLimits::PRODUCTION.process_ids, 131_072);
+        assert_eq!(CollectionLimits::PRODUCTION.fd_entries, 1_048_576);
+        assert_eq!(CollectionLimits::PRODUCTION.port_entries, 262_144);
+        assert_eq!(CollectionLimits::PRODUCTION.process_ids, MAX_PROCESS_IDS);
+        assert_eq!(CollectionLimits::PRODUCTION.fd_entries, MAX_FD_ENTRIES);
+        assert_eq!(CollectionLimits::PRODUCTION.port_entries, MAX_PORT_ENTRIES);
+    }
+
+    #[test]
+    fn row_cap_preserves_shared_owner_fanout_at_cap_and_fails_past_it() {
+        let records = vec![
+            SocketRecord {
+                protocol: Protocol::Tcp,
+                local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                local_port: 3000,
+                state: SocketState::Listen,
+                inode: 44,
+            },
+            SocketRecord {
+                protocol: Protocol::Udp,
+                local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                local_port: 5353,
+                state: SocketState::Bound,
+                inode: 55,
+            },
+        ];
+        let owners = HashMap::from([(44, vec![100, 101]), (55, vec![100])]);
+        let mut metadata_reads = 0;
+        let rows = expand_socket_records(&records, &owners, Path::new("/proc"), 3, |_, _| {
+            metadata_reads += 1;
+            ProcessMetadata::default()
+        })
+        .expect("shared-owner fanout at the row cap must succeed");
+
+        assert_eq!(
+            rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
+            vec![Some(100), Some(101), Some(100)]
+        );
+        assert_eq!(metadata_reads, 2, "metadata is read once per distinct PID");
+
+        let error = expand_socket_records(&records, &owners, Path::new("/proc"), 2, |_, _| {
+            ProcessMetadata::default()
+        })
+        .expect_err("shared-owner fanout past the row cap must fail closed");
+        assert!(error.to_string().contains("port rows exceed"), "{error}");
     }
 }

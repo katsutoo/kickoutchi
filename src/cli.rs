@@ -422,29 +422,8 @@ fn resolve_inspect_target(
     match (args.pid, args.port) {
         (Some(pid), None) => Ok(pid),
         (None, Some(port)) => {
-            let rows: Vec<&PortEntry> = entries
-                .iter()
-                .filter(|entry| entry.matches_port(port))
-                .collect();
-            if rows.is_empty() {
-                return Err(KillTargetError::NoMatch);
-            }
-            if rows.iter().any(|entry| entry.pid.is_none()) {
-                return Err(KillTargetError::MissingPid { port });
-            }
-            let mut pids = rows
-                .iter()
-                .filter_map(|entry| entry.pid)
-                .collect::<Vec<_>>();
-            pids.sort_unstable();
-            pids.dedup();
-            let [pid] = pids.as_slice() else {
-                return Err(KillTargetError::AmbiguousPort {
-                    port,
-                    candidates: candidate_labels(&rows),
-                });
-            };
-            Ok(*pid)
+            let (pid, _rows) = resolve_single_port_owner(port, entries)?;
+            Ok(pid)
         }
         (None, None) | (Some(_), Some(_)) => {
             unreachable!("clap requires exactly one inspect target")
@@ -574,22 +553,30 @@ fn print_post_kill_refresh_status<CollectPorts>(
 ) where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
+    if let Some(message) = post_kill_refresh_status_message(target, collect_ports) {
+        eprintln!("{message}");
+    }
+}
+
+fn post_kill_refresh_status_message<CollectPorts>(
+    target: &KillTarget,
+    collect_ports: &mut CollectPorts,
+) -> Option<String>
+where
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
     // A portless root (a `--pid` supervisor) confirmed no ports, so there is
     // nothing to poll and nothing honest to report about port visibility.
     if target.ports.is_empty() {
-        return;
+        return None;
     }
-    match wait_for_confirmed_ports_to_clear(target, collect_ports, std::thread::sleep) {
-        PostKillPortsStatus::Cleared => {
-            eprintln!("confirmed target ports are no longer visible");
-        }
-        PostKillPortsStatus::StillVisible => eprintln!(
-            "warning: one or more confirmed ports are still visible after termination; another process may own them or shutdown may still be completing",
-        ),
-        PostKillPortsStatus::RefreshFailed(error) => eprintln!(
+    Some(match wait_for_confirmed_ports_to_clear(target, collect_ports, std::thread::sleep) {
+        PostKillPortsStatus::Cleared => "confirmed target ports are no longer visible".to_owned(),
+        PostKillPortsStatus::StillVisible => "warning: one or more confirmed ports are still visible after termination; another process may own them or shutdown may still be completing".to_owned(),
+        PostKillPortsStatus::RefreshFailed(error) => format!(
             "warning: collecting ports after termination failed; refresh manually to verify the port disappeared: {error}",
         ),
-    }
+    })
 }
 
 /// Poll the port table until every confirmed port is gone or the settle window
@@ -735,6 +722,25 @@ fn resolve_port_target<CollectContext>(
 where
     CollectContext: FnMut(u32) -> ProcessContext,
 {
+    let (pid, rows) = resolve_single_port_owner(port, entries)?;
+    if let Some(reason) = process::unsafe_pid_reason(pid) {
+        return Err(KillTargetError::UnsafePid(reason));
+    }
+
+    let context = collect_context(pid);
+    Ok(KillTarget::from_entries(pid, rows, Some(&context)))
+}
+
+/// Resolve the single PID that owns `port`, with the precise refusal when it
+/// cannot: no matching socket, a hidden owner (a row without a PID), or
+/// several distinct owners. Kill and inspect resolution both go through here
+/// so the two policies cannot drift; the unsafe-PID guard deliberately stays
+/// with the kill caller, because reading PID 1's family is legitimate while
+/// signalling it is not.
+fn resolve_single_port_owner(
+    port: u16,
+    entries: &[PortEntry],
+) -> Result<(u32, Vec<&PortEntry>), KillTargetError> {
     let rows: Vec<&PortEntry> = entries
         .iter()
         .filter(|entry| entry.matches_port(port))
@@ -758,12 +764,7 @@ where
             candidates: candidate_labels(&rows),
         });
     };
-    if let Some(reason) = process::unsafe_pid_reason(*pid) {
-        return Err(KillTargetError::UnsafePid(reason));
-    }
-
-    let context = collect_context(*pid);
-    Ok(KillTarget::from_entries(*pid, rows, Some(&context)))
+    Ok((*pid, rows))
 }
 
 fn candidate_labels(rows: &[&PortEntry]) -> Vec<String> {
@@ -867,22 +868,48 @@ fn prompt_confirmation(
 }
 
 fn read_confirmation_line(max_bytes: usize) -> std::io::Result<String> {
-    let mut answer = String::new();
-    let limit = u64::try_from(max_bytes).expect("confirmation limit must fit in u64") + 1;
-    std::io::stdin().lock().take(limit).read_line(&mut answer)?;
-    truncate_to_char_boundary(&mut answer, max_bytes);
-    Ok(answer)
+    read_confirmation_line_from(&mut std::io::stdin().lock(), max_bytes)
 }
 
-fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
-    if text.len() <= max_bytes {
-        return;
+fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<String> {
+    let limit = u64::try_from(max_bytes)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large"))?
+        .checked_add(1)
+        .ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large")
+        })?;
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    (&mut *reader).take(limit).read_until(b'\n', &mut bytes)?;
+
+    if bytes.len() > max_bytes {
+        if bytes.last() != Some(&b'\n') {
+            drain_line(reader)?;
+        }
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("confirmation input exceeds the {max_bytes}-byte limit"),
+        ));
     }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
+
+    String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+}
+
+fn drain_line(reader: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let consumed = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        let line_ended = buffer[consumed - 1] == b'\n';
+        reader.consume(consumed);
+        if line_ended {
+            return Ok(());
+        }
     }
-    text.truncate(end);
 }
 
 fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
@@ -1805,19 +1832,55 @@ where
     if !report.containment_partial && report.not_terminated.is_empty() {
         eprintln!(
             "terminated {} process(es) in the Windows Job Object for the tree rooted at {}",
-            report.job_terminated,
+            report.job_terminated_pids.len(),
             root.identity(),
         );
         print_post_kill_refresh_status(root, collect_ports);
         return ExitReason::Success;
     }
 
-    let fallback = if report.fallback_terminated == 0 {
+    eprintln!("{}", windows_tree_partial_report_text(root, report));
+    if let Some(issue) = &report.post_commit_issue {
+        return windows_post_commit_issue_exit_reason(issue);
+    }
+    if report.not_terminated.is_empty() {
+        ExitReason::Failure
+    } else {
+        ExitReason::PermissionDenied
+    }
+}
+
+#[cfg(windows)]
+fn windows_tree_partial_report_text(
+    root: &KillTarget,
+    report: &crate::windows_tree::WindowsTreeKillReport,
+) -> String {
+    let job = if report.job_terminated_pids.is_empty() {
+        format!("job-terminated 0 of {} observed process(es)", report.total)
+    } else {
+        format!(
+            "job-terminated {} of {} observed process(es) (PIDs: {})",
+            report.job_terminated_pids.len(),
+            report.total,
+            tree::format_pid_list(&report.job_terminated_pids),
+        )
+    };
+    let fallback = if report.fallback_terminated_pids.is_empty() {
         String::new()
     } else {
         format!(
-            "; fallback-terminated {} verified process(es) individually",
-            report.fallback_terminated
+            "; fallback-terminated {} verified process(es) individually (PIDs: {})",
+            report.fallback_terminated_pids.len(),
+            tree::format_pid_list(&report.fallback_terminated_pids),
+        )
+    };
+    let already_exited = if report.already_exited_pids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} process(es) already exited (PIDs: {})",
+            report.already_exited_pids.len(),
+            tree::format_pid_list(&report.already_exited_pids),
         )
     };
     let missing = if report.not_terminated.is_empty() {
@@ -1837,21 +1900,10 @@ where
                 windows_post_commit_issue_text(issue)
             )
         });
-    eprintln!(
-        "warning: Windows tree containment was partial for {}; job-terminated {} of {} observed process(es){}{missing}{post_commit_issue}",
+    format!(
+        "warning: Windows tree containment was partial for {}; {job}{fallback}{already_exited}{missing}{post_commit_issue}",
         root.identity(),
-        report.job_terminated,
-        report.total,
-        fallback,
-    );
-    if let Some(issue) = &report.post_commit_issue {
-        return windows_post_commit_issue_exit_reason(issue);
-    }
-    if report.not_terminated.is_empty() {
-        ExitReason::Failure
-    } else {
-        ExitReason::PermissionDenied
-    }
+    )
 }
 
 #[cfg(windows)]
@@ -2004,36 +2056,49 @@ where
         }
         WindowsTreeKillOutcome::SnapshotFailed(_)
         | WindowsTreeKillOutcome::CommitFailed { .. }
-        | WindowsTreeKillOutcome::JobTerminateFailed(_) => map_windows_tree_system_failure(outcome),
+        | WindowsTreeKillOutcome::JobTerminateFailed { .. } => {
+            let mut stderr = io::stderr().lock();
+            map_windows_tree_system_failure(root, outcome, collect_ports, &mut stderr)
+        }
     }
 }
 
 #[cfg(windows)]
 fn map_windows_tree_system_failure(
+    root: &KillTarget,
     outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    collect_ports: &mut impl FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    stderr: &mut impl Write,
 ) -> ExitReason {
     use crate::windows_tree::WindowsTreeKillOutcome;
 
     match outcome {
         WindowsTreeKillOutcome::SnapshotFailed(error) => {
-            eprintln!(
+            let _ = writeln!(
+                stderr,
                 "error: enumerating the Windows process tree failed: {}; no termination was sent",
                 sanitize(error),
             );
             ExitReason::Failure
         }
         WindowsTreeKillOutcome::CommitFailed { pid, error } => {
-            eprintln!(
+            let _ = writeln!(
+                stderr,
                 "error: assigning root PID {pid} to the Windows Job Object failed before commit: {}; no termination was sent",
                 sanitize(error),
             );
             ExitReason::Failure
         }
-        WindowsTreeKillOutcome::JobTerminateFailed(error) => {
-            eprintln!(
+        WindowsTreeKillOutcome::JobTerminateFailed { error, report } => {
+            let _ = writeln!(
+                stderr,
                 "error: Windows Job Object containment was committed but TerminateJobObject failed: {}",
                 sanitize(error),
             );
+            let _ = writeln!(stderr, "{}", windows_tree_partial_report_text(root, report));
+            if let Some(message) = post_kill_refresh_status_message(root, collect_ports) {
+                let _ = writeln!(stderr, "{message}");
+            }
             ExitReason::Failure
         }
         _ => unreachable!("non-system Windows tree outcome handled above"),
@@ -2667,8 +2732,8 @@ mod tests {
     use super::{
         Cli, Command, ExitReason, KillArgs, KillCollectors, KillTargetError,
         POST_KILL_SETTLE_ATTEMPTS_MAX, PostKillPortsStatus,
-        diagnostic_port_without_confirmed_socket, resolve_kill_target, run_kill_with,
-        truncate_to_char_boundary, wait_for_confirmed_ports_to_clear,
+        diagnostic_port_without_confirmed_socket, read_confirmation_line_from, resolve_kill_target,
+        run_kill_with, wait_for_confirmed_ports_to_clear,
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::{
@@ -2843,9 +2908,9 @@ mod tests {
         };
         let report = crate::windows_tree::WindowsTreeKillReport {
             total: 1,
-            job_terminated: 1,
-            fallback_terminated: 0,
-            already_exited: 0,
+            job_terminated_pids: vec![100],
+            fallback_terminated_pids: Vec::new(),
+            already_exited_pids: Vec::new(),
             not_terminated: vec![101],
             containment_partial: true,
             post_commit_issue: Some(
@@ -2860,6 +2925,116 @@ mod tests {
         let reason = super::map_windows_tree_completed_outcome(&root, &report, &mut collect_ports);
 
         assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_report_names_every_outcome_pid() {
+        let root = KillTarget {
+            pid: 100,
+            process_name: Some("node.exe".to_owned()),
+            platform: Platform::Windows,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: Some(100),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let report = crate::windows_tree::WindowsTreeKillReport {
+            total: 4,
+            job_terminated_pids: Vec::new(),
+            fallback_terminated_pids: vec![101],
+            already_exited_pids: vec![102],
+            not_terminated: vec![100, 103],
+            containment_partial: true,
+            post_commit_issue: Some(
+                crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
+                    pid: 103,
+                    name: Some("lsass.exe".to_owned()),
+                },
+            ),
+        };
+
+        let text = super::windows_tree_partial_report_text(&root, &report);
+
+        assert!(text.contains("job-terminated 0 of 4"), "{text}");
+        assert!(text.contains("fallback-terminated 1"), "{text}");
+        assert!(text.contains("PIDs: 101"), "{text}");
+        assert!(text.contains("already exited (PIDs: 102)"), "{text}");
+        assert!(
+            text.contains("not confirmed terminated: 100, 103"),
+            "{text}"
+        );
+        assert!(
+            text.contains("protected descendant PID 103 (lsass.exe)"),
+            "{text}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_job_mapping_prints_partial_report_and_refreshes_ports() {
+        let root = KillTarget {
+            pid: 100,
+            process_name: Some("node.exe".to_owned()),
+            platform: Platform::Windows,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: vec![crate::process::KillTargetPort {
+                protocol: Protocol::Tcp,
+                local_addr: "127.0.0.1".parse().expect("test address"),
+                local_port: 3000,
+            }],
+            owner_uid: None,
+            process_start_time_marker: Some(100),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let outcome = crate::windows_tree::WindowsTreeKillOutcome::JobTerminateFailed {
+            error: "job failed".to_owned(),
+            report: Box::new(crate::windows_tree::WindowsTreeKillReport {
+                total: 3,
+                job_terminated_pids: Vec::new(),
+                fallback_terminated_pids: vec![101],
+                already_exited_pids: vec![102],
+                not_terminated: vec![100],
+                containment_partial: true,
+                post_commit_issue: None,
+            }),
+        };
+        let mut refreshes = 0;
+        let mut collect_ports = || {
+            refreshes += 1;
+            Ok(Vec::new())
+        };
+        let mut stderr = Vec::new();
+
+        let reason = super::map_windows_tree_system_failure(
+            &root,
+            &outcome,
+            &mut collect_ports,
+            &mut stderr,
+        );
+        let text = String::from_utf8(stderr).expect("diagnostic must be UTF-8");
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert_eq!(refreshes, 1);
+        assert!(
+            text.contains("TerminateJobObject failed: job failed"),
+            "{text}"
+        );
+        assert!(text.contains("fallback-terminated 1"), "{text}");
+        assert!(text.contains("PIDs: 101"), "{text}");
+        assert!(text.contains("already exited (PIDs: 102)"), "{text}");
+        assert!(text.contains("not confirmed terminated: 100"), "{text}");
+        assert!(
+            text.contains("confirmed target ports are no longer visible"),
+            "{text}"
+        );
     }
 
     /// `--tree` and `--group` are two different blast radii; asking for both
@@ -3330,12 +3505,24 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_input_truncation_preserves_utf8_boundaries() {
-        let mut input = "foé".to_owned();
+    fn confirmation_input_accepts_utf8_at_the_byte_limit() {
+        let mut input = std::io::Cursor::new("é\n".as_bytes());
 
-        truncate_to_char_boundary(&mut input, 3);
+        let answer = read_confirmation_line_from(&mut input, 3).expect("input fits exactly");
 
-        assert_eq!(input, "fo");
+        assert_eq!(answer, "é\n");
+    }
+
+    #[test]
+    fn overlong_confirmation_is_rejected_and_its_line_is_drained() {
+        let mut input = std::io::Cursor::new(b"force-extra\ntree\n");
+
+        let error = read_confirmation_line_from(&mut input, 5).expect_err("input is over limit");
+        let next = read_confirmation_line_from(&mut input, 5).expect("next line remains intact");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("5-byte limit"));
+        assert_eq!(next, "tree\n");
     }
 
     fn settle_target() -> KillTarget {
@@ -3389,6 +3576,33 @@ mod tests {
         assert_eq!(collect_calls, POST_KILL_SETTLE_ATTEMPTS_MAX);
         // No trailing sleep after the last poll: once the verdict is known,
         // waiting longer would only delay the honest warning.
+        assert_eq!(sleeps, POST_KILL_SETTLE_ATTEMPTS_MAX - 1);
+    }
+
+    #[test]
+    fn post_kill_settle_stays_visible_while_any_confirmed_port_remains() {
+        // A multi-port target is only "cleared" when every confirmed port is
+        // gone: one lingering port must keep the still-visible warning, not
+        // be averaged away because the other port closed. This pins the
+        // any-port-remains check against a quiet flip to all-ports-remain.
+        let row_a = entry(3000);
+        let row_b = entry(3001);
+        let target = KillTarget::from_entries(18_422, [&row_a, &row_b], None);
+        let mut collect_calls = 0;
+        let mut sleeps = 0;
+
+        let status = wait_for_confirmed_ports_to_clear(
+            &target,
+            &mut || {
+                collect_calls += 1;
+                // Port 3000 closes immediately; 3001 never does.
+                Ok(vec![entry(3001)])
+            },
+            |_delay| sleeps += 1,
+        );
+
+        assert_eq!(status, PostKillPortsStatus::StillVisible);
+        assert_eq!(collect_calls, POST_KILL_SETTLE_ATTEMPTS_MAX);
         assert_eq!(sleeps, POST_KILL_SETTLE_ATTEMPTS_MAX - 1);
     }
 
