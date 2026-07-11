@@ -438,9 +438,8 @@ mod tests {
     #[test]
     fn config_reader_rejects_one_byte_over_limit() {
         let path = std::env::temp_dir().join(format!(
-            "kickoutchi-oversized-config-{}-{}.toml",
+            "kickoutchi-oversized-config-{}.toml",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ));
         fs::write(&path, vec![b' '; CONFIG_FILE_MAX_BYTES + 1])
             .expect("oversized config fixture must be written");
