@@ -4,6 +4,11 @@ Personal [Scoop](https://scoop.sh) bucket reference for Nuggocto projects and
 release artifacts. The live bucket is `nuggocto/scoop-bucket`; this directory is
 kept as the source reference inside the Kickoutchi repository.
 
+The live bucket updates itself: Excavator watches upstream releases and commits
+new versions, URLs, and hashes there on its own (see "How updates happen"
+below). This in-repo copy is a bootstrap seed, not the source of truth — if it
+lags a release, that is expected and installs are unaffected.
+
 ## Usage
 
 The bucket name is local to each machine. These examples use `nuggocto` so the
