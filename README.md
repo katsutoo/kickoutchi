@@ -55,11 +55,36 @@ Website: <https://kickoutchi.com>
 
 ## Performance
 
-On the maintainer's Linux development machine, a local 2,000-run measurement of
-the v1.2.0 release candidate produced 10.836 ms median, 12.289 ms p95, and
-12.831 ms p99 startup latency, with 14.45 MiB peak RSS. These figures are a
-single-machine reference, not a portable guarantee; hardware, kernel, terminal,
-and the number of processes and sockets on the host all affect results.
+The following is a local reference measurement, not a cross-platform promise.
+It used the packaged `x86_64-unknown-linux-gnu` v1.2.0 release-candidate binary,
+not a debug build or `cargo run`, and completed 2,000 successful end-to-end
+invocations.
+
+| Reference host | Value |
+| --- | --- |
+| CPU | AMD Ryzen AI MAX+ 395 with Radeon 8060S |
+| CPU topology | 16 cores / 32 threads, boost enabled, up to 5.19 GHz |
+| CPU cache | 16 MiB L2, 64 MiB L3 |
+| Memory | 64 GiB installed (62 GiB usable) |
+| OS | Arch Linux, Linux 7.0.10-arch1-1, x86_64 |
+| Artifact | Packaged `x86_64-unknown-linux-gnu` release binary |
+| Samples | 2,000 successful runs |
+
+| Result | Value |
+| --- | ---: |
+| Median (p50) startup latency | 10.836 ms |
+| p95 startup latency | 12.289 ms |
+| p99 startup latency | 12.831 ms |
+| p99 minus median | 1.995 ms |
+| Peak resident memory (RSS) | 14.45 MiB |
+
+Half of the measured invocations completed within 10.836 ms, 95% within
+12.289 ms, and 99% within 12.831 ms. The roughly 2 ms spread from median to p99
+shows consistent startup on this host, but it should not be read as a latency
+guarantee. CPU power state, kernel and filesystem caches, terminal behavior,
+background load, and especially the number of processes, file descriptors, and
+open sockets can all change collection time. Windows and macOS use different
+native collectors and were not represented by this Linux measurement.
 
 ## Install
 
