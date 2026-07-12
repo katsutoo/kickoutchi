@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reorganized the CLI implementation into focused list, single-process kill,
+  and scoped tree/group kill modules without changing command behavior, and
+  documented the host-byte-order handling used by the Linux socket parser.
+
 ## [1.2.0] - 2026-07-11
 
 ### Added

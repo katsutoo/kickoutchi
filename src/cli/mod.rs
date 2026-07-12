@@ -1,0 +1,604 @@
+//! The non-TUI command-line side: the argument shape, the stable exit-code
+//! contract, and the `list`/`kill` commands themselves.
+//!
+//! CLI commands never pop open the TUI — they print to stdout/stderr and exit.
+//! The data flows through the same collector and model as the TUI, so the two
+//! stay in sync and this layer doesn't care which collector produced the rows.
+
+mod kill;
+mod list;
+// Scoped (`--tree`/`--group`) kills sit behind the same platform gate as the
+// `tree` module whose planning and execution they drive.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod scoped;
+
+use std::io::{self, ErrorKind, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{ArgGroup, Args, Parser, Subcommand};
+
+use crate::collector;
+use crate::config::{Config, REFRESH_INTERVAL_SECONDS_MAX, REFRESH_INTERVAL_SECONDS_MIN};
+use crate::diagnostic;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::display::sanitize;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use crate::inspect;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use crate::model::Platform;
+use crate::model::{PortEntry, SortMode};
+use crate::platform;
+use crate::protection::mark_protected;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::tree;
+
+use self::kill::run_kill;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use self::kill::{KillTargetError, print_target_error, resolve_single_port_owner};
+use self::list::run_list;
+
+/// Stable exit codes — the script-facing contract.
+///
+/// All in one place so scripts can count on the numbers never drifting. Every
+/// variant really is constructed somewhere on the CLI exit path, so don't reach
+/// for a dead-code allow here; keep the contract complete even though clap is the
+/// one that actually hands out `InvalidArguments` (2) in practice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ExitReason {
+    Success = 0,
+    Failure = 1,
+    InvalidArguments = 2,
+    NoMatch = 3,
+    PermissionDenied = 4,
+    KillCancelled = 5,
+    ProtectedNeedsConfirmation = 6,
+}
+
+impl From<ExitReason> for ExitCode {
+    fn from(reason: ExitReason) -> Self {
+        Self::from(reason as u8)
+    }
+}
+
+/// Top-level argument shape. No subcommand opens the TUI; `list` and `kill`
+/// run headless and exit.
+///
+/// `about` pulls the user-facing summary straight from the Cargo.toml
+/// `description`; `long_about = None` is there so clap *doesn't* dump this doc
+/// comment into `--help` — these lines are notes for developers, not users.
+///
+/// The fixed `name` keeps `--version` reporting the canonical `kickoutchi` under
+/// both binary names, while clap takes the usage line from argv(0), so
+/// `kick --help` correctly shows `Usage: kick ...`. Both are exactly what we want
+/// for the short-alias binary.
+#[derive(Debug, Parser)]
+#[command(name = "kickoutchi", version, about, long_about = None)]
+pub(crate) struct Cli {
+    /// Path to an alternate config file (default: the platform config dir).
+    #[arg(long, value_name = "FILE", global = true)]
+    pub(crate) config: Option<PathBuf>,
+
+    /// Override the configured refresh interval, in seconds.
+    ///
+    /// clap enforces the same bounds as the config file, so an out-of-range
+    /// flag is a usage error (exit 2) instead of a config error (exit 1).
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        global = true,
+        value_parser = clap::value_parser!(u64).range(REFRESH_INTERVAL_SECONDS_MIN..=REFRESH_INTERVAL_SECONDS_MAX)
+    )]
+    pub(crate) refresh_interval: Option<u64>,
+
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum Command {
+    /// Print open ports and exit.
+    List(ListArgs),
+    /// Terminate the process owning a port or PID (after confirmation).
+    Kill(KillArgs),
+    /// Show a process's family — ancestors, descendants, siblings, process
+    /// group, and ports — read-only, to pick the right root for a tree kill.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    Inspect(InspectArgs),
+}
+
+/// `inspect` takes exactly one starting point, like `kill`: a PID (which may
+/// own no port — supervisors usually don't) or a port whose owner to start
+/// from. Strictly read-only; it never signals anything.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
+pub(crate) struct InspectArgs {
+    /// PID whose family to show.
+    #[arg(long)]
+    pub(crate) pid: Option<u32>,
+
+    /// Show the family of the process that owns this port.
+    #[arg(long)]
+    pub(crate) port: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ListArgs {
+    /// Only show rows bound to this exact port.
+    #[arg(long)]
+    pub(crate) port: Option<u16>,
+
+    /// Only show rows whose process name contains this text.
+    #[arg(long)]
+    pub(crate) process: Option<String>,
+
+    /// Apply TUI-style search text or structured filters.
+    ///
+    /// Examples: `3000`, `port:3000`, `proto:udp`, `scope:public`,
+    /// `protected:true`, `parent:node`.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) filter: Option<String>,
+
+    /// Sort rows by port, pid, protocol, process, parent, or scope.
+    #[arg(long, value_name = "MODE", value_parser = parse_sort_mode)]
+    pub(crate) sort: Option<SortMode>,
+
+    /// Print stable JSON instead of a table.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+/// `kill` requires exactly one target: a PID or a port. Requiring one stops
+/// a bare `kickoutchi kill` from meaning "kill something"; forbidding both
+/// stops a contradictory selection.
+// Each bool is one independent CLI flag; clap's derive needs them as bools,
+// and the contradictory combination (`--tree --group`) is already rejected at
+// parse time via `conflicts_with`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
+pub(crate) struct KillArgs {
+    /// PID of the process to terminate.
+    #[arg(long)]
+    pub(crate) pid: Option<u32>,
+
+    /// Terminate the process that owns this port.
+    #[arg(long)]
+    pub(crate) port: Option<u16>,
+
+    /// Force kill instead of normal termination where the platform supports a distinction.
+    #[arg(long)]
+    pub(crate) force: bool,
+
+    /// Skip the confirmation prompt. Never bypasses protected-process
+    /// confirmation.
+    #[arg(long)]
+    pub(crate) yes: bool,
+
+    /// Terminate the whole process tree rooted at the target, not just the one
+    /// process. Opt-in; typed confirmation unless --yes passes all-clear gates.
+    /// Linux, macOS, and Windows CLI only.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[arg(long)]
+    pub(crate) tree: bool,
+
+    /// Terminate the target's whole process group — every process sharing its
+    /// group ID, including members that reparented away from the tree. Opt-in;
+    /// typed confirmation unless --yes passes all-clear gates. Linux and macOS
+    /// only.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[arg(long, conflicts_with = "tree")]
+    pub(crate) group: bool,
+}
+
+/// Run a CLI command to completion and report how the process should exit.
+///
+/// Errors are printed here (stderr) rather than propagated: the exit-code
+/// mapping is this module's whole job, so letting errors escape to `main`
+/// would split that contract across two files.
+pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
+    let mut entries = match collector::collect_ports() {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("error: collecting ports failed: {error}");
+            return ExitReason::Failure;
+        }
+    };
+    mark_protected(&mut entries, &config.protected_processes);
+
+    match command {
+        Command::List(args) => run_list(args, config, &entries),
+        Command::Kill(args) => run_kill(args, config, &entries),
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::Inspect(args) => run_inspect(args, config, &entries),
+    }
+}
+
+fn write_stdout_line(text: &str) -> Option<ExitReason> {
+    write_stdout_with(|stdout| {
+        stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.write_all(b"\n"))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn write_stdout(text: &str) -> Option<ExitReason> {
+    write_stdout_with(|stdout| stdout.write_all(text.as_bytes()))
+}
+
+fn write_stdout_with(
+    write: impl FnOnce(&mut io::StdoutLock<'_>) -> io::Result<()>,
+) -> Option<ExitReason> {
+    let mut stdout = io::stdout().lock();
+    match write(&mut stdout).and_then(|()| stdout.flush()) {
+        Ok(()) => None,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Some(ExitReason::Success),
+        Err(error) => {
+            eprintln!("error: writing stdout failed: {error}");
+            Some(ExitReason::Failure)
+        }
+    }
+}
+
+fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntry]) {
+    let Some(port) = diagnostic_port_without_confirmed_socket(diagnostic_port, entries) else {
+        return;
+    };
+    let hints = platform::collect_related_process_hints(port);
+    if let Some(message) = diagnostic::diagnostic_message(port, &hints) {
+        eprint!("{message}");
+    }
+}
+
+fn diagnostic_port_without_confirmed_socket(
+    diagnostic_port: Option<u16>,
+    entries: &[PortEntry],
+) -> Option<u16> {
+    let port = diagnostic_port?;
+    if entries.iter().any(|entry| entry.local_port == port) {
+        None
+    } else {
+        Some(port)
+    }
+}
+
+fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
+    SortMode::from_label(value)
+        .ok_or_else(|| "expected one of: port, pid, protocol, process, parent, scope".to_owned())
+}
+
+/// Run the read-only family inspection and print the report to stdout.
+///
+/// No signals, no confirmation: the strongest thing this command does is
+/// suggest a `kick kill --pid <root> --tree` for the user to run themselves.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+    let target_pid = match resolve_inspect_target(args, entries) {
+        Ok(pid) => pid,
+        Err(KillTargetError::NoMatch) => {
+            eprintln!("error: no open port matches the requested target");
+            // Same evidence-only hint `list` prints: a command line naming the
+            // port often identifies the process the user was looking for.
+            maybe_print_no_match_diagnostic(args.port, entries);
+            return ExitReason::NoMatch;
+        }
+        Err(error) => return print_target_error(error),
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut ops = crate::platform::linux::LinuxTreeOps::new();
+    #[cfg(target_os = "macos")]
+    let mut ops = crate::platform::macos::MacosTreeOps::new();
+    #[cfg(windows)]
+    let snapshot = crate::platform::windows::collect_tree_process_infos();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let snapshot_result = tree::TreeProcessOps::snapshot(&mut ops);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let snapshot = match snapshot_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "error: enumerating the process table failed: {}",
+                sanitize(&error)
+            );
+            return ExitReason::Failure;
+        }
+    };
+
+    let command_line = platform::inspect_command_line_reader();
+    match inspect::render_family_report(
+        target_pid,
+        &snapshot,
+        entries,
+        &config.protected_processes,
+        TREE_HOST_PLATFORM,
+        command_line,
+    ) {
+        Ok(report) => {
+            if let Some(reason) = write_stdout(&report) {
+                return reason;
+            }
+            ExitReason::Success
+        }
+        Err(inspect::InspectError::TargetMissing) => {
+            eprintln!("error: PID {target_pid} is not running");
+            ExitReason::NoMatch
+        }
+    }
+}
+
+/// Pick the PID to inspect. Unlike kill resolution there is no unsafe-PID
+/// guard: reading PID 1's family is legitimate, and nothing here signals.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn resolve_inspect_target(
+    args: &InspectArgs,
+    entries: &[PortEntry],
+) -> Result<u32, KillTargetError> {
+    match (args.pid, args.port) {
+        (Some(pid), None) => Ok(pid),
+        (None, Some(port)) => {
+            let (pid, _rows) = resolve_single_port_owner(port, entries)?;
+            Ok(pid)
+        }
+        (None, None) | (Some(_), Some(_)) => {
+            unreachable!("clap requires exactly one inspect target")
+        }
+    }
+}
+
+/// The platform a tree target built from the local process table lives on.
+/// Snapshot rows come straight from the host OS, so this is a compile-time
+/// fact, unlike `PortEntry.platform` which rides along per row.
+#[cfg(target_os = "linux")]
+const TREE_HOST_PLATFORM: Platform = Platform::Linux;
+#[cfg(target_os = "macos")]
+const TREE_HOST_PLATFORM: Platform = Platform::Macos;
+#[cfg(windows)]
+const TREE_HOST_PLATFORM: Platform = Platform::Windows;
+
+/// Test-only builders for port rows and process contexts, shared by the
+/// unit tests across this module tree.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
+    };
+
+    pub(crate) fn entry(port: u16) -> PortEntry {
+        entry_with_pid(port, Some(18_422), Protocol::Tcp, "node")
+    }
+
+    pub(crate) fn entry_with_pid(
+        port: u16,
+        pid: Option<u32>,
+        protocol: Protocol,
+        name: &str,
+    ) -> PortEntry {
+        PortEntry {
+            protocol,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: port,
+            state: match protocol {
+                Protocol::Tcp => SocketState::Listen,
+                Protocol::Udp => SocketState::Bound,
+            },
+            pid,
+            process_name: Some(name.to_owned()),
+            executable_path: None,
+            command_line: None,
+            parent_pid: None,
+            parent_process_name: None,
+            child_pids: Vec::new(),
+            protected: false,
+            platform: Platform::Linux,
+            permission: PermissionStatus::Full,
+        }
+    }
+
+    pub(crate) fn no_context(_: u32) -> ProcessContext {
+        ProcessContext {
+            process_start_time_marker: Some(55),
+            ..ProcessContext::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    use super::kill::KillTargetError;
+    use super::test_support::entry;
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    use super::test_support::entry_with_pid;
+    use super::{Cli, Command, ExitReason, diagnostic_port_without_confirmed_socket};
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    use crate::model::Protocol;
+    use crate::model::SortMode;
+
+    #[test]
+    fn exit_codes_match_the_documented_contract() {
+        // These numbers are the script-facing API: if this test breaks, you've
+        // made a breaking change, not done a refactor.
+        assert_eq!(ExitReason::Success as u8, 0);
+        assert_eq!(ExitReason::Failure as u8, 1);
+        assert_eq!(ExitReason::InvalidArguments as u8, 2);
+        assert_eq!(ExitReason::NoMatch as u8, 3);
+        assert_eq!(ExitReason::PermissionDenied as u8, 4);
+        assert_eq!(ExitReason::KillCancelled as u8, 5);
+        assert_eq!(ExitReason::ProtectedNeedsConfirmation as u8, 6);
+    }
+
+    #[test]
+    fn bare_invocation_has_no_command_and_opens_the_tui() {
+        let cli = Cli::try_parse_from(["kickoutchi"]).expect("bare invocation parses");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn list_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "kickoutchi",
+            "list",
+            "--port",
+            "3000",
+            "--process",
+            "node",
+            "--filter",
+            "scope:public",
+            "--sort",
+            "scope",
+            "--json",
+        ])
+        .expect("valid list invocation");
+        let Some(Command::List(args)) = cli.command else {
+            panic!("expected a list command");
+        };
+        assert_eq!(args.port, Some(3000));
+        assert_eq!(args.process.as_deref(), Some("node"));
+        assert_eq!(args.filter.as_deref(), Some("scope:public"));
+        assert_eq!(args.sort, Some(SortMode::Scope));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn list_sort_rejects_unknown_modes_at_parse_time() {
+        assert!(Cli::try_parse_from(["kickoutchi", "list", "--sort", "alphabetical"]).is_err());
+    }
+
+    #[test]
+    fn kill_requires_exactly_one_target() {
+        assert!(Cli::try_parse_from(["kickoutchi", "kill"]).is_err());
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "1", "--port", "80"]).is_err());
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422"]).is_ok());
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--port", "3000", "--force"]).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tree_flag_parses_on_windows() {
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--tree"]).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_subcommand_parses_on_windows() {
+        assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--pid", "18422"]).is_ok());
+    }
+
+    /// Same per-platform contract for `--group`: no field on Windows builds,
+    /// so the flag is a parse-time usage error there.
+    #[cfg(windows)]
+    #[test]
+    fn group_flag_is_rejected_at_parse_time_on_windows() {
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--group"]).is_err());
+    }
+
+    /// `--tree` and `--group` are two different blast radii; asking for both
+    /// is a contradiction clap must reject before any process is looked at.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_flag_parses_and_conflicts_with_tree() {
+        assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--group"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kickoutchi", "kill", "--port", "3000", "--group", "--force"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422", "--tree", "--group",])
+                .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn inspect_requires_exactly_one_target() {
+        assert!(Cli::try_parse_from(["kickoutchi", "inspect"]).is_err());
+        assert!(
+            Cli::try_parse_from(["kickoutchi", "inspect", "--pid", "1", "--port", "80"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--pid", "18422"]).is_ok());
+        assert!(Cli::try_parse_from(["kickoutchi", "inspect", "--port", "3000"]).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn inspect_resolution_mirrors_kill_port_rules_but_allows_any_pid() {
+        use super::{InspectArgs, resolve_inspect_target};
+
+        let by_pid = |pid| InspectArgs {
+            pid: Some(pid),
+            port: None,
+        };
+        let by_port = |port| InspectArgs {
+            pid: None,
+            port: Some(port),
+        };
+
+        // Reading PID 1's family is legitimate — no unsafe-PID guard here.
+        assert_eq!(resolve_inspect_target(&by_pid(1), &[]), Ok(1));
+
+        let rows = vec![entry(3000)];
+        assert_eq!(resolve_inspect_target(&by_port(3000), &rows), Ok(18_422));
+        assert_eq!(
+            resolve_inspect_target(&by_port(4000), &rows),
+            Err(KillTargetError::NoMatch),
+        );
+
+        let hidden = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+        assert_eq!(
+            resolve_inspect_target(&by_port(3000), &hidden),
+            Err(KillTargetError::MissingPid { port: 3000 }),
+        );
+
+        let shared = vec![
+            entry_with_pid(3000, Some(100), Protocol::Tcp, "node"),
+            entry_with_pid(3000, Some(200), Protocol::Udp, "worker"),
+        ];
+        assert!(matches!(
+            resolve_inspect_target(&by_port(3000), &shared),
+            Err(KillTargetError::AmbiguousPort { port: 3000, .. }),
+        ));
+    }
+
+    #[test]
+    fn global_flags_parse_with_and_without_subcommands() {
+        let cli = Cli::try_parse_from(["kickoutchi", "--refresh-interval", "9"])
+            .expect("global flag without subcommand");
+        assert_eq!(cli.refresh_interval, Some(9));
+
+        let cli = Cli::try_parse_from(["kickoutchi", "list", "--config", "/tmp/alt.toml"])
+            .expect("global flag after subcommand");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/alt.toml"))
+        );
+    }
+
+    #[test]
+    fn out_of_range_refresh_interval_is_a_usage_error() {
+        // clap is the one that hands out exit code 2; this pins that the bound is
+        // caught at parse time instead of leaking into config validation.
+        assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "0"]).is_err());
+        assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "3601"]).is_err());
+    }
+
+    #[test]
+    fn no_match_diagnostic_requires_absent_confirmed_socket() {
+        assert_eq!(
+            diagnostic_port_without_confirmed_socket(Some(3000), &[]),
+            Some(3000)
+        );
+        assert_eq!(
+            diagnostic_port_without_confirmed_socket(Some(3000), &[entry(3000)]),
+            None
+        );
+        assert_eq!(diagnostic_port_without_confirmed_socket(None, &[]), None);
+    }
+}

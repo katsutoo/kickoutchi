@@ -362,6 +362,10 @@ fn decode_ipv4_addr(hex: &str) -> Result<Ipv4Addr, SocketParseError> {
     let raw = u32::from_str_radix(hex, 16).map_err(|_| SocketParseError::InvalidIpv4Address {
         value: hex.to_owned(),
     })?;
+    // The kernel prints the address as its raw in-memory u32, so the hex is in
+    // *host* byte order — localhost reads "0100007F" on little-endian machines.
+    // Native-endian decoding is therefore correct on every target; a big-endian
+    // "fix" here would flip every address (and fail the parser fixture tests).
     Ok(Ipv4Addr::from(raw.to_ne_bytes()))
 }
 
@@ -372,6 +376,10 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
         });
     }
 
+    // The kernel prints an IPv6 address as four raw in-memory u32 words, each
+    // rendered as 8 hex chars in *host* byte order (same convention as the IPv4
+    // decoder above). Each chunk of 8 hex chars covers 4 address bytes, so the
+    // hex-char index `start` maps to byte index `start / 2`.
     let mut bytes = [0_u8; 16];
     for chunk_index in 0..4 {
         let start = chunk_index * 8;
