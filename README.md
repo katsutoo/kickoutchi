@@ -38,10 +38,10 @@ Website: <https://kickoutchi.com>
   uses Job Object containment instead: it preflights safely, assigns the root as
   the commit boundary, converges descendants, then hard-terminates contained
   members. Useful for dev servers, agents, and runners that leave workers
-  behind — even ones actively spawning.
+  behind; even ones actively spawning.
 - Kicks out whole process groups too (`kill --group`, Linux and macOS): same
   freeze-first pipeline, but membership comes from the POSIX process group
-  instead of parent links — for survivors that reparented away from the tree
+  instead of parent links; for survivors that reparented away from the tree
   (double-fork daemons, orphaned workers) and for spawners too big for the
   tree cap. The confirmation lists every member, because a group can contain
   more than you think.
@@ -158,7 +158,9 @@ nix profile install github:nuggocto/kickoutchi
 The flake is locked in the repository for reproducible builds; release commits
 update `flake.lock` deliberately instead of floating silently with nixpkgs.
 
-Arch users can use the AUR package after it is published:
+The AUR package is not published yet because new AUR account creation is
+currently unavailable. After publication, Arch users will be able to install it
+with:
 
 ```sh
 yay -S kickoutchi-bin
@@ -166,9 +168,9 @@ yay -S kickoutchi-bin
 
 The AUR templates live in `packaging/arch/` for maintainers who want to build or
 review the package locally before publication. They are pinned to the latest
-published GitHub Release assets and checksums — bumped only after each release's
-assets exist, never against placeholders — and AUR publication waits until AUR
-account creation is available again.
+published GitHub Release assets and checksums; bumped only after each release's
+assets exist, never against placeholders. Publication will proceed when AUR
+account creation becomes available again.
 
 Then use either binary name:
 
@@ -239,7 +241,7 @@ cargo install --path . --locked
   Linux/macOS-only.
 - Linux/macOS tree and group kills refuse anything uncertain: a set over its cap
   (256 for trees, 512 for groups), an unsafe or protected member, unreadable
-  process metadata, or an identity that changed under it — and every refusal
+  process metadata, or an identity that changed under it; and every refusal
   after freezing thaws what it stopped.
 - Windows tree kill refuses cleanly before Job Object commit when preflight sees
   an unsafe PID, protected descendant, incomplete metadata, identity drift, or an

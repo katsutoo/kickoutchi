@@ -6,7 +6,7 @@ kept as the source reference inside the Kickoutchi repository.
 
 The live bucket updates itself: Excavator watches upstream releases and commits
 new versions, URLs, and hashes there on its own (see "How updates happen"
-below). This in-repo copy is a bootstrap seed, not the source of truth — if it
+below). This in-repo copy is a bootstrap seed, not the source of truth; if it
 lags a release, that is expected and installs are unaffected.
 
 ## Usage
