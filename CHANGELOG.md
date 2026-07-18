@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A reviewed implementation contract and dependency record for the next minor release,
+  covering the shared observation model, serialized schemas, platform evidence,
+  resource limits, threat model, and boundary-test plan for named endpoints,
+  `watch`, and `why`.
+- Native dependency contract tests for the approved socket lifecycle across TCP,
+  UDP, IPv4, IPv6, wildcard, reuse-address, IPv6-only, and dual-stack modes,
+  including immediate close and exact endpoint rebinding.
+
 ### Changed
 
+- Pinned `socket2` 0.6.5 with its empty default feature set for future exact bind
+  probes. Its dependency graph, license, MSRV, unsafe call surface, binary-size
+  impact, and Linux, macOS, and Windows behavior passed supply-chain and native
+  CI review before implementation work begins.
 - Reorganized the CLI implementation into focused list, single-process kill,
   and scoped tree/group kill modules without changing command behavior, and
   documented the host-byte-order handling used by the Linux socket parser.

@@ -58,6 +58,11 @@ dirs = "6.0.0"
 # in the dependency tree via ratatui, so this adds no new supply-chain weight.
 unicode-width = "0.2.2"
 
+# Exact bind diagnostics require setting reuse-address and IPv6-only behavior
+# before bind. Keep the dependency exact and on its empty default feature set;
+# in particular, do not enable its broad `all` API surface.
+socket2 = "=0.6.5"
+
 [target.'cfg(unix)'.dependencies]
 # Unix termination uses the OS signal API directly for SIGTERM/SIGKILL instead
 # of shelling out to `kill`; the unsafe boundary is kept inside process.rs.

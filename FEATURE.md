@@ -8,7 +8,7 @@ This document is the implementation and release plan for three related features:
 - `kick watch`, a bounded polling event stream.
 - `kick why`, an evidence-based endpoint diagnostic command.
 
-The features may be developed in internal phases, but they ship together or not
+The features may be developed in internal stages, but they ship together or not
 at all. No incomplete platform fallback, provisional schema, or reduced first
 version is released. The expected release is a new minor version, such as
 `1.3.0`, because it adds commands, configuration, filters, and serialized
@@ -61,8 +61,11 @@ Apply these priorities in order:
 3. Clear contracts and maintainable code.
 
 Operational failures use `Result` and explicit error types. Assertions are only
-for programmer-error invariants. Every loop, retry, allocation, table, buffer,
-label, event batch, and native read must have an explicit bound.
+for programmer-error invariants. Every retry loop and every operation with
+application-controlled termination has an explicit iteration or duration bound.
+A no-duration watch may run until cancellation; each poll, allocation, table,
+buffer, label, event batch, native read, and retained state set remains
+independently bounded.
 
 ## Definition of Complete
 
@@ -86,7 +89,7 @@ The release is complete only when all of the following are true:
 - The final benchmark is reproducible and stays within predeclared regression
   budgets.
 
-## Phase 0: Freeze the Contracts
+## Stage 0: Freeze the Contracts
 
 Do not start platform implementation until these contracts are written and
 reviewed.
@@ -97,12 +100,25 @@ Use the following vocabulary throughout collectors, analysis, schemas, tests,
 and documentation:
 
 - `Protocol` is exactly `Tcp` or `Udp`.
-- An endpoint identity is a concrete protocol, `IpAddr`, and validated port in
-  `1..=65535`. Observed endpoints never contain a wildcard.
+- An endpoint identity is a concrete protocol, `IpAddr`, validated port in
+  `1..=65535`, and IPv6 scope. IPv4 scope is always absent. IPv6 scope is
+  `Unscoped`, `InterfaceIndex(nonzero u32)`, or `Unavailable`; collectors retain
+  a native scope index whenever the source exposes one. Observed endpoints never
+  contain a wildcard. `Unavailable` retains the row, adds
+  `native_field_unavailable`, cannot match an exact selector, and prevents an
+  exact-address proven claim.
 - An endpoint selector is separate from endpoint identity. Its address is either
   one exact `IpAddr` or the explicit `AnyLocalAddress` value represented as `"*"`
   in configuration. Hostnames, DNS resolution, interface names, and CIDR ranges
-  are not endpoint selectors in this release.
+  are not endpoint selectors in this release. An exact IPv6 selector may include
+  an optional separate numeric `scope_id`; it matches only the same scope, and
+  absence matches only an unscoped endpoint. `scope_id` is invalid for IPv4 and
+  wildcard selectors. CLI address arguments use the same literal address plus
+  optional `--scope-id` rule; `%zone` text and interface names are rejected.
+  Why probe targets follow this selector-style rule: an explicit IPv6 address
+  without `--scope-id` is unscoped. Watch address flags are filters instead:
+  `watch --address` matches the normalized address component across all scopes,
+  while `--scope-id` optionally narrows that filter to one interface index.
 - A process identity is a PID plus `ProcessStartMarker::LinuxStartTicks`,
   `ProcessStartMarker::MacOsStartTime`, or
   `ProcessStartMarker::WindowsCreationTime`. Values from different marker
@@ -113,9 +129,12 @@ and documentation:
   set means `NoOwnerObserved`; an empty partial set does not claim that no owner
   exists. Hidden ownership that cannot be tied to one endpoint is a snapshot gap,
   not a fabricated per-socket owner.
-- A platform socket token is a typed optional value such as `LinuxInode` or
-  `MacOsSocketId`. No synthetic token is created on a platform that does not
-  expose one.
+- A platform socket token is a typed optional opaque value such as `LinuxInode`
+  or `MacOsSocketId`. No synthetic token is created on a platform that does not
+  expose one. Linux `/proc/net` inodes and macOS `socket_info.soi_so` values may
+  be retained and used for within-pass association and deterministic ordering,
+  but neither has an approved cross-capture uniqueness guarantee. A token alone
+  therefore never raises replacement certainty to `Proven` in this release.
 - TCP state values are `Closed`, `Listen`, `SynSent`, `SynReceived`,
   `Established`, `FinWait1`, `FinWait2`, `CloseWait`, `Closing`, `LastAck`,
   `TimeWait`, `DeleteTcb`, `NewSynReceived`, or `Unknown(native_code)`. UDP uses
@@ -132,27 +151,33 @@ and documentation:
   complete ownership, while retaining every socket's separate local
   completeness and all observed owner edges. Global uncertainty is never
   rewritten as endpoint-local hidden ownership.
-- Observation scope is `CurrentNetworkNamespace` on Linux and
-  `CurrentHostNetworkStack` on macOS and Windows. Scope carries an identifier
-  only when the native platform exposes one through a supported source.
+- Observation scope is `CurrentNetworkNamespace` on Linux,
+  `CurrentHostProcessVisibleSockets` on macOS, and `CurrentHostNetworkStack` on
+  Windows. Linux identifies its namespace from `/proc/self/ns/net` when readable.
+  The macOS scope names the process-first libproc coverage and is not a claim of
+  global PCB visibility. Windows excludes WSL networking. macOS and Windows have
+  no native scope identifier in this release.
 - Snapshot completeness is `Complete`, `Partial`, or `Raced`. A failed
   collection returns an error and is not represented as an empty snapshot.
 - Evidence gaps use stable reason codes. The initial set is
   `owner_permission_denied`, `owner_attribution_incomplete`,
   `owner_disappeared`, `process_identity_unavailable`,
   `process_metadata_unavailable`, `native_field_unavailable`,
-  `scope_excluded`, and `noncritical_evidence_truncated`.
+  `scope_excluded`, `noncritical_evidence_truncated`, and `observation_raced`.
 - Every evidence gap has impact `Metadata`, `Ownership`, `SocketSet`, or `Scope`.
   The impact determines which analyses may still use a partial snapshot; the
   reason code alone is not interpreted by renderers.
-- Certainty is `Proven`, `Estimated`, `Heuristic`, or `Unknown`. Certainty applies
+- Certainty is `Proven`, `Estimated`, `Heuristic`, or `Unknown`. `Proven` means
+  the specific claim is directly established by an authoritative native fact or
+  exact probe; a native value alone does not prove cross-capture token identity,
+  replacement, respawn, ownership completeness, or future availability. Certainty applies
   to a claim or verdict, not to decorative output text.
 - Individual socket observations remain a multiset. Shared, inherited, and
   reuse-port sockets are not replaced internally by one endpoint count.
 
 ### 0.2 Public contracts
 
-The feature-specific contracts in Phases 3 through 7 are part of the Phase 0
+The feature-specific contracts in Stages 3 through 7 are part of the Stage 0
 freeze and are normative before their implementation begins. The following
 cross-cutting rules apply to every public surface:
 
@@ -174,6 +199,13 @@ cross-cutting rules apply to every public surface:
   explicit null/partial treatment. These named value and aggregate metadata
   bounds are safety exceptions to legacy value compatibility. Additional
   exposure requires a separately reviewed explicit diagnostic mode.
+- Public string limits apply to the final UTF-8 byte representation. Process
+  names and command lines retain the current lossy decoding semantics: invalid
+  Unix bytes or Windows UTF-16 sequences become U+FFFD. An executable path that
+  is not valid UTF-8 becomes `null`, adds `process_metadata_unavailable`, and
+  makes metadata partial. Collectors bound native bytes or code units before
+  conversion and recheck final UTF-8 bytes before retention. A legacy "raw"
+  command-line value means the existing decoded string, not raw OS bytes.
 - Machine-readable enum values and field names use lowercase `snake_case`.
   Stable public codes, not localized messages, are the programmatic contract.
 - Stdout contains only the requested human or structured result. Diagnostics,
@@ -209,12 +241,13 @@ Keep one documented process-wide contract:
 For `why`, success means the exact requested bind probe succeeded at the
 recorded time. It does not guarantee that a later process will bind first.
 
-When `why` evaluates several endpoints, map the aggregate result with this fixed
-precedence:
+When `why` evaluates several endpoints, first map each completed endpoint
+verdict through Stage 6.2, then use this fixed precedence:
 
-1. Exit `1` if an operational failure prevented the complete evaluation.
-2. Otherwise exit `4` if any endpoint lacks a reliable verdict due to permission.
-3. Otherwise exit `3` if any endpoint is not bindable.
+1. Exit `1` if an operational failure prevented complete evaluation or any
+   completed endpoint maps to `1`.
+2. Otherwise exit `4` if any endpoint maps to `4`.
+3. Otherwise exit `3` if any endpoint maps to `3`.
 4. Exit `0` only when every evaluated endpoint is proven bindable now.
 
 For `watch`, Ctrl-C, duration expiry, and a broken stdout pipe exit `0`. Invalid
@@ -226,14 +259,16 @@ consecutive-failure budget exits `1`.
 Filters are command-scoped rather than globally accepted:
 
 - `list` and the TUI continue to expose listening TCP and bound UDP only and
-  accept existing filters plus `label:`, `address:`, and `family:ipv4|ipv6`.
+  accept existing filters plus `label:`, `address:`, `scope_id:`, and
+  `family:ipv4|ipv6`.
 - `list` and the TUI do not accept `state:` because non-listening states are not
   in their visible data set.
 - `watch` accepts the list/TUI vocabulary plus `state:` and filters the complete
   socket-state snapshot.
 - `why` uses exact endpoint arguments and verdict evidence, not general filters.
-- Unsupported filters fail with a clear invalid-arguments error instead of
-  silently matching nothing.
+- A recognized structured field unsupported by the current command fails with a
+  clear invalid-arguments error. An unrecognized `name:value` token retains the
+  existing plain-text-search behavior and is not a structured filter.
 
 Pass explicit query capabilities into shared parsing so command support cannot
 drift accidentally.
@@ -259,7 +294,7 @@ behind a narrow safe boundary. Record as residual supply-chain risk that the
 upstream Windows implementation contains an unused vectored-send safety FIXME;
 the selected probe path does not call that API.
 
-Before Phase 1 begins, review the exact lockfile diff, run repository
+Before Stage 1 begins, review the exact lockfile diff, run repository
 supply-chain and advisory checks, confirm dependency unification, compile and
 test the dependency on all native targets, and measure the release binary-size
 delta. Until those checks pass, `0.6.5` is the conditionally accepted candidate,
@@ -291,7 +326,7 @@ authorized security-test target under this plan.
 | PID reuse or endpoint movement targets the wrong process | Typed start markers, fresh ownership collection, prepared identity-safe handles, and fail-closed revalidation | Mutation-confirmed non-delivery tests |
 | Collection churn creates false ownership or fabricated watch events | Bounded two-pass consistency collection, explicit `Raced`, and recovery from the last valid snapshot | Deterministic race and recovery tests |
 | Permission or scope gaps become a false "free" verdict | Explicit owner/gap/scope states, unknown certainty, and exit `4` where permission blocks reliability | Permission and namespace tests |
-| Large tables, metadata, labels, or diffs exhaust resources | The Phase 0.7 limits, checked capacity arithmetic, streaming writers, and no retry-until-success | Zero, maximum, and maximum-plus-one tests |
+| Large tables, metadata, labels, or diffs exhaust resources | The Stage 0.7 limits, checked capacity arithmetic, streaming writers, and no retry-until-success | Zero, maximum, and maximum-plus-one tests |
 | Watch accumulates unbounded state or spawns Docker repeatedly | Retain two snapshots and one bounded batch; never invoke Docker in the loop | Long-run and injected-failure tests |
 | Bind probes interfere with one another or leak sockets | Sequential probes, RAII-owned sockets, bind then immediate drop, and no listen/send/receive | Native cleanup and rebind tests |
 | Shell or argument injection reaches Docker or another executable | No shell; fixed executable plus structured arguments; Docker remains optional evidence | Source-to-sink review and hostile-input tests |
@@ -383,17 +418,99 @@ count and keep the snapshot partial instead of silently dropping that fact.
 Existing stricter kill, tree, group, Docker, confirmation-input, and process-wait
 limits remain unchanged unless a later measured change is separately approved.
 
-### Phase 0 gate
+### 0.8 Boundary-test plan
 
-- [ ] Contracts have no unresolved semantic ambiguity.
-- [ ] Every public schema has a proposed versioned shape.
-- [ ] Every supported platform has a documented source for each promised fact.
-- [ ] Permanent limitations are accepted as contract, not deferred work.
-- [ ] Security objectives and resource bounds are documented.
-- [ ] Every bound has zero, maximum, and maximum-plus-one test cases planned.
-- [ ] `socket2` version, features, and dependency review are approved.
+Every production limit is a named constant. Tests for large aggregate limits may
+exercise the algorithm through an injected smaller limit, but must also assert
+that the production constant equals this contract and that checked arithmetic is
+identical. Per-value byte limits and serialized-record limits use their actual
+production values. "Above" means the smallest representable value greater than
+the maximum; no test performs an allocation before the above-limit refusal.
+Exact shared-maximum acceptance is tested through source-independent domain and
+serialization fixtures. If a documented native API has a lower representable
+maximum, native tests cover that exact native maximum and first rejected value;
+the lower source limit does not change the shared retained-data maximum.
 
-## Phase 1: Build the Observation Foundation
+| Resource | Zero or below-minimum case | Exact maximum case | Maximum-plus-one case |
+| --- | --- | --- | --- |
+| Endpoint port | Port zero rejected | 65,535 accepted | 65,536 rejected before conversion |
+| IPv6 scope ID | Zero rejected as an interface index; IPv4-with-scope rejected | `u32::MAX` accepted | `u32::MAX + 1` rejected before conversion |
+| Config bytes | Empty file succeeds | 65,536 bytes accepted | 65,537th byte rejected before retention |
+| Label selectors | Zero selectors preserves legacy layout | 256 accepted | 257 rejected |
+| Label bytes / columns | Empty label rejected; empty rendered value impossible | 128 bytes accepted; 32 columns displayed | 129 bytes rejected; 33 columns clipped to at most 32 |
+| Filter bytes | Empty filter succeeds | 256 bytes accepted | 257 rejected before term parsing |
+| Native table bytes | Zero-row table accepted when native format permits | 16 MiB accepted | 16 MiB plus one rejected before allocation/read |
+| Socket observations | Empty snapshot accepted | 262,144 accepted | 262,145 rejected |
+| Candidate or uniquely referenced PIDs | Zero candidates/references accepted | 131,072 accepted independently on each path | 131,073 rejected before identity reads on each path |
+| Linux/macOS FD entries | Zero entries accepted | 1,048,576 accepted per applicable scope | 1,048,577 rejected before retention |
+| Owner edges | Zero edges accepted | 262,144 accepted | 262,145 rejected |
+| Identity reads | Zero reads accepted | 262,144 in one attempt and 524,288 total accepted | One more than either bound rejected; no third attempt |
+| Derived legacy rows | Zero rows accepted | 262,144 accepted | 262,145 rejected before projection retention |
+| Serialized owners | Empty complete and empty partial sets retain distinct meaning | 64 serialized | 65th counted as omitted without changing completeness |
+| Owner reason codes | Zero reasons accepted where complete | Eight distinct reasons accepted | Ninth is `owner_reason_limit_exceeded` |
+| Name/path/command bytes | Empty values retain defined empty-string semantics except protection names, which refuse | 4 KiB / 128 KiB / 1 MiB retained | One byte above becomes null plus partial metadata and a gap |
+| Aggregate optional metadata | Zero metadata accepted | 64 MiB retained | Next value omitted before allocation; identities and sockets remain |
+| Fresh protection evidence | Empty name refuses; zero-member scope is a no-op | 4 KiB name, 512 members, and 2 MiB aggregate accepted | 4 KiB+1, member 513, or 2 MiB+1 refuses delivery |
+| Consistency attempts | Collector never performs zero passes for a requested snapshot | Stable second pass completes attempt two | A third complete attempt is never started |
+| Changing-size read attempts | No call occurs after prevalidation refusal | Success on attempt three accepted | Fourth attempt never starts |
+| Snapshot evidence gaps | Empty list preserves independently derived completeness | 4,096 retained | 4,097th increments omitted count and forces partial |
+| Scope identifier / limitations | Null identifier and zero limitations accepted | 256 UTF-8 bytes and eight codes accepted | Byte 257 yields null, one endpoint-null `native_field_unavailable` Scope gap, and partial completeness without retaining a prefix; ninth distinct code is an operational error |
+| Retained watch snapshots | Before baseline none are retained | Previous and current only | Installing a third drops the no-longer-needed snapshot first |
+| Watch events / batch | Zero-event diff writes nothing | 524,288 events counted; batches contain at most 4,096 | Event 524,289 fails; event 4,097 starts a new batch rather than failing |
+| Watch evidence/gaps | Zero-item arrays accepted | Eight items and eight gaps retained | Ninth increments the applicable omitted count |
+| Watch interval | Zero and 99 ms rejected | 100 ms and 60 s accepted | 60 s plus 1 ms rejected |
+| Consecutive failures | Zero after baseline and after recovery | Third gap is flushed, then exit 1 | Fourth collection is never attempted |
+| Watch duration | Zero and 99 ms rejected | 100 ms and seven days accepted | Seven days plus 1 ms rejected |
+| Why endpoints | Zero endpoints rejected | Eight evaluated sequentially | Ninth rejected before collection/probing |
+| Why evidence/gaps | Zero-item arrays accepted | 16 items and 16 gaps retained | 17th increments the applicable omitted count |
+| Evidence message | Empty explanatory message accepted only where the code remains sufficient | 512 UTF-8 bytes retained | 513th byte clipped safely before serialization |
+| CLI address token | Empty rejected | 64 bytes parsed | 65th byte rejected before IP parsing |
+| NDJSON record | Structurally minimal legal record is serialized and nonempty | Bounded-writer fixture accepts exactly 65,536 bytes; fully populated legal event remains within the separately calculated 52,224-byte bound | Writer refuses byte 65,537 without emitting a partial line |
+
+Inherited limits receive the following explicit production-constant tests. Fixed
+deadlines use injected clocks; tests do not sleep until a real deadline.
+
+| Inherited resource | Zero or below-minimum case | Exact maximum case | Maximum-plus-one case |
+| --- | --- | --- | --- |
+| Config refresh seconds | Zero rejected | 1 and 3,600 accepted | 3,601 rejected |
+| Protected process names | Empty extension accepted; empty name rejected | 256 merged names accepted | 257 rejected |
+| macOS FDs per process | Zero accepted | 65,536 accepted | 65,537 rejected before allocation |
+| Tree/group members | Missing/zero-member target refused | 256 tree and 512 group accepted | Member 257/513 refused before delivery |
+| Group `--yes` members | Empty group refused | Eight accepted when warning-free | Ninth requires interactive confirmation |
+| Unix freeze passes | Stable first pass accepted | Convergence on pass eight accepted | Pass nine never starts; all frozen members are thaw-attempted |
+| Windows tree sweep passes | Stable first sweep accepted | Convergence on sweep eight accepted | Sweep nine never starts and post-commit partiality is reported |
+| Confirmation input | Empty fails confirmation | 128 UTF-8 bytes accepted when otherwise valid | Byte 129 rejected and input remains untruncated |
+| Post-kill settle | Zero attempts is impossible for a requested settle | Port disappearance on attempt ten succeeds | Attempt eleven never starts; timeout remains truthful |
+| Windows single-process wait | Zero-time probe remains nonblocking | Exit at the five-second deadline succeeds | No wait beyond the shared deadline; survivor is unconfirmed |
+| Windows tree wait | Zero-time per-handle probes remain nonblocking | All members share exactly five seconds | No member extends the shared deadline; survivors are reported |
+| Docker command/drain time | Zero deadline returns immediately in injected-clock tests | Completion at 1,500 ms / 250 ms accepted | No poll or wait occurs after either deadline |
+| Docker output bytes | Empty stream accepted | 256 KiB retained | Byte 262,145 drained but not retained |
+| Docker drain workers | Zero available capacity refuses spawn | Eight workers acquired | Ninth refused until capacity returns |
+| Docker rows/matches | Empty output yields none | 128 rows and eight matches retained | Row 129 ignored; match nine omitted deterministically |
+| Docker field bytes | Empty fields handled by parser rules | 4 KiB accepted | 4 KiB+1 row rejected without prefix retention |
+| Docker port segments | Empty segment list matches nothing | 64 parsed | Segment 65 rejects the row |
+| Docker privilege-status read | Empty/malformed status fails closed | 64 KiB accepted | 64 KiB+1 fails closed before Docker execution |
+| Linux identity-critical status/stat reads | Empty/malformed identity input fails closed | 1 MiB status and 4 KiB stat accepted | Next byte fails before parsing and no prefix is used |
+| Linux protected `comm` comparison | Empty process name never proves unprotected | Exact 15-byte kernel `comm` comparison accepted | Configured byte 16 participates only in the documented truncation-aware exact rule, never substring matching |
+| Platform children/hints/ancestors | Empty lists accepted | 64 children, eight hints, and 64 ancestors retained | Next item omitted with existing partial/truncation semantics |
+| Inspect display ancestors/siblings/tree/group | Empty sections render safely | 12/8/20/16 displayed | Next item is omitted with explicit summary wording |
+| Inspect ancestor walk | Missing parent stops immediately | 64 parent edges traversed | Edge 65 is never followed; the report marks the bounded stop |
+| Inspect command/diagnostic text | Empty text remains safe | 120/240 characters displayed | Next character clips without control-sequence leakage |
+| CLI/TUI preview and detail lists | Empty lists render safely | CLI preview 12, TUI tree preview eight, and TUI children/details eight are displayed | Next item is omitted while required prompts remain visible |
+
+### Stage 0 gate
+
+- [x] Contracts have no unresolved semantic ambiguity.
+- [x] Every new public schema has a proposed in-band versioned shape, and the
+      exceptional legacy `kickoutchi.list/1` array plus its sole additive
+      `label` field are fully pinned.
+- [x] Every supported platform has a documented source for each promised fact.
+- [x] Permanent limitations are accepted as contract, not deferred work.
+- [x] Security objectives and resource bounds are documented.
+- [x] Every bound has zero, maximum, and maximum-plus-one test cases planned.
+- [x] `socket2` version, features, and dependency review are approved.
+
+## Stage 1: Build the Observation Foundation
 
 Create a platform-neutral observation layer. The likely layout is:
 
@@ -424,9 +541,21 @@ pub struct ProcessIdentity {
     pub start_marker: ProcessStartMarker,
 }
 
-pub struct SocketObservation {
+pub struct EndpointIdentity {
     pub protocol: Protocol,
-    pub local_endpoint: SocketAddr,
+    pub address: IpAddr,
+    pub port: NonZeroU16,
+    pub ipv6_scope: Option<Ipv6Scope>,
+}
+
+pub enum Ipv6Scope {
+    Unscoped,
+    InterfaceIndex(NonZeroU32),
+    Unavailable,
+}
+
+pub struct SocketObservation {
+    pub local_endpoint: EndpointIdentity,
     pub state: SocketState,
     pub owners: Vec<OwnerObservation>,
     pub owner_completeness: OwnerCompleteness,
@@ -434,10 +563,11 @@ pub struct SocketObservation {
 }
 ```
 
-Use an enum for platform start markers rather than an unqualified integer:
+Use enums and nonzero integer types for identity-bearing fields rather than
+unqualified integers:
 
 - Linux process start ticks.
-- macOS process start timestamp or unique native identity.
+- macOS process start timestamp from `proc_bsdinfo`.
 - Windows process creation time.
 
 Represent unverified ownership separately. Do not invent a placeholder start
@@ -486,6 +616,19 @@ Enforce these invariants by construction where practical:
 - Human-facing certainty is assigned before rendering.
 - Snapshot completeness describes the whole observation, while evidence gaps
   describe specific rows or claims.
+- Snapshot completeness is derived with fixed precedence. It is `Raced` when the
+  accepted result is the second unstable consistency attempt. Otherwise it is
+  `Partial` when any evidence gap was retained or omitted, any socket or global
+  owner set is partial/raced, or bounded optional data was omitted; otherwise it
+  is `Complete`. Permanent limitations listed only in `scope.limitations` define
+  the observation boundary and coexist with `Complete`; an actual failed or
+  truncated scope read is an evidence gap and forces `Partial`.
+- Global owner completeness is `Raced` when owner edges or attributable process
+  identities changed across the returned attempt, `Partial` when any owner scan
+  was denied/truncated/vanished or any native owner PID could not be verified,
+  and `Complete` otherwise. Socket-local owner completeness follows the same rule
+  using only evidence attributable to that socket. Global loss is never copied
+  into an arbitrary local owner set.
 - Diff readiness is derived before watch rendering. `SocketSet` gaps and `Raced`
   snapshots are not safe for bind/release diffing. `Ownership` gaps still permit
   socket multiplicity diffs when the native socket set is authoritative, but
@@ -507,11 +650,18 @@ Use a bounded consistency algorithm:
 4. Read process start identities A once per unique attributable PID.
 5. Collect native socket rows and owner associations again as table B.
 6. Read process start identities B once per unique attributable PID in B.
-7. Accept the snapshot only when socket multiplicity, owner edges, and all
-   comparable process identities are stable between A and B.
+7. Accept the snapshot only when socket multiplicity, owner edges, and process
+   identities are stable between A and B. A PID attributable in only one pass or
+   a marker available in only one pass is unstable.
 8. Retry the complete operation once when stability fails.
-9. Return `Raced` after the second unstable attempt without converting changed
-   rows into bind, release, or replacement facts.
+9. After the second unstable attempt, return pass B from that attempt as the
+   most recent bounded evidence: socket rows and observed owner edges are from B,
+   verified process metadata is keyed only by identities read in B, snapshot
+   completeness is `Raced`, and global/local owner completeness is raced where
+   the unstable comparison applies. Add `observation_raced` gaps naming the
+   affected impact. A PID or identity present in only one pass is unstable, not
+   "non-comparable". No analysis may convert this snapshot into bind, release,
+   replacement, no-owner, or bindability facts.
 
 Linux records whether any PID FD directory or entry was denied or disappeared
 during each owner scan. If that loss cannot be attributed to a socket inode, add
@@ -528,8 +678,8 @@ until success.
 Watch always uses this full consistency algorithm. If collection takes longer
 than the requested interval, it starts the next poll after completion without
 overlap or backlog and records the actual observation times. Run a release-mode
-feasibility measurement after Phase 2 and before exposing watch. If the 100 ms
-minimum is not practical, reopen Phase 0 and update the contract before Phase 3;
+feasibility measurement after Stage 2 and before exposing watch. If the 100 ms
+minimum is not practical, reopen Stage 0 and update the contract before Stage 3;
 never defer that product change until release QA or benchmarking. Performance
 work may not weaken identity consistency or truthful race reporting.
 
@@ -570,7 +720,7 @@ tree, and group kill tests are named migration criteria, not incidental coverage
 Mutation confirmation must first cover ownership loss, PID reuse, endpoint
 movement, newly protected targets, and signal non-delivery on every refusal.
 
-### Phase 1 gate
+### Stage 1 gate
 
 - [ ] Core invariants are represented in types or checked at internal boundaries.
 - [ ] Operational errors do not panic.
@@ -581,7 +731,7 @@ movement, newly protected targets, and signal non-delivery on every refusal.
 - [ ] Unit tests cover stable, partial, denied, raced, duplicate, zero, maximum,
       and maximum-plus-one observations.
 
-## Phase 2: Complete Native Collection
+## Stage 2: Complete Native Collection
 
 No new command is exposed until all supported platform collectors satisfy the
 shared contract.
@@ -590,26 +740,49 @@ Use this fact-source and limitation matrix as the platform contract:
 
 | Fact | Linux source | macOS source | Windows source |
 | --- | --- | --- | --- |
-| IPv4/IPv6 TCP rows and state | `/proc/net/tcp`, `/proc/net/tcp6` | PCB/libproc socket information | `GetExtendedTcpTable` owner tables |
-| IPv4/IPv6 UDP bound rows | `/proc/net/udp`, `/proc/net/udp6` | PCB/libproc socket information | `GetExtendedUdpTable` owner tables |
+| IPv4/IPv6 TCP rows and state | `/proc/net/tcp`, `/proc/net/tcp6` | `proc_listallpids` + `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` | `GetExtendedTcpTable` owner tables |
+| IPv4/IPv6 UDP bound rows | `/proc/net/udp`, `/proc/net/udp6` | `proc_listallpids` + `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` | `GetExtendedUdpTable` owner tables |
 | Socket owner PID | `/proc/<pid>/fd` inode links | Per-process libproc file descriptors | Extended owner-table PID |
 | Process start identity | `/proc/<pid>/stat` field 22 | `proc_bsdinfo` start time | `GetProcessTimes` creation time |
-| Process metadata | `/proc/<pid>` files and links | libproc process APIs | Current `sysinfo` snapshot, retained only if Phase 2 proves pre-allocation bounds; otherwise bounded native reads |
-| Socket token | `/proc/net` inode | Native socket ID where exposed | Unavailable unless a supported native source is added |
-| Timer estimate | Checked `/proc/net` timer fields | Unavailable unless the native API exposes it | Unavailable unless the native API exposes it |
-| Scope | `/proc/self/ns/net` current namespace | Current host network stack | Current Windows host network stack |
+| Process metadata | `/proc/<pid>` files and links | `proc_bsdinfo`, `proc_name`, `proc_pidpath`, and bounded `KERN_PROCARGS2` | `CreateToolhelp32Snapshot`/`Process32FirstW`/`Process32NextW` for bounded name and parent rows, `QueryFullProcessImageNameW` for path, and bounded `NtQueryInformationProcess(ProcessCommandLineInformation)` for the legacy command line |
+| Socket token | `/proc/net` inode | `socket_info.soi_so` returned by `PROC_PIDFDSOCKETINFO` | Unavailable in this release |
+| IPv6 scope ID | Unavailable from the selected `/proc/net` row format; every IPv6 row uses `Unavailable` | `in6_ifindex` | `dwLocalScopeId` |
+| Timer estimate | TCP-only `/proc/net/tcp*` `tr` and `tm->when`, retained as kind and raw ticks; duration uses checked `_SC_CLK_TCK` conversion | Unavailable | Unavailable |
+| Scope | `/proc/self/ns/net` current namespace | Declared process-visible host coverage; no global identifier | Declared current native Windows host stack; no global identifier |
 
 Permanent limitations are part of the contract:
 
 - Linux observes only the current network namespace and never enters another
   namespace implicitly.
-- macOS may expose less owner or timer information than Linux. Missing native
-  fields are evidence gaps, not fabricated defaults.
+- The selected Linux `/proc/net/*6` source exposes no scope identifier, so every
+  Linux IPv6 observation uses `Ipv6Scope::Unavailable`. A snapshot containing
+  such rows adds one endpoint-null `native_field_unavailable` gap with `Scope`
+  impact. Those rows cannot match an exact IPv6 selector or support an
+  exact-address proven observation claim. Wildcard label selectors still match
+  because they do not require scope equality.
+- macOS collection is process-first through `proc_listallpids`,
+  `proc_pidinfo(PROC_PIDLISTFDS)`, and
+  `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`, not a global PCB snapshot. It cannot
+  observe sockets hidden with an inaccessible process or descriptor table, rows
+  that vanish during enumeration, or sockets with no visible user-process
+  descriptor. Such loss has `SocketSet` impact. Missing native fields are
+  evidence gaps, not fabricated defaults.
+- `CurrentHostProcessVisibleSockets` covers sockets reachable through process FD
+  enumeration when every PID returned by `proc_listallpids` is processed
+  successfully. Sockets with no user-process descriptor are permanently outside
+  this scope. Denial, truncation, disappearance, or malformed enumeration for a
+  returned process is a `SocketSet` gap and prevents socket-set completeness; it
+  is not reclassified as an ordinary scope exclusion.
 - Windows collection excludes the separate WSL network stack. Excluded-port or
   reservation evidence is reported only when a supported native source supplies
   it.
-- Permission-denied process metadata can prevent verified ownership on every
-  platform. A visible socket is not removed merely because enrichment failed.
+- Owner PID, verified process identity, and optional process metadata have
+  separate completeness. Failure to read a start marker preserves a native PID
+  as `UnverifiedPid` and affects ownership verification. Failure to read a name,
+  path, parent, or command line has `Metadata` impact only. On process-first
+  macOS, descriptor enumeration failure can hide socket rows and has `SocketSet`
+  impact. A visible authoritative socket row is not removed merely because
+  enrichment failed.
 - Collection is a bounded observation interval, not an atomic kernel snapshot.
 - No collector uses `ss`, `lsof`, `netstat`, `netsh`, Docker, or another process
   as its authoritative source.
@@ -624,6 +797,11 @@ Permanent limitations are part of the contract:
 - Retain UDP-bound observations.
 - Preserve socket inode as an optional native token.
 - Parse timer fields with checked, bounded integer conversion.
+- Retain TCP timer kind and raw ticks at capture. Convert to an estimated
+  duration only when `_SC_CLK_TCK` returns a positive representable value. The
+  estimate is quantized and race-prone, applies only to the represented TCP
+  kernel timer, and never promises socket release or future bindability. UDP
+  timer semantics are not promised in this release.
 - Read process start ticks from `/proc/<pid>/stat`.
 - Report current network namespace scope.
 - Track denied or vanished FD scans. Claim `NoOwnerObserved` only when the owner
@@ -638,7 +816,8 @@ Permanent limitations are part of the contract:
 
 ### 2.2 macOS
 
-- Extend the existing PCB/libproc path to retain all exposed TCP states.
+- Extend the process-first libproc path to retain every TCP state and UDP row
+  returned by `PROC_PIDFDSOCKETINFO`.
 - Retain UDP endpoints and ownership where exposed.
 - Obtain a native process start identity.
 - Represent unavailable fields explicitly.
@@ -647,6 +826,15 @@ Permanent limitations are part of the contract:
 - Keep unsafe blocks small and add a local `// SAFETY:` proof to each one.
 - If process-first libproc failure can hide complete socket rows, add a
   `SocketSet` evidence gap. Do not downgrade it to metadata-only partiality.
+- Map Darwin `tcpsi_state` values `0..=10` to `Closed`, `Listen`, `SynSent`,
+  `SynReceived`, `Established`, `CloseWait`, `FinWait1`, `Closing`, `LastAck`,
+  `FinWait2`, and `TimeWait`; preserve every other nonnegative value as
+  `Unknown(native_code)`; a negative signed value is malformed native data.
+- Derive or validate Darwin layouts, field offsets, constants, and state codes
+  against supported SDK headers for both release architectures. Coarse struct
+  size checks alone are insufficient ABI evidence.
+- Retain `socket_info.soi_so` only as an opaque token for within-pass association
+  and ordering. It does not prove cross-capture identity or replacement.
 
 ### 2.3 Windows
 
@@ -667,14 +855,13 @@ Permanent limitations are part of the contract:
   identity or metadata reads fail. Such failure affects ownership or metadata,
   not the existence of the socket row.
 - The current `sysinfo` metadata snapshot is not considered bounded merely
-  because results are truncated afterward. Before retaining it, prove that the
-  selected refresh path enforces the PID, per-value, and 64 MiB aggregate budgets
-  before allocation. If that cannot be proved, replace process metadata
-  collection with bounded native Windows reads while keeping IP Helper as the
-  socket authority.
-- Record the final decision to retain or remove `sysinfo` in the reviewed
-  lockfile and dependency-size evidence. No provisional unbounded metadata path
-  may ship.
+  because results are truncated afterward and is not approved for the new
+  collector. Replace it with the bounded native sources frozen in the Stage 2
+  matrix. Enumerate at most 131,072 fixed-size Toolhelp rows; allocate name,
+  path, and command-line buffers only after per-value and aggregate budget checks;
+  use at most three changing-size attempts per native read. Keep IP Helper as the
+  socket authority. Remove `sysinfo` after all existing Windows behavior is
+  migrated and covered; no provisional unbounded metadata path may remain.
 
 ### 2.4 Shared state mapping
 
@@ -682,7 +869,7 @@ Use a shared state enum that preserves unknown values. The normal `list` and TUI
 views may continue to show listening TCP and bound UDP rows, while the snapshot
 retains all states for watch and why.
 
-### Phase 2 gate
+### Stage 2 gate
 
 - [ ] All native values map to a shared state or `Unknown(native_code)`.
 - [ ] All unsafe code has reviewed safety contracts.
@@ -692,9 +879,9 @@ retains all states for watch and why.
       has either a proven bounded `sysinfo` path or bounded native replacement.
 - [ ] Linux, macOS, and Windows CI compile and run their collector tests.
 - [ ] Release-mode feasibility measurements confirm the 100 ms watch minimum or
-      Phase 0 is reopened before named endpoints and public commands begin.
+      Stage 0 is reopened before named endpoints and public commands begin.
 
-## Phase 3: Implement Named Endpoints
+## Stage 3: Implement Named Endpoints
 
 Use endpoint-aware labels from the first release:
 
@@ -721,14 +908,17 @@ label = "local web services"
 `protocol` and `address` are required. The explicit address `"*"` means all
 local addresses for that protocol. Exact addresses are literal IP addresses;
 hostnames, DNS, CIDR ranges, and interface names are rejected. There are no
-hidden selector defaults.
+hidden selector defaults. `scope_id` is an optional nonzero `u32` accepted only
+with an exact IPv6 address. A selector without `scope_id` matches only an
+unscoped endpoint; scoped exact selectors match only the same numeric scope.
 
 ### 3.1 Validation
 
 - Cap labels at 256 entries.
-- Cap each label at 128 UTF-8 bytes and 32 displayed terminal columns. Clip by
-  Unicode display width without splitting a code point and append an ellipsis
-  only when it fits within the same 32-column bound.
+- Cap each label at 128 UTF-8 bytes and 32 displayed terminal columns. Display
+  width uses the pinned `unicode-width 0.2.2`. Clip without splitting a Unicode
+  scalar value and append U+2026 only when it fits within the same 32-column
+  bound.
 - Reject empty and whitespace-only labels.
 - Reject leading or trailing whitespace rather than silently normalizing it.
 - Reject duplicate selectors at equal specificity.
@@ -737,10 +927,16 @@ hidden selector defaults.
 - Reject unknown fields.
 - Parse and canonicalize exact addresses with `IpAddr`; apply the same
   IPv4-mapped-IPv6 normalization used by observed endpoints before duplicate
-  detection and matching.
-- Allow normal printable Unicode. Reject C0/C1 controls, DEL, escape/ANSI input,
-  bidi controls, zero-width characters, and other invisible formatting code
-  points. Sanitize again at every terminal render boundary.
+  detection and matching. Canonicalize mapped literals before scope validation;
+  `scope_id` is invalid when normalization produces IPv4. Canonicalizing an
+  observed mapped row produces IPv4 and removes IPv6 scope because scope is not
+  part of canonical IPv4 identity.
+- Accept Unicode scalar values without normalization except characters with
+  Unicode 17.0 General Category `Cc`, the `Bidi_Control` property, or the
+  `Default_Ignorable_Code_Point` property. Reject those values, including escape,
+  ANSI controls, bidi controls, and zero-width formatting. Leading, trailing,
+  and whitespace-only checks use Rust `char::is_whitespace`. Sanitize again at
+  every terminal render boundary.
 - Test ANSI, control, bidi, zero-width, wide-Unicode, canonicalized duplicate,
   128-byte, and 129-byte input.
 
@@ -752,21 +948,26 @@ Apply one deterministic rule:
 2. Protocol and port with an explicit wildcard address.
 3. No ambiguous match at the same specificity.
 
+Exact precedence includes the normalized IPv6 scope. Wildcard selectors ignore
+scope deliberately and therefore apply to scoped and scope-unavailable rows.
+
 ### 3.3 Surfaces
 
-- Add a conditional `LABEL` column to the CLI table.
-- Add a conditional `LABEL` column to the TUI without harming minimum-size
-  behavior.
+- Add a `LABEL` column to the CLI table whenever validated configuration contains
+  at least one selector, even when no visible row currently matches.
+- Apply the same condition to the TUI. `LABEL` is the first optional column
+  omitted when necessary to preserve existing minimum-size behavior.
 - Include labels in plain search.
 - Add a `label:` structured filter.
-- Implement exact normalized `address:` and `family:ipv4|ipv6` filters in the
-  shared query layer for list, TUI, and watch. This phase owns their
-  implementation; Phase 7 only freezes and documents the resulting vocabulary.
+- Implement normalized `address:`, exact numeric `scope_id:`, and
+  `family:ipv4|ipv6` filters in the
+  shared query layer for list, TUI, and watch. This stage owns their
+  implementation; Stage 7 only freezes and documents the resulting vocabulary.
 - Add nullable `label` data to `kickoutchi.list/1` and the versioned snapshot
   schema.
 - Include labels consistently in watch and why output.
 
-### Phase 3 gate
+### Stage 3 gate
 
 - [ ] Unconfigured users see no human-table layout change.
 - [ ] Config errors name the invalid selector without leaking unsafe text.
@@ -774,7 +975,7 @@ Apply one deterministic rule:
 - [ ] JSON changes are pinned and documented.
 - [ ] CLI and TUI rendering remain aligned for Unicode labels.
 
-## Phase 4: Implement the Watch Engine
+## Stage 4: Implement the Watch Engine
 
 Create:
 
@@ -816,6 +1017,15 @@ Rules:
 - Duplicate sockets are diffed by multiplicity. Internally preserve every
   observation; output may group otherwise identical events and carry a positive
   multiplicity.
+- Reconcile each bucket deterministically. First cancel byte-for-byte equal
+  canonical observations by multiplicity. Before positional pairing, apply the
+  exact-one replacement rule below when both original bucket multiplicities are
+  one. Otherwise sort each remaining side by token key then owner-set key and
+  pair `min(previous_remaining, current_remaining)` items by index without
+  emitting owner-only events. Emit releases for unpaired previous items and
+  binds for unpaired current items, grouping adjacent equal event payloads. This
+  fixes payload and filter sides without claiming that positional or token
+  pairing proves socket persistence.
 - `baseline` emits one event for each matching initial observation or grouped
   multiplicity and appears only after the first successful collection.
 - `bind` means the current multiplicity is greater than the previous valid
@@ -823,21 +1033,32 @@ Rules:
 - Socket multiplicity counts native socket observations, not owner edges. One
   process closing an inherited descriptor while another owner retains the same
   native socket does not emit `release`.
-- `replacement` is deliberately narrow. Emit it as `Proven` when the same PID at
-  a matched endpoint has a changed verified start marker, or when one removed and
-  one added socket occurrence have distinct stable tokens and each has exactly
-  one verified owner. When tokens are unavailable, the same one-to-one verified
-  occurrence change may emit `replacement` only as `Heuristic`.
-- Do not pair arbitrary shared-owner edges. Owner-only additions or removals on a
-  socket whose stable token persists are intentionally silent in this release;
-  they are neither endpoint bind/release nor proven process replacement. Any
+- Socket multiplicity buckets are keyed by protocol, normalized address, numeric
+  IPv6 scope, port, and socket state. Replacement pairing occurs only within one
+  bucket, so both sides share the event's single state. A state transition emits
+  a release from the previous state and a bind into the current state rather
+  than a replacement.
+- `replacement` is deliberately narrow. Emit it as `Proven` only for a
+  bucket whose previous and current multiplicity are both exactly one, when both
+  owner sets are complete, each has exactly one verified owner, the owner PIDs
+  are equal, and their verified start markers differ. Emit `replacement` as
+  `Heuristic` under the same exact-one/complete-single-owner conditions when the
+  verified identities differ but the proven same-PID rule does not hold. If the
+  verified identities are equal, emit no replacement regardless of token change.
+  Opaque tokens participate only in deterministic event ordering. Shared,
+  incomplete, or multiplicity-greater-than-one sets are never paired.
+- Owner-only additions or removals do not change socket multiplicity and are
+  intentionally silent unless the exact-one replacement rule above applies;
+  token equality does not establish cross-capture socket persistence. Other
+  owner-only changes are neither endpoint bind/release nor process replacement. Any
   global or per-socket owner-attribution incompleteness disables replacement for
   that comparison.
 - Sort by protocol (`tcp`, then `udp`), address family (IPv4, then IPv6), address
-  bytes, port, the Phase 0.1 state order, event kind (`release`, `replacement`,
+  bytes, IPv6 scope (`unscoped`, interface index, `unavailable`; IPv4 before all
+  IPv6), port, the Stage 0.1 state order, event kind (`release`, `replacement`,
   then `bind`), event token key, event-side owner-set key, label bytes, filter
   result, and certainty. Baseline uses the same key. Owner and token keys are
-  frozen in Phase 7.1. A
+  frozen in Stage 7.1. A
   `collection_gap` is the only event for its failed poll.
 - Event time is an observation interval derived from the previous and current
   capture windows. It is never described as the exact kernel event time.
@@ -885,8 +1106,9 @@ A `Raced` snapshot or partial snapshot with a `SocketSet` gap emits
 valid baseline. A partial snapshot containing only `Metadata`, `Scope`, or
 `Ownership` gaps may advance the baseline and reset the consecutive-failure
 counter. It may emit bind and release events from stable socket multiplicity,
-but replacement is emitted only where both snapshots provide complete verified
-ownership for the matched socket observations.
+but replacement is emitted only when both snapshots have global `Complete`
+owner attribution and both matched owner sets are locally `Complete` with the
+verified identities required by the exact-one rule.
 
 Filter event sides deterministically. Baseline and bind evaluate the current
 event view; release evaluates the previous event view. Replacement builds one
@@ -920,14 +1142,17 @@ JSON mode emits only versioned NDJSON records on stdout. Diagnostics go to
 stderr. The baseline is a typed event, not unstructured prose.
 
 `--tcp` and `--udp` may be combined to select both protocols. Address and port
-arguments are exact event filters. `--filter` uses the Phase 7.2 watch
+arguments are exact event filters. `--filter` uses the Stage 7.2 watch
 capability set. Conflicting or repeated scalar options fail with exit `2`.
+Watch `--address` matches the normalized address component across every IPv6
+scope. `--scope-id` requires one explicit IPv6 address, narrows the filter to
+that nonzero interface index, and never matches unscoped or unavailable scope.
 
 Watch never invokes Docker enrichment in its polling loop. Native socket and
 process observations plus configured labels are sufficient for events. This
 prevents a 100 ms interval from becoming an external-process spawn loop.
 
-### Phase 4 gate
+### Stage 4 gate
 
 - [ ] Bind, release, replacement, duplicates, and gaps are correct.
 - [ ] No failed snapshot fabricates events.
@@ -936,14 +1161,17 @@ prevents a 100 ms interval from becoming an external-process spawn loop.
 - [ ] Cancellation, duration, broken pipes, and repeated failures are tested.
 - [ ] NDJSON schema and stdout/stderr separation are pinned.
 
-## Phase 5: Implement Exact Bind Probes
+## Stage 5: Implement Exact Bind Probes
 
 Create `src/probe.rs` as a narrow OS-I/O boundary.
 
 ### 5.1 Probe contract
 
-Represent an exact probe with protocol, address, port, IPv6-only behavior, and
-reuse-address behavior. Outcomes must distinguish:
+Represent an exact probe with protocol, normalized address, port, IPv6 scope,
+IPv6-only behavior, and reuse-address behavior. IPv4 has no scope. IPv6 uses
+`Unscoped` or `InterfaceIndex(nonzero u32)`; `Unavailable` is never a probe
+target. The wrapper builds `SocketAddrV6` with scope ID zero or the selected
+interface index before bind. Outcomes must distinguish:
 
 - Bindable now.
 - Address in use.
@@ -987,7 +1215,7 @@ Use `socket2 0.6.5` with default features only. The wrapper calls only
 owned drop. Configure all requested options before bind. Do not reproduce this
 platform-sensitive setup with new local unsafe code.
 
-### Phase 5 gate
+### Stage 5 gate
 
 - [ ] Every supported matrix entry has a native test.
 - [ ] Probe results preserve exact OS error categories.
@@ -995,7 +1223,7 @@ platform-sensitive setup with new local unsafe code.
 - [ ] Probe language says "now" and does not promise future availability.
 - [ ] The approved `socket2` dependency matches the reviewed lockfile version.
 
-## Phase 6: Implement the Why Verdict Engine
+## Stage 6: Implement the Why Verdict Engine
 
 Create:
 
@@ -1016,6 +1244,7 @@ read command lines, and those hints are not Why evidence in this release.
 
 ```text
 kick why 3000 --tcp --address 127.0.0.1
+kick why 3000 --tcp --address fe80::1 --scope-id 3
 kick why 5353 --udp --address 0.0.0.0
 kick why 3000 --all-addresses
 kick why 3000 --all-protocols --all-addresses
@@ -1033,6 +1262,9 @@ The CLI matrix is fixed:
   TCP and UDP. These protocol selectors are mutually exclusive.
 - `--address ADDRESS` accepts at most 64 bytes, evaluates one literal IP address,
   and is mutually exclusive with `--all-addresses`.
+- `--scope-id ID` accepts one nonzero `u32`, requires one explicit IPv6
+  `--address`, and is invalid with IPv4, default addresses, or `--all-addresses`.
+  Zone text such as `%eth0` or `%3` in `--address` is rejected.
 - Without an address option, the default is the two loopback addresses.
 - `--all-addresses` means exactly `127.0.0.1`, `0.0.0.0`, `::1`, and `::`; it
   never enumerates configured interfaces.
@@ -1049,7 +1281,7 @@ Collect the snapshot first, then execute exact probes sequentially. For each
 probe target, classify same-protocol, same-port observations with this bounded
 relationship matrix:
 
-- `Exact`: observed and requested addresses are equal.
+- `Exact`: observed and requested addresses and IPv6 scope IDs are equal.
 - `ObservedWildcardCoversTarget`: an observed `0.0.0.0` covers a requested IPv4
   address, or observed `::` covers a requested IPv6 address.
 - `TargetWildcardCoversObserved`: requested `0.0.0.0` covers any observed IPv4
@@ -1057,9 +1289,16 @@ relationship matrix:
 - `PotentialDualStackOverlap`: an IPv6 wildcard and IPv4 address may overlap
   under `DualStack` or `SystemDefault`, but the native source does not expose
   enough socket-option evidence to prove it.
+- `PotentialScopeOverlap`: addresses would otherwise have an exact or wildcard
+  relationship, but either IPv6 scope is unavailable or the known scopes differ.
 - `Unrelated`: different protocol, port, or non-overlapping address family.
 
 Exact and same-family wildcard relationships may explain a failed probe.
+For IPv6, `Exact`, `ObservedWildcardCoversTarget`, and
+`TargetWildcardCoversObserved` require known equal scopes. `Unavailable` never
+satisfies an authoritative relationship. `PotentialScopeOverlap` is supporting
+`Unknown` evidence only and cannot select `Owned`, `OwnerHidden`, or
+`KernelStateObserved`.
 Potential dual-stack overlap is supporting context only; the exact probe decides
 current bindability unless a supported native source proves the relevant
 IPv6-only option. Never infer dual-stack behavior from address shape alone.
@@ -1086,7 +1325,7 @@ Map individual verdicts to process exits as follows:
 - `ObservationRaced` and `Indeterminate` map to `1` because evaluation did not
   produce the complete reliable answer required for success.
 
-The multi-endpoint precedence in Phase 0.3 is applied after this mapping.
+The multi-endpoint precedence in Stage 0.3 is applied after this mapping.
 
 ### 6.3 Evidence order
 
@@ -1137,12 +1376,14 @@ context and never changes the core verdict or exit code.
 Each result contains at most 16 evidence items and 16 evidence gaps, with
 separate omitted counts for additional applicable evidence and gaps. Full
 process command lines are not evidence in human or JSON output. Labels are
-assigned after native collection and before verdict rendering, using the Phase
+assigned after native collection and before verdict rendering, using the Stage
 3 precedence.
 
 ### 6.4 Certainty language
 
-- Proven: directly observed from a native source or exact probe.
+- Proven: the specific claim is directly established by an authoritative native
+  fact or exact probe; interpretation of an opaque native value is not
+  automatically proven.
 - Estimated: derived from a timer or bounded polling interval.
 - Heuristic: plausible interpretation not established by authoritative data.
 - Unknown: unavailable because of permission, scope, race, or platform limits.
@@ -1150,7 +1391,7 @@ assigned after native collection and before verdict rendering, using the Phase
 A Linux TIME_WAIT timer may be shown as an estimate. It must never be presented
 as a guarantee that a future bind will succeed at expiration.
 
-### Phase 6 gate
+### Stage 6 gate
 
 - [ ] Every verdict has an explicit certainty and evidence list.
 - [ ] Conflicting evidence produces raced or indeterminate output.
@@ -1158,7 +1399,7 @@ as a guarantee that a future bind will succeed at expiration.
 - [ ] Human and JSON results carry equivalent facts.
 - [ ] Every verdict maps to a documented exit code.
 
-## Phase 7: Stabilize Public Output and Documentation
+## Stage 7: Stabilize Public Output and Documentation
 
 ### 7.1 Serialized contracts
 
@@ -1169,7 +1410,12 @@ use the following reusable shapes:
 Endpoint = {
   protocol: "tcp" | "udp",
   address: string,
-  port: integer 1..65535
+  port: integer 1..65535,
+  ipv6_scope:
+    null |
+    { kind: "unscoped", interface_index: null } |
+    { kind: "interface_index", interface_index: unsigned integer } |
+    { kind: "unavailable", interface_index: null }
 }
 
 ProcessIdentity = {
@@ -1206,12 +1452,16 @@ EvidenceGap = {
 }
 
 Scope = {
-  kind: "current_network_namespace" | "current_host_network_stack",
+  kind: "current_network_namespace" | "current_host_process_visible_sockets" |
+        "current_host_network_stack",
   identifier: string | null,
   limitations: [
     "other_network_namespaces_excluded" |
+    "process_first_socket_visibility_limited" |
     "wsl_network_stack_excluded" |
     "process_metadata_permission_limited" |
+    "ipv6_scope_unavailable" |
+    "scoped_ipv6_exact_matching_unavailable" |
     "native_field_unavailable" |
     "polling_interval_blind_spot"
   ]
@@ -1227,15 +1477,20 @@ Evidence = {
 }
 ```
 
-Known socket-state names are the lowercase `snake_case` forms frozen in Phase
+Known socket-state names are the lowercase `snake_case` forms frozen in Stage
 0.1. `native_code` is non-null only when `kind` is `unknown`. An evidence gap's
 message is explanatory and not a programmatic contract. Owner `reason` values
-use the evidence-gap codes from Phase 0.1. Socket-token kinds are
+use the evidence-gap codes from Stage 0.1. Socket-token kinds are
 `linux_inode` and `macos_socket_id`; an unavailable token is `null`.
+
+`Endpoint.ipv6_scope` is `null` if and only if the normalized address is IPv4.
+Every IPv6 endpoint uses exactly one scope variant. Interface indexes are in
+`1..=4294967295`, and endpoint address strings use canonical `IpAddr` text with
+no zone suffix.
 
 An empty complete `OwnerSet` means no owner was observed after complete
 attribution. An empty partial set makes no no-owner claim. Owner arrays use the
-canonical owner key below. The internal aggregate edge count is bounded by Phase
+canonical owner key below. The internal aggregate edge count is bounded by Stage
 0.7; public owner sets serialize at most 64 entries and report every additional
 entry through `omitted_owner_count` without changing attribution completeness.
 
@@ -1257,6 +1512,8 @@ Canonical ordering keys are fixed:
   lexicographic owner array.
 - Token kind order is Linux inode then macOS socket ID; a token key is kind then
   value, with a null token after every present token.
+- Endpoint scope order is IPv4/no-scope, IPv6 unscoped, IPv6 interface indexes
+  numerically, then IPv6 unavailable.
 - For event ordering, baseline/bind use current token and owner-set keys, release
   uses previous keys, and replacement uses previous/current key pairs.
 - Filter-result order is `not_applied`, `matched`, then `indeterminate`.
@@ -1275,18 +1532,28 @@ The initial stable evidence codes are `visible_verified_owner`,
 `process_identity_changed`, `exact_bind_succeeded`, `exact_bind_address_in_use`,
 `exact_bind_permission_denied`, `exact_bind_address_unavailable`,
 `exact_bind_unsupported`, `exact_bind_other_error`, `linux_timer_estimate`,
-`docker_context`, `scope_limitation`, and `observation_probe_conflict`. New codes
+`docker_context`, `scope_limitation`, `potential_scope_overlap`, and
+`observation_probe_conflict`. New codes
 are additive schema changes and require documentation and contract tests.
 
 The initial stable public operational codes are `socket_table_unavailable`,
 `socket_table_permission_denied`, `native_data_malformed`,
-`native_data_oversized`, `process_identity_limit_exceeded`,
+`native_data_oversized`, `socket_observation_limit_exceeded`,
+`process_identity_limit_exceeded`, `owner_attribution_limit_exceeded`,
+`legacy_projection_limit_exceeded`,
 `platform_api_failed`, `clock_unavailable`, `partial_socket_set`,
 `observation_raced`, `owner_reason_limit_exceeded`, `event_limit_exceeded`, and
 `writer_failed`. Watch
 collection gaps use only collection-related codes; writer failure cannot be
 represented reliably on the failed writer and is reported to stderr when
 possible.
+
+`native_data_oversized` is reserved for source byte buffers or malformed native
+counts beyond the source-format limit. Socket-row overflow uses
+`socket_observation_limit_exceeded`; PID or identity-read overflow uses
+`process_identity_limit_exceeded`; aggregate FD or owner-edge overflow uses
+`owner_attribution_limit_exceeded`; and derived legacy-row overflow uses
+`legacy_projection_limit_exceeded`.
 
 Scope `identifier` is the bounded sanitized `/proc/self/ns/net` link text in
 `net:[decimal]` form on Linux and `null` on macOS and Windows. Scope limitation
@@ -1296,7 +1563,8 @@ sanitization.
 
 JSON integer domains are fixed: PID and multiplicity are `u32`, port is nonzero
 `u16`, schema version is `u32`, sequence/timestamps/counts/tokens are `u64`,
-native state code is `u32`, and raw OS error is `i32`. Serialization checks every
+IPv6 interface indexes and query scope IDs are nonzero `u32`, native state code
+is `u32`, and raw OS error is `i32`. Serialization checks every
 conversion; values outside the public domain are operational errors, not lossy
 casts.
 
@@ -1327,7 +1595,7 @@ fields and meanings:
 ```
 
 `label` is the only new field and is a string or `null`. Existing missing fields
-remain `null`; command lines retain raw values within the Phase 0.7 bound and
+remain `null`; command lines retain raw values within the Stage 0.7 bound and
 become `null` plus partial permission metadata above it. An empty result remains
 exactly `[]\n`.
 
@@ -1364,13 +1632,16 @@ versioned object:
     name: string | null,
     executable_path: string | null,
     parent_pid: unsigned integer | null,
-    metadata_permission: "full" | "partial"
+    metadata_completeness: "complete" | "partial"
   }]
 }
 ```
 
-The process array does not include full command lines. Snapshot sockets sort by
-protocol, address family, address bytes, port, the Phase 0.1 state order, token
+The process array does not include full command lines. `metadata_completeness`
+describes optional metadata availability regardless of cause; permission and
+other causes remain separate evidence gaps. The legacy `permission` field keeps
+its existing name and meaning. Snapshot sockets sort by protocol, address
+family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.1 state order, token
 kind/value with null last, then canonical owner-set key. Processes sort by PID,
 marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
 `ownership`, `metadata`, `scope`), code, endpoint, PID, and message. Evidence
@@ -1433,10 +1704,10 @@ release has previous owners. Replacement requires both sets and complete
 verified identity evidence. Socket-token fields follow the same previous/current
 side rules; tokenless replacement has both token fields null. Multiplicity is the number added, removed, or
 replaced, not the total current endpoint count. `filter_result` is `not_applied`
-without a user filter, otherwise `matched` or `indeterminate` under Phase 4.2;
+without a user filter, otherwise `matched` or `indeterminate` under Stage 4.2;
 definite non-matches are not serialized. The second shape is used only by
 collection gaps and contains no fabricated endpoint event. Event evidence and
-gap arrays use the Phase 0.7 per-event limits. Sequence starts at zero and
+gap arrays use the Stage 0.7 per-event limits. Sequence starts at zero and
 increments with checked arithmetic.
 
 Serialize each event into a fresh bounded 64 KiB record buffer, write it, flush
@@ -1455,6 +1726,7 @@ according to the watch policy, and then discard it. Exceeding the record bound i
     port: integer,
     protocols: ["tcp" | "udp"],
     addresses: [string],
+    scope_id: unsigned integer | null,
     ipv6_mode: "system_default" | "v6_only" | "dual_stack",
     reuse_address: boolean
   },
@@ -1487,7 +1759,7 @@ according to the watch policy, and then discard it. Exceeding the record bound i
 }
 ```
 
-Verdict names are the lowercase `snake_case` forms from Phase 6.2. Why JSON does
+Verdict names are the lowercase `snake_case` forms from Stage 6.2. Why JSON does
 not include full command lines. Human and JSON output must be generated from the
 same verdict DTO and carry equivalent facts.
 
@@ -1495,7 +1767,8 @@ same verdict DTO and carry equivalent facts.
 
 Document and test the command-specific vocabulary:
 
-- `list`: existing filters plus `label:`, `address:`, and `family:ipv4|ipv6`.
+- `list`: existing filters plus `label:`, `address:`, `scope_id:`, and
+  `family:ipv4|ipv6`.
 - TUI: the same visible-row filters as `list`.
 - `watch`: list-compatible filters plus `state:` over all collected states.
 - `why`: no general filter expression; exact endpoint arguments only.
@@ -1511,11 +1784,18 @@ address searches. All terms are ANDed.
 - Existing `pid:`, `port:`, `proto:`, `scope:`, `protected:`, and `parent:`
   meanings remain unchanged.
 - `label:VALUE` performs a case-insensitive substring match and never matches an
-  unlabeled row.
+  unlabeled row. Both operands use the pinned Rust toolchain's
+  `str::to_lowercase`; matching performs no Unicode normalization or full case
+  folding.
 - `address:VALUE` requires one literal IP address and performs exact normalized
-  address matching.
+  matching of the address component across all scopes.
+- `scope_id:VALUE` accepts one nonzero `u32` and may be used alone. It matches
+  only IPv6 `InterfaceIndex(VALUE)`, never IPv4, unscoped IPv6, or unavailable
+  scope. If combined with `family:`, the family must be `ipv6`; if combined with
+  `address:`, every address term must normalize to IPv6. Invalid combinations
+  fail before collection with exit `2`.
 - `family:ipv4|ipv6` matches the normalized endpoint family.
-- `state:VALUE` accepts the lowercase known names from Phase 0.1 plus `bound` and
+- `state:VALUE` accepts the lowercase known names from Stage 0.1 plus `bound` and
   `unknown`; `unknown` matches any retained unknown native code.
 - List and TUI plain search add label text but otherwise preserve current
   visible-field behavior, including bounded command lines. Watch plain search
@@ -1545,17 +1825,17 @@ Update:
 - Changelog entries for commands, config, filters, and schema additions.
 
 Changelog entries and commit messages must describe their changes
-self-contained. Do not write public history such as "implements Phase 4" that
+self-contained. Do not write public history such as "implements Stage 4" that
 requires this planning document to understand the change.
 
-### Phase 7 gate
+### Stage 7 gate
 
 - [ ] Every public field and enum value is documented.
 - [ ] Help and README examples match executable behavior.
 - [ ] Permanent limitations are visible, not buried.
 - [ ] Changelog identifies additive serialized-contract changes.
 
-## Phase 8: Security Review and Remediation
+## Stage 8: Security Review and Remediation
 
 Load and follow the security skill for a review-and-remediate pass.
 
@@ -1570,7 +1850,7 @@ Trace every untrusted source to sensitive sinks:
 - OS errors to public diagnostics.
 - Collection failures to retry behavior.
 
-Revisit every row of the Phase 0.6 threat table against the final code. Add any
+Revisit every row of the Stage 0.6 threat table against the final code. Add any
 new assets, trust boundaries, attacker capabilities, or residual risks created
 by the implementation. Record technical severity, remediation priority, and
 evidence confidence separately for each confirmed finding.
@@ -1596,17 +1876,17 @@ output as a finding by itself.
 
 For `socket2`, confirm that the final lockfile still selects `0.6.5`, does not
 enable `all`, and does not introduce an unexpected duplicate `libc` or
-`windows-sys`. Recheck advisories at the release commit; the Phase 0 review is
+`windows-sys`. Recheck advisories at the release commit; the Stage 0 review is
 not permanent evidence that no later advisory exists.
 
-### Phase 8 gate
+### Stage 8 gate
 
 - [ ] Threat model reflects final architecture.
 - [ ] Confirmed findings have regression tests and fixes.
 - [ ] No unresolved release-blocking security finding remains.
 - [ ] Residual risks are documented with evidence confidence.
 
-## Phase 9: Automated Test Completion
+## Stage 9: Automated Test Completion
 
 Load and follow the test-quality skill. Tests must protect behavior and fail for
 the intended reason when that behavior is broken.
@@ -1663,8 +1943,9 @@ Watch tests:
 - Same PID with changed start marker.
 - Failed snapshot followed by recovery.
 - Deterministic ordering.
-- Proven baseline/bind/release, proven token-backed replacement, heuristic
-  tokenless replacement, and unknown collection-gap certainty.
+- Proven baseline/bind/release, proven same-PID changed-marker replacement,
+  heuristic token-supported or tokenless replacement, and unknown
+  collection-gap certainty.
 - Cancellation and duration boundaries.
 - Broken pipe and writer errors.
 - No event retention beyond the documented bound.
@@ -1680,8 +1961,8 @@ Watch tests:
 - Partial metadata and ownership snapshots advancing safely, `SocketSet` partial
   and raced snapshots emitting gaps without advancing, and a later usable
   snapshot resetting the failure budget.
-- Proven same-PID/start-marker and distinct-token one-to-one replacement,
-  heuristic tokenless one-to-one replacement, and intentionally silent
+- Proven same-PID changed-marker replacement, heuristic token-supported and
+  tokenless one-to-one replacement, and intentionally silent
   shared-owner-only additions/removals.
 
 Why tests:
@@ -1697,13 +1978,14 @@ Why tests:
 - Scope and permission limitations.
 - Every verdict-to-exit-code mapping.
 - Table-driven coverage of every probe outcome against complete, partial, and
-  raced observation explanations so the Phase 6.3 table is total.
+  raced observation explanations so the Stage 6.3 table is total.
 - Bare TCP loopback matrix, canonical all-addresses matrix, and eight-endpoint
   cap.
 - Invalid protocol/address/IPv6-mode combinations exit `2` before probing.
 - New output omits full command lines.
 - Exact, observed-wildcard, target-wildcard, potential dual-stack, and unrelated
-  evidence relationships for TCP and UDP.
+  evidence relationships for TCP and UDP, plus potential-scope overlap for
+  unavailable and unequal IPv6 scopes.
 - Unavailable default IPv6 returns `Unsupported` and aggregate exit `3` rather
   than being dropped or treated as internal failure.
 - Why broken stdout preserves computed aggregate exits `0`, `1`, `3`, and `4`;
@@ -1780,7 +2062,7 @@ release after a gap, replacement ordering, label precedence, probe-error
 misclassification, why exit precedence, stdout contamination, unknown protection
 treated as unprotected, and signal delivery before final revalidation.
 
-### Phase 9 gate
+### Stage 9 gate
 
 - [ ] Tests assert concrete behavior and negative space.
 - [ ] No flaky retry policy hides failures.
@@ -1788,7 +2070,7 @@ treated as unprotected, and signal delivery before final revalidation.
 - [ ] Critical tests were mutation-confirmed.
 - [ ] The full suite passes repeatedly and in parallel where supported.
 
-## Phase 10: Native Continuous Integration
+## Stage 10: Native Continuous Integration
 
 Run the exact pinned toolchain and repository policy on Linux, macOS, and
 Windows.
@@ -1820,7 +2102,7 @@ Also run platform-native integration tests for collectors, process identity,
 socket states, probes, watch, and why. Verify the release artifacts, not only
 test-harness binaries.
 
-### Phase 10 gate
+### Stage 10 gate
 
 - [ ] Linux native matrix passes.
 - [ ] macOS native matrix passes.
@@ -1828,7 +2110,7 @@ test-harness binaries.
 - [ ] Both release binaries build on every target.
 - [ ] No platform test is skipped merely to make the matrix green.
 
-## Phase 11: End-to-End QA
+## Stage 11: End-to-End QA
 
 Load and follow the QA skill against exact candidate release artifacts. Passing
 unit tests and CI is necessary but not sufficient.
@@ -1889,14 +2171,14 @@ The QA report must state PASS, PASS WITH KNOWN ISSUES, FAIL, BLOCKED, or
 INCONCLUSIVE, followed separately by `ship`, `hold`, or `no recommendation`.
 Preserve the first intermittent failure. Do not retry until green.
 
-### Phase 11 gate
+### Stage 11 gate
 
 - [ ] QA tested the exact release artifacts on all three platforms.
 - [ ] QA verdict is PASS.
 - [ ] QA release recommendation is `ship`.
 - [ ] Cleanup was verified and residual risk is documented.
 
-## Phase 12: Release Benchmark
+## Stage 12: Release Benchmark
 
 Load and follow the benchmark skill only after correctness, security, automated
 tests, and QA are complete. Benchmark release builds, never debug builds.
@@ -1913,7 +2195,7 @@ Before measuring, declare practical regression budgets for:
 - Peak RSS during list, watch, and why.
 - Release binary size and dependency growth.
 
-The Phase 0 `socket2` size measurement is a dependency-acceptance check, not the
+The Stage 0 `socket2` size measurement is a dependency-acceptance check, not the
 release benchmark. Repeat it here against the exact baseline and candidate
 release artifacts and include all transitive dependency and symbol changes in
 the final size justification.
@@ -1924,7 +2206,7 @@ noise floor.
 Performance findings may justify implementation optimization, but any changed
 candidate artifact must repeat the affected security review, automated tests,
 native CI, end-to-end QA, and this benchmark. A higher minimum watch interval is
-a public-contract change: reopen Phase 0 and repeat every affected downstream
+a public-contract change: reopen Stage 0 and repeat every affected downstream
 gate. Findings may never justify single-pass identity collection, overlapping
 polls, skipped validation, fabricated certainty, or weaker kill revalidation.
 
@@ -1960,7 +2242,7 @@ Store reproducible commands, workload generation, raw machine-readable results,
 and a concise report in an approved repository or release-artifact location.
 Do not commit machine-specific marketing numbers without context.
 
-### Phase 12 gate
+### Stage 12 gate
 
 - [ ] Correctness was verified before measurement.
 - [ ] Baseline and candidate were measured under equivalent conditions.
@@ -1968,9 +2250,9 @@ Do not commit machine-specific marketing numbers without context.
 - [ ] Results are reproducible and include uncertainty and caveats.
 - [ ] Binary and dependency growth are justified.
 
-## Phase 13: Final Release Review
+## Stage 13: Final Release Review
 
-Perform one final review of the complete diff, not only the last phase.
+Perform one final review of the complete diff, not only the last stage.
 
 ### 13.1 Code review
 
@@ -2038,4 +2320,4 @@ The internal implementation order is:
 13. Pass the release benchmark.
 14. Pass the final all-or-nothing release gate.
 
-Development may proceed phase by phase. Release remains atomic.
+Development may proceed stage by stage. Release remains atomic.
