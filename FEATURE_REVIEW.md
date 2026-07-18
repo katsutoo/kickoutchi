@@ -148,9 +148,9 @@ Passed locally:
 - `mise run check-macos` for x86_64 and aarch64 Darwin.
 - `mise run clippy-macos` for x86_64 and aarch64 Darwin.
 
-Native CI evidence for dependency commit `78c8daa`:
+Native CI evidence for the reviewed dependency and contract tests:
 
-- Run: <https://github.com/nuggocto/kickoutchi/actions/runs/29650228646>.
+- Run: <https://github.com/nuggocto/kickoutchi/actions/runs/29650821097>.
 - Linux: passed formatting, Clippy, and all tests.
 - macOS: passed formatting, Clippy, and all tests.
 - Windows: passed formatting, Clippy, and all tests.
