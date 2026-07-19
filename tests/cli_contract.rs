@@ -23,6 +23,10 @@ mod linux {
     /// park. Long enough that the kill under test always lands mid-burst.
     const LIVE_SPAWN_WINDOW: Duration = Duration::from_secs(20);
     const LIVE_SPAWN_MAX: usize = 200;
+
+    fn required_linux_capabilities() -> bool {
+        std::env::var_os("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES").is_some()
+    }
     /// Deadline for a spawned `kick` to print an expected stderr line and for
     /// it to exit after confirmation input.
     const PROMPT_WAIT: Duration = Duration::from_secs(10);
@@ -33,11 +37,19 @@ mod linux {
     const HELPER_TREE_ENV: &str = "KICKOUTCHI_TEST_HELPER_TREE";
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
+    const HELPER_BIND_ANY_ENV: &str = "KICKOUTCHI_TEST_HELPER_BIND_ANY";
+    static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
     // Port 0 never hosts a real listening socket (the kernel reads it as "assign an
     // ephemeral port"), so `list --port 0` deterministically finds no confirmed
     // socket — exactly the no-match condition these diagnostics exercise — with no
     // free-port hunting and no bind/release race.
     const DIAGNOSTIC_TEST_PORT: u16 = 0;
+
+    fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
+        HOST_OBSERVATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct ChildGuard {
         child: Child,
@@ -381,7 +393,12 @@ mod linux {
         let ready_file = PathBuf::from(
             std::env::var_os(HELPER_READY_ENV).expect("helper ready path must be set"),
         );
-        let listener = TcpListener::bind(("127.0.0.1", port))
+        let bind_address = if std::env::var_os(HELPER_BIND_ANY_ENV).is_some() {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+        let listener = TcpListener::bind((bind_address, port))
             .expect("helper listener must bind the requested port");
         let bound_port = listener
             .local_addr()
@@ -816,6 +833,7 @@ mod linux {
 
     #[test]
     fn human_list_no_match_prints_diagnostic_to_stderr() {
+        let _host_observation = lock_host_observation();
         let port = DIAGNOSTIC_TEST_PORT;
         let port_text = port.to_string();
         let _helper = spawn_related_process(port);
@@ -832,6 +850,7 @@ mod linux {
 
     #[test]
     fn json_list_no_match_keeps_diagnostic_out_of_stdout_and_stderr() {
+        let _host_observation = lock_host_observation();
         let port = DIAGNOSTIC_TEST_PORT;
         let port_text = port.to_string();
         let _helper = spawn_related_process(port);
@@ -845,9 +864,17 @@ mod linux {
 
     #[test]
     fn udp_ipv6_socket_is_listed_through_the_real_binary() {
+        let _host_observation = lock_host_observation();
         let socket = match UdpSocket::bind("[::1]:0") {
             Ok(socket) => socket,
-            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                assert!(
+                    !required_linux_capabilities(),
+                    "required IPv6 loopback capability is unavailable: {error}"
+                );
+                eprintln!("IPv6 loopback unavailable: {error}");
+                return;
+            }
             Err(error) => panic!("IPv6 UDP socket must bind on loopback: {error}"),
         };
         let port = socket
@@ -868,6 +895,7 @@ mod linux {
 
     #[test]
     fn configured_protected_process_refuses_yes_kill_with_exit_6() {
+        let _host_observation = lock_host_observation();
         let (mut helper, _port, ready_file) = spawn_listener_process();
         let pid = helper.id();
         let pid_text = pid.to_string();
@@ -898,6 +926,7 @@ mod linux {
 
     #[test]
     fn overlong_confirmation_cannot_be_truncated_into_force() {
+        let _host_observation = lock_host_observation();
         let (mut helper, _port, ready_file) = spawn_listener_process();
         let pid_text = helper.id().to_string();
         let input = format!("force{}\n", " ".repeat(1024));
@@ -924,6 +953,7 @@ mod linux {
 
     #[test]
     fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
         let pid_text = helper.id().to_string();
@@ -934,8 +964,8 @@ mod linux {
         assert!(stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi(&["kill", "--pid", pid_text.as_str(), "--yes"]);
-        assert_eq!(killed.status.code(), Some(0));
         let killed_stderr = stderr(&killed);
+        assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
         assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
         // The target banner (identity + equivalent command) prints even on the
         // `--yes` path, so a scripted kill still leaves the safety context — and
@@ -958,7 +988,73 @@ mod linux {
     }
 
     #[test]
-    fn tree_kill_by_port_removes_root_and_child() {
+    fn host_port_kill_sends_real_sigterm() {
+        let _host_observation = lock_host_observation();
+        let (mut helper, port, ready_file) = spawn_listener_process();
+        let port_text = port.to_string();
+
+        let killed = kickoutchi(&["kill", "--port", port_text.as_str(), "--yes"]);
+        let killed_stderr = stderr(&killed);
+        assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
+        assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
+        wait_for_child_exit(&mut helper);
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn isolated_user_and_network_namespace_port_kill_delivers_sigterm() {
+        let test_binary = std::env::current_exe().expect("test binary path resolves");
+        let ready_file = temp_file_path("namespace-listener-ready");
+        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --nocapture & helper=$!; i=0; while test ! -s "$3"; do i=$((i+1)); test "$i" -lt 10000 || exit 90; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
+        let output = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--net",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                "sh",
+                "-c",
+                script,
+                "sh",
+            ])
+            .arg(test_binary)
+            .arg(env!("CARGO_BIN_EXE_kickoutchi"))
+            .arg(&ready_file)
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(
+                    !required_linux_capabilities(),
+                    "required unshare capability is unavailable: {error}"
+                );
+                eprintln!("unshare unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("unshare must start: {error}"),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && (stderr.contains("Operation not permitted")
+                || stderr.contains("Permission denied")
+                || stderr.contains("unshare failed"))
+        {
+            assert!(
+                !required_linux_capabilities(),
+                "required user/network namespaces are unavailable: {stderr}"
+            );
+            eprintln!("user/network namespaces unavailable: {stderr}");
+            return;
+        }
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("sent SIGTERM"), "{stderr}");
+    }
+
+    #[test]
+    fn tree_kill_by_port_removes_root_and_child_and_clears_port() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
@@ -991,6 +1087,7 @@ mod linux {
     /// exact) would fail here by leaving a frozen member behind.
     #[test]
     fn tree_kill_declined_at_prompt_leaves_tree_running_and_unfrozen() {
+        let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
@@ -1022,15 +1119,18 @@ mod linux {
     }
 
     #[test]
-    fn tree_kill_by_port_terminates_previously_stopped_child() {
-        let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
+    fn tree_kill_by_pid_terminates_previously_stopped_child() {
+        let _host_observation = lock_host_observation();
+        let (mut helper, _port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
-        let port_text = port.to_string();
+        let root_pid_text = helper.id().to_string();
         stop_pid(child_pid);
         wait_for_pid_state(child_pid, 'T');
 
-        let killed =
-            kickoutchi_with_stdin(&["kill", "--port", port_text.as_str(), "--tree"], "tree\n");
+        let killed = kickoutchi_with_stdin(
+            &["kill", "--pid", root_pid_text.as_str(), "--tree"],
+            "tree\n",
+        );
 
         assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
         wait_for_child_exit(&mut helper);
@@ -1039,13 +1139,14 @@ mod linux {
     }
 
     #[test]
-    fn tree_kill_by_port_force_uses_sigkill_wording() {
-        let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
+    fn tree_kill_by_pid_force_uses_sigkill_wording() {
+        let _host_observation = lock_host_observation();
+        let (mut helper, _port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
-        let port_text = port.to_string();
+        let root_pid_text = helper.id().to_string();
 
         let killed = kickoutchi_with_stdin(
-            &["kill", "--port", port_text.as_str(), "--tree", "--force"],
+            &["kill", "--pid", root_pid_text.as_str(), "--tree", "--force"],
             "force\n",
         );
 
@@ -1063,6 +1164,7 @@ mod linux {
 
     #[test]
     fn tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
         let port_text = port.to_string();
@@ -1100,6 +1202,7 @@ mod linux {
 
     #[test]
     fn tree_kill_by_pid_reaches_deep_static_chain() {
+        let _host_observation = lock_host_observation();
         let (mut helper, leaf_pid, ready_file) = spawn_deep_chain_process(DEEP_CHAIN_DEPTH);
         let _leaf_cleanup = PidGuard { pid: leaf_pid };
         let root_pid_text = helper.id().to_string();
@@ -1123,6 +1226,7 @@ mod linux {
 
     #[test]
     fn tree_kill_converges_on_active_spawner_and_clears_group() {
+        let _host_observation = lock_host_observation();
         let (mut helper, ready_file) = spawn_live_spawner_process();
         let root_pid = helper.id();
         let root_pid_text = root_pid.to_string();
@@ -1143,6 +1247,7 @@ mod linux {
 
     #[test]
     fn tree_kill_recollects_after_prompt_and_kills_late_fork() {
+        let _host_observation = lock_host_observation();
         let (mut helper, first_child_pid, ready_file) = spawn_fork_on_trigger_process();
         let _first_child_cleanup = PidGuard {
             pid: first_child_pid,
@@ -1181,7 +1286,8 @@ mod linux {
     /// group. A tree kill from the root can never reach it; the group kill
     /// must — and the confirmation must have shown every member first.
     #[test]
-    fn group_kill_reaches_reparented_member_a_tree_walk_cannot() {
+    fn group_kill_by_port_reaches_reparented_member_and_clears_port() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, orphan_pid, ready_file) = spawn_group_process();
         let _orphan_cleanup = PidGuard { pid: orphan_pid };
         let root_pid = helper.id();
@@ -1193,7 +1299,7 @@ mod linux {
         assert_ne!(orphan_parent, root_pid, "orphan must have reparented");
 
         let killed = kickoutchi_with_stdin(
-            &["kill", "--pid", root_pid.to_string().as_str(), "--group"],
+            &["kill", "--port", port_text.as_str(), "--group"],
             "group\n",
         );
 
@@ -1256,6 +1362,7 @@ mod linux {
 
     #[test]
     fn inspect_shows_family_read_only_with_kill_hint() {
+        let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
         let root_pid_text = helper.id().to_string();
@@ -1298,6 +1405,7 @@ mod linux {
 
     #[test]
     fn short_kick_binary_matches_canonical_help_and_version() {
+        let _host_observation = lock_host_observation();
         let help = kick(&["--help"]);
         assert!(help.status.success(), "kick --help must exit 0");
         let help_text = stdout(&help);

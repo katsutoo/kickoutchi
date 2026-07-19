@@ -60,19 +60,21 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 /// Windows snapshots are relatively expensive, so the Windows reader captures
 /// one process snapshot and reuses it for every PID rendered in the same report.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub(crate) fn inspect_command_line_reader() -> impl FnMut(u32) -> Option<String> {
+pub(crate) fn inspect_command_line_reader(pids: &[u32]) -> impl FnMut(u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
+        let _ = pids;
         linux::process_command_line
     }
 
     #[cfg(target_os = "macos")]
     {
+        let _ = pids;
         macos::process_command_line
     }
 
     #[cfg(windows)]
     {
-        windows::process_command_line_reader()
+        windows::process_command_line_reader(pids)
     }
 }

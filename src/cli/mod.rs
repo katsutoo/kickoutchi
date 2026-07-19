@@ -36,7 +36,7 @@ use crate::tree;
 use self::kill::run_kill;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use self::kill::{KillTargetError, print_target_error, resolve_single_port_owner};
-use self::list::run_list;
+use self::list::run_list_snapshot;
 
 /// Stable exit codes — the script-facing contract.
 ///
@@ -199,29 +199,36 @@ pub(crate) struct KillArgs {
 /// mapping is this module's whole job, so letting errors escape to `main`
 /// would split that contract across two files.
 pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
-    let mut entries = match collector::collect_ports() {
-        Ok(entries) => entries,
+    let profile = match command {
+        Command::List(_) => crate::observation::MetadataProfile::LegacyList,
+        Command::Kill(_) => crate::observation::MetadataProfile::Display,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::Inspect(_) => crate::observation::MetadataProfile::Display,
+    };
+    let snapshot = match collector::collect_snapshot(profile) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("error: collecting ports failed: {error}");
             return ExitReason::Failure;
         }
     };
-    mark_protected(&mut entries, &config.protected_processes);
-
     match command {
-        Command::List(args) => run_list(args, config, &entries),
-        Command::Kill(args) => run_kill(args, config, &entries),
+        Command::List(args) => run_list_snapshot(args, config, &snapshot),
+        Command::Kill(args) => {
+            let mut entries =
+                match crate::observation::project_legacy_target(&snapshot, args.pid, args.port) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        eprintln!("error: projecting collected ports failed: {error}");
+                        return ExitReason::Failure;
+                    }
+                };
+            mark_protected(&mut entries, &config.protected_processes);
+            run_kill(args, config, &entries)
+        }
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        Command::Inspect(args) => run_inspect(args, config, &entries),
+        Command::Inspect(args) => run_inspect(args, config, &snapshot),
     }
-}
-
-fn write_stdout_line(text: &str) -> Option<ExitReason> {
-    write_stdout_with(|stdout| {
-        stdout
-            .write_all(text.as_bytes())
-            .and_then(|()| stdout.write_all(b"\n"))
-    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -275,14 +282,26 @@ fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
 /// No signals, no confirmation: the strongest thing this command does is
 /// suggest a `kick kill --pid <root> --tree` for the user to run themselves.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
-    let target_pid = match resolve_inspect_target(args, entries) {
+fn run_inspect(
+    args: &InspectArgs,
+    config: &Config,
+    network_snapshot: &crate::observation::NetworkSnapshot,
+) -> ExitReason {
+    let initial_entries =
+        match crate::observation::project_legacy_target(network_snapshot, args.pid, args.port) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("error: projecting inspect target failed: {error}");
+                return ExitReason::Failure;
+            }
+        };
+    let target_pid = match resolve_inspect_target(args, &initial_entries) {
         Ok(pid) => pid,
         Err(KillTargetError::NoMatch) => {
             eprintln!("error: no open port matches the requested target");
             // Same evidence-only hint `list` prints: a command line naming the
             // port often identifies the process the user was looking for.
-            maybe_print_no_match_diagnostic(args.port, entries);
+            maybe_print_no_match_diagnostic(args.port, &initial_entries);
             return ExitReason::NoMatch;
         }
         Err(error) => return print_target_error(error),
@@ -293,7 +312,16 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
     #[cfg(target_os = "macos")]
     let mut ops = crate::platform::macos::MacosTreeOps::new();
     #[cfg(windows)]
-    let snapshot = crate::platform::windows::collect_tree_process_infos();
+    let snapshot = match crate::platform::windows::collect_tree_process_infos() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!(
+                "error: enumerating the process table failed: {}",
+                crate::display::sanitize(&error.to_string())
+            );
+            return ExitReason::Failure;
+        }
+    };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let snapshot_result = tree::TreeProcessOps::snapshot(&mut ops);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -308,13 +336,29 @@ fn run_inspect(args: &InspectArgs, config: &Config, entries: &[PortEntry]) -> Ex
         }
     };
 
-    let command_line = platform::inspect_command_line_reader();
-    match inspect::render_family_report(
+    let report_scope = inspect::build_scope(
         target_pid,
         &snapshot,
-        entries,
+        TREE_HOST_PLATFORM,
+        &config.protected_processes,
+    );
+    let entries =
+        match crate::observation::project_legacy_pids(network_snapshot, report_scope.port_pids()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("error: projecting inspect report ports failed: {error}");
+                return ExitReason::Failure;
+            }
+        };
+    let command_line_pids = inspect::command_line_scope_pids(target_pid, &snapshot);
+    let command_line = platform::inspect_command_line_reader(&command_line_pids);
+    match inspect::render_family_report_with_scope(
+        target_pid,
+        &snapshot,
+        &entries,
         &config.protected_processes,
         TREE_HOST_PLATFORM,
+        &report_scope,
         command_line,
     ) {
         Ok(report) => {
@@ -388,7 +432,7 @@ pub(crate) mod test_support {
                 Protocol::Udp => SocketState::Bound,
             },
             pid,
-            process_name: Some(name.to_owned()),
+            process_name: Some(name.into()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -397,12 +441,18 @@ pub(crate) mod test_support {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: pid.map(|pid| crate::observation::ProcessIdentity {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
     }
 
     pub(crate) fn no_context(_: u32) -> ProcessContext {
         ProcessContext {
-            process_start_time_marker: Some(55),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
             ..ProcessContext::default()
         }
     }

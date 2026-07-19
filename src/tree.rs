@@ -27,16 +27,19 @@
 //! whole pipeline is exercised in tests with a fake that scripts snapshots and
 //! records the exact order of stop/continue/signal calls.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{Platform, SystemProcessCheck};
+use crate::observation::ProcessStartMarker;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::KillTarget;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::current_user_id;
 use crate::process::{KillMode, UnsafePidReason, unsafe_pid_reason};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process_evidence::{
+    ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
+};
 use crate::protection::is_protected_process_name;
 
 /// Hard cap on the number of processes a single tree kill will touch.
@@ -46,6 +49,7 @@ use crate::protection::is_protected_process_name;
 /// exceeds it is refused, not partially killed: partial kills of a runaway
 /// spawner report false progress while the survivors regrow.
 pub(crate) const MAX_TREE_PROCESSES: usize = 256;
+pub(crate) const PROCESS_TREE_INDEX_MAX: usize = crate::observation::CANDIDATE_PROCESS_IDS_MAX;
 
 /// Hard cap on the number of processes a single group kill will touch.
 ///
@@ -92,7 +96,7 @@ pub(crate) struct TreeProcessInfo {
     pub(crate) unverified_parent_pid: Option<u32>,
     pub(crate) parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
-    pub(crate) start_time_marker: Option<u64>,
+    pub(crate) start_time_marker: Option<ProcessStartMarker>,
     /// Effective owner UID when readable. Drives the ownership warning in kill
     /// banners; deliberately not part of identity verification, which stands on
     /// the start marker and the scope relation.
@@ -162,9 +166,11 @@ pub(crate) trait TreeProcessOps {
     }
     /// `SIGSTOP` a process.
     fn stop(&mut self, pid: u32) -> TreeSignalResult;
-    /// `SIGCONT` a process. Best-effort: used both to resume before the final
-    /// signal and to thaw on any abort, so its result is intentionally ignored.
-    fn cont(&mut self, pid: u32);
+    /// `SIGCONT` a process. `NotFound` leaves no stopped survivor; `Denied`
+    /// must be reported as a cleanup failure.
+    fn cont(&mut self, pid: u32) -> TreeSignalResult;
+    /// Retain the verified identity needed to make a raw-PID thaw safe.
+    fn prepare_thaw(&mut self, _pid: u32, _marker: Option<ProcessStartMarker>) {}
     /// Prepare reuse-proof delivery for a stopped, verified process.
     ///
     /// `verified_start_marker` is the start marker the post-stop verification
@@ -174,8 +180,31 @@ pub(crate) trait TreeProcessOps {
     fn prepare_delivery(
         &mut self,
         pid: u32,
-        verified_start_marker: Option<u64>,
+        verified_start_marker: Option<ProcessStartMarker>,
     ) -> TreeSignalResult;
+    /// Read identity and name again at the final delivery boundary.
+    fn fresh_process_evidence(
+        &mut self,
+        pid: u32,
+    ) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+        let snapshot = self
+            .snapshot()
+            .map_err(|_| ProcessEvidenceError::Missing { pid })?;
+        let info = snapshot
+            .iter()
+            .find(|info| info.pid == pid)
+            .ok_or(ProcessEvidenceError::Missing { pid })?;
+        Ok(FreshProcessEvidence {
+            pid,
+            start_marker: info
+                .start_time_marker
+                .ok_or(ProcessEvidenceError::Missing { pid })?,
+            name: info
+                .process_name
+                .clone()
+                .ok_or(ProcessEvidenceError::NameMissing { pid })?,
+        })
+    }
     /// Deliver the terminating signal (`SIGTERM` for terminate, `SIGKILL` for
     /// force).
     fn deliver(&mut self, pid: u32, mode: KillMode) -> TreeSignalResult;
@@ -232,6 +261,56 @@ pub(crate) struct ProcessTreeTarget {
 pub(crate) enum TreePlanError {
     /// The root PID is not present in the snapshot — it exited already.
     RootMissing,
+    SnapshotLimitExceeded {
+        limit: usize,
+    },
+}
+
+pub(crate) fn plan_error_outcome(error: TreePlanError) -> TreeKillOutcome {
+    match error {
+        TreePlanError::RootMissing => TreeKillOutcome::RootAlreadyExited,
+        TreePlanError::SnapshotLimitExceeded { limit } => TreeKillOutcome::Truncated { limit },
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProcessTreeIndex<'a> {
+    by_pid: HashMap<u32, &'a TreeProcessInfo>,
+    children_by_parent: HashMap<u32, Vec<&'a TreeProcessInfo>>,
+}
+
+impl<'a> ProcessTreeIndex<'a> {
+    pub(crate) fn new(
+        snapshot: &'a [TreeProcessInfo],
+        limit: usize,
+    ) -> Result<Self, TreePlanError> {
+        if snapshot.len() > limit {
+            return Err(TreePlanError::SnapshotLimitExceeded { limit });
+        }
+        let mut by_pid = HashMap::with_capacity(snapshot.len());
+        let mut children_by_parent: HashMap<u32, Vec<&TreeProcessInfo>> = HashMap::new();
+        for info in snapshot {
+            by_pid.entry(info.pid).or_insert(info);
+            if let Some(parent_pid) = info.parent_pid {
+                children_by_parent.entry(parent_pid).or_default().push(info);
+            }
+        }
+        for children in children_by_parent.values_mut() {
+            children.sort_by_key(|info| info.pid);
+        }
+        Ok(Self {
+            by_pid,
+            children_by_parent,
+        })
+    }
+
+    pub(crate) fn process(&self, pid: u32) -> Option<&'a TreeProcessInfo> {
+        self.by_pid.get(&pid).copied()
+    }
+
+    fn children(&self, pid: u32) -> &[&'a TreeProcessInfo] {
+        self.children_by_parent.get(&pid).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Why a group preview could not be built at all.
@@ -417,10 +496,18 @@ pub(crate) fn plan_process_tree(
     platform: Platform,
     limit: usize,
 ) -> Result<ProcessTreeTarget, TreePlanError> {
-    let root_info = snapshot
-        .iter()
-        .find(|info| info.pid == root_pid)
-        .ok_or(TreePlanError::RootMissing)?;
+    let index = ProcessTreeIndex::new(snapshot, PROCESS_TREE_INDEX_MAX)?;
+    plan_process_tree_with_index(root_pid, &index, protected_names, platform, limit)
+}
+
+pub(crate) fn plan_process_tree_with_index(
+    root_pid: u32,
+    index: &ProcessTreeIndex<'_>,
+    protected_names: &[String],
+    platform: Platform,
+    limit: usize,
+) -> Result<ProcessTreeTarget, TreePlanError> {
+    let root_info = index.process(root_pid).ok_or(TreePlanError::RootMissing)?;
 
     let mut nodes = vec![preview_node(root_info, 0, protected_names, platform)];
     let mut seen: HashSet<u32> = HashSet::from([root_pid]);
@@ -428,13 +515,10 @@ pub(crate) fn plan_process_tree(
     let mut truncated = false;
 
     while let Some((parent_pid, parent_depth)) = frontier.pop() {
-        let mut children: Vec<&TreeProcessInfo> = snapshot
-            .iter()
-            .filter(|info| info.parent_pid == Some(parent_pid) && !seen.contains(&info.pid))
-            .collect();
-        children.sort_by_key(|info| info.pid);
-
-        for child in children {
+        for &child in index.children(parent_pid) {
+            if seen.contains(&child.pid) {
+                continue;
+            }
             if nodes.len() >= limit {
                 truncated = true;
                 break;
@@ -587,7 +671,7 @@ struct FrozenNode {
     parent_process_name: Option<String>,
     process_name: Option<String>,
     owner_uid: Option<u32>,
-    start_time_marker: Option<u64>,
+    start_time_marker: Option<ProcessStartMarker>,
     depth: usize,
 }
 
@@ -641,10 +725,11 @@ impl SweepScope {
     fn unfrozen_members(
         self,
         snapshot: &[TreeProcessInfo],
+        index: &ProcessTreeIndex<'_>,
         frozen: &[FrozenNode],
     ) -> Vec<FrozenNode> {
         match self {
-            Self::Tree => unfrozen_children(snapshot, frozen),
+            Self::Tree => unfrozen_children(index, frozen),
             Self::Group { pgid } => unfrozen_group_members(snapshot, frozen, pgid),
         }
     }
@@ -694,6 +779,7 @@ pub(crate) struct TreeKillReport {
     pub(crate) already_exited: usize,
     /// PIDs the OS refused to signal (permission).
     pub(crate) denied: Vec<u32>,
+    pub(crate) thaw_failed: Vec<u32>,
 }
 
 /// The outcome of the whole freeze-first execution.
@@ -735,6 +821,10 @@ pub(crate) enum TreeKillOutcome {
         pid: u32,
     },
     SnapshotFailed(String),
+    ThawFailed {
+        pids: Vec<u32>,
+        cause: Box<TreeKillOutcome>,
+    },
 }
 
 /// Freeze the tree, verify it, and terminate it — root first to stop, root last
@@ -829,28 +919,35 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
         Ok(node) => vec![node],
         Err(outcome) => {
             // Only the root is stopped at this point.
-            ops.cont(root.pid);
-            return outcome;
+            let root_node = FrozenNode {
+                pid: root.pid,
+                parent_pid: None,
+                parent_process_name: None,
+                process_name: root.process_name.clone(),
+                owner_uid: root.owner_uid,
+                start_time_marker: root.process_start_time_marker,
+                depth: 0,
+            };
+            return refuse_after_thaw(outcome, &[root_node], ops);
         }
     };
 
     if let Err(outcome) = freeze_sweep(&mut frozen, scope, ops) {
-        thaw_all(&frozen, ops);
-        return outcome;
+        return refuse_after_thaw(outcome, &frozen, ops);
     }
     if let Err(outcome) = verify_frozen_identities(&mut frozen, scope, ops) {
-        thaw_all(&frozen, ops);
-        return outcome;
+        return refuse_after_thaw(outcome, &frozen, ops);
+    }
+    if let Err(outcome) = prepare_delivery_handles(&frozen, ops) {
+        return refuse_after_thaw(outcome, &frozen, ops);
+    }
+    if let Err(outcome) = verify_fresh_delivery_evidence(&mut frozen, ops) {
+        return refuse_after_thaw(outcome, &frozen, ops);
     }
     if let Err(outcome) =
         check_tree_policy(&frozen, scope, authorization, protected_names, platform)
     {
-        thaw_all(&frozen, ops);
-        return outcome;
-    }
-    if let Err(outcome) = prepare_delivery_handles(&frozen, ops) {
-        thaw_all(&frozen, ops);
-        return outcome;
+        return refuse_after_thaw(outcome, &frozen, ops);
     }
 
     TreeKillOutcome::Completed(signal_tree(&mut frozen, scope, mode, ops))
@@ -915,6 +1012,17 @@ fn freeze_sweep<Ops: TreeProcessOps>(
     let member_cap = scope.member_cap();
     for _ in 0..MAX_FREEZE_PASSES {
         let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
+        let index =
+            ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(
+                |error| match error {
+                    TreePlanError::SnapshotLimitExceeded { limit } => {
+                        TreeKillOutcome::Truncated { limit }
+                    }
+                    TreePlanError::RootMissing => {
+                        unreachable!("index construction does not resolve roots")
+                    }
+                },
+            )?;
         // Members that exited between this snapshot and our stop attempt. They
         // must be excluded from re-discovery in the same (now stale) snapshot,
         // or the drain below would spin on them; whatever they left behind is
@@ -923,7 +1031,7 @@ fn freeze_sweep<Ops: TreeProcessOps>(
         let mut discovered_in_pass = false;
         loop {
             let discovered: Vec<FrozenNode> = scope
-                .unfrozen_members(&snapshot, frozen)
+                .unfrozen_members(&snapshot, &index, frozen)
                 .into_iter()
                 .filter(|member| !vanished.contains(&member.pid))
                 .collect();
@@ -940,6 +1048,9 @@ fn freeze_sweep<Ops: TreeProcessOps>(
                         pid: member.pid,
                         reason,
                     });
+                }
+                if member.start_time_marker.is_none() {
+                    return Err(TreeKillOutcome::PartialMetadata { pid: member.pid });
                 }
                 match ops.stop(member.pid) {
                     TreeSignalResult::Delivered => frozen.push(member),
@@ -964,24 +1075,38 @@ fn freeze_sweep<Ops: TreeProcessOps>(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn unfrozen_children(snapshot: &[TreeProcessInfo], frozen: &[FrozenNode]) -> Vec<FrozenNode> {
+fn unfrozen_children(index: &ProcessTreeIndex<'_>, frozen: &[FrozenNode]) -> Vec<FrozenNode> {
+    unfrozen_children_with_operation_count(index, frozen).0
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unfrozen_children_with_operation_count(
+    index: &ProcessTreeIndex<'_>,
+    frozen: &[FrozenNode],
+) -> (Vec<FrozenNode>, usize) {
     let frozen_depths: HashMap<u32, usize> =
         frozen.iter().map(|node| (node.pid, node.depth)).collect();
     let mut discovered = Vec::new();
-    for info in snapshot {
-        if frozen_depths.contains_key(&info.pid) {
-            continue;
+    let mut seen = frozen_depths.keys().copied().collect::<HashSet<_>>();
+    let mut frontier = frozen
+        .iter()
+        .map(|node| (node.pid, node.depth))
+        .collect::<Vec<_>>();
+    let mut operations = 0usize;
+    while let Some((parent_pid, parent_depth)) = frontier.pop() {
+        operations += 1;
+        for &info in index.children(parent_pid) {
+            operations += 1;
+            if !seen.insert(info.pid) {
+                continue;
+            }
+            let depth = parent_depth + 1;
+            discovered.push(FrozenNode::from_info(info, depth));
+            frontier.push((info.pid, depth));
         }
-        let Some(parent_pid) = info.parent_pid else {
-            continue;
-        };
-        let Some(parent_depth) = frozen_depths.get(&parent_pid) else {
-            continue;
-        };
-        discovered.push(FrozenNode::from_info(info, parent_depth + 1));
     }
     discovered.sort_by_key(|node| node.pid);
-    discovered
+    (discovered, operations)
 }
 
 /// Group members are a flat filter on the group ID; depth 1 keeps them grouped
@@ -1014,8 +1139,11 @@ fn verify_frozen_identities<Ops: TreeProcessOps>(
     ops: &mut Ops,
 ) -> Result<(), TreeKillOutcome> {
     let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
+    let index = ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(|error| {
+        TreeKillOutcome::SnapshotFailed(format!("process index construction failed: {error:?}"))
+    })?;
     for node in frozen.iter_mut() {
-        let Some(info) = snapshot.iter().find(|info| info.pid == node.pid) else {
+        let Some(info) = index.process(node.pid) else {
             return Err(TreeKillOutcome::TargetChanged { pid: node.pid });
         };
         if info.start_time_marker.is_none() || info.process_name.is_none() {
@@ -1047,6 +1175,47 @@ fn prepare_delivery_handles<Ops: TreeProcessOps>(
         }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_fresh_delivery_evidence<Ops: TreeProcessOps>(
+    frozen: &mut [FrozenNode],
+    ops: &mut Ops,
+) -> Result<(), TreeKillOutcome> {
+    let mut scope = ProcessEvidenceScope::new(frozen.len()).map_err(evidence_tree_outcome)?;
+    for node in frozen {
+        let expected = ExpectedProcessEvidence {
+            pid: node.pid,
+            start_marker: node
+                .start_time_marker
+                .ok_or(TreeKillOutcome::PartialMetadata { pid: node.pid })?,
+            name: None,
+        };
+        let fresh = scope
+            .observe(&expected, ops.fresh_process_evidence(node.pid))
+            .map_err(evidence_tree_outcome)?;
+        node.process_name = Some(fresh.name);
+    }
+    scope.finish().map_err(evidence_tree_outcome)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn evidence_tree_outcome(error: ProcessEvidenceError) -> TreeKillOutcome {
+    match error {
+        ProcessEvidenceError::PermissionDenied { pid } => TreeKillOutcome::PermissionDenied { pid },
+        ProcessEvidenceError::IdentityChanged { pid }
+        | ProcessEvidenceError::NameChanged { pid }
+        | ProcessEvidenceError::Missing { pid } => TreeKillOutcome::TargetChanged { pid },
+        ProcessEvidenceError::NameMissing { pid }
+        | ProcessEvidenceError::NameOversized { pid, .. } => {
+            TreeKillOutcome::PartialMetadata { pid }
+        }
+        ProcessEvidenceError::IncompleteScope { .. }
+        | ProcessEvidenceError::MemberLimitExceeded { .. }
+        | ProcessEvidenceError::ByteLimitExceeded { .. } => TreeKillOutcome::SnapshotFailed(
+            "fresh process evidence exceeded its bounded scope".to_owned(),
+        ),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1141,13 +1310,16 @@ fn signal_tree<Ops: TreeProcessOps>(
     let mut delivered = 0;
     let mut already_exited = 0;
     let mut denied = Vec::new();
+    let mut thaw_failed = Vec::new();
     for node in frozen.iter() {
         let result = ops.deliver(node.pid, mode);
         if mode == KillMode::Terminate {
             // SIGTERM stays pending while the process is stopped; continue it so
             // it actually handles the termination. SIGKILL needs no continue —
             // it removes a stopped process directly.
-            ops.cont(node.pid);
+            if ops.cont(node.pid) == TreeSignalResult::Denied {
+                thaw_failed.push(node.pid);
+            }
         }
         match result {
             TreeSignalResult::Delivered => delivered += 1,
@@ -1156,7 +1328,9 @@ fn signal_tree<Ops: TreeProcessOps>(
                 if mode == KillMode::Force {
                     // SIGKILL needs no CONT only after it succeeds. A denied
                     // force signal leaves the member stopped unless we thaw it.
-                    ops.cont(node.pid);
+                    if ops.cont(node.pid) == TreeSignalResult::Denied {
+                        thaw_failed.push(node.pid);
+                    }
                 }
                 denied.push(node.pid);
             }
@@ -1168,6 +1342,7 @@ fn signal_tree<Ops: TreeProcessOps>(
         delivered,
         already_exited,
         denied,
+        thaw_failed,
     }
 }
 
@@ -1181,6 +1356,7 @@ fn signal_group<Ops: TreeProcessOps>(
     let mut delivered = 0;
     let mut already_exited = 0;
     let mut denied = Vec::new();
+    let mut thaw_failed = Vec::new();
     let mut continue_after_delivery = Vec::new();
 
     for node in frozen {
@@ -1204,7 +1380,9 @@ fn signal_group<Ops: TreeProcessOps>(
     // parent cannot wake up and spawn survivors while children are still merely
     // frozen.
     for pid in continue_after_delivery {
-        ops.cont(pid);
+        if ops.cont(pid) == TreeSignalResult::Denied {
+            thaw_failed.push(pid);
+        }
     }
 
     TreeKillReport {
@@ -1212,29 +1390,57 @@ fn signal_group<Ops: TreeProcessOps>(
         delivered,
         already_exited,
         denied,
+        thaw_failed,
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) {
+fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) -> Vec<u32> {
+    let mut failed = Vec::new();
     for node in frozen.iter().rev() {
-        ops.cont(node.pid);
+        ops.prepare_thaw(node.pid, node.start_time_marker);
+        if ops.cont(node.pid) == TreeSignalResult::Denied {
+            failed.push(node.pid);
+        }
+    }
+    failed.sort_unstable();
+    failed
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_after_thaw<Ops: TreeProcessOps>(
+    cause: TreeKillOutcome,
+    frozen: &[FrozenNode],
+    ops: &mut Ops,
+) -> TreeKillOutcome {
+    let pids = thaw_all(frozen, ops);
+    if pids.is_empty() {
+        cause
+    } else {
+        TreeKillOutcome::ThawFailed {
+            pids,
+            cause: Box::new(cause),
+        }
     }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        GROUP_YES_SKIP_MAX_PROCESSES, GroupPlanError, MAX_GROUP_PROCESSES, MAX_TREE_PROCESSES,
-        ScopeAuthorization, TreeKillOutcome, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
+        FrozenNode, GROUP_YES_SKIP_MAX_PROCESSES, GroupPlanError, MAX_GROUP_PROCESSES,
+        MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ScopeAuthorization,
+        TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
         execute_group_kill, execute_tree_kill, plan_process_group, plan_process_tree,
+        unfrozen_children_with_operation_count, verify_frozen_identities,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
     };
     use crate::process::{KillMode, KillTarget};
+    use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 
     #[derive(Debug, PartialEq, Eq)]
     enum Event {
@@ -1255,6 +1461,9 @@ mod tests {
         missing_stop: Vec<u32>,
         missing_deliver: Vec<u32>,
         deny_deliver: Vec<u32>,
+        deny_cont: Vec<u32>,
+        prepared_thaws: HashMap<u32, Option<crate::observation::ProcessStartMarker>>,
+        fresh_evidence: HashMap<u32, Result<FreshProcessEvidence, ProcessEvidenceError>>,
     }
 
     impl FakeOps {
@@ -1267,6 +1476,9 @@ mod tests {
                 missing_stop: Vec::new(),
                 missing_deliver: Vec::new(),
                 deny_deliver: Vec::new(),
+                deny_cont: Vec::new(),
+                prepared_thaws: HashMap::new(),
+                fresh_evidence: HashMap::new(),
             }
         }
 
@@ -1299,16 +1511,55 @@ mod tests {
             TreeSignalResult::Delivered
         }
 
-        fn cont(&mut self, pid: u32) {
+        fn cont(&mut self, pid: u32) -> TreeSignalResult {
             self.events.push(Event::Cont(pid));
+            if self.deny_cont.contains(&pid) {
+                TreeSignalResult::Denied
+            } else {
+                TreeSignalResult::Delivered
+            }
+        }
+
+        fn prepare_thaw(
+            &mut self,
+            pid: u32,
+            marker: Option<crate::observation::ProcessStartMarker>,
+        ) {
+            self.prepared_thaws.insert(pid, marker);
         }
 
         fn prepare_delivery(
             &mut self,
             _pid: u32,
-            _verified_start_marker: Option<u64>,
+            _verified_start_marker: Option<crate::observation::ProcessStartMarker>,
         ) -> TreeSignalResult {
             TreeSignalResult::Delivered
+        }
+
+        fn fresh_process_evidence(
+            &mut self,
+            pid: u32,
+        ) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+            if let Some(evidence) = self.fresh_evidence.get(&pid) {
+                return evidence.clone();
+            }
+            let snapshot = self
+                .snapshot()
+                .map_err(|_| ProcessEvidenceError::Missing { pid })?;
+            let info = snapshot
+                .iter()
+                .find(|info| info.pid == pid)
+                .ok_or(ProcessEvidenceError::Missing { pid })?;
+            Ok(FreshProcessEvidence {
+                pid,
+                start_marker: info
+                    .start_time_marker
+                    .ok_or(ProcessEvidenceError::Missing { pid })?,
+                name: info
+                    .process_name
+                    .clone()
+                    .ok_or(ProcessEvidenceError::NameMissing { pid })?,
+            })
         }
 
         fn deliver(&mut self, pid: u32, mode: KillMode) -> TreeSignalResult {
@@ -1323,17 +1574,159 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refusal_prepares_verified_identity_before_each_thaw() {
+        let marker = crate::observation::ProcessStartMarker::linux(55).ok();
+        let frozen = [FrozenNode {
+            pid: 42,
+            parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node".to_owned()),
+            owner_uid: None,
+            start_time_marker: marker,
+            depth: 0,
+        }];
+        let mut ops = FakeOps::new(Vec::new());
+
+        assert!(super::thaw_all(&frozen, &mut ops).is_empty());
+        assert_eq!(ops.prepared_thaws.get(&42), Some(&marker));
+        assert_eq!(ops.events, [Event::Cont(42)]);
+    }
+
     fn info(pid: u32, parent: Option<u32>, name: &str, marker: u64) -> TreeProcessInfo {
         TreeProcessInfo {
             pid,
             parent_pid: parent,
             unverified_parent_pid: None,
             parent_process_name: None,
-            process_name: Some(name.to_owned()),
-            start_time_marker: Some(marker),
+            process_name: Some(name.into()),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(marker).ok(),
             owner_uid: None,
             process_group: None,
         }
+    }
+
+    #[test]
+    fn process_tree_index_accepts_exact_limit_and_rejects_max_plus_one() {
+        let exact = vec![
+            info(3, Some(1), "three", 3),
+            info(1, None, "one", 1),
+            info(2, Some(1), "two", 2),
+        ];
+        let index = ProcessTreeIndex::new(&exact, 3).expect("exact index limit is accepted");
+        assert_eq!(index.process(2).map(|process| process.pid), Some(2));
+        assert_eq!(
+            index
+                .children(1)
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        let error = ProcessTreeIndex::new(&exact, 2).expect_err("max plus one is rejected");
+        assert_eq!(error, TreePlanError::SnapshotLimitExceeded { limit: 2 });
+    }
+
+    #[test]
+    fn deep_discovery_operations_scale_with_tree_depth_not_snapshot_size() {
+        const DEPTH: u32 = 256;
+        const SNAPSHOT_SIZE: usize = 131_072;
+        let mut snapshot = Vec::with_capacity(SNAPSHOT_SIZE);
+        snapshot.push(info(2, None, "root", 2));
+        for pid in 3..=DEPTH + 2 {
+            snapshot.push(info(pid, Some(pid - 1), "chain", u64::from(pid)));
+        }
+        for offset in snapshot.len()..SNAPSHOT_SIZE {
+            let pid = u32::try_from(offset + 10_000).expect("fixture PID fits u32");
+            snapshot.push(info(pid, None, "unrelated", u64::from(pid)));
+        }
+        let index = ProcessTreeIndex::new(&snapshot, SNAPSHOT_SIZE).expect("index builds");
+        let frozen = [FrozenNode::from_info(&snapshot[0], 0)];
+
+        let (discovered, operations) = unfrozen_children_with_operation_count(&index, &frozen);
+
+        assert_eq!(discovered.len(), usize::try_from(DEPTH).unwrap());
+        assert_eq!(operations, usize::try_from(DEPTH * 2 + 1).unwrap());
+        assert!(operations < SNAPSHOT_SIZE / 100);
+    }
+
+    #[test]
+    fn production_index_bound_is_wired_through_planning_and_final_verification() {
+        struct OneSnapshot(Option<Vec<TreeProcessInfo>>);
+        impl TreeProcessOps for OneSnapshot {
+            fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
+                self.0
+                    .take()
+                    .ok_or_else(|| "snapshot already read".to_owned())
+            }
+            fn stop(&mut self, _pid: u32) -> TreeSignalResult {
+                TreeSignalResult::Denied
+            }
+            fn cont(&mut self, _pid: u32) -> TreeSignalResult {
+                TreeSignalResult::Denied
+            }
+            fn prepare_delivery(
+                &mut self,
+                _pid: u32,
+                _marker: Option<crate::observation::ProcessStartMarker>,
+            ) -> TreeSignalResult {
+                TreeSignalResult::Denied
+            }
+            fn deliver(&mut self, _pid: u32, _mode: KillMode) -> TreeSignalResult {
+                TreeSignalResult::Denied
+            }
+        }
+
+        let mut exact = Vec::with_capacity(PROCESS_TREE_INDEX_MAX + 1);
+        exact.push(info(2, None, "root", 2));
+        for offset in 1..PROCESS_TREE_INDEX_MAX {
+            let pid = u32::try_from(offset + 2).expect("production index bound fits u32");
+            exact.push(TreeProcessInfo {
+                pid,
+                parent_pid: None,
+                unverified_parent_pid: None,
+                parent_process_name: None,
+                process_name: None,
+                start_time_marker: None,
+                owner_uid: None,
+                process_group: None,
+            });
+        }
+
+        let preview = plan_process_tree(2, &exact, &[], Platform::Linux, MAX_TREE_PROCESSES)
+            .expect("exact production index maximum plans");
+        assert_eq!(preview.len(), 1);
+        assert!(!preview.truncated());
+
+        let root = FrozenNode::from_info(&exact[0], 0);
+        let mut frozen = [root];
+        let mut exact_ops = OneSnapshot(Some(exact.clone()));
+        verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &mut exact_ops)
+            .expect("exact production index maximum verifies");
+
+        exact.push(TreeProcessInfo {
+            pid: u32::MAX,
+            parent_pid: None,
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: None,
+            start_time_marker: None,
+            owner_uid: None,
+            process_group: None,
+        });
+        assert_eq!(
+            plan_process_tree(2, &exact, &[], Platform::Linux, MAX_TREE_PROCESSES),
+            Err(TreePlanError::SnapshotLimitExceeded {
+                limit: PROCESS_TREE_INDEX_MAX
+            })
+        );
+        let mut over_ops = OneSnapshot(Some(exact));
+        assert!(matches!(
+            verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &mut over_ops),
+            Err(TreeKillOutcome::SnapshotFailed(message))
+                if message.contains("process index construction failed")
+        ));
     }
 
     /// Authorization for the common test case: no protected-root confirmation
@@ -1352,7 +1745,7 @@ mod tests {
             local_port: 3000,
             state: SocketState::Listen,
             pid: Some(pid),
-            process_name: Some(name.to_owned()),
+            process_name: Some(name.into()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -1361,9 +1754,15 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::linux(marker)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         };
         let context = ProcessContext {
-            process_start_time_marker: Some(marker),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(marker).ok(),
             ..ProcessContext::default()
         };
         KillTarget::from_entries(pid, [&entry], Some(&context))
@@ -1639,6 +2038,72 @@ mod tests {
     }
 
     #[test]
+    fn tree_thaw_failure_attempts_every_member_and_reports_survivors() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "postgres", 11),
+        ];
+        let mut ops = FakeOps::new(vec![
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot,
+        ]);
+        ops.deny_cont.extend([100, 101]);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &["postgres".to_owned()],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(
+            outcome,
+            TreeKillOutcome::ThawFailed { ref pids, .. } if pids == &[100, 101]
+        ));
+        assert!(ops.events.contains(&Event::Cont(100)));
+        assert!(ops.events.contains(&Event::Cont(101)));
+        assert!(ops.delivered_pids().is_empty());
+    }
+
+    #[test]
+    fn group_thaw_failure_is_typed_and_visible() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            ginfo(100, Some(1), "root", 10, 77),
+            ginfo(101, Some(1), "postgres", 11, 77),
+        ];
+        let mut ops = FakeOps::new(vec![
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot.clone(),
+            snapshot,
+        ]);
+        ops.deny_cont.push(101);
+
+        let outcome = execute_group_kill(
+            &root,
+            77,
+            KillMode::Terminate,
+            &["postgres".to_owned()],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(
+            outcome,
+            TreeKillOutcome::ThawFailed { ref pids, .. } if pids == &[101]
+        ));
+        assert!(ops.events.contains(&Event::Cont(100)));
+        assert!(ops.events.contains(&Event::Cont(101)));
+    }
+
+    #[test]
     fn cap_exceeded_during_freeze_thaws_and_refuses() {
         let root = root_target(100, "root", 10);
         let mut snapshot = vec![info(100, Some(1), "root", 10)];
@@ -1733,7 +2198,47 @@ mod tests {
 
         assert_eq!(outcome, TreeKillOutcome::PartialMetadata { pid: 101 });
         assert!(ops.delivered_pids().is_empty());
-        assert!(ops.events.ends_with(&[Event::Cont(101), Event::Cont(100)]));
+        assert_eq!(ops.events, [Event::Stop(100), Event::Cont(100)]);
+    }
+
+    #[test]
+    fn markerless_descendant_refuses_before_stop_and_thaws_prior_members() {
+        let root = root_target(100, "root", 10);
+        let mut markerless = info(102, Some(101), "grandchild", 12);
+        markerless.start_time_marker = None;
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "child", 11),
+            markerless,
+        ];
+        let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(outcome, TreeKillOutcome::PartialMetadata { pid: 102 });
+        assert_eq!(
+            ops.events,
+            [
+                Event::Stop(100),
+                Event::Stop(101),
+                Event::Cont(101),
+                Event::Cont(100),
+            ]
+        );
+        assert_eq!(
+            ops.prepared_thaws,
+            HashMap::from([
+                (100, crate::observation::ProcessStartMarker::linux(10).ok()),
+                (101, crate::observation::ProcessStartMarker::linux(11).ok()),
+            ])
+        );
     }
 
     #[test]
@@ -1762,6 +2267,37 @@ mod tests {
                 Event::Deliver(100, KillMode::Force),
                 Event::Cont(100)
             ],
+        );
+    }
+
+    #[test]
+    fn post_delivery_thaw_failure_is_retained_in_the_completion_report() {
+        let root = root_target(100, "node", 10);
+        let mut ops = FakeOps::new(vec![vec![info(100, Some(1), "node", 10)]]);
+        ops.deny_cont.push(100);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        let TreeKillOutcome::Completed(report) = outcome else {
+            panic!("delivery completed and cleanup failure must remain reportable");
+        };
+        assert_eq!(report.delivered, 1);
+        assert!(report.denied.is_empty());
+        assert_eq!(report.thaw_failed, vec![100]);
+        assert_eq!(
+            ops.events,
+            vec![
+                Event::Stop(100),
+                Event::Deliver(100, KillMode::Terminate),
+                Event::Cont(100)
+            ]
         );
     }
 
@@ -2535,5 +3071,100 @@ mod tests {
             .filter(|event| matches!(event, Event::Cont(_)))
             .count();
         assert_eq!(stops, conts, "every stopped member must be thawed");
+    }
+
+    #[test]
+    fn final_evidence_missing_denied_oversized_and_identity_changed_deliver_nothing() {
+        let cases = [
+            (
+                ProcessEvidenceError::Missing { pid: 100 },
+                TreeKillOutcome::TargetChanged { pid: 100 },
+            ),
+            (
+                ProcessEvidenceError::PermissionDenied { pid: 100 },
+                TreeKillOutcome::PermissionDenied { pid: 100 },
+            ),
+            (
+                ProcessEvidenceError::NameOversized {
+                    pid: 100,
+                    bytes: crate::observation::PROTECTION_NAME_MAX_BYTES + 1,
+                },
+                TreeKillOutcome::PartialMetadata { pid: 100 },
+            ),
+            (
+                ProcessEvidenceError::IdentityChanged { pid: 100 },
+                TreeKillOutcome::TargetChanged { pid: 100 },
+            ),
+        ];
+        for (error, expected_outcome) in cases {
+            let root = root_target(100, "root", 10);
+            let snapshot = vec![info(100, Some(500), "root", 10)];
+            let mut ops = FakeOps::new(vec![snapshot]);
+            ops.fresh_evidence.insert(100, Err(error));
+
+            let outcome = execute_tree_kill(
+                &root,
+                KillMode::Terminate,
+                &[],
+                Platform::Linux,
+                auth(),
+                &mut ops,
+            );
+
+            assert_eq!(outcome, expected_outcome);
+            assert!(ops.delivered_pids().is_empty());
+            assert_eq!(
+                ops.events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Stop(_)))
+                    .count(),
+                ops.events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Cont(_)))
+                    .count(),
+            );
+        }
+    }
+
+    #[test]
+    fn newly_protected_final_evidence_refuses_before_any_delivery() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(500), "root", 10),
+            info(101, Some(100), "worker", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot]);
+        ops.fresh_evidence.insert(
+            101,
+            Ok(FreshProcessEvidence {
+                pid: 101,
+                start_marker: crate::observation::ProcessStartMarker::linux(11)
+                    .expect("nonzero marker"),
+                name: "postgres".to_owned(),
+            }),
+        );
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &["postgres".to_owned()],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(
+            outcome,
+            TreeKillOutcome::ProtectedDescendant {
+                pid: 101,
+                name: Some("postgres".to_owned()),
+            }
+        );
+        assert!(ops.delivered_pids().is_empty());
+        assert!(
+            !ops.events
+                .iter()
+                .any(|event| matches!(event, Event::Deliver(_, _)))
+        );
     }
 }

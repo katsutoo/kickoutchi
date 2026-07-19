@@ -1,15 +1,19 @@
 //! The shared vocabulary: the types the CLI, TUI, collectors, filters, and the
 //! kill flow all pass around.
 //!
-//! Every collector hands back the same [`PortEntry`] shape, so platform weirdness
-//! stays bottled up in `platform/` and the rest of the app only ever thinks about
-//! one model. The serde derives are the stable JSON contract for `list --json`,
-//! so renaming a field or an enum variant here quietly breaks people's scripts.
+//! Platform collectors produce one authoritative `NetworkSnapshot`; existing
+//! CLI and TUI surfaces borrow or materialize this legacy [`PortEntry`] view.
+//! The serde shape is the stable `list --json` contract, so internal identity
+//! evidence is skipped and renaming a serialized field still breaks scripts.
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::Path;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
+
+use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 
 /// Transport protocol of a socket row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -114,22 +118,144 @@ pub(crate) struct PortEntry {
     pub(crate) local_port: u16,
     pub(crate) state: SocketState,
     pub(crate) pid: Option<u32>,
-    pub(crate) process_name: Option<String>,
-    pub(crate) executable_path: Option<PathBuf>,
-    pub(crate) command_line: Option<String>,
+    #[serde(serialize_with = "serialize_optional_shared_str")]
+    pub(crate) process_name: Option<Arc<str>>,
+    #[serde(serialize_with = "serialize_optional_shared_path")]
+    pub(crate) executable_path: Option<Arc<Path>>,
+    #[serde(serialize_with = "serialize_optional_shared_str")]
+    pub(crate) command_line: Option<Arc<str>>,
     pub(crate) parent_pid: Option<u32>,
-    pub(crate) parent_process_name: Option<String>,
+    #[serde(serialize_with = "serialize_optional_shared_str")]
+    pub(crate) parent_process_name: Option<Arc<str>>,
     /// Reserved, and effectively always empty on real rows: the Linux collector
     /// never populates this. Per-row child enumeration would mean walking the whole
     /// process table on every refresh, so the selected row's children are resolved
     /// lazily into the [`ProcessContext`] `children` field instead. The field stays
     /// only because it's part of the
-    /// stable `list --json` shape and the fake fixture fills it — real child data
-    /// does not flow through here.
+    /// stable `list --json` shape; real child data does not flow through here.
     pub(crate) child_pids: Vec<u32>,
     pub(crate) protected: bool,
     pub(crate) platform: Platform,
     pub(crate) permission: PermissionStatus,
+    #[serde(skip)]
+    pub(crate) process_identity: Option<ProcessIdentity>,
+    #[serde(skip)]
+    pub(crate) ipv6_scope: Option<Ipv6Scope>,
+}
+
+/// Borrowed TUI/query row backed by one socket and its shared process metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PortEntryView<'a> {
+    pub(crate) protocol: Protocol,
+    pub(crate) local_addr: IpAddr,
+    pub(crate) local_port: u16,
+    pub(crate) state: SocketState,
+    pub(crate) pid: Option<u32>,
+    pub(crate) process_name: Option<&'a str>,
+    pub(crate) executable_path: Option<&'a Path>,
+    pub(crate) command_line: Option<&'a str>,
+    pub(crate) parent_pid: Option<u32>,
+    pub(crate) parent_process_name: Option<&'a str>,
+    pub(crate) protected: bool,
+    pub(crate) platform: Platform,
+    pub(crate) permission: PermissionStatus,
+    pub(crate) process_identity: Option<ProcessIdentity>,
+    pub(crate) ipv6_scope: Option<Ipv6Scope>,
+}
+
+impl Serialize for PortEntryView<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut row = serializer.serialize_struct("PortEntry", 14)?;
+        row.serialize_field("protocol", &self.protocol)?;
+        row.serialize_field("local_addr", &self.local_addr)?;
+        row.serialize_field("local_port", &self.local_port)?;
+        row.serialize_field("state", &self.state)?;
+        row.serialize_field("pid", &self.pid)?;
+        row.serialize_field("process_name", &self.process_name)?;
+        row.serialize_field("executable_path", &self.executable_path)?;
+        row.serialize_field("command_line", &self.command_line)?;
+        row.serialize_field("parent_pid", &self.parent_pid)?;
+        row.serialize_field("parent_process_name", &self.parent_process_name)?;
+        row.serialize_field("child_pids", &[] as &[u32])?;
+        row.serialize_field("protected", &self.protected)?;
+        row.serialize_field("platform", &self.platform)?;
+        row.serialize_field("permission", &self.permission)?;
+        row.end()
+    }
+}
+
+impl<'a> From<&'a PortEntry> for PortEntryView<'a> {
+    fn from(entry: &'a PortEntry) -> Self {
+        Self {
+            protocol: entry.protocol,
+            local_addr: entry.local_addr,
+            local_port: entry.local_port,
+            state: entry.state,
+            pid: entry.pid,
+            process_name: entry.process_name.as_deref(),
+            executable_path: entry.executable_path.as_deref(),
+            command_line: entry.command_line.as_deref(),
+            parent_pid: entry.parent_pid,
+            parent_process_name: entry.parent_process_name.as_deref(),
+            protected: entry.protected,
+            platform: entry.platform,
+            permission: entry.permission,
+            process_identity: entry.process_identity,
+            ipv6_scope: entry.ipv6_scope,
+        }
+    }
+}
+
+impl PortEntryView<'_> {
+    pub(crate) fn scope(self) -> BindScope {
+        bind_scope(self.local_addr)
+    }
+
+    pub(crate) fn scope_label(self) -> &'static str {
+        self.scope().label()
+    }
+
+    pub(crate) fn is_system_process(self) -> bool {
+        SystemProcessCheck {
+            platform: self.platform,
+            pid: self.pid,
+            parent_pid: self.parent_pid,
+            process_name: self.process_name,
+            parent_process_name: self.parent_process_name,
+        }
+        .is_system_process()
+    }
+}
+
+#[allow(
+    clippy::ref_option,
+    reason = "serde serialize_with passes the field by reference"
+)]
+fn serialize_optional_shared_str<S>(
+    value: &Option<Arc<str>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.as_deref().serialize(serializer)
+}
+
+#[allow(
+    clippy::ref_option,
+    reason = "serde serialize_with passes the field by reference"
+)]
+fn serialize_optional_shared_path<S>(
+    value: &Option<Arc<Path>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.as_deref().serialize(serializer)
 }
 
 /// Extra context we gather lazily for the selected process.
@@ -144,7 +270,7 @@ pub(crate) struct ProcessContext {
     /// identity guard. We never render or serialize it: it only exists so a PID
     /// that wanders off and comes back wearing another process's face gets caught
     /// before the boot hits the swamp water.
-    pub(crate) process_start_time_marker: Option<u64>,
+    pub(crate) process_start_time_marker: Option<ProcessStartMarker>,
     pub(crate) children: ChildProcessSnapshot,
     pub(crate) docker: Option<DockerPortContext>,
 }
@@ -223,40 +349,6 @@ impl PortEntry {
         self.local_port == port
     }
 
-    /// Substring match against an already-lowercased needle. Rows with no
-    /// readable name never match — claiming a hit on data we can't see would
-    /// just be a guess.
-    pub(crate) fn matches_process_normalized(&self, needle_lower: &str) -> bool {
-        let Some(name) = &self.process_name else {
-            return false;
-        };
-        name.to_lowercase().contains(needle_lower)
-    }
-
-    /// Human-facing bind scope for table/details output.
-    pub(crate) fn scope(&self) -> BindScope {
-        let addr = match self.local_addr {
-            // Normalize IPv4-mapped IPv6 (::ffff:127.0.0.1) down to real V4 so the
-            // loopback/unspecified checks below see the actual address family. The
-            // V4 arm is just the passthrough that keeps the match exhaustive.
-            IpAddr::V4(addr) => IpAddr::V4(addr),
-            IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
-        };
-
-        if addr.is_loopback() {
-            BindScope::Loopback
-        } else if addr.is_unspecified() {
-            BindScope::Public
-        } else {
-            BindScope::Local
-        }
-    }
-
-    /// Human-facing bind scope label for table/details output.
-    pub(crate) fn scope_label(&self) -> &'static str {
-        self.scope().label()
-    }
-
     /// Best-effort "is this a system/service process?" check, used for optional
     /// hiding.
     ///
@@ -266,14 +358,25 @@ impl PortEntry {
     /// it. And a protected app like `postgres` doesn't count as a system process
     /// just because it's protected — those are two different ideas.
     pub(crate) fn is_system_process(&self) -> bool {
-        SystemProcessCheck {
-            platform: self.platform,
-            pid: self.pid,
-            parent_pid: self.parent_pid,
-            process_name: self.process_name.as_deref(),
-            parent_process_name: self.parent_process_name.as_deref(),
-        }
-        .is_system_process()
+        PortEntryView::from(self).is_system_process()
+    }
+}
+
+fn bind_scope(local_addr: IpAddr) -> BindScope {
+    let addr = match local_addr {
+        // Normalize IPv4-mapped IPv6 (::ffff:127.0.0.1) down to real V4 so the
+        // loopback/unspecified checks below see the actual address family. The
+        // V4 arm is just the passthrough that keeps the match exhaustive.
+        IpAddr::V4(addr) => IpAddr::V4(addr),
+        IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
+    };
+
+    if addr.is_loopback() {
+        BindScope::Loopback
+    } else if addr.is_unspecified() {
+        BindScope::Public
+    } else {
+        BindScope::Local
     }
 }
 
@@ -402,61 +505,13 @@ impl SortMode {
     }
 }
 
-/// Sort entries in place by the given mode.
-///
-/// Every mode falls back to (port, protocol) so the order is total and stable
-/// across refreshes — equal keys must never reshuffle, or the table would
-/// visibly jitter on each tick. Rows missing the sort key (`None` PID or name)
-/// sink to the bottom, so the rows you can actually act on float to the top.
-pub(crate) fn sort_entries(entries: &mut [PortEntry], mode: SortMode) {
-    entries.sort_by(|a, b| {
-        let key = match mode {
-            SortMode::Port => std::cmp::Ordering::Equal,
-            SortMode::Pid => (a.pid.is_none(), a.pid).cmp(&(b.pid.is_none(), b.pid)),
-            SortMode::Protocol => a.protocol.cmp(&b.protocol),
-            SortMode::Process => {
-                let name_a = a.process_name.as_ref().map(|n| n.to_lowercase());
-                let name_b = b.process_name.as_ref().map(|n| n.to_lowercase());
-                (name_a.is_none(), name_a).cmp(&(name_b.is_none(), name_b))
-            }
-            SortMode::Parent => {
-                let name_a = a.parent_process_name.as_ref().map(|n| n.to_lowercase());
-                let name_b = b.parent_process_name.as_ref().map(|n| n.to_lowercase());
-                (
-                    name_a.is_none(),
-                    name_a,
-                    a.parent_pid.is_none(),
-                    a.parent_pid,
-                )
-                    .cmp(&(
-                        name_b.is_none(),
-                        name_b,
-                        b.parent_pid.is_none(),
-                        b.parent_pid,
-                    ))
-            }
-            SortMode::Scope => a.scope().cmp(&b.scope()),
-        };
-        key.then_with(|| {
-            (a.local_port, a.protocol, a.local_addr, a.pid).cmp(&(
-                b.local_port,
-                b.protocol,
-                b.local_addr,
-                b.pid,
-            ))
-        })
-    });
-}
-
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
-    use super::{
-        BindScope, PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode,
-        sort_entries,
-    };
+    use super::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
 
     /// A tiny entry builder so each test only spells out the fields it cares
     /// about.
@@ -467,7 +522,7 @@ mod tests {
             local_port: port,
             state: SocketState::Listen,
             pid,
-            process_name: name.map(str::to_owned),
+            process_name: name.map(Arc::from),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -476,6 +531,8 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: None,
+            ipv6_scope: None,
         }
     }
 
@@ -484,33 +541,6 @@ mod tests {
         let row = entry(3000, Some(1), Some("node"));
         assert!(row.matches_port(3000));
         assert!(!row.matches_port(300));
-    }
-
-    #[test]
-    fn normalized_process_filter_matches_substring() {
-        let row = entry(3000, Some(1), Some("Node"));
-        assert!(row.matches_process_normalized("node"));
-        assert!(row.matches_process_normalized("od"));
-        assert!(!row.matches_process_normalized("vite"));
-        // A hidden name must never match — that'd be claiming we know something
-        // we don't.
-        assert!(!entry(53, None, None).matches_process_normalized("node"));
-    }
-
-    #[test]
-    fn scope_label_identifies_common_bind_shapes() {
-        let mut row = entry(3000, Some(1), Some("node"));
-        assert_eq!(row.scope_label(), "loopback");
-
-        row.local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        assert_eq!(row.scope_label(), "public");
-
-        row.local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
-        assert_eq!(row.scope_label(), "local");
-
-        row.local_addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
-        assert_eq!(row.scope_label(), "loopback");
-        assert_eq!(row.scope(), BindScope::Loopback);
     }
 
     #[test]
@@ -527,97 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_port_orders_ascending() {
-        let mut rows = vec![
-            entry(5173, Some(2), Some("vite")),
-            entry(80, Some(1), Some("nginx")),
-        ];
-        sort_entries(&mut rows, SortMode::Port);
-        assert_eq!(rows[0].local_port, 80);
-        assert_eq!(rows[1].local_port, 5173);
-    }
-
-    #[test]
-    fn sort_by_pid_puts_unknown_pids_last() {
-        let mut rows = vec![
-            entry(53, None, None),
-            entry(5173, Some(2), Some("vite")),
-            entry(3000, Some(900), Some("node")),
-        ];
-        sort_entries(&mut rows, SortMode::Pid);
-        assert_eq!(rows[0].pid, Some(2));
-        assert_eq!(rows[1].pid, Some(900));
-        assert_eq!(rows[2].pid, None);
-    }
-
-    #[test]
-    fn sort_by_process_is_case_insensitive_with_unknown_last() {
-        let mut rows = vec![
-            entry(1, None, None),
-            entry(2, Some(1), Some("Vite")),
-            entry(3, Some(2), Some("node")),
-        ];
-        sort_entries(&mut rows, SortMode::Process);
-        assert_eq!(rows[0].process_name.as_deref(), Some("node"));
-        assert_eq!(rows[1].process_name.as_deref(), Some("Vite"));
-        assert_eq!(rows[2].process_name, None);
-    }
-
-    #[test]
-    fn equal_sort_keys_fall_back_to_port_order() {
-        // Same protocol on every row, so the protocol sort has to fall back to
-        // the (port, protocol) tie-breaker to stay deterministic.
-        let mut rows = vec![
-            entry(5173, Some(2), Some("vite")),
-            entry(80, Some(1), Some("nginx")),
-            entry(3000, Some(3), Some("node")),
-        ];
-        sort_entries(&mut rows, SortMode::Protocol);
-        let ports: Vec<u16> = rows.iter().map(|row| row.local_port).collect();
-        assert_eq!(ports, vec![80, 3000, 5173]);
-    }
-
-    #[test]
-    fn sort_by_parent_uses_name_then_pid_with_unknown_last() {
-        let mut rows = vec![
-            entry(1, Some(1), Some("a")),
-            entry(2, Some(2), Some("b")),
-            entry(3, Some(3), Some("c")),
-        ];
-        rows[0].parent_process_name = None;
-        rows[0].parent_pid = Some(99);
-        rows[1].parent_process_name = Some("Zed".to_owned());
-        rows[1].parent_pid = Some(10);
-        rows[2].parent_process_name = Some("agent".to_owned());
-        rows[2].parent_pid = Some(20);
-
-        sort_entries(&mut rows, SortMode::Parent);
-
-        assert_eq!(rows[0].parent_process_name.as_deref(), Some("agent"));
-        assert_eq!(rows[1].parent_process_name.as_deref(), Some("Zed"));
-        assert_eq!(rows[2].parent_pid, Some(99));
-    }
-
-    #[test]
-    fn sort_by_scope_surfaces_public_binds_first() {
-        let mut rows = vec![
-            entry(1, Some(1), Some("loopback")),
-            entry(2, Some(2), Some("local")),
-            entry(3, Some(3), Some("public")),
-        ];
-        rows[1].local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
-        rows[2].local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-
-        sort_entries(&mut rows, SortMode::Scope);
-
-        let names: Vec<&str> = rows
-            .iter()
-            .filter_map(|row| row.process_name.as_deref())
-            .collect();
-        assert_eq!(names, vec!["public", "local", "loopback"]);
-    }
-
-    #[test]
     fn system_process_classification_is_conservative() {
         let mut row = entry(5432, Some(1201), Some("postgres"));
         assert!(!row.is_system_process());
@@ -626,7 +565,7 @@ mod tests {
         assert!(row.is_system_process());
 
         row.parent_pid = None;
-        row.process_name = Some("systemd".to_owned());
+        row.process_name = Some(Arc::from("systemd"));
         assert!(row.is_system_process());
     }
 
@@ -637,14 +576,14 @@ mod tests {
         assert!(row.is_system_process());
 
         row.pid = Some(20_000);
-        row.process_name = Some("SVCHOST.EXE".to_owned());
+        row.process_name = Some(Arc::from("SVCHOST.EXE"));
         assert!(row.is_system_process());
 
-        row.process_name = Some("vendor-service.exe".to_owned());
-        row.parent_process_name = Some("services.exe".to_owned());
+        row.process_name = Some(Arc::from("vendor-service.exe"));
+        row.parent_process_name = Some(Arc::from("services.exe"));
         assert!(row.is_system_process());
 
-        row.parent_process_name = Some("explorer.exe".to_owned());
+        row.parent_process_name = Some(Arc::from("explorer.exe"));
         assert!(!row.is_system_process());
     }
 
@@ -654,10 +593,10 @@ mod tests {
         // null handling. Touch any assertion here and you've broken someone's
         // script.
         let mut row = entry(3000, Some(18422), Some("node"));
-        row.executable_path = Some(PathBuf::from("/usr/bin/node"));
-        row.command_line = Some("node server.js".to_owned());
+        row.executable_path = Some(PathBuf::from("/usr/bin/node").into());
+        row.command_line = Some(Arc::from("node server.js"));
         row.parent_pid = Some(18001);
-        row.parent_process_name = Some("cursor-agent".to_owned());
+        row.parent_process_name = Some(Arc::from("cursor-agent"));
         row.child_pids = vec![18430];
 
         let value = serde_json::to_value(&row).expect("PortEntry must serialize");

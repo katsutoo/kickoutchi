@@ -879,8 +879,8 @@ mod tests {
                 Protocol::Udp => SocketState::Bound,
             },
             pid: Some(1234),
-            process_name: Some(process_name.to_owned()),
-            executable_path: Some(PathBuf::from(format!("/usr/bin/{process_name}"))),
+            process_name: Some(process_name.into()),
+            executable_path: Some(PathBuf::from(format!("/usr/bin/{process_name}")).into()),
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
@@ -888,6 +888,8 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: None,
+            ipv6_scope: None,
         }
     }
 

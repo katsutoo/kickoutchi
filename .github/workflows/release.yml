@@ -95,8 +95,11 @@ jobs:
         if: matrix.name == 'Supply Chain'
         shell: bash
         run: cargo install --locked cargo-deny --version 0.19.4
+      - name: Run tests (Linux capabilities required)
+        if: matrix.name == 'Linux'
+        run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features
       - name: Run tests
-        if: matrix.name != 'Supply Chain'
+        if: matrix.name == 'Windows' || matrix.name == 'macOS'
         run: cargo test --locked --all-features
       - name: Run supply-chain policy
         if: matrix.name == 'Supply Chain'

@@ -479,7 +479,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("node".to_owned()),
-                start_time_marker: Some(55),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
                 owner_uid: None,
                 process_group: None,
             },
@@ -489,7 +489,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("worker".to_owned()),
-                start_time_marker: Some(56),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(56).ok(),
                 owner_uid: None,
                 process_group: None,
             },
@@ -516,7 +516,8 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("aaaaaaaaaaa bbbbbbbbbbb ccccccccccc".to_owned()),
-                start_time_marker: Some(u64::from(pid)),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid))
+                    .ok(),
                 owner_uid: None,
                 process_group: None,
             });

@@ -5,11 +5,12 @@
 //! parsing and process-metadata digging stays in here, so Linux's particular
 //! file formats never leak out into the shared CLI or TUI code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -17,13 +18,23 @@ use thiserror::Error;
 use crate::collector::{Collector, CollectorError};
 use crate::diagnostic;
 use crate::model::{
-    ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
-    Protocol, RelatedProcessHint, SocketState,
+    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint, SocketState,
+};
+use crate::observation::{
+    CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EndpointIdentity, EvidenceGap,
+    EvidenceGapCode, EvidenceImpact, FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness,
+    MetadataOmission, MetadataProfile, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation,
+    NetworkSnapshot, OWNER_EDGES_MAX, ObservationScope, ObservationScopeKind, OwnerAssociations,
+    OwnerCompleteness, PROCESS_NAME_MAX_BYTES, PlatformSocketToken, ProcessIdentity,
+    ProcessObservation, ProcessRead, ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES,
+    ScopeLimitation, SnapshotCompleteness, SocketState as ObservationSocketState,
+    UnverifiedOwnerReason,
 };
 use crate::process::{
     TreeDeliveryHandle, tree_cont, tree_cont_handle, tree_deliver_handle,
     tree_open_delivery_handle, tree_stop_handle,
 };
+use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
 
 const PROC_ROOT: &str = "/proc";
@@ -34,9 +45,7 @@ const TCP_LISTEN_STATE: &str = "0A";
 // truncate: dropping bytes drops whole socket rows, i.e. real open ports. So
 // `read_bounded_text` fails closed past this cap — the scan surfaces a clear
 // error instead of a short, misleading table.
-const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CMDLINE_BYTES: usize = 16 * 1024;
-const MAX_CMDLINE_READ_BYTES: u64 = 16 * 1024 + 1;
 // `/proc/<pid>/status` and `/proc/<pid>/stat` are kernel-generated and read
 // on every refresh, so they are bounded like every other /proc read here —
 // and the reads fail closed past the cap rather than silently truncating,
@@ -57,13 +66,10 @@ const MAX_PROCESS_ANCESTORS: usize = 64;
 // bound deserves to be explicit and symmetric with the macOS collector's cap.
 // Truncating would silently drop processes — potentially real port owners —
 // so the scan fails closed past it, like the socket table above.
-const MAX_PROCESS_IDS: usize = 131_072;
 // Aggregate bounds for the two multiplicative parts of collection. One million
 // fd entries covers ordinary high-density hosts while bounding procfs traversal;
 // 262k rows allows substantial shared-socket fanout above the socket-table size.
 // Both limits fail closed because a partial owner map or row set is misleading.
-const MAX_FD_ENTRIES: usize = 1_048_576;
-const MAX_PORT_ENTRIES: usize = 262_144;
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
@@ -82,9 +88,9 @@ struct CollectionLimits {
 
 impl CollectionLimits {
     const PRODUCTION: Self = Self {
-        process_ids: MAX_PROCESS_IDS,
-        fd_entries: MAX_FD_ENTRIES,
-        port_entries: MAX_PORT_ENTRIES,
+        process_ids: CANDIDATE_PROCESS_IDS_MAX,
+        fd_entries: FILE_DESCRIPTOR_ENTRIES_MAX,
+        port_entries: DERIVED_PORT_ENTRIES_MAX,
     };
 }
 
@@ -110,24 +116,209 @@ impl LinuxCollector {
     }
 }
 
+pub(crate) fn fresh_process_evidence(
+    pid: u32,
+) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+    read_fresh_process_evidence(Path::new(PROC_ROOT), pid)
+}
+
 impl Collector for LinuxCollector {
-    fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
-        let records = collect_socket_records(&self.proc_root)?;
+    fn collect(&self, profile: MetadataProfile) -> Result<NetworkSnapshot, CollectorError> {
+        let raw_scope_identifier = fs::read_link(self.proc_root.join("self/ns/net")).ok();
+        let scope_identifier = raw_scope_identifier
+            .as_deref()
+            .and_then(bounded_scope_identifier);
+        let scope_read_failed = scope_identifier.is_none();
+        let scope = ObservationScope::new(
+            ObservationScopeKind::CurrentNetworkNamespace,
+            scope_identifier,
+            [
+                ScopeLimitation::OtherNetworkNamespacesExcluded,
+                ScopeLimitation::Ipv6ScopeUnavailable,
+                ScopeLimitation::ScopedIpv6ExactMatchingUnavailable,
+            ],
+        )?;
+        let mut snapshot = crate::collector::collect_native_snapshot(
+            profile,
+            scope,
+            |_profile| self.collect_native_pass(),
+            |pids, profile, remaining| self.read_native_processes(pids, profile, remaining),
+        )?;
+        if scope_read_failed {
+            let gap = EvidenceGap::new(
+                EvidenceImpact::Scope,
+                EvidenceGapCode::NativeFieldUnavailable,
+                None,
+                None,
+                "current network namespace identifier is unavailable",
+            );
+            if snapshot.evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+                snapshot.evidence_gaps.push(gap);
+                snapshot.evidence_gaps.sort();
+            } else {
+                snapshot.omitted_evidence_gap_count =
+                    snapshot.omitted_evidence_gap_count.saturating_add(1);
+            }
+            if snapshot.completeness != SnapshotCompleteness::Raced {
+                snapshot.completeness = SnapshotCompleteness::Partial;
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+fn bounded_scope_identifier(path: &Path) -> Option<&str> {
+    path.to_str()
+        .filter(|identifier| identifier.len() <= SCOPE_IDENTIFIER_MAX_BYTES)
+}
+
+impl LinuxCollector {
+    fn read_native_processes(
+        &self,
+        pids: &[u32],
+        profile: MetadataProfile,
+        optional_metadata_bytes_remaining: usize,
+    ) -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError> {
+        let mut parent_names = HashMap::new();
+        crate::collector::read_processes_sequentially(
+            pids,
+            profile,
+            optional_metadata_bytes_remaining,
+            |pid, profile, remaining| {
+                self.read_native_process_cached(pid, profile, remaining, &mut parent_names)
+            },
+        )
+    }
+
+    fn collect_native_pass(
+        &self,
+    ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
+        let records = collect_socket_records_bounded(&self.proc_root, self.limits.port_entries)?;
         let target_inodes: HashSet<u64> = records.iter().map(|record| record.inode).collect();
-        let owners = collect_socket_owners(
+        let owner_scan = collect_socket_owners_detailed(
             &self.proc_root,
             &target_inodes,
             self.limits.process_ids,
             self.limits.fd_entries,
         )?;
+        let projected_rows = records.iter().try_fold(0usize, |count, record| {
+            count.checked_add(
+                owner_scan
+                    .owners
+                    .get(&record.inode)
+                    .map_or(1, |owners| owners.len().max(1)),
+            )
+        });
+        if projected_rows.is_none_or(|count| count > self.limits.port_entries) {
+            return Err(resource_cap_error(
+                &self.proc_root,
+                format!(
+                    "collected port rows exceed {} entry cap",
+                    self.limits.port_entries
+                ),
+            ));
+        }
 
-        expand_socket_records(
-            &records,
-            &owners,
-            &self.proc_root,
-            self.limits.port_entries,
-            read_process_metadata,
+        native_pass_from_records(&records, owner_scan)
+    }
+
+    #[cfg(test)]
+    fn read_native_process(
+        &self,
+        pid: u32,
+        profile: MetadataProfile,
+        optional_metadata_bytes_remaining: usize,
+    ) -> Result<ProcessRead, CollectorError> {
+        self.read_native_process_cached(
+            pid,
+            profile,
+            optional_metadata_bytes_remaining,
+            &mut HashMap::new(),
         )
+    }
+
+    fn read_native_process_cached(
+        &self,
+        pid: u32,
+        profile: MetadataProfile,
+        optional_metadata_bytes_remaining: usize,
+        parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+    ) -> Result<ProcessRead, CollectorError> {
+        let process_dir = self.proc_root.join(pid.to_string());
+        let stat_path = process_dir.join("stat");
+        let marker = match read_native_process_marker(&stat_path) {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == ErrorKind::InvalidData => {
+                return Err(CollectorError::Read {
+                    path: stat_path,
+                    source: error,
+                });
+            }
+            Err(error) => {
+                return Ok(ProcessRead::Unverified(unverified_reason_for_io(&error)));
+            }
+        };
+        if profile == MetadataProfile::IdentityOnly {
+            return Ok(ProcessRead::Verified {
+                marker,
+                observation: ProcessObservation::identity_only(),
+            });
+        }
+        let metadata = if optional_metadata_bytes_remaining == 0 {
+            ProcessMetadata {
+                partial: true,
+                budget_omitted: true,
+                ..ProcessMetadata::default()
+            }
+        } else {
+            read_process_metadata_bounded_with_parent_cache(
+                &self.proc_root,
+                pid,
+                profile,
+                optional_metadata_bytes_remaining,
+                parent_names,
+            )
+        };
+        let marker_after = match read_native_process_marker(&stat_path) {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == ErrorKind::InvalidData => {
+                return Err(CollectorError::Read {
+                    path: stat_path,
+                    source: error,
+                });
+            }
+            Err(error) => {
+                return Ok(ProcessRead::Unverified(unverified_reason_for_io(&error)));
+            }
+        };
+        if marker_after != marker {
+            return Ok(ProcessRead::Unverified(UnverifiedOwnerReason::Raced));
+        }
+        let path_invalid_utf8 = metadata
+            .executable_path
+            .as_ref()
+            .is_some_and(|path| path.to_str().is_none());
+        Ok(ProcessRead::Verified {
+            marker: marker_after,
+            observation: ProcessObservation {
+                name: metadata.process_name.map(Into::into),
+                executable_path: metadata
+                    .executable_path
+                    .filter(|path| path.to_str().is_some())
+                    .map(Into::into),
+                command_line: metadata.command_line.map(Into::into),
+                parent_pid: metadata.parent_pid,
+                parent_process_name: metadata.parent_process_name.map(Into::into),
+                metadata_omission: metadata
+                    .budget_omitted
+                    .then_some(MetadataOmission::BudgetExceeded),
+                metadata_completeness: if metadata.partial || path_invalid_utf8 {
+                    MetadataCompleteness::Partial
+                } else {
+                    MetadataCompleteness::Complete
+                },
+            },
+        })
     }
 }
 
@@ -154,6 +345,122 @@ struct SocketRecord {
     inode: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OwnerScanLoss {
+    PermissionDenied(u32),
+    Disappeared(u32),
+    Unattributable(u32),
+}
+
+#[derive(Debug, Default)]
+struct OwnerScanResult {
+    owners: HashMap<u64, Vec<u32>>,
+    losses: BTreeSet<OwnerScanLoss>,
+    omitted_loss_count: u64,
+    owner_edges: usize,
+}
+
+impl OwnerScanResult {
+    fn record_loss(&mut self, loss: OwnerScanLoss) {
+        if self.losses.contains(&loss) {
+            return;
+        }
+        if self.losses.len() < crate::observation::EVIDENCE_GAPS_MAX {
+            self.losses.insert(loss);
+        } else {
+            self.omitted_loss_count = self.omitted_loss_count.saturating_add(1);
+        }
+    }
+}
+
+fn native_pass_from_records(
+    records: &[SocketRecord],
+    owner_scan: OwnerScanResult,
+) -> Result<crate::observation::NativeObservationPass, CollectorError> {
+    let mut sockets = Vec::with_capacity(records.len());
+    let mut owners_by_socket = Vec::with_capacity(records.len());
+    for record in records {
+        let ipv6_scope = record
+            .local_addr
+            .is_ipv6()
+            .then_some(Ipv6Scope::Unavailable);
+        let endpoint = EndpointIdentity::new(
+            record.protocol,
+            record.local_addr,
+            u32::from(record.local_port),
+            ipv6_scope,
+        )
+        .map_err(|error| {
+            CollectorError::Observation(crate::observation::ObservationError::PlatformApiFailed(
+                error.to_string(),
+            ))
+        })?;
+        sockets.push(NativeSocketObservation {
+            endpoint,
+            state: match record.state {
+                SocketState::Listen => ObservationSocketState::Listen,
+                SocketState::Bound => ObservationSocketState::Bound,
+            },
+            token: PlatformSocketToken::linux_inode(record.inode),
+        });
+        owners_by_socket.push(
+            owner_scan
+                .owners
+                .get(&record.inode)
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+
+    let mut reasons = BTreeSet::new();
+    let mut evidence_gaps = Vec::with_capacity(owner_scan.losses.len());
+    let omitted_evidence_gap_count = owner_scan.omitted_loss_count;
+    for loss in owner_scan.losses {
+        let (pid, code, message) = match loss {
+            OwnerScanLoss::PermissionDenied(pid) => (
+                pid,
+                EvidenceGapCode::OwnerPermissionDenied,
+                "permission denied before the PID's socket ownership could be attributed",
+            ),
+            OwnerScanLoss::Disappeared(pid) => (
+                pid,
+                EvidenceGapCode::OwnerDisappeared,
+                "PID disappeared before its socket ownership could be attributed",
+            ),
+            OwnerScanLoss::Unattributable(pid) => (
+                pid,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "a PID file-descriptor entry could not be attributed to a socket",
+            ),
+        };
+        reasons.insert(code);
+        evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            code,
+            None,
+            Some(pid),
+            message,
+        ));
+    }
+    let global_completeness = OwnerCompleteness::partial(reasons)?;
+    // PID/fd traversal losses have no endpoint provenance. They reduce only
+    // global authority; copying them into every socket would falsely turn an
+    // unknown global owner into socket-local evidence. Consequently, local
+    // Complete means all attributable edges were retained; it cannot exclude an
+    // unreadable process that shares the same socket inode.
+    let local_completeness = vec![OwnerCompleteness::Complete; records.len()];
+    Ok(crate::observation::NativeObservationPass {
+        sockets,
+        owners: OwnerAssociations {
+            owners_by_socket,
+            local_completeness,
+            global_completeness,
+            evidence_gaps,
+            omitted_evidence_gap_count,
+        },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum SocketParseError {
     #[error("missing field {field}")]
@@ -178,6 +485,7 @@ struct ProcessMetadata {
     parent_pid: Option<u32>,
     parent_process_name: Option<String>,
     partial: bool,
+    budget_omitted: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +514,15 @@ pub(crate) fn process_command_line(pid: u32) -> Option<String> {
         .and_then(|(command_line, _)| command_line)
 }
 
+#[cfg(test)]
 fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, CollectorError> {
+    collect_socket_records_bounded(proc_root, crate::observation::SOCKET_OBSERVATIONS_MAX)
+}
+
+fn collect_socket_records_bounded(
+    proc_root: &Path,
+    max_records: usize,
+) -> Result<Vec<SocketRecord>, CollectorError> {
     let tables = [
         SocketTable {
             relative_path: "net/tcp",
@@ -240,17 +556,28 @@ fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, Collect
         let Some(text) = read_socket_table(&path, table.optional)? else {
             continue;
         };
-        records.extend(parse_socket_table(
-            &text,
-            table.protocol,
-            table.address_family,
-        ));
+        let parsed =
+            parse_socket_table(&text, table.protocol, table.address_family).map_err(|error| {
+                CollectorError::Read {
+                    path: path.clone(),
+                    source: std::io::Error::new(ErrorKind::InvalidData, error),
+                }
+            })?;
+        for record in parsed {
+            if records.len() >= max_records {
+                return Err(resource_cap_error(
+                    proc_root,
+                    format!("collected sockets exceed {max_records} entry cap"),
+                ));
+            }
+            records.push(record);
+        }
     }
     Ok(records)
 }
 
 fn read_socket_table(path: &Path, optional: bool) -> Result<Option<String>, CollectorError> {
-    match read_bounded_text(path, MAX_SOCKET_TABLE_BYTES) {
+    match read_bounded_text(path, NATIVE_SOCKET_TABLE_MAX_BYTES) {
         Ok(text) => Ok(Some(text)),
         Err(source) if optional && source.kind() == ErrorKind::NotFound => Ok(None),
         Err(source) => Err(CollectorError::Read {
@@ -275,11 +602,37 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
     Ok(text)
 }
 
+fn read_bounded_lossy_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let limit = u64::try_from(max_bytes)
+        .expect("/proc read byte limit must fit in u64")
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte read limit"),
+        ));
+    }
+    let decoded_len = crate::observation::lossy_utf8_len(&bytes).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "decoded text length overflow")
+    })?;
+    if decoded_len > max_bytes {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("decoded text exceeds {max_bytes} byte limit"),
+        ));
+    }
+    let mut text = String::with_capacity(decoded_len);
+    crate::observation::push_utf8_lossy(&mut text, &bytes);
+    Ok(text)
+}
+
 fn parse_socket_table(
     text: &str,
     protocol: Protocol,
     address_family: AddressFamily,
-) -> Vec<SocketRecord> {
+) -> Result<Vec<SocketRecord>, SocketParseError> {
     let mut records = Vec::new();
     for (line_index, line) in text.lines().enumerate().skip(1) {
         if line.trim().is_empty() {
@@ -289,11 +642,12 @@ fn parse_socket_table(
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(line = line_index + 1, %error, "skipping malformed /proc/net row");
+                tracing::warn!(line = line_index + 1, %error, "malformed /proc/net row");
+                return Err(error);
             }
         }
     }
-    records
+    Ok(records)
 }
 
 fn parse_socket_line(
@@ -312,10 +666,6 @@ fn parse_socket_line(
         .get(9)
         .ok_or(SocketParseError::MissingField { field: "inode" })?;
 
-    if protocol == Protocol::Tcp && state_hex != TCP_LISTEN_STATE {
-        return Ok(None);
-    }
-
     let (addr_hex, port_hex) =
         local
             .split_once(':')
@@ -332,6 +682,9 @@ fn parse_socket_line(
         .map_err(|_| SocketParseError::InvalidInode {
             value: inode_hex.to_owned(),
         })?;
+    if protocol == Protocol::Tcp && state_hex != TCP_LISTEN_STATE {
+        return Ok(None);
+    }
     let state = match protocol {
         Protocol::Tcp => SocketState::Listen,
         Protocol::Udp => SocketState::Bound,
@@ -404,14 +757,25 @@ fn decode_ipv6_addr(hex: &str) -> Result<IpAddr, SocketParseError> {
     }
 }
 
+#[cfg(test)]
 fn collect_socket_owners(
     proc_root: &Path,
     target_inodes: &HashSet<u64>,
     max_process_ids: usize,
     max_fd_entries: usize,
 ) -> Result<HashMap<u64, Vec<u32>>, CollectorError> {
+    collect_socket_owners_detailed(proc_root, target_inodes, max_process_ids, max_fd_entries)
+        .map(|result| result.owners)
+}
+
+fn collect_socket_owners_detailed(
+    proc_root: &Path,
+    target_inodes: &HashSet<u64>,
+    max_process_ids: usize,
+    max_fd_entries: usize,
+) -> Result<OwnerScanResult, CollectorError> {
     if target_inodes.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(OwnerScanResult::default());
     }
 
     let pids = process_ids_with_limit(proc_root, max_process_ids).map_err(|source| {
@@ -429,23 +793,28 @@ fn collect_socket_owners(
     // others happily keep the port open. Correctness wins over the fd walks we'd
     // save. If this scan ever becomes the refresh bottleneck on a huge host, the
     // fix is netlink `sock_diag`, not a correctness-breaking early stop.
-    let mut owners = HashMap::with_capacity(target_inodes.len());
+    let mut result = OwnerScanResult {
+        owners: HashMap::with_capacity(target_inodes.len()),
+        losses: BTreeSet::new(),
+        omitted_loss_count: 0,
+        owner_edges: 0,
+    };
     let mut fd_entries_visited = 0;
     for pid in pids {
-        collect_pid_socket_owners(
+        scan_pid_socket_owners(
             proc_root,
             pid,
             target_inodes,
-            &mut owners,
+            &mut result,
             &mut fd_entries_visited,
             max_fd_entries,
         )?;
     }
-    Ok(owners)
+    Ok(result)
 }
 
 fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
-    process_ids_with_limit(proc_root, MAX_PROCESS_IDS)
+    process_ids_with_limit(proc_root, CANDIDATE_PROCESS_IDS_MAX)
 }
 
 fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::Result<Vec<u32>> {
@@ -472,6 +841,7 @@ fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::
     Ok(pids)
 }
 
+#[cfg(test)]
 fn collect_pid_socket_owners(
     proc_root: &Path,
     pid: u32,
@@ -480,11 +850,42 @@ fn collect_pid_socket_owners(
     fd_entries_visited: &mut usize,
     max_fd_entries: usize,
 ) -> Result<(), CollectorError> {
+    let owner_edges = owners.values().map(Vec::len).sum();
+    let mut result = OwnerScanResult {
+        owners: std::mem::take(owners),
+        losses: BTreeSet::new(),
+        omitted_loss_count: 0,
+        owner_edges,
+    };
+    let scan = scan_pid_socket_owners(
+        proc_root,
+        pid,
+        target_inodes,
+        &mut result,
+        fd_entries_visited,
+        max_fd_entries,
+    );
+    *owners = result.owners;
+    scan
+}
+
+fn scan_pid_socket_owners(
+    proc_root: &Path,
+    pid: u32,
+    target_inodes: &HashSet<u64>,
+    result: &mut OwnerScanResult,
+    fd_entries_visited: &mut usize,
+    max_fd_entries: usize,
+) -> Result<(), CollectorError> {
     let fd_dir = proc_root.join(pid.to_string()).join("fd");
     let fd_entries = match fs::read_dir(&fd_dir) {
         Ok(entries) => entries,
-        // Processes routinely vanish or deny fd access during a procfs scan.
-        Err(error) if process_vanished(&error) || error.kind() == ErrorKind::PermissionDenied => {
+        Err(error) if process_vanished(&error) => {
+            result.record_loss(OwnerScanLoss::Disappeared(pid));
+            return Ok(());
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            result.record_loss(OwnerScanLoss::PermissionDenied(pid));
             return Ok(());
         }
         Err(source) => {
@@ -503,12 +904,19 @@ fn collect_pid_socket_owners(
             ));
         }
         *fd_entries_visited += 1;
-        let Ok(entry) = entry else {
-            // The failed directory entry still consumed traversal budget.
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                result.record_loss(owner_scan_loss(pid, &error));
+                continue;
+            }
         };
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
+        let target = match fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(error) => {
+                result.record_loss(owner_scan_loss(pid, &error));
+                continue;
+            }
         };
         let Some(inode) = parse_socket_inode(&target) else {
             continue;
@@ -516,48 +924,52 @@ fn collect_pid_socket_owners(
         if !target_inodes.contains(&inode) {
             continue;
         }
-        let pids = owners.entry(inode).or_default();
-        if !pids.contains(&pid) {
+        let pids = result.owners.entry(inode).or_default();
+        if pids.last().copied() != Some(pid) {
+            if result.owner_edges >= OWNER_EDGES_MAX {
+                return Err(resource_cap_error(
+                    &fd_dir,
+                    format!("socket ownership exceeds {OWNER_EDGES_MAX} edge cap"),
+                ));
+            }
             pids.push(pid);
+            result.owner_edges += 1;
         }
     }
     Ok(())
 }
 
-fn expand_socket_records<F>(
-    records: &[SocketRecord],
-    owners: &HashMap<u64, Vec<u32>>,
-    proc_root: &Path,
-    max_entries: usize,
-    mut read_metadata: F,
-) -> Result<Vec<PortEntry>, CollectorError>
-where
-    F: FnMut(&Path, u32) -> ProcessMetadata,
-{
-    let mut entries = Vec::with_capacity(records.len().min(max_entries));
-    let mut metadata_by_pid = HashMap::new();
-    for record in records {
-        let pids = owners.get(&record.inode).filter(|pids| !pids.is_empty());
-        let emitted_for_record = pids.map_or(1, Vec::len);
-        if entries.len().saturating_add(emitted_for_record) > max_entries {
-            return Err(resource_cap_error(
-                proc_root,
-                format!("collected port rows exceed {max_entries} entry cap"),
-            ));
-        }
-
-        if let Some(pids) = pids {
-            for &pid in pids {
-                let metadata = metadata_by_pid
-                    .entry(pid)
-                    .or_insert_with(|| read_metadata(proc_root, pid));
-                entries.push(entry_from_record(record, Some(pid), Some(metadata)));
-            }
-        } else {
-            entries.push(entry_from_record(record, None, None));
-        }
+#[cfg(test)]
+fn append_sorted_owner(owners: &mut Vec<u32>, pid: u32) {
+    if owners.last().copied() != Some(pid) {
+        owners.push(pid);
     }
-    Ok(entries)
+}
+
+fn owner_scan_loss(pid: u32, error: &std::io::Error) -> OwnerScanLoss {
+    if error.kind() == ErrorKind::PermissionDenied {
+        OwnerScanLoss::PermissionDenied(pid)
+    } else if process_vanished(error) {
+        OwnerScanLoss::Disappeared(pid)
+    } else {
+        OwnerScanLoss::Unattributable(pid)
+    }
+}
+
+fn unverified_reason_for_io(error: &std::io::Error) -> UnverifiedOwnerReason {
+    if error.kind() == ErrorKind::PermissionDenied {
+        UnverifiedOwnerReason::PermissionDenied
+    } else if process_vanished(error) {
+        UnverifiedOwnerReason::Disappeared
+    } else {
+        UnverifiedOwnerReason::IdentityUnavailable
+    }
+}
+
+fn read_native_process_marker(path: &Path) -> std::io::Result<ProcessStartMarker> {
+    let ticks = read_process_start_time_ticks(path)?;
+    ProcessStartMarker::linux(ticks)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
 }
 
 fn resource_cap_error(path: &Path, message: String) -> CollectorError {
@@ -575,58 +987,65 @@ fn parse_socket_inode(target: &Path) -> Option<u64> {
     inode.parse::<u64>().ok()
 }
 
-fn entry_from_record(
-    record: &SocketRecord,
-    pid: Option<u32>,
-    metadata: Option<&ProcessMetadata>,
-) -> PortEntry {
-    let permission = if pid.is_none() || metadata.is_some_and(|metadata| metadata.partial) {
-        PermissionStatus::Partial
-    } else {
-        PermissionStatus::Full
-    };
-
-    PortEntry {
-        protocol: record.protocol,
-        local_addr: record.local_addr,
-        local_port: record.local_port,
-        state: record.state,
+#[cfg(test)]
+fn read_process_metadata_bounded(
+    proc_root: &Path,
+    pid: u32,
+    profile: MetadataProfile,
+    aggregate_remaining: usize,
+) -> ProcessMetadata {
+    read_process_metadata_bounded_with_parent_cache(
+        proc_root,
         pid,
-        process_name: metadata.and_then(|metadata| metadata.process_name.clone()),
-        executable_path: metadata.and_then(|metadata| metadata.executable_path.clone()),
-        command_line: metadata.and_then(|metadata| metadata.command_line.clone()),
-        parent_pid: metadata.and_then(|metadata| metadata.parent_pid),
-        parent_process_name: metadata.and_then(|metadata| metadata.parent_process_name.clone()),
-        child_pids: Vec::new(),
-        protected: false,
-        platform: Platform::Linux,
-        permission,
-    }
+        profile,
+        aggregate_remaining,
+        &mut HashMap::new(),
+    )
 }
 
-fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
+#[allow(
+    clippy::too_many_lines,
+    reason = "deterministic metadata field order and one aggregate budget stay together"
+)]
+fn read_process_metadata_bounded_with_parent_cache(
+    proc_root: &Path,
+    pid: u32,
+    profile: MetadataProfile,
+    aggregate_remaining: usize,
+    parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+) -> ProcessMetadata {
+    if profile == MetadataProfile::IdentityOnly {
+        return ProcessMetadata::default();
+    }
     let process_dir = proc_root.join(pid.to_string());
     let mut metadata = ProcessMetadata::default();
+    let mut remaining = aggregate_remaining;
 
-    match read_process_name(&process_dir) {
-        Ok(name) => {
-            metadata.process_name = name;
-            metadata.partial |= metadata.process_name.is_none();
-        }
-        Err(_) => metadata.partial = true,
+    let name_budget = remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES);
+    if let Ok(name) = read_bounded_lossy_text(&process_dir.join("comm"), name_budget)
+        .map(|text| trimmed_non_empty(&text))
+    {
+        metadata.process_name = name;
+        metadata.partial |= metadata.process_name.is_none();
+        remaining = remaining.saturating_sub(metadata.process_name.as_ref().map_or(0, String::len));
+    } else {
+        metadata.partial = true;
+        metadata.budget_omitted |= name_budget < crate::observation::PROCESS_NAME_MAX_BYTES;
     }
 
-    match read_cmdline(&process_dir.join("cmdline")) {
-        Ok((command_line, truncated)) => {
-            metadata.command_line = command_line;
-            metadata.partial |= truncated;
+    let path_budget = remaining.min(crate::observation::EXECUTABLE_PATH_MAX_BYTES);
+    match read_link_bounded(&process_dir.join("exe"), path_budget) {
+        Ok(path)
+            if path.as_os_str().as_encoded_bytes().len()
+                <= remaining.min(crate::observation::EXECUTABLE_PATH_MAX_BYTES) =>
+        {
+            remaining = remaining.saturating_sub(path.as_os_str().as_encoded_bytes().len());
+            metadata.executable_path = Some(path);
         }
-        Err(_) => metadata.partial = true,
-    }
-
-    match fs::read_link(process_dir.join("exe")) {
-        Ok(path) => metadata.executable_path = Some(path),
-        Err(_) => metadata.partial = true,
+        Err(_) | Ok(_) => {
+            metadata.partial = true;
+            metadata.budget_omitted |= path_budget < crate::observation::EXECUTABLE_PATH_MAX_BYTES;
+        }
     }
 
     match read_process_status(&process_dir.join("status")) {
@@ -636,12 +1055,49 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
         }) => {
             metadata.parent_pid = Some(parent_pid);
             if parent_pid != 0 {
-                match read_process_name(&proc_root.join(parent_pid.to_string())) {
-                    Ok(name) => {
-                        metadata.parent_process_name = name;
-                        metadata.partial |= metadata.parent_process_name.is_none();
+                let parent_name_budget = remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES);
+                let parent_marker = read_native_process_marker(
+                    &proc_root.join(parent_pid.to_string()).join("stat"),
+                );
+                let name = parent_marker.ok().and_then(|start_marker| {
+                    let identity = ProcessIdentity {
+                        pid: parent_pid,
+                        start_marker,
+                    };
+                    if let Some(name) = parent_names.get(&identity) {
+                        return name
+                            .as_ref()
+                            .filter(|name| name.len() <= parent_name_budget)
+                            .cloned();
                     }
-                    Err(_) => metadata.partial = true,
+                    let name = (parent_name_budget != 0)
+                        .then(|| {
+                            read_bounded_lossy_text(
+                                &proc_root.join(parent_pid.to_string()).join("comm"),
+                                parent_name_budget,
+                            )
+                            .ok()
+                            .and_then(|text| trimmed_non_empty(&text))
+                        })
+                        .flatten();
+                    let marker_after = read_native_process_marker(
+                        &proc_root.join(parent_pid.to_string()).join("stat"),
+                    );
+                    let verified = matches!(marker_after, Ok(after) if after == start_marker)
+                        .then_some(name)
+                        .flatten();
+                    parent_names.insert(identity, verified.clone());
+                    verified
+                });
+                if let Some(name) = name {
+                    metadata.parent_process_name = Some(name);
+                    remaining = remaining.saturating_sub(
+                        metadata.parent_process_name.as_ref().map_or(0, String::len),
+                    );
+                } else {
+                    metadata.partial = true;
+                    metadata.budget_omitted |=
+                        parent_name_budget < crate::observation::PROCESS_NAME_MAX_BYTES;
                 }
             }
         }
@@ -651,7 +1107,54 @@ fn read_process_metadata(proc_root: &Path, pid: u32) -> ProcessMetadata {
         | Err(_) => metadata.partial = true,
     }
 
+    if profile == MetadataProfile::LegacyList {
+        let command_line_budget = remaining.min(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES);
+        if let Ok((command_line, truncated)) =
+            read_cmdline_bounded(&process_dir.join("cmdline"), command_line_budget)
+        {
+            metadata.command_line = command_line;
+            metadata.partial |= truncated;
+            metadata.budget_omitted |= truncated;
+        } else {
+            metadata.partial = true;
+            metadata.budget_omitted |=
+                command_line_budget < crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
+        }
+    }
+
     metadata
+}
+
+fn read_link_bounded(path: &Path, max_bytes: usize) -> std::io::Result<PathBuf> {
+    if max_bytes == 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "symlink target has no remaining byte budget",
+        ));
+    }
+    let reported_length = fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.len());
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut bytes = vec![0_u8; max_bytes];
+    let written = unsafe {
+        // SAFETY: `path` is NUL terminated, `bytes` is writable for its length
+        // bytes, and readlink does not retain either pointer.
+        libc::readlink(path.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len())
+    };
+    if written < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let written = usize::try_from(written).expect("non-negative readlink size fits usize");
+    if written == max_bytes && reported_length != u64::try_from(max_bytes).ok() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("symlink target exceeds {max_bytes} byte limit"),
+        ));
+    }
+    bytes.truncate(written);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
 fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
@@ -659,7 +1162,9 @@ fn collect_process_context_from(proc_root: &Path, pid: u32) -> ProcessContext {
     let owner_uid = read_process_status(&process_dir.join("status"))
         .ok()
         .and_then(|status| status.owner_uid);
-    let process_start_time_marker = read_process_start_time_ticks(&process_dir.join("stat")).ok();
+    let process_start_time_marker = read_process_start_time_ticks(&process_dir.join("stat"))
+        .ok()
+        .and_then(|ticks| ProcessStartMarker::linux(ticks).ok());
     ProcessContext {
         owner_uid,
         process_start_time_marker,
@@ -784,11 +1289,11 @@ impl TreeProcessOps for LinuxTreeOps {
         result
     }
 
-    fn cont(&mut self, pid: u32) {
+    fn cont(&mut self, pid: u32) -> TreeSignalResult {
         if let Some(handle) = self.delivery_handles.get(&pid) {
-            let _ = tree_cont_handle(handle);
+            tree_cont_handle(handle)
         } else {
-            tree_cont(pid);
+            tree_cont(pid)
         }
     }
 
@@ -798,7 +1303,7 @@ impl TreeProcessOps for LinuxTreeOps {
     fn prepare_delivery(
         &mut self,
         pid: u32,
-        _verified_start_marker: Option<u64>,
+        _verified_start_marker: Option<ProcessStartMarker>,
     ) -> TreeSignalResult {
         if self.delivery_handles.contains_key(&pid) {
             return TreeSignalResult::Delivered;
@@ -813,11 +1318,65 @@ impl TreeProcessOps for LinuxTreeOps {
         }
     }
 
+    fn fresh_process_evidence(
+        &mut self,
+        pid: u32,
+    ) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+        read_fresh_process_evidence(&self.proc_root, pid)
+    }
+
     fn deliver(&mut self, pid: u32, mode: crate::process::KillMode) -> TreeSignalResult {
         let Some(handle) = self.delivery_handles.get(&pid) else {
             return TreeSignalResult::Denied;
         };
         tree_deliver_handle(handle, mode)
+    }
+}
+
+fn read_fresh_process_evidence(
+    proc_root: &Path,
+    pid: u32,
+) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+    let process_dir = proc_root.join(pid.to_string());
+    let start_marker = read_process_start_time_ticks(&process_dir.join("stat"))
+        .map_err(|error| process_evidence_io_error(pid, &error))?;
+    let name = read_bounded_text(
+        &process_dir.join("comm"),
+        crate::observation::PROTECTION_NAME_MAX_BYTES,
+    )
+    .map_err(|error| {
+        if error.kind() == ErrorKind::InvalidData {
+            ProcessEvidenceError::NameOversized {
+                pid,
+                bytes: crate::observation::PROTECTION_NAME_MAX_BYTES + 1,
+            }
+        } else {
+            process_evidence_io_error(pid, &error)
+        }
+    })?
+    .trim_end_matches(['\n', '\r'])
+    .to_owned();
+    if name.is_empty() {
+        return Err(ProcessEvidenceError::NameMissing { pid });
+    }
+    let marker_after = read_process_start_time_ticks(&process_dir.join("stat"))
+        .map_err(|error| process_evidence_io_error(pid, &error))?;
+    if marker_after != start_marker {
+        return Err(ProcessEvidenceError::IdentityChanged { pid });
+    }
+    Ok(FreshProcessEvidence {
+        pid,
+        start_marker: ProcessStartMarker::linux(marker_after)
+            .map_err(|_| ProcessEvidenceError::IdentityChanged { pid })?,
+        name,
+    })
+}
+
+fn process_evidence_io_error(pid: u32, error: &std::io::Error) -> ProcessEvidenceError {
+    if error.kind() == ErrorKind::PermissionDenied {
+        ProcessEvidenceError::PermissionDenied { pid }
+    } else {
+        ProcessEvidenceError::Missing { pid }
     }
 }
 
@@ -863,7 +1422,7 @@ fn collect_tree_process_infos(proc_root: &Path) -> Result<Vec<TreeProcessInfo>, 
 
 /// The two `stat` fields the tree snapshot carries, read in one pass.
 struct TreeStat {
-    start_time_marker: u64,
+    start_time_marker: ProcessStartMarker,
     process_group: Option<u32>,
 }
 
@@ -911,8 +1470,12 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
     // hole in the member set, exactly like a missing start marker would be a
     // hole in identity verification. Group 0 is the kernel's own group — never
     // a valid target — and maps to "no targetable group" rather than an error.
-    let start_time_marker =
-        parse_process_start_time_ticks(&text).map_err(|source| CollectorError::Read {
+    let start_time_marker = parse_process_start_time_ticks(&text)
+        .and_then(|ticks| {
+            ProcessStartMarker::linux(ticks)
+                .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
+        })
+        .map_err(|source| CollectorError::Read {
             path: path.to_path_buf(),
             source,
         })?;
@@ -963,7 +1526,10 @@ fn process_ancestor_pids_from(proc_root: &Path, pid: u32) -> HashSet<u32> {
 }
 
 fn read_process_name(process_dir: &Path) -> std::io::Result<Option<String>> {
-    fs::read_to_string(process_dir.join("comm")).map(|text| trimmed_non_empty(&text))
+    let mut text = read_bounded_lossy_text(&process_dir.join("comm"), PROCESS_NAME_MAX_BYTES)?;
+    let trimmed_len = text.trim_end_matches(['\n', '\r']).len();
+    text.truncate(trimmed_len);
+    Ok((!text.is_empty()).then_some(text))
 }
 
 fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
@@ -1027,30 +1593,72 @@ fn trimmed_non_empty(text: &str) -> Option<String> {
 }
 
 fn read_cmdline(path: &Path) -> std::io::Result<(Option<String>, bool)> {
-    let file = File::open(path)?;
-    let mut reader = file.take(MAX_CMDLINE_READ_BYTES);
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-
-    let truncated = bytes.len() > MAX_CMDLINE_BYTES;
-    if truncated {
-        bytes.truncate(MAX_CMDLINE_BYTES);
-    }
-
-    Ok((decode_cmdline(&bytes), truncated))
+    read_cmdline_bounded(path, MAX_CMDLINE_BYTES)
 }
 
-fn decode_cmdline(bytes: &[u8]) -> Option<String> {
-    let parts: Vec<String> = bytes
+fn read_cmdline_bounded(path: &Path, max_bytes: usize) -> std::io::Result<(Option<String>, bool)> {
+    let file = File::open(path)?;
+    let read_limit = u64::try_from(max_bytes)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "cmdline limit is too large"))?
+        .checked_add(1)
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidInput, "cmdline limit is too large")
+        })?;
+    let mut reader = file.take(read_limit);
+    let capacity = max_bytes.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "cmdline limit is too large")
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    reader.read_to_end(&mut bytes)?;
+
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        return Ok((None, true));
+    }
+
+    Ok(decode_cmdline(&bytes, max_bytes))
+}
+
+fn decode_cmdline(bytes: &[u8], max_bytes: usize) -> (Option<String>, bool) {
+    let mut output_len = 0usize;
+    let mut argument_count = 0usize;
+    for argument in bytes
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
+    {
+        let Some(argument_len) = crate::observation::lossy_utf8_len(argument) else {
+            return (None, true);
+        };
+        let separator_len = usize::from(argument_count != 0);
+        let Some(next_len) = output_len
+            .checked_add(separator_len)
+            .and_then(|length| length.checked_add(argument_len))
+        else {
+            return (None, true);
+        };
+        if next_len > max_bytes {
+            return (None, true);
+        }
+        output_len = next_len;
+        argument_count += 1;
     }
+
+    if argument_count == 0 {
+        return (None, false);
+    }
+
+    let mut output = String::with_capacity(output_len);
+    for argument in bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        crate::observation::push_utf8_lossy(&mut output, argument);
+    }
+    debug_assert_eq!(output.len(), output_len);
+    (Some(output), false)
 }
 
 #[cfg(test)]
@@ -1062,18 +1670,78 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AddressFamily, CollectionLimits, LinuxCollector, MAX_CHILD_PROCESSES, MAX_FD_ENTRIES,
-        MAX_PORT_ENTRIES, MAX_PROCESS_IDS, MAX_STATUS_BYTES, ProcessMetadata, SocketParseError,
-        SocketRecord, collect_child_processes_from, collect_pid_socket_owners,
+        AddressFamily, CollectionLimits, LinuxCollector, MAX_CHILD_PROCESSES, MAX_STATUS_BYTES,
+        OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord, append_sorted_owner,
+        bounded_scope_identifier, collect_child_processes_from, collect_pid_socket_owners,
         collect_process_context_from, collect_related_process_hints_from, collect_socket_owners,
-        collect_socket_records, collect_tree_process_infos, decode_cmdline, entry_from_record,
-        expand_socket_records, parse_process_group_id, parse_process_start_time_ticks,
+        collect_socket_records, collect_tree_process_infos, decode_cmdline,
+        native_pass_from_records, parse_process_group_id, parse_process_start_time_ticks,
         parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
-        read_bounded_text, read_process_status,
+        read_bounded_text, read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
+        read_process_metadata_bounded, read_process_status,
     };
-    use crate::collector::Collector;
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
+    use crate::observation::{
+        CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EvidenceGapCode, EvidenceImpact,
+        FILE_DESCRIPTOR_ENTRIES_MAX, OwnerCompleteness, PROCESS_NAME_MAX_BYTES,
+        PlatformSocketToken, SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness,
+        UnverifiedOwnerReason,
+    };
 
+    #[test]
+    fn scope_identifier_exact_max_is_retained_and_max_plus_one_is_omitted() {
+        let exact = PathBuf::from("x".repeat(SCOPE_IDENTIFIER_MAX_BYTES));
+        let over = PathBuf::from("x".repeat(SCOPE_IDENTIFIER_MAX_BYTES + 1));
+
+        assert_eq!(bounded_scope_identifier(&exact), exact.to_str());
+        assert_eq!(bounded_scope_identifier(&over), None);
+    }
+
+    #[test]
+    fn collector_reports_one_scope_gap_for_oversized_namespace_identifier() {
+        let proc_root = temp_proc_root("oversized-scope-identifier");
+        write_socket_table(&proc_root, "net/tcp", &[]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        fs::create_dir_all(proc_root.join("self/ns")).expect("test namespace directory");
+        let namespace = proc_root.join("self/ns/net");
+        let exact = "x".repeat(SCOPE_IDENTIFIER_MAX_BYTES);
+        std::os::unix::fs::symlink(&exact, &namespace).expect("exact namespace identifier");
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let exact_snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("exact scope identifier collects");
+        assert_eq!(
+            exact_snapshot.scope.identifier.as_deref(),
+            Some(exact.as_str())
+        );
+
+        fs::remove_file(&namespace).expect("replace namespace identifier");
+        std::os::unix::fs::symlink("x".repeat(SCOPE_IDENTIFIER_MAX_BYTES + 1), &namespace)
+            .expect("oversized namespace identifier");
+        let oversized_snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("oversized scope identifier remains a partial snapshot");
+
+        assert_eq!(oversized_snapshot.scope.identifier, None);
+        assert_eq!(
+            oversized_snapshot.completeness,
+            SnapshotCompleteness::Partial
+        );
+        assert_eq!(oversized_snapshot.omitted_evidence_gap_count, 0);
+        assert_eq!(oversized_snapshot.evidence_gaps.len(), 1);
+        let gap = &oversized_snapshot.evidence_gaps[0];
+        assert_eq!(gap.impact, EvidenceImpact::Scope);
+        assert_eq!(gap.code, EvidenceGapCode::NativeFieldUnavailable);
+        assert_eq!(gap.endpoint, None);
+        assert_eq!(gap.pid, None);
+
+        fs::remove_dir_all(proc_root).expect("test proc root cleanup");
+    }
     const HEADER: &str =
         "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
 
@@ -1083,10 +1751,28 @@ mod tests {
         )
     }
 
+    #[test]
+    fn shared_socket_owner_dedup_scales_with_sorted_owner_count() {
+        let mut owners = Vec::new();
+        for pid in 1..=32_768 {
+            append_sorted_owner(&mut owners, pid);
+            append_sorted_owner(&mut owners, pid);
+        }
+
+        assert_eq!(owners.len(), 32_768);
+        assert_eq!(owners.first(), Some(&1));
+        assert_eq!(owners.last(), Some(&32_768));
+    }
+
     fn temp_proc_root(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("kickoutchi-linux-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock is after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "kickoutchi-linux-{name}-{}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(path.join("net")).expect("test proc net directory must be created");
         path
     }
@@ -1118,6 +1804,47 @@ mod tests {
         .expect("test stat must be written");
         std::os::unix::fs::symlink(format!("/usr/bin/{name}"), process_dir.join("exe"))
             .expect("test exe symlink must be created");
+    }
+
+    #[test]
+    fn fresh_name_reader_accepts_exact_4k_and_refuses_empty_and_max_plus_one() {
+        let proc_root = temp_proc_root("fresh-name-boundaries");
+        let pid = 42;
+        write_process(&proc_root, pid, "worker", 1);
+        let comm = proc_root.join(pid.to_string()).join("comm");
+
+        fs::write(
+            &comm,
+            "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES),
+        )
+        .expect("exact-max name");
+        let exact = read_fresh_process_evidence(&proc_root, pid).expect("exact 4 KiB name");
+        assert_eq!(
+            exact.name.len(),
+            crate::observation::PROTECTION_NAME_MAX_BYTES
+        );
+
+        fs::write(&comm, "").expect("empty name");
+        assert_eq!(
+            read_fresh_process_evidence(&proc_root, pid),
+            Err(crate::process_evidence::ProcessEvidenceError::NameMissing { pid })
+        );
+
+        fs::write(
+            &comm,
+            "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES + 1),
+        )
+        .expect("oversized name");
+        assert_eq!(
+            read_fresh_process_evidence(&proc_root, pid),
+            Err(
+                crate::process_evidence::ProcessEvidenceError::NameOversized {
+                    pid,
+                    bytes: crate::observation::PROTECTION_NAME_MAX_BYTES + 1
+                }
+            )
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root cleanup");
     }
 
     fn stat_text(pid: u32, name: &str, parent_pid: u32, start_time_ticks: u64) -> String {
@@ -1265,16 +1992,38 @@ mod tests {
     }
 
     #[test]
-    fn table_parser_keeps_valid_rows_and_skips_malformed_rows() {
+    fn table_parser_rejects_a_pass_containing_a_malformed_row() {
         let text = format!(
             "{HEADER}\n{}\nnot enough fields\n{}\n",
             row("0100007F:0BB8", "0A", 1),
             row("0100007F:1770", "01", 2),
         );
-        let records = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4);
+        let error = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4)
+            .expect_err("an authoritative table with a malformed row must fail");
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].local_port, 3000);
+        assert!(matches!(error, SocketParseError::MissingField { .. }));
+    }
+
+    #[test]
+    fn collector_fails_a_pass_with_a_malformed_authoritative_socket_row() {
+        let proc_root = temp_proc_root("malformed-authoritative-row");
+        let text = format!(
+            "{HEADER}\n{}\nnot enough fields\n",
+            row("0100007F:0BB8", "0A", 1),
+        );
+        fs::write(proc_root.join("net/tcp"), text).expect("test TCP table must be written");
+        write_socket_table(&proc_root, "net/udp", &[]);
+
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect_err("malformed authoritative rows must fail the pass");
+
+        assert!(error.to_string().contains("net/tcp"), "{error}");
+        assert!(error.to_string().contains("missing field"), "{error}");
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
     #[test]
@@ -1292,6 +2041,26 @@ mod tests {
     }
 
     #[test]
+    fn executable_symlink_reader_enforces_budget_before_read_allocation() {
+        let root = temp_proc_root("bounded-readlink");
+        fs::create_dir_all(&root).expect("fixture root");
+        let link = root.join("exe");
+        std::os::unix::fs::symlink("12345678", &link).expect("fixture symlink");
+
+        assert_eq!(
+            read_link_bounded(&link, 8).expect("exact byte maximum is accepted"),
+            PathBuf::from("12345678"),
+        );
+        assert_eq!(
+            read_link_bounded(&link, 7)
+                .expect_err("maximum plus one is rejected")
+                .kind(),
+            ErrorKind::InvalidData,
+        );
+        fs::remove_dir_all(root).expect("remove fixture root");
+    }
+
+    #[test]
     fn socket_inode_is_extracted_from_fd_symlink_targets() {
         assert_eq!(
             parse_socket_inode(Path::new("socket:[12345]")),
@@ -1302,13 +2071,99 @@ mod tests {
     }
 
     #[test]
-    fn command_line_decoding_joins_nul_separated_arguments() {
+    fn command_line_decoding_accepts_exact_output_max_and_counts_separators() {
         assert_eq!(
-            decode_cmdline(b"python3\0-m\0http.server\x003000\0"),
-            Some("python3 -m http.server 3000".to_owned())
+            decode_cmdline(b"python3\0-m\0http.server\x003000\0", 27),
+            (Some("python3 -m http.server 3000".to_owned()), false)
         );
-        assert_eq!(decode_cmdline(b""), None);
-        assert_eq!(decode_cmdline(b"\0\0"), None);
+        assert_eq!(
+            decode_cmdline(b"ab\0cd\0", 5),
+            (Some("ab cd".to_owned()), false)
+        );
+        assert_eq!(decode_cmdline(b"ab\0cd\0", 4), (None, true));
+    }
+
+    #[test]
+    fn command_line_decoding_handles_empty_arguments_without_extra_spaces() {
+        assert_eq!(decode_cmdline(b"", 0), (None, false));
+        assert_eq!(decode_cmdline(b"\0\0", 0), (None, false));
+        assert_eq!(
+            decode_cmdline(b"\0alpha\0\0beta\0", 10),
+            (Some("alpha beta".to_owned()), false)
+        );
+    }
+
+    #[test]
+    fn command_line_decoding_bounds_lossy_utf8_expansion() {
+        assert_eq!(
+            decode_cmdline(b"a\xff\0b", 6),
+            (Some("a� b".to_owned()), false)
+        );
+        assert_eq!(decode_cmdline(b"a\xff\0b", 5), (None, true));
+        assert_eq!(decode_cmdline(b"\xff", 2), (None, true));
+    }
+
+    #[test]
+    fn command_line_reader_rejects_lossy_output_over_max_when_raw_bytes_fit() {
+        let proc_root = temp_proc_root("lossy-command-line-boundary");
+        let path = proc_root.join("cmdline");
+        fs::write(&path, [0xff]).expect("invalid UTF-8 command fixture");
+
+        assert_eq!(
+            read_cmdline_bounded(&path, 3).expect("exact decoded maximum reads"),
+            (Some("�".to_owned()), false)
+        );
+        assert_eq!(
+            read_cmdline_bounded(&path, 2).expect("decoded overage is typed"),
+            (None, true)
+        );
+
+        fs::remove_dir_all(proc_root).expect("test proc root cleanup");
+    }
+
+    #[test]
+    fn legacy_command_line_retains_exact_one_mib_and_rejects_max_plus_one() {
+        let proc_root = temp_proc_root("legacy-command-line-boundary");
+        let pid = 42;
+        write_process(&proc_root, pid, "worker", 0);
+        let path = proc_root.join(pid.to_string()).join("cmdline");
+        let limit = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
+        assert_eq!(limit, 1024 * 1024);
+
+        fs::write(&path, vec![b'x'; limit]).expect("exact-limit command fixture");
+        let (command, partial) = read_cmdline_bounded(&path, limit).expect("exact limit reads");
+        assert_eq!(command.as_deref().map(str::len), Some(limit));
+        assert!(!partial);
+
+        fs::write(&path, vec![b'x'; limit + 1]).expect("oversized command fixture");
+        let (command, partial) = read_cmdline_bounded(&path, limit).expect("over limit is typed");
+        assert_eq!(command, None);
+        assert!(partial);
+
+        let legacy = read_process_metadata_bounded(
+            &proc_root,
+            pid,
+            crate::observation::MetadataProfile::LegacyList,
+            usize::MAX,
+        );
+        assert!(legacy.command_line.is_none());
+        assert!(legacy.partial);
+        assert!(
+            legacy.budget_omitted,
+            "oversize must produce an evidence gap"
+        );
+
+        let display = read_process_metadata_bounded(
+            &proc_root,
+            pid,
+            crate::observation::MetadataProfile::Display,
+            usize::MAX,
+        );
+        assert!(
+            display.command_line.is_none(),
+            "Display skips command lines"
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root cleanup");
     }
 
     #[test]
@@ -1446,46 +2301,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_process_metadata_produces_partial_rows_without_dropping_the_port() {
-        let record = SocketRecord {
-            protocol: Protocol::Tcp,
-            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            local_port: 3000,
-            state: SocketState::Listen,
-            inode: 1,
-        };
-
-        let entry = entry_from_record(
-            &record,
-            Some(1234),
-            Some(&ProcessMetadata {
-                partial: true,
-                ..ProcessMetadata::default()
-            }),
-        );
-
-        assert_eq!(entry.pid, Some(1234));
-        assert_eq!(entry.process_name, None);
-        assert_eq!(entry.executable_path, None);
-        assert_eq!(entry.command_line, None);
-        assert_eq!(entry.permission, PermissionStatus::Partial);
-    }
-
-    #[test]
     fn linux_collection_enriches_rows_with_parent_metadata() {
         let proc_root = temp_proc_root("parent-metadata");
         write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
         write_socket_table(&proc_root, "net/udp", &[]);
         write_process(&proc_root, 1234, "node", 1);
-        fs::create_dir_all(proc_root.join("1")).expect("test parent process directory must exist");
-        fs::write(proc_root.join("1").join("comm"), "systemd\n")
-            .expect("test parent process name must be written");
+        write_process(&proc_root, 1, "systemd", 0);
         std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234").join("fd").join("0"))
             .expect("test socket symlink must be created");
 
-        let entries = LinuxCollector::with_proc_root(proc_root.clone())
-            .collect()
-            .expect("test proc root must collect");
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect("test proc root must collect");
+        let entries = crate::observation::project_legacy(&snapshot).expect("legacy projection");
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].pid, Some(1234));
@@ -1494,6 +2324,47 @@ mod tests {
         assert_eq!(entries[0].parent_process_name.as_deref(), Some("systemd"));
         assert_eq!(entries[0].permission, PermissionStatus::Full);
         assert!(entries[0].is_system_process());
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn retried_enrichment_does_not_reuse_parent_names_from_discarded_attempts() {
+        let proc_root = temp_proc_root("parent-metadata-retry");
+        write_process(&proc_root, 1234, "child", 1);
+        write_process(&proc_root, 1, "parent-old", 0);
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let discarded = collector
+            .read_native_processes(
+                &[1234],
+                crate::observation::MetadataProfile::Display,
+                crate::observation::OPTIONAL_METADATA_MAX_BYTES,
+            )
+            .expect("discarded enrichment pass reads");
+        fs::write(proc_root.join("1/comm"), "parent-new\n")
+            .expect("parent name changes without changing its start marker");
+        let accepted = collector
+            .read_native_processes(
+                &[1234],
+                crate::observation::MetadataProfile::Display,
+                crate::observation::OPTIONAL_METADATA_MAX_BYTES,
+            )
+            .expect("accepted retry reads");
+
+        let discarded_parent_name = match &discarded[&1234] {
+            crate::observation::ProcessRead::Verified { observation, .. } => {
+                observation.parent_process_name.clone()
+            }
+            crate::observation::ProcessRead::Unverified(_) => None,
+        };
+        let accepted_parent_name = match &accepted[&1234] {
+            crate::observation::ProcessRead::Verified { observation, .. } => {
+                observation.parent_process_name.clone()
+            }
+            crate::observation::ProcessRead::Unverified(_) => None,
+        };
+        assert_eq!(discarded_parent_name.as_deref(), Some("parent-old"));
+        assert_eq!(accepted_parent_name.as_deref(), Some("parent-new"));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -1509,13 +2380,192 @@ mod tests {
         std::os::unix::fs::symlink("socket:[77]", proc_root.join("1235").join("fd").join("0"))
             .expect("child socket symlink must be created");
 
-        let entries = LinuxCollector::with_proc_root(proc_root.clone())
-            .collect()
-            .expect("test proc root must collect");
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect("test proc root must collect");
+        let entries = crate::observation::project_legacy(&snapshot).expect("legacy projection");
         let pids = entries.iter().map(|entry| entry.pid).collect::<Vec<_>>();
 
         assert_eq!(pids, vec![Some(1234), Some(1235)]);
         assert!(entries.iter().all(|entry| entry.local_port == 3000));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn native_snapshot_retains_inode_and_complete_empty_owner_set() {
+        let proc_root = temp_proc_root("native-inode-ownerless");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("native ownerless collection succeeds");
+
+        assert_eq!(snapshot.sockets.len(), 1);
+        assert_eq!(
+            snapshot.sockets[0].socket_token,
+            PlatformSocketToken::linux_inode(77)
+        );
+        assert!(snapshot.sockets[0].owners.is_empty());
+        assert_eq!(snapshot.owner_completeness, OwnerCompleteness::Complete);
+        assert_eq!(
+            snapshot.sockets[0].owner_completeness,
+            OwnerCompleteness::Complete
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn native_snapshot_retains_shared_socket_owners() {
+        let proc_root = temp_proc_root("native-shared-socket");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        for pid in [1234, 1235] {
+            write_process(&proc_root, pid, "worker", 1);
+            std::os::unix::fs::symlink("socket:[77]", proc_root.join(pid.to_string()).join("fd/0"))
+                .expect("shared socket symlink must be created");
+        }
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("native shared ownership collection succeeds");
+        let owner_pids = snapshot.sockets[0]
+            .owners
+            .iter()
+            .map(|owner| match owner {
+                crate::observation::OwnerObservation::Verified(identity) => identity.pid,
+                crate::observation::OwnerObservation::UnverifiedPid { pid, .. } => *pid,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(owner_pids, vec![1234, 1235]);
+        assert_eq!(snapshot.processes.len(), 2);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn unattributable_owner_scan_denial_is_global_not_socket_local() {
+        let record = SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            state: SocketState::Listen,
+            inode: 77,
+        };
+        let pass = native_pass_from_records(
+            &[record],
+            OwnerScanResult {
+                owners: HashMap::new(),
+                losses: [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
+                omitted_loss_count: 0,
+                owner_edges: 0,
+            },
+        )
+        .expect("denied scan is retained as partial evidence");
+
+        assert_eq!(
+            pass.owners.global_completeness,
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap()
+        );
+        assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
+        assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
+        assert_eq!(
+            pass.owners.local_completeness,
+            [OwnerCompleteness::Complete]
+        );
+    }
+
+    #[test]
+    fn global_scan_denial_does_not_reduce_verified_endpoint_completeness() {
+        let record = SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            state: SocketState::Listen,
+            inode: 77,
+        };
+        let pass = native_pass_from_records(
+            &[record],
+            OwnerScanResult {
+                owners: HashMap::from([(77, vec![1234])]),
+                losses: [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
+                omitted_loss_count: 0,
+                owner_edges: 1,
+            },
+        )
+        .expect("proven ownership remains usable");
+
+        assert!(!pass.owners.global_completeness.is_complete());
+        assert_eq!(
+            pass.owners.local_completeness,
+            [OwnerCompleteness::Complete]
+        );
+    }
+
+    #[test]
+    fn owner_scan_losses_are_bounded_at_the_source() {
+        let mut scan = OwnerScanResult::default();
+        for pid in 1..=u32::try_from(crate::observation::EVIDENCE_GAPS_MAX).unwrap() {
+            scan.record_loss(OwnerScanLoss::Disappeared(pid));
+        }
+        assert_eq!(scan.losses.len(), crate::observation::EVIDENCE_GAPS_MAX);
+        assert_eq!(scan.omitted_loss_count, 0);
+
+        scan.record_loss(OwnerScanLoss::Disappeared(u32::MAX));
+        assert_eq!(scan.losses.len(), crate::observation::EVIDENCE_GAPS_MAX);
+        assert_eq!(scan.omitted_loss_count, 1);
+
+        let pass = native_pass_from_records(&[], scan).expect("bounded losses remain observable");
+        assert_eq!(
+            pass.owners.evidence_gaps.len(),
+            crate::observation::EVIDENCE_GAPS_MAX
+        );
+        assert_eq!(pass.owners.omitted_evidence_gap_count, 1);
+    }
+
+    #[test]
+    fn vanished_pid_identity_is_reported_after_an_owner_edge_is_known() {
+        let proc_root = temp_proc_root("vanished-native-identity");
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        assert_eq!(
+            collector
+                .read_native_process(
+                    42,
+                    crate::observation::MetadataProfile::Display,
+                    crate::observation::OPTIONAL_METADATA_MAX_BYTES,
+                )
+                .expect("a vanished stat is ordinary unavailable identity"),
+            crate::observation::ProcessRead::Unverified(UnverifiedOwnerReason::Disappeared)
+        );
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn malformed_identity_stat_fails_the_collection_attempt() {
+        let proc_root = temp_proc_root("malformed-native-identity");
+        write_process(&proc_root, 42, "worker", 1);
+        fs::write(proc_root.join("42/stat"), "malformed stat\n")
+            .expect("malformed stat fixture must be written");
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let error = collector
+            .read_native_process(
+                42,
+                crate::observation::MetadataProfile::Display,
+                crate::observation::OPTIONAL_METADATA_MAX_BYTES,
+            )
+            .expect_err("malformed identity-critical stat must fail");
+
+        assert!(error.to_string().contains("42/stat"), "{error}");
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -1530,7 +2580,10 @@ mod tests {
         let context = collect_process_context_from(&proc_root, 100);
 
         assert_eq!(context.owner_uid, Some(1000));
-        assert_eq!(context.process_start_time_marker, Some(1000));
+        assert_eq!(
+            context.process_start_time_marker,
+            crate::observation::ProcessStartMarker::linux(1000).ok()
+        );
         let children: Vec<(u32, Option<&str>)> = context
             .children
             .children
@@ -1542,6 +2595,45 @@ mod tests {
             vec![(101, Some("worker-a")), (102, Some("worker-b"))]
         );
         assert!(!context.children.truncated);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn process_context_and_child_collection_bound_optional_process_names() {
+        let proc_root = temp_proc_root("context-child-name-boundary");
+        write_process(&proc_root, 100, "parent", 1);
+        write_process(&proc_root, 101, "worker", 100);
+        let comm = proc_root.join("101/comm");
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES]).expect("exact-max child name");
+        let exact = collect_process_context_from(&proc_root, 100);
+        assert_eq!(exact.children.children.len(), 1);
+        assert_eq!(
+            exact.children.children[0]
+                .process_name
+                .as_deref()
+                .map(str::len),
+            Some(PROCESS_NAME_MAX_BYTES)
+        );
+        let exact_children = collect_child_processes_from(&proc_root, 100);
+        assert_eq!(
+            exact_children.children[0]
+                .process_name
+                .as_deref()
+                .map(str::len),
+            Some(PROCESS_NAME_MAX_BYTES)
+        );
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES + 1]).expect("oversized child name");
+        let oversized = collect_process_context_from(&proc_root, 100);
+        assert_eq!(oversized.children.children.len(), 1);
+        assert_eq!(oversized.children.children[0].pid, 101);
+        assert_eq!(oversized.children.children[0].process_name, None);
+        let oversized_children = collect_child_processes_from(&proc_root, 100);
+        assert_eq!(oversized_children.children.len(), 1);
+        assert_eq!(oversized_children.children[0].pid, 101);
+        assert_eq!(oversized_children.children[0].process_name, None);
+
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -1569,9 +2661,60 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(tree.len(), 3);
-        assert!(tuples.contains(&(100, Some(1), Some("root"), Some(1000))));
-        assert!(tuples.contains(&(101, Some(100), Some("child"), Some(1010))));
-        assert!(tuples.contains(&(102, Some(101), Some("grandchild"), Some(1020))));
+        assert!(tuples.contains(&(
+            100,
+            Some(1),
+            Some("root"),
+            crate::observation::ProcessStartMarker::linux(1000).ok()
+        )));
+        assert!(tuples.contains(&(
+            101,
+            Some(100),
+            Some("child"),
+            crate::observation::ProcessStartMarker::linux(1010).ok()
+        )));
+        assert!(tuples.contains(&(
+            102,
+            Some(101),
+            Some("grandchild"),
+            crate::observation::ProcessStartMarker::linux(1020).ok()
+        )));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn tree_snapshot_accepts_exact_max_name_and_rejects_max_plus_one() {
+        let proc_root = temp_proc_root("tree-name-boundary");
+        write_process(&proc_root, 100, "worker", 1);
+        let comm = proc_root.join("100/comm");
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES]).expect("exact-max tree name");
+        let exact =
+            collect_tree_process_infos(&proc_root).expect("exact-max tree name must collect");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(
+            exact[0].process_name.as_deref().map(str::len),
+            Some(PROCESS_NAME_MAX_BYTES)
+        );
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES + 1]).expect("oversized tree name");
+        let error = collect_tree_process_infos(&proc_root)
+            .expect_err("oversized live tree name must fail closed");
+        assert!(error.to_string().contains("100/comm"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {PROCESS_NAME_MAX_BYTES} byte read limit")),
+            "{error}"
+        );
+
+        fs::remove_file(&comm).expect("vanished tree name");
+        assert!(
+            collect_tree_process_infos(&proc_root)
+                .expect("a process vanishing during its name read must still be skipped")
+                .is_empty()
+        );
+
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -1632,14 +2775,44 @@ mod tests {
     }
 
     #[test]
+    fn related_hint_retains_exact_max_name_and_omits_max_plus_one() {
+        let proc_root = temp_proc_root("hint-name-boundary");
+        write_process(&proc_root, 100, "candidate", 1);
+        fs::write(
+            proc_root.join("100/cmdline"),
+            b"python3\0-m\0http.server\0--port\x003000\0",
+        )
+        .expect("candidate cmdline must be written");
+        let comm = proc_root.join("100/comm");
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES]).expect("exact-max hint name");
+        let exact = collect_related_process_hints_from(&proc_root, 3000);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(
+            exact[0].process_name.as_deref().map(str::len),
+            Some(PROCESS_NAME_MAX_BYTES)
+        );
+
+        fs::write(&comm, vec![b'x'; PROCESS_NAME_MAX_BYTES + 1]).expect("oversized hint name");
+        let oversized = collect_related_process_hints_from(&proc_root, 3000);
+        assert_eq!(oversized.len(), 1);
+        assert_eq!(oversized[0].pid, 100);
+        assert_eq!(oversized[0].process_name, None);
+
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn missing_proc_root_is_a_collection_error() {
         let collector = LinuxCollector::with_proc_root(PathBuf::from(
             "/definitely-not-a-real-kickoutchi-proc-root",
         ));
 
-        let error = collector
-            .collect()
-            .expect_err("missing proc root must fail");
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect_err("missing proc root must fail");
         assert!(error.to_string().contains("cannot read"), "{error}");
     }
 
@@ -1649,8 +2822,8 @@ mod tests {
         let error = collect_socket_owners(
             Path::new("/definitely-not-a-real-kickoutchi-proc-root"),
             &target_inodes,
-            MAX_PROCESS_IDS,
-            MAX_FD_ENTRIES,
+            CANDIDATE_PROCESS_IDS_MAX,
+            FILE_DESCRIPTOR_ENTRIES_MAX,
         )
         .expect_err("missing proc root must fail");
 
@@ -1670,8 +2843,8 @@ mod tests {
         let owners = collect_socket_owners(
             &proc_root,
             &HashSet::from([22]),
-            MAX_PROCESS_IDS,
-            MAX_FD_ENTRIES,
+            CANDIDATE_PROCESS_IDS_MAX,
+            FILE_DESCRIPTOR_ENTRIES_MAX,
         )
         .expect("targeted owner collection must succeed");
 
@@ -1693,8 +2866,8 @@ mod tests {
         let owners = collect_socket_owners(
             &proc_root,
             &HashSet::from([44]),
-            MAX_PROCESS_IDS,
-            MAX_FD_ENTRIES,
+            CANDIDATE_PROCESS_IDS_MAX,
+            FILE_DESCRIPTOR_ENTRIES_MAX,
         )
         .expect("targeted owner collection must succeed");
 
@@ -1781,9 +2954,11 @@ mod tests {
             },
         );
 
-        let error = collector
-            .collect()
-            .expect_err("collector must enforce fd cap");
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect_err("collector must enforce fd cap");
 
         assert!(
             error.to_string().contains("file-descriptor traversal"),
@@ -1810,9 +2985,11 @@ mod tests {
             },
         );
 
-        let error = collector
-            .collect()
-            .expect_err("collector must enforce row cap");
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect_err("collector must enforce row cap");
 
         assert!(error.to_string().contains("port rows exceed"), "{error}");
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
@@ -1834,9 +3011,11 @@ mod tests {
             },
         );
 
-        let error = collector
-            .collect()
-            .expect_err("collector must enforce PID cap");
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::LegacyList,
+        )
+        .expect_err("collector must enforce PID cap");
 
         assert!(
             error.to_string().contains("process list exceeds"),
@@ -1847,50 +3026,17 @@ mod tests {
 
     #[test]
     fn production_collection_limits_match_the_documented_policy() {
-        assert_eq!(CollectionLimits::PRODUCTION.process_ids, 131_072);
-        assert_eq!(CollectionLimits::PRODUCTION.fd_entries, 1_048_576);
-        assert_eq!(CollectionLimits::PRODUCTION.port_entries, 262_144);
-        assert_eq!(CollectionLimits::PRODUCTION.process_ids, MAX_PROCESS_IDS);
-        assert_eq!(CollectionLimits::PRODUCTION.fd_entries, MAX_FD_ENTRIES);
-        assert_eq!(CollectionLimits::PRODUCTION.port_entries, MAX_PORT_ENTRIES);
-    }
-
-    #[test]
-    fn row_cap_preserves_shared_owner_fanout_at_cap_and_fails_past_it() {
-        let records = vec![
-            SocketRecord {
-                protocol: Protocol::Tcp,
-                local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                local_port: 3000,
-                state: SocketState::Listen,
-                inode: 44,
-            },
-            SocketRecord {
-                protocol: Protocol::Udp,
-                local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                local_port: 5353,
-                state: SocketState::Bound,
-                inode: 55,
-            },
-        ];
-        let owners = HashMap::from([(44, vec![100, 101]), (55, vec![100])]);
-        let mut metadata_reads = 0;
-        let rows = expand_socket_records(&records, &owners, Path::new("/proc"), 3, |_, _| {
-            metadata_reads += 1;
-            ProcessMetadata::default()
-        })
-        .expect("shared-owner fanout at the row cap must succeed");
-
         assert_eq!(
-            rows.iter().map(|row| row.pid).collect::<Vec<_>>(),
-            vec![Some(100), Some(101), Some(100)]
+            CollectionLimits::PRODUCTION.process_ids,
+            CANDIDATE_PROCESS_IDS_MAX
         );
-        assert_eq!(metadata_reads, 2, "metadata is read once per distinct PID");
-
-        let error = expand_socket_records(&records, &owners, Path::new("/proc"), 2, |_, _| {
-            ProcessMetadata::default()
-        })
-        .expect_err("shared-owner fanout past the row cap must fail closed");
-        assert!(error.to_string().contains("port rows exceed"), "{error}");
+        assert_eq!(
+            CollectionLimits::PRODUCTION.fd_entries,
+            FILE_DESCRIPTOR_ENTRIES_MAX
+        );
+        assert_eq!(
+            CollectionLimits::PRODUCTION.port_entries,
+            DERIVED_PORT_ENTRIES_MAX
+        );
     }
 }

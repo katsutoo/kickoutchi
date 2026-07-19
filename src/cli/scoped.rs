@@ -11,6 +11,7 @@ use crate::collector;
 use crate::config::Config;
 use crate::display::sanitize;
 use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, SystemProcessCheck};
+use crate::observation::MetadataProfile;
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
@@ -21,8 +22,8 @@ use crate::tree;
 #[cfg(windows)]
 use super::kill::post_kill_refresh_status_message;
 use super::kill::{
-    KillTargetError, print_post_kill_refresh_status, print_target_error, read_confirmation_line,
-    resolve_kill_target, revalidate_cli_target,
+    KillTargetError, collect_kill_authority_ports, print_post_kill_refresh_status,
+    print_target_error, read_confirmation_line, resolve_kill_target, revalidate_cli_target,
 };
 use super::{ExitReason, KillArgs, TREE_HOST_PLATFORM};
 
@@ -75,9 +76,10 @@ fn scope_authorization(confirmation: ScopedConfirmationFacts) -> tree::ScopeAuth
 /// The injected seams for a tree kill, bundled so the entry point stays under
 /// the argument-count limit and mirrors [`KillCollectors`].
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-struct TreeKillSeams<CollectContext, Prompt, CollectPorts> {
+struct TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts> {
     collect_context: CollectContext,
     prompt: Prompt,
+    collect_kill_ports: CollectKillPorts,
     collect_ports: CollectPorts,
 }
 
@@ -101,7 +103,8 @@ pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEnt
         TreeKillSeams {
             collect_context: platform::collect_process_context,
             prompt: prompt_tree_confirmation,
-            collect_ports: collector::collect_ports,
+            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
         },
     )
 }
@@ -117,18 +120,19 @@ pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEnt
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_tree_kill_with<Ops, CollectContext, Prompt, CollectPorts>(
+fn run_tree_kill_with<Ops, CollectContext, Prompt, CollectKillPorts, CollectPorts>(
     args: &KillArgs,
     config: &Config,
     entries: &[PortEntry],
     mode: KillMode,
     ops: &mut Ops,
-    mut seams: TreeKillSeams<CollectContext, Prompt, CollectPorts>,
+    mut seams: TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts>,
 ) -> ExitReason
 where
     Ops: tree::TreeProcessOps,
     CollectContext: FnMut(u32) -> ProcessContext,
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
+    CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
     // Preview snapshot: informational only. Execution re-enumerates under the
@@ -170,6 +174,10 @@ where
             );
             return ExitReason::NoMatch;
         }
+        Err(tree::TreePlanError::SnapshotLimitExceeded { limit }) => {
+            eprintln!("error: process snapshot exceeds the bounded {limit}-PID index");
+            return ExitReason::Failure;
+        }
     };
 
     if let Some(reason) = scoped_preflight_refusal(&preview, "tree") {
@@ -191,7 +199,7 @@ where
         &root,
         confirmation,
         &mut seams.collect_context,
-        &mut seams.collect_ports,
+        &mut seams.collect_kill_ports,
         ops,
     ) {
         Ok(root) => root,
@@ -216,13 +224,94 @@ fn run_windows_tree_kill(
     entries: &[PortEntry],
     mode: KillMode,
 ) -> ExitReason {
-    let snapshot = crate::platform::windows::collect_tree_process_infos();
-    let mut collect_context = platform::collect_process_context;
-    let root =
-        match resolve_scoped_kill_root(args, config, entries, &snapshot, &mut collect_context) {
-            Ok(target) => target,
-            Err(reason) => return reason,
-        };
+    run_windows_tree_kill_with(
+        args,
+        config,
+        entries,
+        mode,
+        WindowsTreeKillSeams {
+            collect_tree: crate::platform::windows::collect_tree_process_infos,
+            collect_context: platform::collect_process_context,
+            prompt: prompt_tree_confirmation,
+            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
+            prepare_root: process::prepare_termination,
+            execute: crate::windows_tree::execute_tree_kill,
+        },
+    )
+}
+
+#[cfg(windows)]
+struct WindowsTreeKillSeams<
+    CollectTree,
+    CollectContext,
+    Prompt,
+    CollectKillPorts,
+    CollectPorts,
+    PrepareRoot,
+    Execute,
+> {
+    collect_tree: CollectTree,
+    collect_context: CollectContext,
+    prompt: Prompt,
+    collect_kill_ports: CollectKillPorts,
+    collect_ports: CollectPorts,
+    prepare_root: PrepareRoot,
+    execute: Execute,
+}
+
+#[cfg(windows)]
+fn run_windows_tree_kill_with<
+    CollectTree,
+    CollectContext,
+    Prompt,
+    CollectKillPorts,
+    CollectPorts,
+    PrepareRoot,
+    Execute,
+    RootHandle,
+>(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntry],
+    mode: KillMode,
+    mut seams: WindowsTreeKillSeams<
+        CollectTree,
+        CollectContext,
+        Prompt,
+        CollectKillPorts,
+        CollectPorts,
+        PrepareRoot,
+        Execute,
+    >,
+) -> ExitReason
+where
+    CollectTree: FnMut() -> Result<Vec<tree::TreeProcessInfo>, collector::CollectorError>,
+    CollectContext: FnMut(u32) -> ProcessContext,
+    Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
+    CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    PrepareRoot: FnMut(u32) -> Result<RootHandle, TerminationOutcome>,
+    Execute:
+        FnMut(&KillTarget, &[String], bool, bool) -> crate::windows_tree::WindowsTreeKillOutcome,
+{
+    let snapshot = match (seams.collect_tree)() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("error: enumerating the process table failed: {error}");
+            return ExitReason::Failure;
+        }
+    };
+    let root = match resolve_scoped_kill_root(
+        args,
+        config,
+        entries,
+        &snapshot,
+        &mut seams.collect_context,
+    ) {
+        Ok(target) => target,
+        Err(reason) => return reason,
+    };
     let preview = match tree::plan_process_tree(
         root.pid,
         &snapshot,
@@ -238,57 +327,81 @@ fn run_windows_tree_kill(
             );
             return ExitReason::NoMatch;
         }
+        Err(tree::TreePlanError::SnapshotLimitExceeded { limit }) => {
+            eprintln!("error: process snapshot exceeds the bounded {limit}-PID index");
+            return ExitReason::Failure;
+        }
     };
 
     if let Some(reason) = scoped_preflight_refusal(&preview, "tree") {
         return reason;
     }
 
-    let mut prompt = prompt_tree_confirmation;
-    let confirmation = match confirm_tree_kill(&root, &preview, mode, args.yes, &mut prompt) {
+    let confirmation = match confirm_tree_kill(&root, &preview, mode, args.yes, &mut seams.prompt) {
         Ok(confirmation) => confirmation,
         Err(reason) => return reason,
     };
 
-    let mut collect_ports = collector::collect_ports;
+    // A port-selected root must be retained before the final authoritative
+    // endpoint collection. PID mode deliberately keeps its existing path.
+    let prepared_root = if args.port.is_some() {
+        match (seams.prepare_root)(root.pid) {
+            Ok(handle) => Some(handle),
+            Err(outcome) => {
+                let outcome = crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(
+                    tree_outcome_from_termination(&root, outcome),
+                );
+                return map_windows_tree_outcome(&root, mode, &outcome, &mut seams.collect_ports);
+            }
+        }
+    } else {
+        None
+    };
+
     let fresh_root = match revalidate_windows_tree_root_before_commit(
         args,
         config,
         &root,
         confirmation,
-        &mut collect_context,
-        &mut collect_ports,
+        &mut seams.collect_tree,
+        &mut seams.collect_context,
+        &mut seams.collect_kill_ports,
     ) {
         Ok(root) => root,
         Err(outcome) => {
-            return map_windows_tree_outcome(&root, mode, &outcome, &mut collect_ports);
+            return map_windows_tree_outcome(&root, mode, &outcome, &mut seams.collect_ports);
         }
     };
 
-    let outcome = crate::windows_tree::execute_tree_kill(
+    let outcome = (seams.execute)(
         &fresh_root,
         &config.protected_processes,
         confirmation.protected_confirmed,
         confirmation.skipped_prompt,
     );
-    map_windows_tree_outcome(&fresh_root, mode, &outcome, &mut collect_ports)
+    drop(prepared_root);
+    map_windows_tree_outcome(&fresh_root, mode, &outcome, &mut seams.collect_ports)
 }
 
 #[cfg(windows)]
-fn revalidate_windows_tree_root_before_commit<CollectContext, CollectPorts>(
+fn revalidate_windows_tree_root_before_commit<CollectTree, CollectContext, CollectPorts>(
     args: &KillArgs,
     config: &Config,
     confirmed: &KillTarget,
     confirmation: ScopedConfirmationFacts,
+    collect_tree: &mut CollectTree,
     collect_context: &mut CollectContext,
     collect_ports: &mut CollectPorts,
 ) -> Result<KillTarget, crate::windows_tree::WindowsTreeKillOutcome>
 where
+    CollectTree: FnMut() -> Result<Vec<tree::TreeProcessInfo>, collector::CollectorError>,
     CollectContext: FnMut(u32) -> ProcessContext,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
     let fresh_root = if confirmed.ports.is_empty() {
-        let snapshot = crate::platform::windows::collect_tree_process_infos();
+        let snapshot = collect_tree().map_err(|error| {
+            crate::windows_tree::WindowsTreeKillOutcome::SnapshotFailed(error.to_string())
+        })?;
         let root = revalidate_portless_tree_root(confirmed, &snapshot, &config.protected_processes)
             .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
         windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
@@ -299,7 +412,9 @@ where
             let outcome = tree_outcome_from_termination(confirmed, outcome);
             crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(outcome)
         })?;
-        let snapshot = crate::platform::windows::collect_tree_process_infos();
+        let snapshot = collect_tree().map_err(|error| {
+            crate::windows_tree::WindowsTreeKillOutcome::SnapshotFailed(error.to_string())
+        })?;
         windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
     };
@@ -320,9 +435,8 @@ fn windows_fresh_tree_gates(
         root.platform,
         tree::MAX_TREE_PROCESSES,
     )
-    .map_err(|tree::TreePlanError::RootMissing| {
-        crate::windows_tree::WindowsTreeKillOutcome::RootAlreadyExited
-    })?;
+    .map_err(tree::plan_error_outcome)
+    .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
     tree::preflight_outcome(&preview)
         .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
     tree::root_protection_outcome(&preview, confirmation.protected_confirmed)
@@ -538,7 +652,7 @@ where
             root.platform,
             tree::MAX_TREE_PROCESSES,
         )
-        .map_err(|tree::TreePlanError::RootMissing| tree::TreeKillOutcome::RootAlreadyExited)?;
+        .map_err(tree::plan_error_outcome)?;
         tree::preflight_outcome(&preview)?;
         tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
         fresh_tree_yes_outcome(&root, &preview, confirmation)?;
@@ -557,7 +671,7 @@ where
             root.platform,
             tree::MAX_TREE_PROCESSES,
         )
-        .map_err(|tree::TreePlanError::RootMissing| tree::TreeKillOutcome::RootAlreadyExited)?;
+        .map_err(tree::plan_error_outcome)?;
         tree::preflight_outcome(&preview)?;
         tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
         fresh_tree_yes_outcome(&root, &preview, confirmation)?;
@@ -605,6 +719,10 @@ fn tree_outcome_from_termination(
             tree::TreeKillOutcome::PermissionDenied { pid: confirmed.pid }
         }
         TerminationOutcome::UnknownFailure(error) => tree::TreeKillOutcome::SnapshotFailed(error),
+        TerminationOutcome::ThawFailed { pid, prior } => tree::TreeKillOutcome::ThawFailed {
+            pids: vec![pid],
+            cause: Box::new(tree_outcome_from_termination(confirmed, *prior)),
+        },
     }
 }
 
@@ -872,6 +990,9 @@ where
     if let Some(issue) = &report.post_commit_issue {
         return windows_post_commit_issue_exit_reason(issue);
     }
+    if report.cleanup_issue.is_some() {
+        return ExitReason::Failure;
+    }
     if report.not_terminated.is_empty() {
         ExitReason::Failure
     } else {
@@ -920,6 +1041,11 @@ fn windows_tree_partial_report_text(
             tree::format_pid_list(&report.not_terminated)
         )
     };
+    let withheld = if report.job_termination_withheld {
+        "; job termination was withheld because safe termination of the contained membership could not be established"
+    } else {
+        ""
+    };
     let post_commit_issue = report
         .post_commit_issue
         .as_ref()
@@ -929,10 +1055,42 @@ fn windows_tree_partial_report_text(
                 windows_post_commit_issue_text(issue)
             )
         });
+    let secondary_post_commit_issue =
+        report
+            .secondary_post_commit_issue
+            .as_ref()
+            .map_or_else(String::new, |issue| {
+                format!(
+                    "; secondary post-commit issue: {}",
+                    windows_post_commit_issue_text(issue)
+                )
+            });
+    let cleanup_issue = report
+        .cleanup_issue
+        .as_ref()
+        .map_or_else(String::new, |issue| {
+            format!("; cleanup issue: {}", windows_cleanup_issue_text(issue))
+        });
     format!(
-        "warning: Windows tree containment was partial for {}; {job}{fallback}{already_exited}{missing}{post_commit_issue}",
+        "warning: Windows tree containment was partial for {}; {job}{fallback}{already_exited}{missing}{withheld}{post_commit_issue}{secondary_post_commit_issue}{cleanup_issue}",
         root.identity(),
     )
+}
+
+#[cfg(windows)]
+fn windows_cleanup_issue_text(issue: &crate::windows_tree::WindowsTreeCleanupIssue) -> String {
+    use crate::windows_tree::WindowsTreeCleanupIssue;
+
+    match issue {
+        WindowsTreeCleanupIssue::WithheldJobThawFailed(error) => format!(
+            "thawing the withheld Windows Job Object failed: {}",
+            sanitize(error)
+        ),
+        WindowsTreeCleanupIssue::FailedTerminationThawFailed(error) => format!(
+            "thawing the Windows Job Object after TerminateJobObject failed: {}",
+            sanitize(error)
+        ),
+    }
 }
 
 #[cfg(windows)]
@@ -1085,6 +1243,7 @@ where
         }
         WindowsTreeKillOutcome::SnapshotFailed(_)
         | WindowsTreeKillOutcome::CommitFailed { .. }
+        | WindowsTreeKillOutcome::FreezeCapabilityUnavailable { .. }
         | WindowsTreeKillOutcome::JobTerminateFailed { .. } => {
             let mut stderr = io::stderr().lock();
             map_windows_tree_system_failure(root, outcome, collect_ports, &mut stderr)
@@ -1114,6 +1273,14 @@ fn map_windows_tree_system_failure(
             let _ = writeln!(
                 stderr,
                 "error: assigning root PID {pid} to the Windows Job Object failed before commit: {}; no termination was sent",
+                sanitize(error),
+            );
+            ExitReason::Failure
+        }
+        WindowsTreeKillOutcome::FreezeCapabilityUnavailable { error } => {
+            let _ = writeln!(
+                stderr,
+                "error: Windows Job Object freeze/thaw capability is unavailable: {}; no containment was committed and no termination was sent",
                 sanitize(error),
             );
             ExitReason::Failure
@@ -1176,6 +1343,10 @@ fn scoped_delivery_summary(
 /// different codes depending on how the same processes were targeted;
 /// `scope_noun` and `scope_of_target` only shape the wording.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive typed scoped-outcome mapping is intentionally centralized"
+)]
 fn map_scoped_outcome<CollectPorts>(
     root: &KillTarget,
     mode: KillMode,
@@ -1191,7 +1362,16 @@ where
 
     let delivery = mode.delivery_label(root.platform);
     match outcome {
-        TreeKillOutcome::Completed(report) if report.denied.is_empty() => {
+        TreeKillOutcome::ThawFailed { pids, .. } => {
+            eprintln!(
+                "error: cleanup could not continue PID(s) {}; they may remain stopped and require SIGCONT",
+                tree::format_pid_list(pids),
+            );
+            ExitReason::Failure
+        }
+        TreeKillOutcome::Completed(report)
+            if report.denied.is_empty() && report.thaw_failed.is_empty() =>
+        {
             eprintln!(
                 "{}",
                 scoped_delivery_summary(delivery, scope_noun, scope_of_target, report)
@@ -1204,7 +1384,15 @@ where
                 "{}",
                 scoped_delivery_summary(delivery, scope_noun, scope_of_target, report)
             );
-            ExitReason::PermissionDenied
+            if report.thaw_failed.is_empty() {
+                ExitReason::PermissionDenied
+            } else {
+                eprintln!(
+                    "error: PID(s) {} may remain stopped because SIGCONT failed",
+                    tree::format_pid_list(&report.thaw_failed),
+                );
+                ExitReason::Failure
+            }
         }
         TreeKillOutcome::RootAlreadyExited => {
             eprintln!(
@@ -1318,24 +1506,26 @@ pub(super) fn run_group_kill(
         TreeKillSeams {
             collect_context: platform::collect_process_context,
             prompt: prompt_group_confirmation,
-            collect_ports: collector::collect_ports,
+            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
         },
     )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_group_kill_with<Ops, CollectContext, Prompt, CollectPorts>(
+fn run_group_kill_with<Ops, CollectContext, Prompt, CollectKillPorts, CollectPorts>(
     args: &KillArgs,
     config: &Config,
     entries: &[PortEntry],
     mode: KillMode,
     ops: &mut Ops,
-    mut seams: TreeKillSeams<CollectContext, Prompt, CollectPorts>,
+    mut seams: TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts>,
 ) -> ExitReason
 where
     Ops: tree::TreeProcessOps,
     CollectContext: FnMut(u32) -> ProcessContext,
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
+    CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
     // Preview snapshot: informational only, exactly like tree scope. Execution
@@ -1413,7 +1603,7 @@ where
             confirmation,
         },
         &mut seams.collect_context,
-        &mut seams.collect_ports,
+        &mut seams.collect_kill_ports,
         ops,
     ) {
         Ok(root) => root,
@@ -1751,9 +1941,8 @@ fn fresh_group_gates(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::cell::RefCell;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use std::io::Write;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::net::{IpAddr, Ipv4Addr};
@@ -1766,22 +1955,188 @@ mod tests {
         kill_target_from_tree_info, run_group_kill_with, run_tree_kill_with, tree_confirmation,
     };
     use crate::cli::ExitReason;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::cli::KillArgs;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use crate::cli::test_support::{entry, entry_with_pid, no_context};
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::cli::test_support::entry_with_pid;
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    use crate::cli::test_support::{entry, no_context};
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::config::Config;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, PortEntry, ProcessContext, SocketState,
     };
     use crate::model::{PermissionStatus, Platform, Protocol};
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    use crate::observation::{
+        EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot, OwnerCompleteness,
+        SnapshotCompleteness,
+    };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::process::KillMode;
     use crate::process::KillTarget;
+    #[cfg(windows)]
+    use crate::process::TerminationOutcome;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::tree::{ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult};
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn locally_incomplete_kill_snapshot() -> NetworkSnapshot {
+        use crate::collector::Collector;
+
+        let mut snapshot = crate::collector::FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake snapshot collects");
+        snapshot.completeness = SnapshotCompleteness::Complete;
+        snapshot.owner_completeness = OwnerCompleteness::Complete;
+        snapshot
+            .evidence_gaps
+            .retain(|gap| gap.impact != EvidenceImpact::SocketSet);
+        for socket in &mut snapshot.sockets {
+            socket.owner_completeness = OwnerCompleteness::Complete;
+        }
+
+        snapshot
+            .sockets
+            .iter_mut()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("fixture has port 3000")
+            .owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
+                .expect("one reason fits");
+        snapshot
+    }
+
+    #[cfg(windows)]
+    fn confirm_windows_tree_prompt(
+        _target: &KillTarget,
+        _tree: &crate::tree::ProcessTreeTarget,
+        _requirement: super::TreeConfirmation,
+    ) -> std::io::Result<bool> {
+        std::io::sink().write_all(&[])?;
+        Ok(true)
+    }
+
+    #[cfg(windows)]
+    fn panic_windows_tree_execute(
+        _root: &KillTarget,
+        _protected: &[String],
+        _confirmed: bool,
+        _skipped: bool,
+    ) -> crate::windows_tree::WindowsTreeKillOutcome {
+        panic!("authoritative refusal must precede Job Object assignment")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tree_authority_refusal_precedes_job_assignment() {
+        let snapshot = locally_incomplete_kill_snapshot();
+        let process_snapshot = vec![crate::tree::TreeProcessInfo {
+            pid: 18_422,
+            parent_pid: Some(500),
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node.exe".to_owned()),
+            start_time_marker: crate::observation::ProcessStartMarker::windows(55).ok(),
+            owner_uid: None,
+            process_group: None,
+        }];
+
+        let reason = super::run_windows_tree_kill_with(
+            &KillArgs {
+                pid: Some(18_422),
+                port: None,
+                force: false,
+                yes: false,
+                tree: true,
+            },
+            &Config::default(),
+            &[entry(3000)],
+            crate::process::KillMode::Terminate,
+            super::WindowsTreeKillSeams {
+                collect_tree: || Ok(process_snapshot.clone()),
+                collect_context: no_context,
+                prompt: confirm_windows_tree_prompt,
+                collect_kill_ports: || {
+                    crate::collector::kill_ports_from_snapshot(&snapshot, Some(18_422), None)
+                },
+                collect_ports: || panic!("refusal must not visibility-poll ports"),
+                prepare_root: |_pid| -> Result<u32, TerminationOutcome> {
+                    panic!("PID mode must preserve its existing preparation path")
+                },
+                execute: panic_windows_tree_execute,
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_port_owner_move_after_root_prepare_never_commits_job() {
+        let process_snapshot = vec![crate::tree::TreeProcessInfo {
+            pid: 18_422,
+            parent_pid: Some(500),
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node".to_owned()),
+            start_time_marker: crate::observation::ProcessStartMarker::windows(55).ok(),
+            owner_uid: None,
+            process_group: None,
+        }];
+        let moved = vec![crate::cli::test_support::entry_with_pid(
+            3000,
+            Some(29_999),
+            Protocol::Tcp,
+            "replacement",
+        )];
+        let events = RefCell::new(Vec::new());
+        let context = || crate::model::ProcessContext {
+            owner_uid: None,
+            process_start_time_marker: crate::observation::ProcessStartMarker::windows(55).ok(),
+            children: crate::model::ChildProcessSnapshot::default(),
+            docker: None,
+        };
+
+        let reason = super::run_windows_tree_kill_with(
+            &KillArgs {
+                pid: None,
+                port: Some(3000),
+                force: false,
+                yes: true,
+                tree: true,
+            },
+            &Config::default(),
+            &[entry(3000)],
+            crate::process::KillMode::Terminate,
+            super::WindowsTreeKillSeams {
+                collect_tree: || Ok(process_snapshot.clone()),
+                collect_context: |_pid| context(),
+                prompt: confirm_windows_tree_prompt,
+                collect_kill_ports: || {
+                    events.borrow_mut().push("collect");
+                    Ok(moved.clone())
+                },
+                collect_ports: || panic!("refusal must not visibility-poll ports"),
+                prepare_root: |pid| {
+                    assert_eq!(pid, 18_422);
+                    events.borrow_mut().push("prepare");
+                    Ok::<u32, TerminationOutcome>(pid)
+                },
+                execute: |_root: &KillTarget,
+                          _protected: &[String],
+                          _confirmed: bool,
+                          _skipped: bool| {
+                    events.borrow_mut().push("commit");
+                    panic!("moved endpoint must prevent Job Object commit")
+                },
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert_eq!(*events.borrow(), ["prepare", "collect"]);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1795,7 +2150,7 @@ mod tests {
             system_process: false,
             ports: Vec::new(),
             owner_uid: None,
-            process_start_time_marker: Some(100),
+            process_start_time_marker: crate::observation::ProcessStartMarker::windows(100).ok(),
             child_count: 0,
             children_truncated: false,
         };
@@ -1806,11 +2161,22 @@ mod tests {
             already_exited_pids: Vec::new(),
             not_terminated: vec![101],
             containment_partial: true,
+            job_termination_withheld: false,
             post_commit_issue: Some(
                 crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
                     pid: 101,
                     name: Some("lsass.exe".to_owned()),
                 },
+            ),
+            secondary_post_commit_issue: Some(
+                crate::windows_tree::WindowsTreePostCommitIssue::SnapshotFailed(
+                    "freezing committed Job Object failed: freeze failed".to_owned(),
+                ),
+            ),
+            cleanup_issue: Some(
+                crate::windows_tree::WindowsTreeCleanupIssue::WithheldJobThawFailed(
+                    "thaw failed".to_owned(),
+                ),
             ),
         };
         let mut collect_ports = || Ok(Vec::new());
@@ -1818,6 +2184,51 @@ mod tests {
         let reason = super::map_windows_tree_completed_outcome(&root, &report, &mut collect_ports);
 
         assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tree_success_polls_post_kill_visibility() {
+        let root = KillTarget {
+            pid: 100,
+            process_name: Some("node.exe".to_owned()),
+            platform: Platform::Windows,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: vec![crate::process::KillTargetPort {
+                protocol: Protocol::Tcp,
+                local_addr: "127.0.0.1".parse().expect("test address"),
+                local_port: 3000,
+                ipv6_scope: None,
+            }],
+            owner_uid: None,
+            process_start_time_marker: crate::observation::ProcessStartMarker::windows(100).ok(),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let report = crate::windows_tree::WindowsTreeKillReport {
+            total: 1,
+            job_terminated_pids: vec![100],
+            fallback_terminated_pids: Vec::new(),
+            already_exited_pids: Vec::new(),
+            not_terminated: Vec::new(),
+            containment_partial: false,
+            job_termination_withheld: false,
+            post_commit_issue: None,
+            secondary_post_commit_issue: None,
+            cleanup_issue: None,
+        };
+        let mut visibility_polls = 0;
+        let mut collect_ports = || {
+            visibility_polls += 1;
+            Ok(Vec::new())
+        };
+
+        let reason = super::map_windows_tree_completed_outcome(&root, &report, &mut collect_ports);
+
+        assert_eq!(reason, ExitReason::Success);
+        assert_eq!(visibility_polls, 1);
     }
 
     #[cfg(windows)]
@@ -1832,7 +2243,7 @@ mod tests {
             system_process: false,
             ports: Vec::new(),
             owner_uid: None,
-            process_start_time_marker: Some(100),
+            process_start_time_marker: crate::observation::ProcessStartMarker::windows(100).ok(),
             child_count: 0,
             children_truncated: false,
         };
@@ -1843,11 +2254,22 @@ mod tests {
             already_exited_pids: vec![102],
             not_terminated: vec![100, 103],
             containment_partial: true,
+            job_termination_withheld: true,
             post_commit_issue: Some(
                 crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
                     pid: 103,
                     name: Some("lsass.exe".to_owned()),
                 },
+            ),
+            secondary_post_commit_issue: Some(
+                crate::windows_tree::WindowsTreePostCommitIssue::SnapshotFailed(
+                    "freezing committed Job Object failed: freeze failed".to_owned(),
+                ),
+            ),
+            cleanup_issue: Some(
+                crate::windows_tree::WindowsTreeCleanupIssue::WithheldJobThawFailed(
+                    "thaw failed".to_owned(),
+                ),
             ),
         };
 
@@ -1863,6 +2285,20 @@ mod tests {
         );
         assert!(
             text.contains("protected descendant PID 103 (lsass.exe)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("secondary post-commit issue: enumerating the Windows process tree failed after commit: freezing committed Job Object failed: freeze failed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("safe termination of the contained membership could not be established"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cleanup issue: thawing the withheld Windows Job Object failed: thaw failed"
+            ),
             "{text}"
         );
     }
@@ -1881,9 +2317,10 @@ mod tests {
                 protocol: Protocol::Tcp,
                 local_addr: "127.0.0.1".parse().expect("test address"),
                 local_port: 3000,
+                ipv6_scope: None,
             }],
             owner_uid: None,
-            process_start_time_marker: Some(100),
+            process_start_time_marker: crate::observation::ProcessStartMarker::windows(100).ok(),
             child_count: 0,
             children_truncated: false,
         };
@@ -1896,7 +2333,14 @@ mod tests {
                 already_exited_pids: vec![102],
                 not_terminated: vec![100],
                 containment_partial: true,
+                job_termination_withheld: false,
                 post_commit_issue: None,
+                secondary_post_commit_issue: None,
+                cleanup_issue: Some(
+                    crate::windows_tree::WindowsTreeCleanupIssue::FailedTerminationThawFailed(
+                        "thaw failed".to_owned(),
+                    ),
+                ),
             }),
         };
         let mut refreshes = 0;
@@ -1925,6 +2369,10 @@ mod tests {
         assert!(text.contains("already exited (PIDs: 102)"), "{text}");
         assert!(text.contains("not confirmed terminated: 100"), "{text}");
         assert!(
+            text.contains("cleanup issue: thawing the Windows Job Object after TerminateJobObject failed: thaw failed"),
+            "{text}"
+        );
+        assert!(
             text.contains("confirmed target ports are no longer visible"),
             "{text}"
         );
@@ -1945,14 +2393,14 @@ mod tests {
             panic!("no process may be stopped for an unresolved root")
         }
 
-        fn cont(&mut self, _pid: u32) {
+        fn cont(&mut self, _pid: u32) -> TreeSignalResult {
             panic!("no process may be continued for an unresolved root")
         }
 
         fn prepare_delivery(
             &mut self,
             _pid: u32,
-            _verified_start_marker: Option<u64>,
+            _verified_start_marker: Option<crate::observation::ProcessStartMarker>,
         ) -> TreeSignalResult {
             panic!("no pidfd may be opened for an unresolved root")
         }
@@ -2010,12 +2458,14 @@ mod tests {
             TreeSignalResult::Delivered
         }
 
-        fn cont(&mut self, _pid: u32) {}
+        fn cont(&mut self, _pid: u32) -> TreeSignalResult {
+            TreeSignalResult::Delivered
+        }
 
         fn prepare_delivery(
             &mut self,
             _pid: u32,
-            _verified_start_marker: Option<u64>,
+            _verified_start_marker: Option<crate::observation::ProcessStartMarker>,
         ) -> TreeSignalResult {
             TreeSignalResult::Delivered
         }
@@ -2068,6 +2518,7 @@ mod tests {
                 prompt: |_target: &KillTarget, _tree: &ProcessTreeTarget, _requirement| {
                     panic!("unresolved root must not prompt")
                 },
+                collect_kill_ports: || panic!("unresolved root must not re-collect ports"),
                 collect_ports: || panic!("unresolved root must not re-collect ports"),
             },
         );
@@ -2083,7 +2534,7 @@ mod tests {
             unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(name.to_owned()),
-            start_time_marker: Some(u64::from(pid)),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid)).ok(),
             owner_uid: None,
             process_group: None,
         }
@@ -2256,17 +2707,22 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn tree_root_is_pinned_before_revalidation_and_no_stop_on_drift() {
+    fn port_selected_tree_pins_old_root_before_endpoint_move_and_sends_no_signal() {
         let rows = vec![entry(3000)];
         let preview = vec![tree_info(18_422, Some(500), "node")];
         let mut ops = RecordingTreeOps::new(vec![preview]);
         let events = Rc::clone(&ops.events);
-        let fresh_rows = vec![entry_with_pid(4000, Some(18_422), Protocol::Tcp, "node")];
+        let fresh_rows = vec![entry_with_pid(
+            3000,
+            Some(29_999),
+            Protocol::Tcp,
+            "replacement",
+        )];
 
         let reason = run_tree_kill_with(
             &KillArgs {
-                pid: Some(18_422),
-                port: None,
+                pid: None,
+                port: Some(3000),
                 force: false,
                 yes: false,
                 tree: true,
@@ -2279,10 +2735,11 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
-                collect_ports: || {
+                collect_kill_ports: || {
                     events.borrow_mut().push(RecordingTreeEvent::CollectPorts);
                     Ok(fresh_rows.clone())
                 },
+                collect_ports: || Ok(Vec::new()),
             },
         );
 
@@ -2293,7 +2750,7 @@ mod tests {
                 RecordingTreeEvent::Pin(18_422),
                 RecordingTreeEvent::CollectPorts,
             ],
-            "the Linux root handle must be prepared before final revalidation",
+            "the old root handle must be prepared before final endpoint ownership collection",
         );
         assert!(ops.stops.is_empty());
     }
@@ -2317,6 +2774,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
+                collect_kill_ports: || panic!("portless tree root must not re-collect ports"),
                 collect_ports: || panic!("portless tree root must not re-collect ports"),
             },
         );
@@ -2351,10 +2809,11 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
-                collect_ports: || {
+                collect_kill_ports: || {
                     events.borrow_mut().push(RecordingTreeEvent::CollectPorts);
                     Ok(fresh_rows.clone())
                 },
+                collect_ports: || Ok(Vec::new()),
             },
         );
 
@@ -2367,6 +2826,40 @@ mod tests {
             ],
         );
         assert!(ops.stops.is_empty(), "refusal must precede any stop");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_authority_refusal_has_zero_stop_or_delivery() {
+        let snapshot = locally_incomplete_kill_snapshot();
+        let rows = vec![entry(3000)];
+        let preview = vec![tree_info(18_422, Some(500), "node")];
+        let mut ops = RecordingTreeOps::new(vec![preview]);
+
+        let reason = run_tree_kill_with(
+            &kill_pid_tree(18_422),
+            &Config::default(),
+            &rows,
+            KillMode::Terminate,
+            &mut ops,
+            TreeKillSeams {
+                collect_context: no_context,
+                prompt: confirm_tree_prompt,
+                collect_kill_ports: || {
+                    crate::collector::kill_ports_from_snapshot(&snapshot, Some(18_422), None)
+                },
+                collect_ports: || panic!("refusal must not visibility-poll ports"),
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(ops.stops.is_empty());
+        assert!(
+            !ops.events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, RecordingTreeEvent::Deliver(_)))
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2398,6 +2891,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
+                collect_kill_ports: || Ok(rows.clone()),
                 collect_ports: || Ok(rows.clone()),
             },
         );
@@ -2418,7 +2912,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: None,
-                start_time_marker: Some(18_423),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(18_423).ok(),
                 owner_uid: None,
                 process_group: None,
             },
@@ -2434,6 +2928,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("portless tree root must not re-collect ports"),
                 collect_ports: || panic!("portless tree root must not re-collect ports"),
             },
         );
@@ -2461,6 +2956,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("portless tree root must not re-collect ports"),
                 collect_ports: || panic!("portless tree root must not re-collect ports"),
             },
         );
@@ -2498,6 +2994,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("protected descendant must not re-collect ports"),
                 collect_ports: || panic!("protected descendant must not re-collect ports"),
             },
         );
@@ -2524,6 +3021,12 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Partial,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
     }
 
@@ -2542,7 +3045,7 @@ mod tests {
             unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("postgres".to_owned()),
-            start_time_marker: Some(18_422),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(18_422).ok(),
             owner_uid: None,
             process_group: None,
         }];
@@ -2568,6 +3071,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
+                collect_kill_ports: || Ok(rows.clone()),
                 collect_ports: || Ok(rows.clone()),
             },
         );
@@ -2597,7 +3101,7 @@ mod tests {
             parent_process_name: None,
             process_name: Some("postgres".to_owned()),
             // Matches the confirmed context marker from `no_context`.
-            start_time_marker: Some(55),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
             owner_uid: None,
             process_group: None,
         }];
@@ -2607,7 +3111,8 @@ mod tests {
         };
         let mut ops = RecordingTreeOps::new(vec![snapshot]);
         let mut prompts = 0;
-        let mut collect_calls = 0;
+        let mut authority_collections = 0;
+        let mut visibility_polls = 0;
 
         let reason = run_tree_kill_with(
             &KillArgs {
@@ -2628,19 +3133,21 @@ mod tests {
                     prompts += 1;
                     Ok(true)
                 },
+                collect_kill_ports: || {
+                    authority_collections += 1;
+                    Ok(rows.clone())
+                },
                 collect_ports: || {
-                    collect_calls += 1;
-                    if collect_calls == 1 {
-                        Ok(rows.clone())
-                    } else {
-                        Ok(Vec::new())
-                    }
+                    visibility_polls += 1;
+                    Ok(Vec::new())
                 },
             },
         );
 
         assert_eq!(reason, ExitReason::Success);
         assert_eq!(prompts, 2, "protected root asks for PID/name and the word");
+        assert_eq!(authority_collections, 1);
+        assert_eq!(visibility_polls, 1);
         assert_eq!(ops.stops, vec![18_422]);
     }
 
@@ -2670,6 +3177,18 @@ mod tests {
             port: None,
             force: false,
             yes,
+            tree: false,
+            group: true,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn kill_port_group(port: u16) -> KillArgs {
+        KillArgs {
+            pid: None,
+            port: Some(port),
+            force: false,
+            yes: false,
             tree: false,
             group: true,
         }
@@ -2792,6 +3311,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("protected member must not re-collect ports"),
                 collect_ports: || panic!("protected member must not re-collect ports"),
             },
         );
@@ -2815,6 +3335,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("untargetable group must not re-collect ports"),
                 collect_ports: || panic!("untargetable group must not re-collect ports"),
             },
         );
@@ -2844,6 +3365,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
+                collect_kill_ports: || Ok(Vec::new()),
                 collect_ports: || Ok(Vec::new()),
             },
         );
@@ -2877,10 +3399,11 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: confirm_tree_prompt,
-                collect_ports: || {
+                collect_kill_ports: || {
                     events.borrow_mut().push(RecordingTreeEvent::CollectPorts);
                     Ok(fresh_rows.clone())
                 },
+                collect_ports: || Ok(Vec::new()),
             },
         );
 
@@ -2893,6 +3416,40 @@ mod tests {
             ],
         );
         assert!(ops.stops.is_empty(), "refusal must precede any stop");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_authority_refusal_has_zero_stop_or_delivery() {
+        let snapshot = locally_incomplete_kill_snapshot();
+        let rows = vec![entry(3000)];
+        let preview = vec![grouped_info(18_422, Some(500), "node", 42)];
+        let mut ops = RecordingTreeOps::new(vec![preview]);
+
+        let reason = run_group_kill_with(
+            &kill_pid_group(18_422, false),
+            &Config::default(),
+            &rows,
+            KillMode::Terminate,
+            &mut ops,
+            TreeKillSeams {
+                collect_context: no_context,
+                prompt: confirm_tree_prompt,
+                collect_kill_ports: || {
+                    crate::collector::kill_ports_from_snapshot(&snapshot, Some(18_422), None)
+                },
+                collect_ports: || panic!("refusal must not visibility-poll ports"),
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(ops.stops.is_empty());
+        assert!(
+            !ops.events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, RecordingTreeEvent::Deliver(_)))
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2914,6 +3471,7 @@ mod tests {
             TreeKillSeams {
                 collect_context: no_context,
                 prompt: panic_tree_prompt,
+                collect_kill_ports: || panic!("portless group root must not re-collect ports"),
                 collect_ports: || panic!("portless group root must not re-collect ports"),
             },
         );
@@ -2924,22 +3482,25 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn group_kill_happy_path_freezes_root_first_and_succeeds() {
-        // A portless supervisor root plus an already-reparented member: the
-        // scenario group scope exists for. One word prompt, then execution
-        // freezes the confirmed root before the member and reports success.
-        let snapshot = vec![
-            grouped_info(18_422, Some(500), "node", 42),
-            grouped_info(17_000, Some(1), "orphan", 42),
-        ];
+    fn port_selected_group_success_separates_authority_from_visibility_polling() {
+        // A port-selected root plus an already-reparented member: one word
+        // prompt, then authority is re-collected before delivery and visibility
+        // is polled only after successful delivery.
+        let rows = vec![entry(3000)];
+        let root = TreeProcessInfo {
+            start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
+            ..grouped_info(18_422, Some(500), "node", 42)
+        };
+        let snapshot = vec![root, grouped_info(17_000, Some(1), "orphan", 42)];
         let mut ops = RecordingTreeOps::new(vec![snapshot]);
         let mut prompts = 0;
-        let mut collect_calls = 0;
+        let mut authority_collections = 0;
+        let mut visibility_polls = 0;
 
         let reason = run_group_kill_with(
-            &kill_pid_group(18_422, false),
+            &kill_port_group(3000),
             &Config::default(),
-            &[],
+            &rows,
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -2949,8 +3510,12 @@ mod tests {
                     assert_eq!(members.len(), 2, "the prompt must name the full count");
                     Ok(true)
                 },
+                collect_kill_ports: || {
+                    authority_collections += 1;
+                    Ok(rows.clone())
+                },
                 collect_ports: || {
-                    collect_calls += 1;
+                    visibility_polls += 1;
                     Ok(Vec::new())
                 },
             },
@@ -2958,6 +3523,8 @@ mod tests {
 
         assert_eq!(reason, ExitReason::Success);
         assert_eq!(prompts, 1, "an unprotected group asks for the word once");
+        assert_eq!(authority_collections, 1);
+        assert_eq!(visibility_polls, 1);
         assert_eq!(
             ops.stops,
             vec![18_422, 17_000],

@@ -12,7 +12,7 @@
 //! nothing else. No signals, no handles, no confirmation flow. The only kill
 //! it ever mentions is the `kick kill --pid <root> --tree` hint at the end.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 // Writing into a String is infallible, so the `let _ =` on each `write!` is
 // discarding a Result that cannot be Err.
 use std::fmt::Write as _;
@@ -21,7 +21,8 @@ use crate::display::sanitize;
 use crate::model::{Platform, PortEntry};
 use crate::protection::is_protected_process_name;
 use crate::tree::{
-    MAX_TREE_PROCESSES, ProcessTreeNode, TreePlanError, TreeProcessInfo, plan_process_tree,
+    MAX_TREE_PROCESSES, ProcessTreeNode, ProcessTreeTarget, TreePlanError, TreeProcessInfo,
+    plan_process_tree,
 };
 
 /// Display caps. The walk itself is bounded elsewhere (the tree builder caps at
@@ -45,18 +46,129 @@ pub(crate) enum InspectError {
     TargetMissing,
 }
 
+pub(crate) fn command_line_scope_pids(target_pid: u32, snapshot: &[TreeProcessInfo]) -> Vec<u32> {
+    let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
+        return Vec::new();
+    };
+    let mut pids = vec![target_pid];
+    pids.extend(
+        ancestor_chain(target, snapshot)
+            .into_iter()
+            .take(ANCESTORS_DISPLAY_MAX)
+            .map(|info| info.pid),
+    );
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+pub(crate) struct InspectScope {
+    port_pids: BTreeSet<u32>,
+    tree: Result<ProcessTreeTarget, TreePlanError>,
+}
+
+impl InspectScope {
+    pub(crate) fn port_pids(&self) -> &BTreeSet<u32> {
+        &self.port_pids
+    }
+}
+
+pub(crate) fn build_scope(
+    target_pid: u32,
+    snapshot: &[TreeProcessInfo],
+    platform: Platform,
+    protected_names: &[String],
+) -> InspectScope {
+    let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
+        return InspectScope {
+            port_pids: BTreeSet::new(),
+            tree: Err(TreePlanError::RootMissing),
+        };
+    };
+    let mut pids = BTreeSet::from([target_pid]);
+    pids.extend(
+        ancestor_chain(target, snapshot)
+            .into_iter()
+            .take(ANCESTORS_DISPLAY_MAX)
+            .map(|info| info.pid),
+    );
+    if let Some(parent_pid) = target.parent_pid {
+        let mut siblings = snapshot
+            .iter()
+            .filter(|info| info.parent_pid == Some(parent_pid) && info.pid != target_pid)
+            .map(|info| info.pid)
+            .collect::<Vec<_>>();
+        siblings.sort_unstable();
+        pids.extend(siblings.into_iter().take(SIBLINGS_DISPLAY_MAX));
+    }
+    let tree = plan_process_tree(
+        target_pid,
+        snapshot,
+        protected_names,
+        platform,
+        MAX_TREE_PROCESSES,
+    );
+    if let Ok(tree) = &tree {
+        pids.extend(
+            ordered_tree_nodes(tree.preview_nodes(tree.len()), TREE_DISPLAY_MAX)
+                .into_iter()
+                .map(|node| node.pid),
+        );
+    }
+    if platform != Platform::Windows
+        && let Some(group) = target.process_group
+    {
+        let mut members = snapshot
+            .iter()
+            .filter(|info| info.process_group == Some(group))
+            .map(|info| info.pid)
+            .collect::<Vec<_>>();
+        members.sort_unstable();
+        pids.extend(members.into_iter().take(GROUP_DISPLAY_MAX));
+    }
+    InspectScope {
+        port_pids: pids,
+        tree,
+    }
+}
+
 /// Render the family report for `target_pid` from one process-table snapshot
 /// plus the current socket table.
 ///
 /// Pure aside from the injected `command_line` reader, so tests drive it with
 /// a scripted table and pin the exact report shape. Every OS-provided string
 /// is sanitized before it reaches the output.
+#[cfg(test)]
 pub(crate) fn render_family_report<CommandLine>(
     target_pid: u32,
     snapshot: &[TreeProcessInfo],
     entries: &[PortEntry],
     protected_names: &[String],
     platform: Platform,
+    command_line: CommandLine,
+) -> Result<String, InspectError>
+where
+    CommandLine: FnMut(u32) -> Option<String>,
+{
+    let scope = build_scope(target_pid, snapshot, platform, protected_names);
+    render_family_report_with_scope(
+        target_pid,
+        snapshot,
+        entries,
+        protected_names,
+        platform,
+        &scope,
+        command_line,
+    )
+}
+
+pub(crate) fn render_family_report_with_scope<CommandLine>(
+    target_pid: u32,
+    snapshot: &[TreeProcessInfo],
+    entries: &[PortEntry],
+    protected_names: &[String],
+    platform: Platform,
+    scope: &InspectScope,
     mut command_line: CommandLine,
 ) -> Result<String, InspectError>
 where
@@ -87,14 +199,7 @@ where
         &mut command_line,
     );
     render_siblings(&mut out, target, snapshot, protected_names, platform);
-    let tree_pids = render_tree(
-        &mut out,
-        target_pid,
-        snapshot,
-        &ports_by_pid,
-        protected_names,
-        platform,
-    );
+    let tree_pids = render_tree(&mut out, target_pid, &ports_by_pid, &scope.tree);
     let members_outside_tree = render_group(
         &mut out,
         target,
@@ -237,24 +342,23 @@ fn render_siblings(
 fn render_tree(
     out: &mut String,
     target_pid: u32,
-    snapshot: &[TreeProcessInfo],
     ports_by_pid: &HashMap<u32, Vec<String>>,
-    protected_names: &[String],
-    platform: Platform,
+    preview: &Result<ProcessTreeTarget, TreePlanError>,
 ) -> Vec<u32> {
-    let preview = match plan_process_tree(
-        target_pid,
-        snapshot,
-        protected_names,
-        platform,
-        MAX_TREE_PROCESSES,
-    ) {
+    let preview = match preview {
         Ok(preview) => preview,
         // The target row was found by the caller, so only a racing exit lands
         // here; report the tree as just the target rather than failing the
         // whole report.
         Err(TreePlanError::RootMissing) => {
             let _ = writeln!(out, "Tree: only PID {target_pid} (already exiting?)");
+            return vec![target_pid];
+        }
+        Err(TreePlanError::SnapshotLimitExceeded { limit }) => {
+            let _ = writeln!(
+                out,
+                "Tree: unavailable (process index exceeds {limit} PIDs)"
+            );
             return vec![target_pid];
         }
     };
@@ -336,6 +440,7 @@ fn render_group(
     let Some(group) = target.process_group else {
         return 0;
     };
+    let tree_pids = tree_pids.iter().copied().collect::<HashSet<_>>();
     let mut members: Vec<&TreeProcessInfo> = snapshot
         .iter()
         .filter(|info| info.process_group == Some(group))
@@ -378,20 +483,19 @@ fn ancestor_chain<'snapshot>(
     snapshot: &'snapshot [TreeProcessInfo],
 ) -> Vec<&'snapshot TreeProcessInfo> {
     let mut chain = Vec::new();
-    let mut seen = vec![target.pid];
+    let mut seen = HashSet::from([target.pid]);
     let mut parent_pid = target.parent_pid;
 
     for _ in 0..ANCESTOR_WALK_MAX {
         let Some(pid) = parent_pid else {
             break;
         };
-        if seen.contains(&pid) {
+        if !seen.insert(pid) {
             break;
         }
         let Some(info) = snapshot.iter().find(|info| info.pid == pid) else {
             break;
         };
-        seen.push(pid);
         chain.push(info);
         parent_pid = info.parent_pid;
     }
@@ -455,7 +559,7 @@ mod tests {
             unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some(name.to_owned()),
-            start_time_marker: Some(u64::from(pid)),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid)).ok(),
             owner_uid: None,
             process_group: Some(group),
         }
@@ -477,6 +581,12 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid))
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
     }
 
@@ -641,7 +751,7 @@ mod tests {
             unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("evil\x1b[2Jname".to_owned()),
-            start_time_marker: Some(501),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(501).ok(),
             owner_uid: None,
             process_group: Some(300),
         });

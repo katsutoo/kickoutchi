@@ -11,6 +11,7 @@ use crate::command;
 use crate::config::Config;
 use crate::display::sanitize;
 use crate::model::{PortEntry, ProcessContext};
+use crate::observation::MetadataProfile;
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
@@ -23,6 +24,16 @@ use super::scoped::run_group_kill;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use super::scoped::run_tree_kill;
 use super::{ExitReason, KillArgs};
+
+const KILL_AUTHORITY_PROFILE: MetadataProfile = MetadataProfile::Display;
+
+pub(super) fn collect_kill_authority_ports(
+    pid: Option<u32>,
+    port: Option<u16>,
+) -> Result<Vec<PortEntry>, collector::CollectorError> {
+    debug_assert_eq!(KILL_AUTHORITY_PROFILE, MetadataProfile::Display);
+    collector::collect_kill_ports(pid, port)
+}
 
 pub(super) fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -42,34 +53,48 @@ pub(super) fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) 
         entries,
         KillCollectors {
             collect_context: platform::collect_process_context,
-            collect_ports: collector::collect_ports,
+            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_visibility_ports: || {
+                collector::collect_ports_with_profile(POST_KILL_VISIBILITY_PROFILE)
+            },
         },
         prompt_confirmation,
         process::prepare_termination,
-        process::terminate_handle,
+        process::terminate_handle_checked,
     )
 }
 
-struct KillCollectors<CollectContext, CollectPorts> {
+#[allow(clippy::struct_field_names)]
+struct KillCollectors<CollectContext, CollectKillPorts, CollectVisibilityPorts> {
     collect_context: CollectContext,
-    collect_ports: CollectPorts,
+    collect_kill_ports: CollectKillPorts,
+    collect_visibility_ports: CollectVisibilityPorts,
 }
 
-fn run_kill_with<CollectContext, CollectPorts, Prompt, Prepare, Terminate, Handle>(
+fn run_kill_with<
+    CollectContext,
+    CollectKillPorts,
+    CollectVisibilityPorts,
+    Prompt,
+    Prepare,
+    Terminate,
+    Handle,
+>(
     args: &KillArgs,
     config: &Config,
     entries: &[PortEntry],
-    mut collectors: KillCollectors<CollectContext, CollectPorts>,
+    mut collectors: KillCollectors<CollectContext, CollectKillPorts, CollectVisibilityPorts>,
     mut prompt: Prompt,
     mut prepare: Prepare,
     mut terminate: Terminate,
 ) -> ExitReason
 where
     CollectContext: FnMut(u32) -> ProcessContext,
-    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    CollectVisibilityPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     Prompt: FnMut(&KillTarget, KillMode, ConfirmationRequirement) -> std::io::Result<bool>,
     Prepare: FnMut(u32) -> Result<Handle, TerminationOutcome>,
-    Terminate: FnMut(&Handle, KillMode) -> TerminationOutcome,
+    Terminate: FnMut(&Handle, &KillTarget, &[String], KillMode) -> TerminationOutcome,
 {
     let mode = if args.force {
         KillMode::Force
@@ -126,12 +151,12 @@ where
         }
     };
 
-    let target = match revalidate_cli_target(
+    let target = match revalidate_single_cli_target(
         args,
         config,
         &target,
         &mut collectors.collect_context,
-        &mut collectors.collect_ports,
+        &mut collectors.collect_kill_ports,
     ) {
         Ok(target) => target,
         Err(outcome) => {
@@ -139,11 +164,10 @@ where
             return exit_reason_for_outcome(&outcome);
         }
     };
-
-    let outcome = terminate(&handle, mode);
+    let outcome = terminate(&handle, &target, &config.protected_processes, mode);
     print_termination_outcome(&target, mode, &outcome);
     if outcome == TerminationOutcome::Success {
-        print_post_kill_refresh_status(&target, &mut collectors.collect_ports);
+        print_post_kill_refresh_status(&target, &mut collectors.collect_visibility_ports);
     }
     exit_reason_for_outcome(&outcome)
 }
@@ -157,6 +181,7 @@ where
 /// promptly.
 const POST_KILL_SETTLE_ATTEMPTS_MAX: usize = 10;
 const POST_KILL_SETTLE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const POST_KILL_VISIBILITY_PROFILE: MetadataProfile = MetadataProfile::IdentityOnly;
 
 /// What the confirmed ports looked like once the settle window closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,9 +241,9 @@ where
             Ok(entries) => entries,
             Err(error) => return PostKillPortsStatus::RefreshFailed(error.to_string()),
         };
-        let still_visible = entries
-            .iter()
-            .any(|entry| target.ports.contains(&process::KillTargetPort::from(entry)));
+        let still_visible = entries.iter().any(|entry| {
+            process::kill_target_has_port(&target.ports, &process::KillTargetPort::from(entry))
+        });
         if !still_visible {
             return PostKillPortsStatus::Cleared;
         }
@@ -240,8 +265,57 @@ where
     CollectContext: FnMut(u32) -> ProcessContext,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
+    revalidate_cli_target_with(
+        args,
+        config,
+        confirmed,
+        collect_context,
+        collect_ports,
+        false,
+    )
+}
+
+fn revalidate_single_cli_target<CollectContext, CollectPorts>(
+    args: &KillArgs,
+    config: &Config,
+    confirmed: &KillTarget,
+    collect_context: &mut CollectContext,
+    collect_ports: &mut CollectPorts,
+) -> Result<KillTarget, TerminationOutcome>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
+    revalidate_cli_target_with(
+        args,
+        config,
+        confirmed,
+        collect_context,
+        collect_ports,
+        true,
+    )
+}
+
+fn revalidate_cli_target_with<CollectContext, CollectPorts>(
+    args: &KillArgs,
+    config: &Config,
+    confirmed: &KillTarget,
+    collect_context: &mut CollectContext,
+    collect_ports: &mut CollectPorts,
+    require_protection_name: bool,
+) -> Result<KillTarget, TerminationOutcome>
+where
+    CollectContext: FnMut(u32) -> ProcessContext,
+    CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+{
     let mut fresh_entries = collect_ports().map_err(|error| {
-        TerminationOutcome::UnknownFailure(format!("collecting ports before kill failed: {error}"))
+        if error.is_ownership_permission_denied() {
+            TerminationOutcome::OwnershipUnavailable
+        } else {
+            TerminationOutcome::UnknownFailure(format!(
+                "collecting ports before kill failed: {error}"
+            ))
+        }
     })?;
     mark_protected(&mut fresh_entries, &config.protected_processes);
 
@@ -278,6 +352,9 @@ where
         }
     };
 
+    if require_protection_name {
+        process::validate_single_delivery_evidence(confirmed, &fresh)?;
+    }
     if !process::target_still_matches_confirmation(confirmed, &fresh) {
         return Err(TerminationOutcome::TargetChanged);
     }
@@ -567,6 +644,9 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             target.identity(),
             sanitize(error),
         ),
+        TerminationOutcome::ThawFailed { pid, .. } => eprintln!(
+            "error: cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+        ),
     }
 }
 
@@ -581,24 +661,30 @@ fn exit_reason_for_outcome(outcome: &TerminationOutcome) -> ExitReason {
         }
         TerminationOutcome::Cancelled => ExitReason::KillCancelled,
         TerminationOutcome::ProtectedProcess => ExitReason::ProtectedNeedsConfirmation,
-        TerminationOutcome::UnsafePid(_) | TerminationOutcome::UnknownFailure(_) => {
-            ExitReason::Failure
-        }
+        TerminationOutcome::UnsafePid(_)
+        | TerminationOutcome::UnknownFailure(_)
+        | TerminationOutcome::ThawFailed { .. } => ExitReason::Failure,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::{
-        KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX, PostKillPortsStatus,
-        read_confirmation_line_from, resolve_kill_target, run_kill_with,
-        wait_for_confirmed_ports_to_clear,
+        KILL_AUTHORITY_PROFILE, KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX,
+        POST_KILL_VISIBILITY_PROFILE, PostKillPortsStatus, read_confirmation_line_from,
+        resolve_kill_target, run_kill_with, wait_for_confirmed_ports_to_clear,
     };
     use crate::cli::test_support::{entry, entry_with_pid, no_context};
     use crate::cli::{ExitReason, KillArgs};
-    use crate::collector::CollectorError;
+    use crate::collector::{Collector, CollectorError, FakeCollector, kill_ports_from_snapshot};
     use crate::config::Config;
     use crate::model::Protocol;
+    use crate::observation::{
+        EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot,
+        ObservationError, OwnerCompleteness, OwnerObservation, UnverifiedOwnerReason,
+    };
     use crate::process::{
         ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
     };
@@ -627,6 +713,49 @@ mod tests {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             group: false,
         }
+    }
+
+    fn permission_denied_owner_snapshot() -> NetworkSnapshot {
+        let mut snapshot = FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake collection succeeds");
+        let socket = snapshot
+            .sockets
+            .iter_mut()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("fixture has target socket");
+        let endpoint = socket.local_endpoint.clone();
+        socket.owners = vec![OwnerObservation::UnverifiedPid {
+            pid: 18_422,
+            reason: UnverifiedOwnerReason::PermissionDenied,
+        }];
+        socket.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                .expect("one reason fits");
+        snapshot
+            .processes
+            .retain(|identity, _| identity.pid != 18_422);
+        snapshot.owner_completeness = OwnerCompleteness::partial([
+            EvidenceGapCode::OwnerAttributionIncomplete,
+            EvidenceGapCode::OwnerPermissionDenied,
+        ])
+        .expect("fixture reasons fit");
+        for _ in 0..2 {
+            snapshot.evidence_gaps.push(EvidenceGap::new(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                Some(endpoint.clone()),
+                Some(18_422),
+                "native owner PID could not be verified to a process start identity",
+            ));
+        }
+        snapshot
+    }
+
+    #[test]
+    fn kill_collection_profiles_separate_authority_from_post_kill_visibility() {
+        assert_eq!(KILL_AUTHORITY_PROFILE, MetadataProfile::Display);
+        assert_eq!(POST_KILL_VISIBILITY_PROFILE, MetadataProfile::IdentityOnly);
     }
 
     #[test]
@@ -677,13 +806,14 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || panic!("missing PID target must fail before revalidation"),
+                collect_kill_ports: || panic!("missing PID target must fail before revalidation"),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("missing PID target must not prompt"),
             |_pid| -> Result<u32, TerminationOutcome> {
                 panic!("missing PID target must not prepare termination")
             },
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -719,31 +849,38 @@ mod tests {
     }
 
     #[test]
+    fn resolution_pins_the_snapshot_owner_marker_not_detached_context_identity() {
+        let rows = vec![entry(3000)];
+        let target = resolve_kill_target(&kill_pid(18_422, false, true), &rows, |_pid| {
+            crate::model::ProcessContext {
+                process_start_time_marker: crate::observation::ProcessStartMarker::linux(99).ok(),
+                ..crate::model::ProcessContext::default()
+            }
+        })
+        .expect("verified snapshot row resolves");
+
+        assert_eq!(
+            target.process_start_time_marker,
+            crate::observation::ProcessStartMarker::linux(55).ok(),
+        );
+    }
+
+    #[test]
     fn kill_yes_sends_signal_without_prompt_for_unprotected_target() {
         let rows = vec![entry(3000)];
         let mut terminated = None;
-        // First collect backs pre-signal revalidation, so it must still show the
-        // target; the post-kill settle poll then sees the port gone.
-        let mut collect_calls = 0;
-
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || {
-                    collect_calls += 1;
-                    if collect_calls == 1 {
-                        Ok(rows.clone())
-                    } else {
-                        Ok(Vec::new())
-                    }
-                },
+                collect_kill_ports: || Ok(rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes must skip normal prompts"),
             Ok::<u32, TerminationOutcome>,
-            |pid: &u32, mode| {
+            |pid: &u32, _target, _protected, mode| {
                 terminated = Some((*pid, mode));
                 TerminationOutcome::Success
             },
@@ -766,13 +903,14 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(rows.clone()),
+                collect_kill_ports: || Ok(rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("protected --yes must not prompt"),
             |_pid| -> Result<u32, TerminationOutcome> {
                 panic!("protected --yes must not prepare termination")
             },
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -786,30 +924,21 @@ mod tests {
     fn force_kill_uses_force_word_confirmation_when_configured() {
         let rows = vec![entry(3000)];
         let mut prompted = None;
-        // As above: revalidation still sees the target, the settle poll does not.
-        let mut collect_calls = 0;
-
         let reason = run_kill_with(
             &kill_pid(18_422, true, false),
             &Config::default(),
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || {
-                    collect_calls += 1;
-                    if collect_calls == 1 {
-                        Ok(rows.clone())
-                    } else {
-                        Ok(Vec::new())
-                    }
-                },
+                collect_kill_ports: || Ok(rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, mode, requirement| {
                 prompted = Some((mode, requirement));
                 Ok(true)
             },
             Ok::<u32, TerminationOutcome>,
-            |_pid: &u32, _mode| TerminationOutcome::Success,
+            |_pid: &u32, _target, _protected, _mode| TerminationOutcome::Success,
         );
 
         assert_eq!(reason, ExitReason::Success);
@@ -830,7 +959,8 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(rows.clone()),
+                collect_kill_ports: || Ok(rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, requirement| {
                 assert_eq!(requirement, ConfirmationRequirement::Yes);
@@ -839,7 +969,7 @@ mod tests {
             |_pid| -> Result<u32, TerminationOutcome> {
                 panic!("declined confirmation must not prepare termination")
             },
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -862,14 +992,15 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(fresh_rows.clone()),
+                collect_kill_ports: || Ok(fresh_rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
             |pid| {
                 prepared = Some(pid);
                 Ok(pid)
             },
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -892,14 +1023,15 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || {
+                collect_kill_ports: || {
                     collected = true;
                     Ok(rows.clone())
                 },
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
             |_pid| -> Result<u32, TerminationOutcome> { Err(TerminationOutcome::AlreadyExited) },
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -913,7 +1045,7 @@ mod tests {
     #[test]
     fn target_losing_readable_pid_during_revalidation_exits_permission_denied() {
         let rows = vec![entry(3000)];
-        let fresh_rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
+        let snapshot = permission_denied_owner_snapshot();
         let mut terminated = false;
 
         let reason = run_kill_with(
@@ -922,11 +1054,12 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(fresh_rows.clone()),
+                collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
             Ok::<u32, TerminationOutcome>,
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -937,13 +1070,51 @@ mod tests {
     }
 
     #[test]
-    fn kill_pid_losing_readable_owner_during_revalidation_exits_permission_denied() {
-        // A `--pid` kill whose confirmed port stays visible but whose owner PID
-        // becomes unreadable during revalidation must abort as
-        // ownership-unavailable (exit 4), matching `--port` and the TUI, instead
-        // of looking like a vanished target (exit 3). No signal is sent.
+    fn unrelated_endpointless_ownership_gap_does_not_block_port_delivery() {
+        let mut snapshot = FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake collection succeeds");
+        snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerAttributionIncomplete,
+            None,
+            Some(29_999),
+            "unrelated process ownership could not be attributed to an endpoint",
+        ));
+        let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
+            .expect("the unrelated ownership gap must not block the target port");
+        let mut delivered = false;
+        let mut visibility_polls = 0;
+
+        let reason = run_kill_with(
+            &kill_port(3000, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+                collect_visibility_ports: || {
+                    visibility_polls += 1;
+                    Ok(Vec::new())
+                },
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            Ok::<u32, TerminationOutcome>,
+            |_handle: &u32, target, _protected, _mode| {
+                delivered = true;
+                assert_eq!(target.pid, 18_422);
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        assert!(delivered);
+        assert_eq!(visibility_polls, 1);
+    }
+
+    #[test]
+    fn authoritative_snapshot_refusal_reaches_zero_delivery() {
         let rows = vec![entry(3000)];
-        let fresh_rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
         let mut terminated = false;
 
         let reason = run_kill_with(
@@ -952,11 +1123,114 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(fresh_rows.clone()),
+                collect_kill_ports: || {
+                    Err(CollectorError::Observation(
+                        ObservationError::PartialSocketSet,
+                    ))
+                },
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
             Ok::<u32, TerminationOutcome>,
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
+                terminated = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(!terminated);
+    }
+
+    #[test]
+    fn port_global_authority_denial_exits_four_after_prepare_without_delivery() {
+        let rows = vec![entry(3000)];
+        let snapshot = permission_denied_owner_snapshot();
+        let mut prepared = false;
+        let mut delivered = false;
+
+        let reason = run_kill_with(
+            &kill_port(3000, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+                collect_visibility_ports: || Ok(Vec::new()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |_pid| {
+                prepared = true;
+                Ok::<u32, TerminationOutcome>(18_422)
+            },
+            |_handle: &u32, _target, _protected, _mode| {
+                delivered = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::PermissionDenied);
+        assert!(prepared);
+        assert!(!delivered);
+    }
+
+    #[test]
+    fn port_owner_moving_after_handle_preparation_never_signals_old_owner() {
+        let rows = vec![entry(3000)];
+        let moved = vec![entry_with_pid(
+            3000,
+            Some(29_999),
+            Protocol::Tcp,
+            "replacement",
+        )];
+        let events = RefCell::new(Vec::new());
+
+        let reason = run_kill_with(
+            &kill_port(3000, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || {
+                    events.borrow_mut().push("collect");
+                    Ok(moved.clone())
+                },
+                collect_visibility_ports: || Ok(Vec::new()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            |pid| {
+                assert_eq!(pid, 18_422);
+                events.borrow_mut().push("prepare");
+                Ok::<u32, TerminationOutcome>(pid)
+            },
+            |_handle: &u32, _target, _protected, _mode| {
+                events.borrow_mut().push("deliver");
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(*events.borrow(), ["prepare", "collect"]);
+    }
+
+    #[test]
+    fn kill_pid_losing_readable_owner_during_revalidation_exits_permission_denied() {
+        let rows = vec![entry(3000)];
+        let snapshot = permission_denied_owner_snapshot();
+        let mut terminated = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || kill_ports_from_snapshot(&snapshot, Some(18_422), None),
+                collect_visibility_ports: || Ok(Vec::new()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            Ok::<u32, TerminationOutcome>,
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -980,11 +1254,12 @@ mod tests {
             &rows,
             KillCollectors {
                 collect_context: no_context,
-                collect_ports: || Ok(fresh_rows.clone()),
+                collect_kill_ports: || Ok(fresh_rows.clone()),
+                collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
             Ok::<u32, TerminationOutcome>,
-            |_pid: &u32, _mode| {
+            |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -992,6 +1267,66 @@ mod tests {
 
         assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
         assert!(!terminated);
+    }
+
+    #[test]
+    fn missing_fresh_protection_name_refuses_without_delivery() {
+        let rows = vec![entry(3000)];
+        let mut fresh = entry(3000);
+        fresh.process_name = None;
+        let mut delivered = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || Ok(vec![fresh.clone()]),
+                collect_visibility_ports: || Ok(Vec::new()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            Ok::<u32, TerminationOutcome>,
+            |_handle: &u32, _target, _protected, _mode| {
+                delivered = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(!delivered);
+    }
+
+    #[test]
+    fn oversized_fresh_protection_name_refuses_without_delivery() {
+        let mut rows = vec![entry(3000)];
+        rows[0].process_name = None;
+        let mut fresh = entry(3000);
+        fresh.process_name = Some(
+            "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES + 1)
+                .into(),
+        );
+        let mut delivered = false;
+
+        let reason = run_kill_with(
+            &kill_pid(18_422, false, true),
+            &Config::default(),
+            &rows,
+            KillCollectors {
+                collect_context: no_context,
+                collect_kill_ports: || Ok(vec![fresh.clone()]),
+                collect_visibility_ports: || Ok(Vec::new()),
+            },
+            |_target, _mode, _requirement| panic!("--yes skips prompts"),
+            Ok::<u32, TerminationOutcome>,
+            |_handle: &u32, _target, _protected, _mode| {
+                delivered = true;
+                TerminationOutcome::Success
+            },
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(!delivered);
     }
 
     #[test]

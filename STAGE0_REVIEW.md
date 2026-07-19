@@ -1,4 +1,4 @@
-# Feature Contract and Dependency Review
+# Stage 0 Feature Contract and Dependency Review
 
 ## Status
 
@@ -26,8 +26,8 @@ measured files more precisely than a dirty-worktree commit ID would.
   single verified owners. Shared and incomplete owner sets are never paired.
 - macOS scope explicitly means process-visible libproc sockets, not a global PCB
   snapshot.
-- Windows optional metadata will move from unbounded `sysinfo` allocation to the
-  bounded native sources named in `FEATURE.md`.
+- Windows optional metadata uses the bounded native sources named in `FEATURE.md`;
+  the former unbounded `sysinfo` snapshot has been removed.
 - Why maps each endpoint first and aggregates with fixed `1 > 4 > 3 > 0`
   precedence.
 - Every new schema has an in-band version; the legacy list array remains the
@@ -51,9 +51,10 @@ start-identity read before every delivery; unavailable evidence refuses rather
 than meaning "not protected."
 
 Accepted residual risks remain polling blind spots, the post-probe bind race,
-platform/version differences, scope exclusions, synchronous native/output calls
-that the application cannot portably deadline, and the final macOS identity-read
-to signal interval.
+platform/version differences, scope exclusions, a Linux unreadable same-inode
+socket co-holder, the private Windows Job Object freeze ABI, synchronous
+native/output calls that the application cannot portably deadline, and the final
+macOS identity-read to signal interval.
 
 ## socket2 Acceptance
 
@@ -84,11 +85,11 @@ Reviewed safe call surface:
 - `local_addr` in dependency contract tests only.
 - Owned drop.
 
-The production wrapper will not expose raw handles, unsafe `SockAddr`
+The future production probe wrapper may not expose raw handles, unsafe `SockAddr`
 constructors, connect, listen, accept, send, receive, or ownership-escaping
-conversion. The upstream Windows vectored-send safety FIXME is outside this call
-graph. The wrapper is implemented with the exact bind probes, not provisionally
-during contract review.
+conversion. The upstream Windows vectored-send safety FIXME is outside the
+approved call graph. Stage 0 approves and contract-tests the exact bind surface;
+production probe integration remains a later feature stage.
 
 `tests/socket2_contract.rs` verifies TCP and UDP, IPv4 and IPv6 loopback,
 wildcards, default controls, reuse enabled/disabled, IPv6-only and dual-stack
@@ -131,30 +132,6 @@ dc1471a89f864b2832db95541e2267e07f2cc43e514d3b244f7b3a3c70f637b9  kick
 ```
 
 This is the dependency-acceptance size check, not the deferred release benchmark.
-
-## Verification Evidence
-
-Passed locally:
-
-- `cargo fmt --all -- --check`.
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`.
-- `cargo test --locked --all-features`: 307 unit tests, 19 Linux real-binary
-  integration tests, and four dependency contract tests.
-- `cargo test --locked --all-features --doc`.
-- `cargo test --locked --test socket2_contract`: four tests.
-- `cargo build --locked --release --all-features --bin kickoutchi --bin kick`.
-- `cargo deny check`.
-- `mise run clippy-windows`.
-- `mise run check-macos` for x86_64 and aarch64 Darwin.
-- `mise run clippy-macos` for x86_64 and aarch64 Darwin.
-
-Native CI evidence for the reviewed dependency and contract tests:
-
-- Run: <https://github.com/nuggocto/kickoutchi/actions/runs/29650821097>.
-- Linux: passed formatting, Clippy, and all tests.
-- macOS: passed formatting, Clippy, and all tests.
-- Windows: passed formatting, Clippy, and all tests.
-- Supply chain: passed `cargo deny check`.
 
 ## Gate Decision
 

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::app::App;
 use crate::display::sanitize;
 use crate::model::{
-    ChildProcessSnapshot, DockerContainerPort, DockerPortContext, PermissionStatus, PortEntry,
+    ChildProcessSnapshot, DockerContainerPort, DockerPortContext, PermissionStatus, PortEntryView,
     ProcessContext, Protocol,
 };
 
@@ -72,7 +72,7 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
 }
 
 fn panel_lines(
-    entry: &PortEntry,
+    entry: PortEntryView<'_>,
     context: Option<&ProcessContext>,
     context_loading: bool,
     theme: Theme,
@@ -92,7 +92,7 @@ fn panel_lines(
             format!(
                 "{} | Process: {}",
                 optional_u32(entry.pid),
-                sanitize_optional_str(entry.process_name.as_deref())
+                sanitize_optional_str(entry.process_name)
             ),
             theme,
         ),
@@ -120,11 +120,7 @@ fn panel_lines(
             theme,
         ),
         field("Path", path_text(entry), theme),
-        field(
-            "Command",
-            sanitize_optional_str(entry.command_line.as_deref()),
-            theme,
-        ),
+        field("Command", sanitize_optional_str(entry.command_line), theme),
         warning_or_permission,
     ]);
     debug_assert!(lines.len() <= PANEL_LINES_MAX);
@@ -132,7 +128,7 @@ fn panel_lines(
 }
 
 fn modal_lines(
-    entry: &PortEntry,
+    entry: PortEntryView<'_>,
     context: Option<&ProcessContext>,
     context_loading: bool,
     theme: Theme,
@@ -144,11 +140,7 @@ fn modal_lines(
         field("Scope", entry.scope_label().to_owned(), theme),
         field("State", entry.state.label().to_owned(), theme),
         field("PID", optional_u32(entry.pid), theme),
-        field(
-            "Process",
-            sanitize_optional_str(entry.process_name.as_deref()),
-            theme,
-        ),
+        field("Process", sanitize_optional_str(entry.process_name), theme),
     ];
 
     if let Some(docker) = context.and_then(|context| context.docker.as_ref()) {
@@ -176,7 +168,7 @@ fn modal_lines(
     lines.push(field("Path", path_text(entry), theme));
     lines.push(field(
         "Command",
-        sanitize_optional_str(entry.command_line.as_deref()),
+        sanitize_optional_str(entry.command_line),
         theme,
     ));
 
@@ -191,8 +183,8 @@ fn optional_u32(value: Option<u32>) -> String {
     value.map_or_else(|| MISSING.to_owned(), |value| value.to_string())
 }
 
-fn path_text(entry: &PortEntry) -> String {
-    entry.executable_path.as_ref().map_or_else(
+fn path_text(entry: PortEntryView<'_>) -> String {
+    entry.executable_path.map_or_else(
         || MISSING.to_owned(),
         |path| sanitize(&path.display().to_string()),
     )
@@ -202,8 +194,8 @@ fn sanitize_optional_str(value: Option<&str>) -> String {
     value.map_or_else(|| MISSING.to_owned(), sanitize)
 }
 
-fn parent_text(entry: &PortEntry) -> String {
-    match (entry.parent_process_name.as_deref(), entry.parent_pid) {
+fn parent_text(entry: PortEntryView<'_>) -> String {
+    match (entry.parent_process_name, entry.parent_pid) {
         (Some(name), Some(pid)) => format!("{} (PID {pid})", sanitize(name)),
         (Some(name), None) => sanitize(name),
         (None, Some(pid)) => format!("PID {pid}"),
@@ -212,7 +204,7 @@ fn parent_text(entry: &PortEntry) -> String {
 }
 
 fn children_text(
-    entry: &PortEntry,
+    entry: PortEntryView<'_>,
     context: Option<&ProcessContext>,
     context_loading: bool,
 ) -> String {
@@ -361,7 +353,8 @@ mod tests {
     };
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, DockerContainerPort, DockerPortContext,
-        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
+        PermissionStatus, Platform, PortEntry, PortEntryView, ProcessContext, Protocol,
+        SocketState,
     };
     use crate::ui::theme::Theme;
 
@@ -372,22 +365,30 @@ mod tests {
             local_port: 3000,
             state: SocketState::Listen,
             pid: Some(18_422),
-            process_name: Some("node".to_owned()),
-            executable_path: Some(PathBuf::from("/usr/bin/node")),
-            command_line: Some("node server.js".to_owned()),
+            process_name: Some("node".into()),
+            executable_path: Some(PathBuf::from("/usr/bin/node").into()),
+            command_line: Some("node server.js".into()),
             parent_pid: Some(18_001),
-            parent_process_name: Some("cursor-agent".to_owned()),
+            parent_process_name: Some("cursor-agent".into()),
             child_pids: vec![18_430, 18_431],
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: None,
+            ipv6_scope: None,
         }
     }
 
     #[test]
     fn panel_summary_fits_the_default_details_area() {
         let context = ProcessContext::default();
-        let lines = panel_lines(&entry(), Some(&context), false, Theme::from_environment());
+        let row = entry();
+        let lines = panel_lines(
+            PortEntryView::from(&row),
+            Some(&context),
+            false,
+            Theme::from_environment(),
+        );
 
         assert!(lines.len() <= PANEL_LINES_MAX);
     }
@@ -410,7 +411,13 @@ mod tests {
             docker: Some(docker.clone()),
             ..ProcessContext::default()
         };
-        let lines = panel_lines(&entry(), Some(&context), false, Theme::from_environment());
+        let row = entry();
+        let lines = panel_lines(
+            PortEntryView::from(&row),
+            Some(&context),
+            false,
+            Theme::from_environment(),
+        );
 
         assert!(lines.len() <= PANEL_LINES_MAX);
         assert_eq!(
@@ -426,13 +433,16 @@ mod tests {
     #[test]
     fn parent_text_covers_partial_metadata() {
         let mut row = entry();
-        assert_eq!(parent_text(&row), "cursor-agent (PID 18001)");
+        assert_eq!(
+            parent_text(PortEntryView::from(&row)),
+            "cursor-agent (PID 18001)"
+        );
 
         row.parent_process_name = None;
-        assert_eq!(parent_text(&row), "PID 18001");
+        assert_eq!(parent_text(PortEntryView::from(&row)), "PID 18001");
 
         row.parent_pid = None;
-        assert_eq!(parent_text(&row), MISSING);
+        assert_eq!(parent_text(PortEntryView::from(&row)), MISSING);
     }
 
     #[test]
@@ -440,7 +450,7 @@ mod tests {
         let mut row = entry();
         let context = ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_marker: Some(55),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
             children: ChildProcessSnapshot {
                 children: vec![
                     ChildProcess {
@@ -458,24 +468,34 @@ mod tests {
         };
 
         assert_eq!(
-            children_text(&row, Some(&context), false),
+            children_text(PortEntryView::from(&row), Some(&context), false),
             "2 (PID 18430 (worker), PID 18431 (<unknown>))"
         );
         assert_eq!(user_text(Some(&context)), "uid 1000");
 
         row.pid = None;
         assert_eq!(
-            children_text(&row, Some(&context), false),
+            children_text(PortEntryView::from(&row), Some(&context), false),
             "unavailable (missing PID)"
         );
 
         row.pid = Some(18_422);
         assert_eq!(
-            children_text(&row, Some(&ProcessContext::default()), false),
+            children_text(
+                PortEntryView::from(&row),
+                Some(&ProcessContext::default()),
+                false
+            ),
             "none"
         );
-        assert_eq!(children_text(&row, None, true), "loading");
-        assert_eq!(children_text(&row, None, false), "open details to load");
+        assert_eq!(
+            children_text(PortEntryView::from(&row), None, true),
+            "loading"
+        );
+        assert_eq!(
+            children_text(PortEntryView::from(&row), None, false),
+            "open details to load"
+        );
     }
 
     #[test]

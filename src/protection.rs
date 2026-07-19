@@ -103,7 +103,7 @@ mod tests {
             local_port: port,
             state: SocketState::Listen,
             pid: Some(u32::from(port)),
-            process_name: name.map(str::to_owned),
+            process_name: name.map(Into::into),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -112,6 +112,8 @@ mod tests {
             protected: false,
             platform,
             permission: PermissionStatus::Full,
+            process_identity: None,
+            ipv6_scope: None,
         }
     }
 

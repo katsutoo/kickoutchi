@@ -4,9 +4,12 @@
 //! confirmed rows are visible for a given query, and in what order. It never
 //! conjures a row out of thin air.
 
+use std::collections::HashMap;
+use std::fmt::{self, Write as _};
+
 use thiserror::Error;
 
-use crate::model::{BindScope, PortEntry, Protocol, SortMode, sort_entries};
+use crate::model::{BindScope, PortEntryView, Protocol, SortMode};
 
 /// Longest search text we'll take from the TUI or CLI.
 ///
@@ -24,10 +27,25 @@ pub(crate) struct QueryOptions<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct QueryResult {
-    pub(crate) entries: Vec<PortEntry>,
+pub(crate) struct QueryIndexResult {
+    pub(crate) indices: Vec<usize>,
     pub(crate) explicit_filter_active: bool,
     pub(crate) hidden_system_process_count: usize,
+    #[cfg(test)]
+    pub(crate) metadata_normalization_count: usize,
+    #[cfg(test)]
+    pub(crate) metadata_scan_count: usize,
+    #[cfg(test)]
+    pub(crate) metadata_match_cache_peak: usize,
+}
+
+struct MatchingIndices {
+    indices: Vec<usize>,
+    hidden_system_process_count: usize,
+    explicit_filter_active: bool,
+    normalization_count: usize,
+    scan_count: usize,
+    match_cache_peak: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -53,42 +71,149 @@ enum FilterTerm {
     Parent(String),
 }
 
-pub(crate) fn query_entries(
-    entries: &[PortEntry],
+pub(crate) fn query_view_indices(
+    entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
-) -> Result<QueryResult, QueryError> {
+) -> Result<QueryIndexResult, QueryError> {
+    let MatchingIndices {
+        indices,
+        hidden_system_process_count,
+        explicit_filter_active,
+        normalization_count,
+        scan_count,
+        match_cache_peak,
+    } = matching_indices(entries, options)?;
+    #[cfg(not(test))]
+    let _ = (normalization_count, scan_count, match_cache_peak);
+    Ok(QueryIndexResult {
+        indices,
+        explicit_filter_active,
+        hidden_system_process_count,
+        #[cfg(test)]
+        metadata_normalization_count: normalization_count,
+        #[cfg(test)]
+        metadata_scan_count: scan_count,
+        #[cfg(test)]
+        metadata_match_cache_peak: match_cache_peak,
+    })
+}
+
+fn matching_indices(
+    entries: &[PortEntryView<'_>],
+    options: QueryOptions<'_>,
+) -> Result<MatchingIndices, QueryError> {
     let terms = parse_filter_text(options.filter_text)?;
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
         options.port.is_some() || options.process.is_some() || !terms.is_empty();
 
     let mut hidden_system_process_count = 0;
-    let mut filtered: Vec<PortEntry> = entries
-        .iter()
-        .filter(|entry| {
-            if options.hide_system_processes && entry.is_system_process() {
-                hidden_system_process_count += 1;
-                false
-            } else {
-                true
-            }
-        })
-        .filter(|entry| options.port.is_none_or(|port| entry.local_port == port))
-        .filter(|entry| {
-            process_needle
-                .as_deref()
-                .is_none_or(|process| entry.matches_process_normalized(process))
-        })
-        .filter(|entry| terms.iter().all(|term| term_matches(entry, term)))
-        .cloned()
-        .collect();
+    let mut metadata = MetadataMatchCache::default();
+    let mut indices = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if options.hide_system_processes && entry.is_system_process() {
+            hidden_system_process_count += 1;
+            continue;
+        }
+        if options.port.is_some_and(|port| entry.local_port != port) {
+            continue;
+        }
+        indices.push(index);
+    }
 
-    sort_entries(&mut filtered, options.sort_mode);
+    if let Some(needle) = process_needle.as_deref() {
+        metadata.clear_matches();
+        indices.retain(|&index| {
+            entries[index]
+                .process_name
+                .is_some_and(|name| metadata.contains(name, needle))
+        });
+    }
+    for term in &terms {
+        metadata.clear_matches();
+        indices.retain(|&index| term_matches(&entries[index], term, &mut metadata));
+    }
 
-    Ok(QueryResult {
-        entries: filtered,
-        explicit_filter_active,
+    let normalized_keys = normalized_sort_keys(
+        entries,
+        &indices,
+        options.sort_mode,
+        &mut metadata.normalization,
+    );
+    indices.sort_by(|left, right| {
+        compare_views(
+            entries[*left],
+            entries[*right],
+            options.sort_mode,
+            normalized_keys[*left].map(|key| metadata.normalization.values[key].as_str()),
+            normalized_keys[*right].map(|key| metadata.normalization.values[key].as_str()),
+        )
+    });
+
+    Ok(MatchingIndices {
+        indices,
         hidden_system_process_count,
+        explicit_filter_active,
+        normalization_count: metadata.normalization.values.len(),
+        scan_count: metadata.scans,
+        match_cache_peak: metadata.match_entries_peak,
+    })
+}
+
+fn normalized_sort_keys<'a>(
+    entries: &[PortEntryView<'a>],
+    visible_indices: &[usize],
+    mode: SortMode,
+    normalization: &mut NormalizationCache<'a>,
+) -> Vec<Option<usize>> {
+    let mut keys = vec![None; entries.len()];
+    for &index in visible_indices {
+        let value = match mode {
+            SortMode::Process => entries[index].process_name,
+            SortMode::Parent => entries[index].parent_process_name,
+            _ => None,
+        };
+        let Some(value) = value else { continue };
+        keys[index] = Some(normalization.key(value));
+    }
+    keys
+}
+
+fn compare_views(
+    a: PortEntryView<'_>,
+    b: PortEntryView<'_>,
+    mode: SortMode,
+    normalized_a: Option<&str>,
+    normalized_b: Option<&str>,
+) -> std::cmp::Ordering {
+    let key = match mode {
+        SortMode::Port => std::cmp::Ordering::Equal,
+        SortMode::Pid => (a.pid.is_none(), a.pid).cmp(&(b.pid.is_none(), b.pid)),
+        SortMode::Protocol => a.protocol.cmp(&b.protocol),
+        SortMode::Process => {
+            (normalized_a.is_none(), normalized_a).cmp(&(normalized_b.is_none(), normalized_b))
+        }
+        SortMode::Parent => (
+            normalized_a.is_none(),
+            normalized_a,
+            a.parent_pid.is_none(),
+            a.parent_pid,
+        )
+            .cmp(&(
+                normalized_b.is_none(),
+                normalized_b,
+                b.parent_pid.is_none(),
+                b.parent_pid,
+            )),
+        SortMode::Scope => a.scope().cmp(&b.scope()),
+    };
+    key.then_with(|| {
+        (a.local_port, a.protocol, a.local_addr, a.pid).cmp(&(
+            b.local_port,
+            b.protocol,
+            b.local_addr,
+            b.pid,
+        ))
     })
 }
 
@@ -184,69 +309,175 @@ fn invalid_value(field: &'static str, value: &str, expected: &'static str) -> Qu
     }
 }
 
-fn term_matches(entry: &PortEntry, term: &FilterTerm) -> bool {
+fn term_matches<'a>(
+    entry: &'a PortEntryView<'a>,
+    term: &FilterTerm,
+    metadata: &mut MetadataMatchCache<'a>,
+) -> bool {
     match term {
-        FilterTerm::Plain(needle) => plain_matches(entry, needle),
+        FilterTerm::Plain(needle) => plain_matches(entry, needle, metadata),
         FilterTerm::Pid(pid) => entry.pid == Some(*pid),
         FilterTerm::Port(port) => entry.local_port == *port,
         FilterTerm::Protocol(protocol) => entry.protocol == *protocol,
         FilterTerm::Scope(scope) => entry.scope() == *scope,
         FilterTerm::Protected(protected) => entry.protected == *protected,
-        FilterTerm::Parent(needle) => parent_matches(entry, needle),
+        FilterTerm::Parent(needle) => parent_matches(entry, needle, metadata),
     }
 }
 
-fn plain_matches(entry: &PortEntry, needle_lower: &str) -> bool {
-    contains(&entry.local_port.to_string(), needle_lower)
+fn plain_matches<'a>(
+    entry: &'a PortEntryView<'a>,
+    needle_lower: &str,
+    metadata: &mut MetadataMatchCache<'a>,
+) -> bool {
+    scalar_matches(entry.local_port, needle_lower)
         || entry
             .pid
-            .is_some_and(|pid| contains(&pid.to_string(), needle_lower))
-        || contains(&entry.local_addr.to_string(), needle_lower)
+            .is_some_and(|pid| scalar_matches(pid, needle_lower))
+        || display_matches(entry.local_addr, needle_lower)
         || socket_text_matches(entry, needle_lower)
-        || contains(entry.protocol.label(), needle_lower)
-        || contains(entry.state.label(), needle_lower)
-        || contains(entry.scope_label(), needle_lower)
+        || contains_ascii(entry.protocol.label(), needle_lower)
+        || contains_ascii(entry.state.label(), needle_lower)
+        || contains_ascii(entry.scope_label(), needle_lower)
         || entry
             .process_name
-            .as_deref()
-            .is_some_and(|value| contains(value, needle_lower))
+            .is_some_and(|value| metadata.contains(value, needle_lower))
         || entry
             .executable_path
             .as_ref()
-            .is_some_and(|path| contains(&path.display().to_string(), needle_lower))
+            .and_then(|path| path.to_str())
+            .is_some_and(|value| metadata.contains(value, needle_lower))
         || entry
             .command_line
-            .as_deref()
-            .is_some_and(|value| contains(value, needle_lower))
-        || parent_matches(entry, needle_lower)
+            .is_some_and(|value| metadata.contains(value, needle_lower))
+        || parent_matches(entry, needle_lower, metadata)
 }
 
-fn socket_text_matches(entry: &PortEntry, needle_lower: &str) -> bool {
+fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
     if !needle_lower.contains(':') {
         return false;
     }
 
-    contains(
-        &format!("{}:{}", entry.local_addr, entry.local_port),
-        needle_lower,
-    ) || contains(
-        &format!("[{}]:{}", entry.local_addr, entry.local_port),
-        needle_lower,
-    )
+    let mut plain = StackText::new();
+    let _ = write!(plain, "{}:{}", entry.local_addr, entry.local_port);
+    if contains_ascii(plain.as_str(), needle_lower) {
+        return true;
+    }
+    let mut bracketed = StackText::new();
+    let _ = write!(bracketed, "[{}]:{}", entry.local_addr, entry.local_port);
+    contains_ascii(bracketed.as_str(), needle_lower)
 }
 
-fn parent_matches(entry: &PortEntry, needle_lower: &str) -> bool {
+fn parent_matches<'a>(
+    entry: &'a PortEntryView<'a>,
+    needle_lower: &str,
+    metadata: &mut MetadataMatchCache<'a>,
+) -> bool {
     entry
         .parent_pid
-        .is_some_and(|pid| contains(&pid.to_string(), needle_lower))
+        .is_some_and(|pid| scalar_matches(pid, needle_lower))
         || entry
             .parent_process_name
-            .as_deref()
-            .is_some_and(|value| contains(value, needle_lower))
+            .is_some_and(|value| metadata.contains(value, needle_lower))
 }
 
-fn contains(haystack: &str, needle_lower: &str) -> bool {
-    haystack.to_lowercase().contains(needle_lower)
+fn scalar_matches(value: impl fmt::Display, needle: &str) -> bool {
+    display_matches(value, needle)
+}
+
+fn display_matches(value: impl fmt::Display, needle: &str) -> bool {
+    let mut text = StackText::new();
+    let _ = write!(text, "{value}");
+    contains_ascii(text.as_str(), needle)
+}
+
+fn contains_ascii(haystack: &str, needle: &str) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[derive(Default)]
+struct NormalizationCache<'a> {
+    by_pointer: HashMap<(usize, usize), usize>,
+    by_value: HashMap<&'a str, usize>,
+    values: Vec<String>,
+}
+
+#[derive(Default)]
+struct MetadataMatchCache<'a> {
+    normalization: NormalizationCache<'a>,
+    matches: HashMap<usize, bool>,
+    scans: usize,
+    match_entries_peak: usize,
+}
+
+impl<'a> MetadataMatchCache<'a> {
+    fn clear_matches(&mut self) {
+        self.matches.clear();
+    }
+
+    fn contains(&mut self, value: &'a str, needle: &str) -> bool {
+        let value_key = self.normalization.key(value);
+        if let Some(result) = self.matches.get(&value_key) {
+            return *result;
+        }
+        let result = self.normalization.values[value_key].contains(needle);
+        self.matches.insert(value_key, result);
+        self.match_entries_peak = self.match_entries_peak.max(self.matches.len());
+        self.scans += 1;
+        result
+    }
+}
+
+impl<'a> NormalizationCache<'a> {
+    fn key(&mut self, value: &'a str) -> usize {
+        let pointer = (value.as_ptr() as usize, value.len());
+        if let Some(&key) = self.by_pointer.get(&pointer) {
+            key
+        } else if let Some(&key) = self.by_value.get(value) {
+            self.by_pointer.insert(pointer, key);
+            key
+        } else {
+            let key = self.values.len();
+            self.values.push(value.to_lowercase());
+            self.by_pointer.insert(pointer, key);
+            self.by_value.insert(value, key);
+            key
+        }
+    }
+}
+
+struct StackText {
+    bytes: [u8; 128],
+    len: usize,
+}
+
+impl StackText {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 128],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("formatted scalars are UTF-8")
+    }
+}
+
+impl fmt::Write for StackText {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -254,8 +485,12 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
 
-    use super::{FILTER_TEXT_MAX_BYTES, QueryError, QueryOptions, query_entries};
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
+    use super::{
+        FILTER_TEXT_MAX_BYTES, QueryError, QueryOptions, normalized_sort_keys, query_view_indices,
+    };
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState, SortMode,
+    };
 
     fn entry(port: u16, name: &str) -> PortEntry {
         PortEntry {
@@ -264,15 +499,17 @@ mod tests {
             local_port: port,
             state: SocketState::Listen,
             pid: Some(u32::from(port)),
-            process_name: Some(name.to_owned()),
-            executable_path: Some(PathBuf::from(format!("/usr/bin/{name}"))),
-            command_line: Some(format!("{name} --port {port}")),
+            process_name: Some(name.into()),
+            executable_path: Some(PathBuf::from(format!("/usr/bin/{name}")).into()),
+            command_line: Some(format!("{name} --port {port}").into()),
             parent_pid: Some(10),
-            parent_process_name: Some("agent".to_owned()),
+            parent_process_name: Some("agent".into()),
             child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: None,
+            ipv6_scope: None,
         }
     }
 
@@ -287,11 +524,12 @@ mod tests {
     }
 
     fn matching_ports(rows: &[PortEntry], filter_text: &str) -> Vec<u16> {
-        query_entries(rows, query(filter_text))
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        query_view_indices(&views, query(filter_text))
             .expect("query is valid")
-            .entries
-            .iter()
-            .map(|entry| entry.local_port)
+            .indices
+            .into_iter()
+            .map(|index| rows[index].local_port)
             .collect()
     }
 
@@ -299,7 +537,7 @@ mod tests {
     fn plain_search_matches_user_visible_fields() {
         let mut node = entry(3000, "node");
         node.local_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        node.parent_process_name = Some("cursor-agent".to_owned());
+        node.parent_process_name = Some("cursor-agent".into());
         let mut vite = entry(5173, "vite");
         vite.local_addr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
         let rows = vec![node, vite];
@@ -318,17 +556,18 @@ mod tests {
     fn process_filter_option_matches_case_insensitive_substring() {
         let mut hidden = entry(8080, "hidden");
         hidden.process_name = None;
-        let rows = vec![entry(3000, "Node"), entry(5173, "vite"), hidden];
+        let rows = [entry(3000, "Node"), entry(5173, "vite"), hidden];
         let options = QueryOptions {
             process: Some("OD"),
             ..query("")
         };
 
-        let result = query_entries(&rows, options).expect("query is valid");
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let result = query_view_indices(&views, options).expect("query is valid");
         let ports: Vec<u16> = result
-            .entries
+            .indices
             .iter()
-            .map(|entry| entry.local_port)
+            .map(|&index| rows[index].local_port)
             .collect();
 
         assert_eq!(ports, vec![3000]);
@@ -346,7 +585,7 @@ mod tests {
         udp.state = SocketState::Bound;
         udp.pid = Some(902);
         udp.parent_pid = Some(1);
-        udp.parent_process_name = Some("systemd".to_owned());
+        udp.parent_process_name = Some("systemd".into());
 
         let rows = vec![entry(3000, "node"), protected, udp];
 
@@ -360,15 +599,16 @@ mod tests {
 
     #[test]
     fn structured_filters_reject_bad_values() {
-        let rows = vec![entry(3000, "node")];
+        let rows = [entry(3000, "node")];
 
-        let error = query_entries(&rows, query("port:not-a-port")).expect_err("invalid port");
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let error = query_view_indices(&views, query("port:not-a-port")).expect_err("invalid port");
         assert!(matches!(
             error,
             QueryError::InvalidValue { field: "port", .. }
         ));
 
-        let error = query_entries(&rows, query("protected:maybe")).expect_err("invalid bool");
+        let error = query_view_indices(&views, query("protected:maybe")).expect_err("invalid bool");
         assert!(matches!(
             error,
             QueryError::InvalidValue {
@@ -383,11 +623,12 @@ mod tests {
         // The TUI already caps input in `append_search_char`, so the only way to
         // actually hit this bound is via CLI `--filter`. The cap lives here, so
         // the test pins it here too; the CLI turns the error into exit 2.
-        let rows = vec![entry(3000, "node")];
+        let rows = [entry(3000, "node")];
         let too_long = "a".repeat(FILTER_TEXT_MAX_BYTES + 1);
 
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
         let error =
-            query_entries(&rows, query(&too_long)).expect_err("over-cap filter is rejected");
+            query_view_indices(&views, query(&too_long)).expect_err("over-cap filter is rejected");
 
         assert_eq!(
             error,
@@ -402,16 +643,20 @@ mod tests {
     fn hide_system_processes_uses_conservative_classification() {
         let mut service = entry(53, "systemd-resolved");
         service.parent_pid = Some(1);
-        let rows = vec![entry(3000, "node"), service];
+        let rows = [entry(3000, "node"), service];
         let options = QueryOptions {
             hide_system_processes: true,
             ..query("")
         };
 
-        let result = query_entries(&rows, options).expect("query is valid");
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let result = query_view_indices(&views, options).expect("query is valid");
 
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].process_name.as_deref(), Some("node"));
+        assert_eq!(result.indices.len(), 1);
+        assert_eq!(
+            rows[result.indices[0]].process_name.as_deref(),
+            Some("node")
+        );
         assert!(!result.explicit_filter_active);
         assert_eq!(result.hidden_system_process_count, 1);
     }
@@ -429,13 +674,176 @@ mod tests {
             ..query("")
         };
 
-        let result = query_entries(&[loopback, local, public], options).expect("valid query");
+        let rows = [loopback, local, public];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let result = query_view_indices(&views, options).expect("valid query");
         let ports: Vec<u16> = result
-            .entries
+            .indices
             .iter()
-            .map(|entry| entry.local_port)
+            .map(|&index| rows[index].local_port)
             .collect();
 
         assert_eq!(ports, vec![4000, 2000, 1000]);
+    }
+
+    #[test]
+    fn process_sort_computes_one_unicode_key_per_visible_row() {
+        let rows = [
+            entry(3000, "Äther"),
+            entry(4000, "Zulu"),
+            entry(5000, "hidden"),
+        ];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let mut normalization = super::NormalizationCache::default();
+        let keys = normalized_sort_keys(&views, &[0, 1], SortMode::Process, &mut normalization);
+        let values = normalization.values;
+
+        assert_eq!(keys[0].map(|key| values[key].as_str()), Some("äther"));
+        assert_eq!(keys[1].map(|key| values[key].as_str()), Some("zulu"));
+        assert_eq!(keys[2], None);
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn maximum_shared_name_is_normalized_once_for_filter_and_sort_keys() {
+        const ROWS: usize = crate::observation::DERIVED_PORT_ENTRIES_MAX;
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("Ä".repeat(2_048));
+        let mut template = entry(3000, "placeholder");
+        template.process_name = Some(std::sync::Arc::clone(&shared));
+        let rows = vec![template; ROWS];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        let result = query_view_indices(
+            &views,
+            QueryOptions {
+                process: Some("ä"),
+                sort_mode: SortMode::Port,
+                ..query("")
+            },
+        )
+        .expect("maximum bounded query succeeds");
+        assert_eq!(result.indices.len(), ROWS);
+        assert_eq!(result.metadata_normalization_count, 1);
+
+        let mut normalization = super::NormalizationCache::default();
+        let _keys = normalized_sort_keys(
+            &views,
+            &result.indices,
+            SortMode::Process,
+            &mut normalization,
+        );
+        let normalized = normalization.values;
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].len(), shared.len());
+    }
+
+    #[test]
+    fn shared_one_mib_command_is_scanned_once_for_ascii_and_unicode_no_match_filters() {
+        for (text, needle) in [
+            (
+                "X".repeat(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES),
+                "not-present",
+            ),
+            (
+                "Ä".repeat(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES / 2),
+                "not-present",
+            ),
+        ] {
+            let shared: std::sync::Arc<str> = text.into();
+            let mut template = entry(3000, "worker");
+            template.process_name = None;
+            template.executable_path = None;
+            template.parent_pid = None;
+            template.parent_process_name = None;
+            template.command_line = Some(std::sync::Arc::clone(&shared));
+            let rows = vec![template; 32];
+            let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+            let result = query_view_indices(&views, query(needle)).expect("bounded query succeeds");
+
+            assert!(result.indices.is_empty());
+            assert_eq!(result.metadata_normalization_count, 1);
+            assert_eq!(result.metadata_scan_count, 1);
+        }
+    }
+
+    #[test]
+    fn equal_metadata_values_at_distinct_addresses_share_one_term_scan() {
+        let mut first = entry(3000, "first");
+        first.process_name = None;
+        first.executable_path = None;
+        first.parent_pid = None;
+        first.parent_process_name = None;
+        first.command_line = Some(std::sync::Arc::from("shared command value"));
+        let mut second = first.clone();
+        second.local_port = 3001;
+        second.command_line = Some(std::sync::Arc::from("shared command value"));
+        assert!(!std::sync::Arc::ptr_eq(
+            first.command_line.as_ref().unwrap(),
+            second.command_line.as_ref().unwrap(),
+        ));
+        let rows = [first, second];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        let result = query_view_indices(&views, query("absent")).expect("query succeeds");
+
+        assert!(result.indices.is_empty());
+        assert_eq!(result.metadata_normalization_count, 1);
+        assert_eq!(result.metadata_scan_count, 1);
+    }
+
+    #[test]
+    fn many_terms_reuse_one_linear_match_cache() {
+        const ROWS: usize = 1_024;
+        const TERMS: usize = FILTER_TEXT_MAX_BYTES.div_ceil(2);
+        let rows = (0..ROWS)
+            .map(|index| {
+                let port = u16::try_from(10_000 + index).expect("test port fits u16");
+                entry(port, &format!("z-{index}"))
+            })
+            .collect::<Vec<_>>();
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let filter = std::iter::repeat_n("z", TERMS)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(filter.len(), FILTER_TEXT_MAX_BYTES - 1);
+
+        let result = query_view_indices(&views, query(&filter)).expect("maximum-term query works");
+
+        assert_eq!(result.indices.len(), ROWS);
+        assert_eq!(result.metadata_match_cache_peak, ROWS);
+        assert_eq!(result.metadata_scan_count, ROWS * TERMS);
+    }
+
+    #[test]
+    fn process_and_parent_sort_use_cached_keys_without_changing_shared_metadata() {
+        let process_a: std::sync::Arc<str> = "Zulu".into();
+        let process_b: std::sync::Arc<str> = "Äther".into();
+        let parent_a: std::sync::Arc<str> = "Zulu Parent".into();
+        let parent_b: std::sync::Arc<str> = "Äther Parent".into();
+        let mut zulu = entry(3000, "placeholder");
+        zulu.process_name = Some(std::sync::Arc::clone(&process_a));
+        zulu.parent_process_name = Some(std::sync::Arc::clone(&parent_a));
+        let mut aether = entry(4000, "placeholder");
+        aether.process_name = Some(std::sync::Arc::clone(&process_b));
+        aether.parent_process_name = Some(std::sync::Arc::clone(&parent_b));
+        let rows = [zulu, aether];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        for sort_mode in [SortMode::Process, SortMode::Parent] {
+            let result = query_view_indices(
+                &views,
+                QueryOptions {
+                    sort_mode,
+                    ..query("")
+                },
+            )
+            .expect("sort succeeds");
+            assert_eq!(result.indices, [0, 1]);
+        }
+        assert_eq!(&*process_a, "Zulu");
+        assert_eq!(&*process_b, "Äther");
+        assert_eq!(&*parent_a, "Zulu Parent");
+        assert_eq!(&*parent_b, "Äther Parent");
     }
 }

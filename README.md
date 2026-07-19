@@ -222,6 +222,10 @@ cargo install --path . --locked
   containment. Windows termination is hard termination (`TerminateProcess` /
   `TerminateJobObject`); there is no graceful signal tier. Use an elevated
   terminal when higher-privilege processes hide metadata or reject termination.
+  The final tree-validation freeze uses Windows' private Job Object information
+  class 18. Kickoutchi tests freeze and thaw support on an empty job before
+  assigning the target and refuses without containment when the host does not
+  support it.
   `--group` and the TUI `t`/`T` tree keys are not available on Windows. Native
   Windows cannot see individual Linux processes inside WSL2; use the Linux build
   inside WSL2 for those trees.
@@ -233,6 +237,13 @@ cargo install --path . --locked
 
 - PID `0`, PID `1`, Kickoutchi's own PID, and Windows PID `4` are blocked.
 - `kill --port` refuses ambiguous ports instead of guessing.
+- Unreadable processes elsewhere on the host do not make `kill --port` require
+  root. Kickoutchi requires complete attributable ownership evidence for every
+  socket matching the selected port and refuses any observed target-local hidden
+  or ambiguous owner. On Linux, `/proc` cannot reveal whether an unreadable
+  process shares the same socket inode as a visible owner. Kickoutchi may safely
+  terminate the visible genuine owner while that hidden co-holder keeps the port
+  bound, which the post-kill check reports.
 - Protected processes require typing the PID or process name.
 - Force kill requires stronger confirmation by default.
 - Termination targets only the confirmed PID; `--tree` and `--group` are the
@@ -248,11 +259,14 @@ cargo install --path . --locked
   over-cap tree. If Windows reports a parent link into the confirmed tree but the
   creation-time metadata needed to sanity-check that edge is missing, Kickoutchi
   refuses as incomplete metadata rather than omitting a possible descendant.
-  After the root is assigned to the Job Object, failures are reported as partial
-  containment, fallback termination, or not-terminated PIDs; they are never
-  hidden as full success. The preview is an observed tree, not the complete
-  blast radius: Windows may also terminate newly spawned job-contained children
-  that were not visible before confirmation.
+  After the root is assigned, Kickoutchi freezes the Job Object through the
+  private class-18 ABI for one final bounded validation sweep before termination.
+  Freeze or validation failure withholds whole-job termination, attempts thaw
+  when needed, and reports the primary, secondary, and cleanup failures plus
+  verified fallback termination or not-terminated PIDs; partial work is never
+  hidden as full success. The preview is an observed tree, not the complete blast radius:
+  Windows may also terminate newly spawned job-contained children that were not
+  visible before confirmation.
 - A protected tree or group root requires its PID or name *and* the scope
   word, checked again against a fresh scan right before scoped execution.
 - Group kill shows every member before asking, never signals a raw `-pgid`,

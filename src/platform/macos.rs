@@ -11,7 +11,7 @@
     reason = "Darwin FFI structs mirror the C header names exactly"
 )]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, OsStr, c_void};
 use std::mem::{MaybeUninit, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -21,24 +21,29 @@ use std::path::PathBuf;
 use crate::collector::{Collector, CollectorError};
 use crate::diagnostic;
 use crate::model::{
-    ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
-    Protocol, RelatedProcessHint, SocketState,
+    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint, SocketState,
 };
+use crate::observation::{
+    CANDIDATE_PROCESS_IDS_MAX, EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact,
+    FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness, MetadataOmission,
+    MetadataProfile, NATIVE_RESIZE_ATTEMPTS_MAX, NativeSocketObservation, NetworkSnapshot,
+    ObservationScope, ObservationScopeKind, OwnerAssociations, OwnerCompleteness,
+    PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker,
+    ScopeLimitation, SocketState as ObservationSocketState, UnverifiedOwnerReason,
+};
+use crate::observation::{OWNER_EDGES_MAX, SOCKET_OBSERVATIONS_MAX};
 use crate::process::{tree_cont, tree_deliver_by_pid, tree_prepare_delivery_probe, tree_stop};
+use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 use crate::tree::{
     MAX_TREE_PROCESSES, TreeProcessInfo, TreeProcessOps, TreeSignalResult, TreeSnapshotScope,
 };
 
-const PID_LIST_ATTEMPTS: usize = 3;
-const FD_LIST_ATTEMPTS: usize = 3;
 const PROCESS_LIST_GROWTH_MARGIN: usize = 64;
 const FD_LIST_GROWTH_MARGIN: usize = 16;
-const MAX_PROCESS_IDS: usize = 131_072;
 const MAX_PROCESS_FDS: usize = 65_536;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const MAX_PROCESS_ANCESTORS: usize = 64;
-const MAX_PROCARGS_BYTES: usize = 1024 * 1024;
 
 const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
 const INI_IPV4: u8 = 0x1;
@@ -52,13 +57,243 @@ const MAX_KCTL_NAME: usize = 96;
 pub(crate) struct MacosCollector;
 
 impl Collector for MacosCollector {
-    fn collect(&self) -> Result<Vec<PortEntry>, CollectorError> {
+    fn collect(&self, profile: MetadataProfile) -> Result<NetworkSnapshot, CollectorError> {
+        let scope = ObservationScope::new(
+            ObservationScopeKind::CurrentHostProcessVisibleSockets,
+            None,
+            [ScopeLimitation::ProcessFirstSocketVisibilityLimited],
+        )?;
+        crate::collector::collect_native_snapshot(
+            profile,
+            scope,
+            |_profile| Self::collect_native_pass(),
+            Self::read_native_processes,
+        )
+    }
+}
+
+impl MacosCollector {
+    fn read_native_processes(
+        pids: &[u32],
+        profile: MetadataProfile,
+        optional_metadata_bytes_remaining: usize,
+    ) -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError> {
+        let mut parent_names = HashMap::new();
+        crate::collector::read_processes_sequentially(
+            pids,
+            profile,
+            optional_metadata_bytes_remaining,
+            |pid, profile, remaining| {
+                Ok(Self::read_native_process(
+                    pid,
+                    profile,
+                    remaining,
+                    &mut parent_names,
+                ))
+            },
+        )
+    }
+
+    fn collect_native_pass() -> Result<crate::observation::NativeObservationPass, CollectorError> {
         let pids = process_ids()?;
-        let mut entries = Vec::new();
+        let mut grouped_records = Vec::<SocketRecord>::new();
+        let mut owners_by_socket = Vec::<Vec<u32>>::new();
+        let mut socket_indexes = HashMap::<SocketRecordKey, usize>::new();
+        let mut socket_set_losses = BTreeSet::new();
+        let mut omitted_socket_set_loss_count = 0u64;
+        let mut aggregate_fd_entries = 0usize;
+        let mut owner_edges = 0usize;
         for pid in pids {
-            collect_pid_entries(pid, &mut entries);
+            let (records, pid_losses) =
+                match collect_pid_socket_records(pid, &mut aggregate_fd_entries) {
+                    Ok(scan) => scan,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        return Err(platform_error(
+                            "proc_pidinfo(PROC_PIDLISTFDS)",
+                            error.to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        retain_socket_scan_loss(
+                            &mut socket_set_losses,
+                            &mut omitted_socket_set_loss_count,
+                            socket_scan_loss(pid, &error),
+                        );
+                        continue;
+                    }
+                };
+            for loss in pid_losses {
+                retain_socket_scan_loss(
+                    &mut socket_set_losses,
+                    &mut omitted_socket_set_loss_count,
+                    loss,
+                );
+            }
+            for record in records {
+                retain_socket_record(
+                    &mut grouped_records,
+                    &mut owners_by_socket,
+                    &mut socket_indexes,
+                    &mut owner_edges,
+                    record,
+                    pid,
+                )?;
+            }
         }
-        Ok(entries)
+        native_pass_from_records(
+            &grouped_records,
+            owners_by_socket,
+            socket_set_losses,
+            omitted_socket_set_loss_count,
+        )
+    }
+
+    fn read_native_process(
+        pid: u32,
+        profile: MetadataProfile,
+        optional_metadata_bytes_remaining: usize,
+        parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+    ) -> ProcessRead {
+        let info = match read_process_bsdinfo(pid) {
+            Ok(info) => info,
+            Err(error) => return ProcessRead::Unverified(unverified_reason_for_io(&error)),
+        };
+        let Ok(microseconds) = u32::try_from(info.pbi_start_tvusec) else {
+            return ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable);
+        };
+        let Ok(marker) = ProcessStartMarker::macos(info.pbi_start_tvsec, microseconds) else {
+            return ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable);
+        };
+        if profile == MetadataProfile::IdentityOnly {
+            return ProcessRead::Verified {
+                marker,
+                observation: ProcessObservation::identity_only(),
+            };
+        }
+        let metadata = if optional_metadata_bytes_remaining == 0 {
+            ProcessMetadata {
+                partial: true,
+                budget_omitted: true,
+                ..ProcessMetadata::default()
+            }
+        } else {
+            read_process_metadata_bounded(
+                pid,
+                profile,
+                optional_metadata_bytes_remaining,
+                parent_names,
+            )
+        };
+        let after = match read_process_bsdinfo(pid) {
+            Ok(info) => info,
+            Err(error) => return ProcessRead::Unverified(unverified_reason_for_io(&error)),
+        };
+        let Ok(after_microseconds) = u32::try_from(after.pbi_start_tvusec) else {
+            return ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable);
+        };
+        let Ok(marker_after) = ProcessStartMarker::macos(after.pbi_start_tvsec, after_microseconds)
+        else {
+            return ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable);
+        };
+        if marker_after != marker {
+            return ProcessRead::Unverified(UnverifiedOwnerReason::Raced);
+        }
+        ProcessRead::Verified {
+            marker: marker_after,
+            observation: process_observation_from_metadata(metadata),
+        }
+    }
+}
+
+fn retain_socket_record(
+    grouped_records: &mut Vec<SocketRecord>,
+    owners_by_socket: &mut Vec<Vec<u32>>,
+    socket_indexes: &mut HashMap<SocketRecordKey, usize>,
+    owner_edges: &mut usize,
+    record: SocketRecord,
+    pid: u32,
+) -> Result<(), CollectorError> {
+    let socket_key = (record.socket_id != 0).then(|| record.key());
+    if let Some(key) = socket_key
+        && let Some(index) = socket_indexes.get(&key).copied()
+    {
+        if sorted_owner_is_new(&owners_by_socket[index], pid) {
+            if *owner_edges >= OWNER_EDGES_MAX {
+                return Err(
+                    crate::observation::ObservationError::OwnerAttributionLimitExceeded.into(),
+                );
+            }
+            owners_by_socket[index].push(pid);
+            *owner_edges += 1;
+        }
+        return Ok(());
+    }
+    if grouped_records.len() >= SOCKET_OBSERVATIONS_MAX {
+        return Err(crate::observation::ObservationError::SocketObservationLimitExceeded.into());
+    }
+    if *owner_edges >= OWNER_EDGES_MAX {
+        return Err(crate::observation::ObservationError::OwnerAttributionLimitExceeded.into());
+    }
+    if let Some(key) = socket_key {
+        socket_indexes.insert(key, grouped_records.len());
+    }
+    grouped_records.push(record);
+    owners_by_socket.push(vec![pid]);
+    *owner_edges += 1;
+    Ok(())
+}
+
+fn sorted_owner_is_new(owners: &[u32], pid: u32) -> bool {
+    owners.last().copied() != Some(pid)
+}
+
+pub(crate) fn fresh_process_evidence(
+    pid: u32,
+) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+    let before =
+        read_process_bsdinfo(pid).map_err(|error| process_evidence_io_error(pid, &error))?;
+    let name = read_process_name(pid)
+        .map_err(|error| process_evidence_io_error(pid, &error))?
+        .or_else(|| process_name_from_bsd_info(&before))
+        .ok_or(ProcessEvidenceError::NameMissing { pid })?;
+    let after =
+        read_process_bsdinfo(pid).map_err(|error| process_evidence_io_error(pid, &error))?;
+    fresh_process_evidence_from_reads(pid, &before, name, &after)
+}
+
+fn fresh_process_evidence_from_reads(
+    pid: u32,
+    before: &libc::proc_bsdinfo,
+    name: String,
+    after: &libc::proc_bsdinfo,
+) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+    if name.is_empty() {
+        return Err(ProcessEvidenceError::NameMissing { pid });
+    }
+    let before_marker = process_start_time_marker_from_bsd_info(before)
+        .map_err(|_| ProcessEvidenceError::IdentityChanged { pid })?;
+    let after_marker = process_start_time_marker_from_bsd_info(after)
+        .map_err(|_| ProcessEvidenceError::IdentityChanged { pid })?;
+    if before_marker != after_marker {
+        return Err(ProcessEvidenceError::IdentityChanged { pid });
+    }
+    if name.len() > crate::observation::PROTECTION_NAME_MAX_BYTES {
+        return Err(ProcessEvidenceError::NameOversized {
+            pid,
+            bytes: name.len(),
+        });
+    }
+    Ok(FreshProcessEvidence {
+        pid,
+        start_marker: after_marker,
+        name,
+    })
+}
+
+fn process_evidence_io_error(pid: u32, error: &std::io::Error) -> ProcessEvidenceError {
+    match error.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => ProcessEvidenceError::PermissionDenied { pid },
+        _ => ProcessEvidenceError::Missing { pid },
     }
 }
 
@@ -67,6 +302,7 @@ struct SocketRecordKey {
     protocol: Protocol,
     local_addr: IpAddr,
     local_port: u16,
+    ipv6_ifindex: u16,
     socket_id: u64,
 }
 
@@ -75,6 +311,7 @@ struct SocketRecord {
     protocol: Protocol,
     local_addr: IpAddr,
     local_port: u16,
+    ipv6_ifindex: u16,
     state: SocketState,
     pid: u32,
     socket_id: u64,
@@ -86,8 +323,158 @@ impl SocketRecord {
             protocol: self.protocol,
             local_addr: self.local_addr,
             local_port: self.local_port,
+            ipv6_ifindex: self.ipv6_ifindex,
             socket_id: self.socket_id,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SocketScanLoss {
+    PermissionDenied(u32),
+    Disappeared(u32),
+    Malformed(u32),
+    Unavailable(u32),
+}
+
+fn native_pass_from_records(
+    records: &[SocketRecord],
+    owners_by_socket: Vec<Vec<u32>>,
+    losses: BTreeSet<SocketScanLoss>,
+    omitted_evidence_gap_count: u64,
+) -> Result<crate::observation::NativeObservationPass, CollectorError> {
+    if records.len() != owners_by_socket.len() {
+        return Err(crate::observation::ObservationError::NativeDataMalformed.into());
+    }
+    let sockets = records
+        .iter()
+        .map(|record| {
+            let ipv6_scope = record.local_addr.is_ipv6().then(|| {
+                std::num::NonZeroU32::new(u32::from(record.ipv6_ifindex))
+                    .map_or(Ipv6Scope::Unscoped, Ipv6Scope::InterfaceIndex)
+            });
+            let endpoint = EndpointIdentity::new(
+                record.protocol,
+                record.local_addr,
+                u32::from(record.local_port),
+                ipv6_scope,
+            )
+            .map_err(|error| {
+                CollectorError::Observation(
+                    crate::observation::ObservationError::PlatformApiFailed(error.to_string()),
+                )
+            })?;
+            Ok(NativeSocketObservation {
+                endpoint,
+                state: match record.state {
+                    SocketState::Listen => ObservationSocketState::Listen,
+                    SocketState::Bound => ObservationSocketState::Bound,
+                },
+                token: PlatformSocketToken::macos_socket_id(record.socket_id),
+            })
+        })
+        .collect::<Result<Vec<_>, CollectorError>>()?;
+
+    let mut evidence_gaps = Vec::with_capacity(losses.len());
+    for loss in losses {
+        let (pid, code, message) = match loss {
+            SocketScanLoss::PermissionDenied(pid) => (
+                pid,
+                EvidenceGapCode::OwnerPermissionDenied,
+                "permission denied before the PID's socket descriptors could be enumerated",
+            ),
+            SocketScanLoss::Disappeared(pid) => (
+                pid,
+                EvidenceGapCode::OwnerDisappeared,
+                "PID or socket descriptor disappeared during socket enumeration",
+            ),
+            SocketScanLoss::Malformed(pid) => (
+                pid,
+                EvidenceGapCode::NativeFieldUnavailable,
+                "malformed socket descriptor information could have hidden a socket",
+            ),
+            SocketScanLoss::Unavailable(pid) => (
+                pid,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "a PID socket scan failed before its socket set could be enumerated",
+            ),
+        };
+        evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::SocketSet,
+            code,
+            None,
+            Some(pid),
+            message,
+        ));
+    }
+    let local_completeness = vec![OwnerCompleteness::Complete; sockets.len()];
+    Ok(crate::observation::NativeObservationPass {
+        sockets,
+        owners: OwnerAssociations {
+            owners_by_socket,
+            local_completeness,
+            global_completeness: OwnerCompleteness::Complete,
+            evidence_gaps,
+            omitted_evidence_gap_count,
+        },
+    })
+}
+
+fn socket_scan_loss(pid: u32, error: &std::io::Error) -> SocketScanLoss {
+    match error.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => SocketScanLoss::PermissionDenied(pid),
+        Some(libc::ESRCH | libc::ENOENT) => SocketScanLoss::Disappeared(pid),
+        _ if error.kind() == std::io::ErrorKind::InvalidData => SocketScanLoss::Malformed(pid),
+        _ => SocketScanLoss::Unavailable(pid),
+    }
+}
+
+fn retain_socket_scan_loss(
+    losses: &mut BTreeSet<SocketScanLoss>,
+    omitted: &mut u64,
+    loss: SocketScanLoss,
+) {
+    if losses.contains(&loss) {
+        return;
+    }
+    if losses.len() < crate::observation::EVIDENCE_GAPS_MAX {
+        losses.insert(loss);
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
+}
+
+fn process_observation_from_metadata(mut metadata: ProcessMetadata) -> ProcessObservation {
+    if metadata
+        .executable_path
+        .as_ref()
+        .is_some_and(|path| path.to_str().is_none())
+    {
+        metadata.executable_path = None;
+        metadata.partial = true;
+    }
+    ProcessObservation {
+        name: metadata.process_name.map(Into::into),
+        executable_path: metadata.executable_path.map(Into::into),
+        command_line: metadata.command_line.map(Into::into),
+        parent_pid: metadata.parent_pid,
+        parent_process_name: metadata.parent_process_name.map(Into::into),
+        metadata_omission: metadata
+            .budget_omitted
+            .then_some(MetadataOmission::BudgetExceeded),
+        metadata_completeness: if metadata.partial {
+            MetadataCompleteness::Partial
+        } else {
+            MetadataCompleteness::Complete
+        },
+    }
+}
+
+fn unverified_reason_for_io(error: &std::io::Error) -> UnverifiedOwnerReason {
+    match error.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => UnverifiedOwnerReason::PermissionDenied,
+        Some(libc::ESRCH | libc::ENOENT) => UnverifiedOwnerReason::Disappeared,
+        _ => UnverifiedOwnerReason::IdentityUnavailable,
     }
 }
 
@@ -99,6 +486,7 @@ struct ProcessMetadata {
     parent_pid: Option<u32>,
     parent_process_name: Option<String>,
     partial: bool,
+    budget_omitted: bool,
 }
 
 #[repr(C)]
@@ -254,16 +642,16 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
         owner_uid: bsd_info.as_ref().map(|info| info.pbi_uid),
         process_start_time_marker: bsd_info
             .as_ref()
-            .map(process_start_time_marker_from_bsd_info),
+            .and_then(|info| process_start_time_marker_from_bsd_info(info).ok()),
         children: collect_child_processes(pid),
         docker: None,
     }
 }
 
-pub(crate) fn process_start_time_marker(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_time_marker(pid: u32) -> Option<ProcessStartMarker> {
     read_process_bsdinfo(pid)
         .ok()
-        .map(|info| process_start_time_marker_from_bsd_info(&info))
+        .and_then(|info| process_start_time_marker_from_bsd_info(&info).ok())
 }
 
 /// Best-effort command line for one PID, for the read-only inspect view.
@@ -319,7 +707,7 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 /// instructions between that read and the signal; without a pidfd equivalent
 /// it cannot be closed completely.
 pub(crate) struct MacosTreeOps {
-    verified_markers: std::collections::HashMap<u32, u64>,
+    verified_markers: std::collections::HashMap<u32, ProcessStartMarker>,
     snapshot_scope: TreeSnapshotScope,
 }
 
@@ -333,15 +721,16 @@ impl MacosTreeOps {
 
     /// Whether `pid` still carries the start marker the pipeline verified.
     ///
-    /// `Ok(())` when the marker matches or was never recorded (thaw paths run
-    /// before `prepare_delivery`); `Err` with the honest signal result when the
-    /// process is gone or has been replaced by a PID-recycled stranger.
+    /// `Ok(())` only when a recorded marker still matches; `Err` when identity
+    /// is unavailable, the process is gone, or the PID was recycled.
     fn recheck_marker(&self, pid: u32) -> Result<(), TreeSignalResult> {
         let Some(expected) = self.verified_markers.get(&pid) else {
-            return Ok(());
+            return Err(TreeSignalResult::Denied);
         };
         match read_process_bsdinfo(pid) {
-            Ok(info) if process_start_time_marker_from_bsd_info(&info) == *expected => Ok(()),
+            Ok(info) if process_start_time_marker_from_bsd_info(&info).ok() == Some(*expected) => {
+                Ok(())
+            }
             // A different marker means the verified process is gone and the
             // PID now belongs to someone else: report the member as exited
             // rather than signalling the stranger.
@@ -368,18 +757,25 @@ impl TreeProcessOps for MacosTreeOps {
         tree_stop(pid)
     }
 
-    fn cont(&mut self, pid: u32) {
+    fn cont(&mut self, pid: u32) -> TreeSignalResult {
         match self.recheck_marker(pid) {
-            Ok(()) | Err(TreeSignalResult::Denied) => tree_cont(pid),
-            Err(TreeSignalResult::NotFound) => {}
+            Ok(()) => tree_cont(pid),
+            Err(TreeSignalResult::NotFound) => TreeSignalResult::NotFound,
+            Err(TreeSignalResult::Denied) => TreeSignalResult::Denied,
             Err(TreeSignalResult::Delivered) => unreachable!("recheck_marker never delivers"),
+        }
+    }
+
+    fn prepare_thaw(&mut self, pid: u32, marker: Option<ProcessStartMarker>) {
+        if let Some(marker) = marker {
+            self.verified_markers.insert(pid, marker);
         }
     }
 
     fn prepare_delivery(
         &mut self,
         pid: u32,
-        verified_start_marker: Option<u64>,
+        verified_start_marker: Option<ProcessStartMarker>,
     ) -> TreeSignalResult {
         // Post-stop verification guarantees a marker for every member; a
         // missing one here is a pipeline invariant break, so refuse delivery
@@ -389,6 +785,13 @@ impl TreeProcessOps for MacosTreeOps {
         };
         self.verified_markers.insert(pid, marker);
         tree_prepare_delivery_probe(pid)
+    }
+
+    fn fresh_process_evidence(
+        &mut self,
+        pid: u32,
+    ) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+        fresh_process_evidence(pid)
     }
 
     fn deliver(&mut self, pid: u32, mode: crate::process::KillMode) -> TreeSignalResult {
@@ -532,7 +935,7 @@ fn tree_process_info_from_readable_bsd(
             format!("PID {pid}: process name is unreadable"),
         ));
     };
-    Ok(tree_process_info_from_bsd(pid, info, name))
+    tree_process_info_from_bsd(pid, info, name)
 }
 
 fn should_skip_unreadable_snapshot_error(error: &std::io::Error) -> bool {
@@ -609,106 +1012,194 @@ fn tree_process_info_from_bsd(
     pid: u32,
     info: &libc::proc_bsdinfo,
     process_name: String,
-) -> TreeProcessInfo {
-    TreeProcessInfo {
+) -> Result<TreeProcessInfo, CollectorError> {
+    let start_time_marker = process_start_time_marker_from_bsd_info(info).map_err(|error| {
+        platform_error(
+            "proc_pidinfo(PROC_PIDTBSDINFO)",
+            format!("PID {pid}: invalid process start marker: {error}"),
+        )
+    })?;
+    Ok(TreeProcessInfo {
         pid,
         parent_pid: nonzero_pid(info.pbi_ppid),
         unverified_parent_pid: None,
         parent_process_name: None,
         process_name: Some(process_name),
-        start_time_marker: Some(process_start_time_marker_from_bsd_info(info)),
+        start_time_marker: Some(start_time_marker),
         owner_uid: Some(info.pbi_uid),
         process_group: nonzero_pid(info.pbi_pgid),
-    }
+    })
 }
 
-fn collect_pid_entries(pid: u32, entries: &mut Vec<PortEntry>) {
-    let Ok(records) = collect_pid_socket_records(pid) else {
-        return;
-    };
-    if records.is_empty() {
-        return;
-    }
-
-    let metadata = read_process_metadata(pid);
-    for record in records {
-        entries.push(entry_from_record(&record, &metadata));
-    }
+fn collect_pid_socket_records(
+    pid: u32,
+    aggregate_fd_entries: &mut usize,
+) -> Result<(Vec<SocketRecord>, BTreeSet<SocketScanLoss>), std::io::Error> {
+    let fds = list_process_fds(pid)?;
+    collect_pid_socket_records_from_fds(
+        pid,
+        &fds,
+        aggregate_fd_entries,
+        FILE_DESCRIPTOR_ENTRIES_MAX,
+        |fd| socket_record_for_fd(pid, fd),
+    )
 }
 
-fn collect_pid_socket_records(pid: u32) -> Result<Vec<SocketRecord>, std::io::Error> {
-    let fds = list_socket_fds(pid)?;
+fn collect_pid_socket_records_from_fds<ReadFd>(
+    pid: u32,
+    fds: &[libc::proc_fdinfo],
+    aggregate_fd_entries: &mut usize,
+    max_aggregate_fds: usize,
+    mut read_fd: ReadFd,
+) -> Result<(Vec<SocketRecord>, BTreeSet<SocketScanLoss>), std::io::Error>
+where
+    ReadFd: FnMut(libc::c_int) -> std::io::Result<Option<SocketRecord>>,
+{
+    *aggregate_fd_entries = aggregate_fd_entries
+        .checked_add(fds.len())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "FD count overflow"))?;
+    if *aggregate_fd_entries > max_aggregate_fds {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("aggregate FD traversal exceeds {max_aggregate_fds} entries"),
+        ));
+    }
     let mut records = Vec::new();
     let mut seen = HashSet::new();
+    let mut losses = BTreeSet::new();
     for fd in fds {
-        let Some(record) = socket_record_for_fd(pid, fd) else {
+        if fd.proc_fdtype
+            != u32::try_from(libc::PROX_FDTYPE_SOCKET).expect("Darwin socket fd type must fit u32")
+        {
             continue;
+        }
+        let record = match read_fd(fd.proc_fd) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(error) => {
+                losses.insert(socket_scan_loss(pid, &error));
+                continue;
+            }
         };
-        if seen.insert(record.key()) {
+        if record.socket_id == 0 || seen.insert(record.key()) {
             records.push(record);
         }
     }
-    Ok(records)
+    Ok((records, losses))
 }
 
-fn entry_from_record(record: &SocketRecord, metadata: &ProcessMetadata) -> PortEntry {
-    PortEntry {
-        protocol: record.protocol,
-        local_addr: record.local_addr,
-        local_port: record.local_port,
-        state: record.state,
-        pid: Some(record.pid),
-        process_name: metadata.process_name.clone(),
-        executable_path: metadata.executable_path.clone(),
-        command_line: metadata.command_line.clone(),
-        parent_pid: metadata.parent_pid,
-        parent_process_name: metadata.parent_process_name.clone(),
-        child_pids: Vec::new(),
-        protected: false,
-        platform: Platform::Macos,
-        permission: if metadata.partial {
-            PermissionStatus::Partial
-        } else {
-            PermissionStatus::Full
-        },
+#[allow(
+    clippy::too_many_lines,
+    reason = "ordered native metadata reads share one aggregate byte budget"
+)]
+fn read_process_metadata_bounded(
+    pid: u32,
+    profile: MetadataProfile,
+    aggregate_remaining: usize,
+    parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+) -> ProcessMetadata {
+    if profile == MetadataProfile::IdentityOnly {
+        return ProcessMetadata::default();
     }
-}
-
-fn read_process_metadata(pid: u32) -> ProcessMetadata {
     let bsd_info = read_process_bsdinfo(pid).ok();
-    let process_name = read_process_name(pid)
+    let name_budget = aggregate_remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES);
+    let process_name = read_process_name_bounded(pid, name_budget)
         .ok()
         .flatten()
-        .or_else(|| bsd_info.as_ref().and_then(process_name_from_bsd_info));
+        .or_else(|| {
+            bsd_info
+                .as_ref()
+                .and_then(|info| process_name_from_bsd_info_bounded(info, name_budget))
+        });
     let mut metadata = ProcessMetadata {
         process_name,
         ..ProcessMetadata::default()
     };
+    metadata.budget_omitted =
+        metadata.process_name.is_none() && name_budget < crate::observation::PROCESS_NAME_MAX_BYTES;
     metadata.partial |= metadata.process_name.is_none();
+    let mut remaining =
+        aggregate_remaining.saturating_sub(metadata.process_name.as_ref().map_or(0, String::len));
 
-    match read_executable_path(pid) {
-        Ok(Some(path)) => metadata.executable_path = Some(path),
-        Ok(None) | Err(_) => metadata.partial = true,
-    }
-
-    match read_command_line(pid) {
-        Ok(command_line) => metadata.command_line = command_line,
-        Err(_) => metadata.partial = true,
+    match read_executable_path_bounded(
+        pid,
+        remaining.min(crate::observation::EXECUTABLE_PATH_MAX_BYTES),
+    ) {
+        Ok(Some(path)) => {
+            remaining = remaining.saturating_sub(path.as_os_str().as_bytes().len());
+            metadata.executable_path = Some(path);
+        }
+        Ok(None) => metadata.partial = true,
+        Err(_) => {
+            metadata.partial = true;
+            metadata.budget_omitted |= remaining < crate::observation::EXECUTABLE_PATH_MAX_BYTES;
+        }
     }
 
     if let Some(info) = &bsd_info {
         metadata.parent_pid = nonzero_pid(info.pbi_ppid);
         if let Some(parent_pid) = metadata.parent_pid {
-            match read_process_name(parent_pid) {
-                Ok(parent_name) => {
-                    metadata.parent_process_name = parent_name;
+            let parent_name_budget = remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES);
+            let parent = read_process_bsdinfo(parent_pid)
+                .ok()
+                .and_then(|parent_info| {
+                    let start_marker =
+                        process_start_time_marker_from_bsd_info(&parent_info).ok()?;
+                    let identity = ProcessIdentity {
+                        pid: parent_pid,
+                        start_marker,
+                    };
+                    if let Some(name) = parent_names.get(&identity) {
+                        return Some(
+                            name.as_ref()
+                                .filter(|name| name.len() <= parent_name_budget)
+                                .cloned(),
+                        );
+                    }
+                    let name = (parent_name_budget != 0)
+                        .then(|| {
+                            read_process_name_bounded(parent_pid, parent_name_budget)
+                                .ok()
+                                .flatten()
+                        })
+                        .flatten();
+                    let verified = read_process_bsdinfo(parent_pid)
+                        .ok()
+                        .and_then(|after| process_start_time_marker_from_bsd_info(&after).ok())
+                        .filter(|after| *after == start_marker)
+                        .and(name);
+                    parent_names.insert(identity, verified.clone());
+                    Some(verified)
+                })
+                .flatten();
+            match parent {
+                Some(parent_name) => {
+                    metadata.parent_process_name = Some(parent_name);
                     metadata.partial |= metadata.parent_process_name.is_none();
+                    metadata.budget_omitted |= metadata.parent_process_name.is_none()
+                        && parent_name_budget < crate::observation::PROCESS_NAME_MAX_BYTES;
+                    remaining = remaining.saturating_sub(
+                        metadata.parent_process_name.as_ref().map_or(0, String::len),
+                    );
                 }
-                Err(_) => metadata.partial = true,
+                None => metadata.partial = true,
             }
         }
     } else {
         metadata.partial = true;
+    }
+
+    if profile == MetadataProfile::LegacyList {
+        if let Ok(command_line) = read_command_line_bounded(
+            pid,
+            remaining.min(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES),
+        ) {
+            metadata.command_line = command_line;
+        } else {
+            metadata.partial = true;
+            metadata.budget_omitted |=
+                remaining < crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
+        }
     }
 
     metadata
@@ -770,42 +1261,76 @@ fn process_ancestor_pids(pid: u32) -> HashSet<u32> {
 }
 
 fn process_ids() -> Result<Vec<u32>, CollectorError> {
-    let initial_count = unsafe {
-        // SAFETY: a null buffer and zero size is the documented sizing call for
-        // proc_listallpids; it writes no Rust-owned memory.
-        libc::proc_listallpids(std::ptr::null_mut(), 0)
-    };
+    process_ids_with_reader(|buffer, buffer_bytes| {
+        let (buffer, buffer_bytes) = buffer.map_or((std::ptr::null_mut(), 0), |buffer| {
+            (buffer.as_mut_ptr().cast::<c_void>(), buffer_bytes)
+        });
+        let count = unsafe {
+            // SAFETY: a null buffer and zero size is the documented sizing call.
+            // Otherwise buffer owns buffer_bytes bytes and libproc does not retain it.
+            libc::proc_listallpids(buffer, buffer_bytes)
+        };
+        if count < 0 {
+            Err(last_platform_error("proc_listallpids"))
+        } else {
+            Ok(count)
+        }
+    })
+}
+
+fn process_ids_with_reader<Read>(mut read: Read) -> Result<Vec<u32>, CollectorError>
+where
+    Read: FnMut(Option<&mut [libc::pid_t]>, libc::c_int) -> Result<libc::c_int, CollectorError>,
+{
+    let initial_count = read(None, 0)?;
     if initial_count < 0 {
-        return Err(last_platform_error("proc_listallpids"));
+        return Err(platform_error(
+            "proc_listallpids",
+            "negative process count".to_owned(),
+        ));
     }
     if initial_count == 0 {
         return Ok(Vec::new());
     }
 
-    let mut capacity = usize::try_from(initial_count)
-        .expect("non-negative proc_listallpids count must fit usize")
-        .saturating_add(PROCESS_LIST_GROWTH_MARGIN);
+    let initial_count =
+        usize::try_from(initial_count).expect("non-negative proc_listallpids count must fit usize");
+    if initial_count > CANDIDATE_PROCESS_IDS_MAX {
+        return Err(platform_error(
+            "proc_listallpids",
+            format!("process list exceeds {CANDIDATE_PROCESS_IDS_MAX} PID cap"),
+        ));
+    }
+    let sentinel_capacity = CANDIDATE_PROCESS_IDS_MAX.saturating_add(1);
+    let mut capacity = initial_count
+        .saturating_add(PROCESS_LIST_GROWTH_MARGIN)
+        .min(sentinel_capacity);
 
-    for _ in 0..PID_LIST_ATTEMPTS {
-        if capacity > MAX_PROCESS_IDS {
+    for _ in 0..NATIVE_RESIZE_ATTEMPTS_MAX {
+        if capacity > sentinel_capacity {
             return Err(platform_error(
                 "proc_listallpids",
-                format!("process list exceeds {MAX_PROCESS_IDS} PID cap"),
+                format!("process list exceeds {CANDIDATE_PROCESS_IDS_MAX} PID cap"),
             ));
         }
         let buffer_bytes = checked_buffer_len::<libc::pid_t>(capacity, "proc_listallpids")?;
         let mut raw_pids = vec![0 as libc::pid_t; capacity];
-        let count = unsafe {
-            // SAFETY: raw_pids owns buffer_bytes bytes and proc_listallpids writes
-            // at most that many pid_t values into it.
-            libc::proc_listallpids(raw_pids.as_mut_ptr().cast::<c_void>(), buffer_bytes)
-        };
+        let count = read(Some(&mut raw_pids), buffer_bytes)?;
         if count < 0 {
-            return Err(last_platform_error("proc_listallpids"));
+            return Err(platform_error(
+                "proc_listallpids",
+                "negative process count".to_owned(),
+            ));
         }
 
         let count =
             usize::try_from(count).expect("non-negative proc_listallpids count must fit usize");
+        if count > CANDIDATE_PROCESS_IDS_MAX {
+            return Err(platform_error(
+                "proc_listallpids",
+                format!("process list exceeds {CANDIDATE_PROCESS_IDS_MAX} PID cap"),
+            ));
+        }
         if count < raw_pids.len() {
             raw_pids.truncate(count);
             let mut pids = raw_pids
@@ -817,7 +1342,7 @@ fn process_ids() -> Result<Vec<u32>, CollectorError> {
             return Ok(pids);
         }
 
-        capacity = capacity.saturating_mul(2);
+        capacity = capacity.saturating_mul(2).min(sentinel_capacity);
     }
 
     Err(platform_error(
@@ -826,27 +1351,68 @@ fn process_ids() -> Result<Vec<u32>, CollectorError> {
     ))
 }
 
-fn list_socket_fds(pid: u32) -> std::io::Result<Vec<libc::c_int>> {
+fn list_process_fds(pid: u32) -> std::io::Result<Vec<libc::proc_fdinfo>> {
     let pid = pid_to_c_int(pid)?;
-    let needed_bytes = unsafe {
-        // SAFETY: null buffer sizing call; no Rust-managed memory is touched.
-        libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
-    };
+    list_process_fds_with_reader(|buffer, buffer_bytes| {
+        let buffer = if let Some(buffer) = buffer {
+            buffer.as_mut_ptr().cast::<c_void>()
+        } else {
+            unsafe {
+                // SAFETY: __error returns this thread's errno slot. Clearing it lets a
+                // zero-byte successful FD list differ from libproc's zero-on-error result.
+                *libc::__error() = 0;
+            }
+            std::ptr::null_mut()
+        };
+        let written_bytes = unsafe {
+            // SAFETY: a null buffer is the sizing call. Otherwise buffer owns
+            // buffer_bytes bytes and libproc does not retain the pointer.
+            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buffer, buffer_bytes)
+        };
+        if written_bytes < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(written_bytes)
+        }
+    })
+}
+
+fn list_process_fds_with_reader<Read>(mut read: Read) -> std::io::Result<Vec<libc::proc_fdinfo>>
+where
+    Read: FnMut(Option<&mut [libc::proc_fdinfo]>, libc::c_int) -> std::io::Result<libc::c_int>,
+{
+    let needed_bytes = read(None, 0)?;
     if needed_bytes < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "negative fd list byte count",
+        ));
     }
     if needed_bytes == 0 {
-        return Ok(Vec::new());
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(0) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
     }
 
     let needed_bytes =
         usize::try_from(needed_bytes).expect("non-negative proc_pidinfo byte count must fit usize");
-    let mut capacity = needed_bytes
-        .div_ceil(size_of::<libc::proc_fdinfo>())
-        .saturating_add(FD_LIST_GROWTH_MARGIN);
+    let initial_count = fd_record_count(needed_bytes, usize::MAX)?;
+    if initial_count > MAX_PROCESS_FDS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
+        ));
+    }
+    let sentinel_capacity = MAX_PROCESS_FDS.saturating_add(1);
+    let mut capacity = initial_count
+        .saturating_add(FD_LIST_GROWTH_MARGIN)
+        .min(sentinel_capacity);
 
-    for _ in 0..FD_LIST_ATTEMPTS {
-        if capacity > MAX_PROCESS_FDS {
+    for _ in 0..NATIVE_RESIZE_ATTEMPTS_MAX {
+        if capacity > sentinel_capacity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
@@ -860,36 +1426,32 @@ fn list_socket_fds(pid: u32) -> std::io::Result<Vec<libc::c_int>> {
             };
             capacity
         ];
-        let written_bytes = unsafe {
-            // SAFETY: fds owns buffer_bytes bytes and proc_pidinfo writes at most
-            // that many proc_fdinfo records for this PID.
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDLISTFDS,
-                0,
-                fds.as_mut_ptr().cast::<c_void>(),
-                buffer_bytes,
-            )
-        };
+        let written_bytes = read(Some(&mut fds), buffer_bytes)?;
         if written_bytes < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "negative fd list byte count",
+            ));
         }
 
         let written_bytes = usize::try_from(written_bytes)
             .expect("non-negative proc_pidinfo byte count must fit usize");
-        let count = written_bytes / size_of::<libc::proc_fdinfo>();
-        if count < fds.len() {
+        let count = fd_record_count(
+            written_bytes,
+            usize::try_from(buffer_bytes).expect("positive c_int fits usize"),
+        )?;
+        if count > MAX_PROCESS_FDS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
+            ));
+        }
+        if fd_list_is_complete(count, fds.len()) {
             fds.truncate(count);
-            let socket_fd_type = u32::try_from(libc::PROX_FDTYPE_SOCKET)
-                .expect("Darwin socket fd type must fit u32");
-            return Ok(fds
-                .into_iter()
-                .filter(|fd| fd.proc_fdtype == socket_fd_type)
-                .map(|fd| fd.proc_fd)
-                .collect());
+            return Ok(fds);
         }
 
-        capacity = capacity.saturating_mul(2);
+        capacity = capacity.saturating_mul(2).min(sentinel_capacity);
     }
 
     Err(std::io::Error::new(
@@ -898,8 +1460,22 @@ fn list_socket_fds(pid: u32) -> std::io::Result<Vec<libc::c_int>> {
     ))
 }
 
-fn socket_record_for_fd(pid: u32, fd: libc::c_int) -> Option<SocketRecord> {
-    let info = read_socket_fdinfo(pid, fd).ok()?;
+fn fd_record_count(bytes: usize, max_bytes: usize) -> std::io::Result<usize> {
+    if bytes > max_bytes || !bytes.is_multiple_of(size_of::<libc::proc_fdinfo>()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fd list result is oversized or not record-aligned",
+        ));
+    }
+    Ok(bytes / size_of::<libc::proc_fdinfo>())
+}
+
+const fn fd_list_is_complete(count: usize, capacity: usize) -> bool {
+    count < capacity
+}
+
+fn socket_record_for_fd(pid: u32, fd: libc::c_int) -> std::io::Result<Option<SocketRecord>> {
+    let info = read_socket_fdinfo(pid, fd)?;
     socket_record_from_info(pid, &info)
 }
 
@@ -935,7 +1511,7 @@ fn read_socket_fdinfo(pid: u32, fd: libc::c_int) -> std::io::Result<SocketFdinfo
     Ok(info)
 }
 
-fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> Option<SocketRecord> {
+fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> std::io::Result<Option<SocketRecord>> {
     let socket = &info.psi;
     match socket.soi_protocol {
         protocol if protocol == libc::IPPROTO_TCP && socket.soi_kind == SOCKINFO_TCP => {
@@ -944,8 +1520,11 @@ fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> Option<SocketRecord
                 // protocol payload in Darwin's socket_info union.
                 socket.soi_proto.pri_tcp
             };
+            if tcp.tcpsi_state < 0 {
+                return Err(malformed_socket_fdinfo("negative TCP state"));
+            }
             if tcp.tcpsi_state != TSI_S_LISTEN {
-                return None;
+                return Ok(None);
             }
             socket_record_from_in_sockinfo(
                 pid,
@@ -955,6 +1534,7 @@ fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> Option<SocketRecord
                 socket.soi_so,
                 &tcp.tcpsi_ini,
             )
+            .map(Some)
         }
         protocol if protocol == libc::IPPROTO_UDP && socket.soi_kind == SOCKINFO_IN => {
             let udp = unsafe {
@@ -970,8 +1550,12 @@ fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> Option<SocketRecord
                 socket.soi_so,
                 &udp,
             )
+            .map(Some)
         }
-        _ => None,
+        protocol if protocol == libc::IPPROTO_TCP || protocol == libc::IPPROTO_UDP => Err(
+            malformed_socket_fdinfo("IP socket has an incompatible info kind"),
+        ),
+        _ => Ok(None),
     }
 }
 
@@ -982,17 +1566,28 @@ fn socket_record_from_in_sockinfo(
     family: libc::c_int,
     socket_id: u64,
     info: &InSockinfo,
-) -> Option<SocketRecord> {
-    let local_port = decode_port(info.insi_lport)?;
-    let local_addr = decode_local_addr(info, family)?;
-    Some(SocketRecord {
+) -> std::io::Result<SocketRecord> {
+    let local_port = decode_port(info.insi_lport)
+        .ok_or_else(|| malformed_socket_fdinfo("IP socket has an invalid local port"))?;
+    let local_addr = decode_local_addr(info, family)
+        .ok_or_else(|| malformed_socket_fdinfo("IP socket has an invalid local address"))?;
+    Ok(SocketRecord {
         protocol,
         local_addr,
         local_port,
+        ipv6_ifindex: if family == libc::AF_INET6 {
+            info.insi_v6.in6_ifindex
+        } else {
+            0
+        },
         state,
         pid,
         socket_id,
     })
+}
+
+fn malformed_socket_fdinfo(detail: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, detail)
 }
 
 fn decode_port(raw: libc::c_int) -> Option<u16> {
@@ -1058,6 +1653,10 @@ fn read_process_bsdinfo(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
 }
 
 fn read_process_name(pid: u32) -> std::io::Result<Option<String>> {
+    read_process_name_bounded(pid, crate::observation::PROCESS_NAME_MAX_BYTES)
+}
+
+fn read_process_name_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Option<String>> {
     let pid = pid_to_c_int(pid)?;
     let mut buffer = [0 as libc::c_char; 64];
     let written_bytes = unsafe {
@@ -1071,13 +1670,17 @@ fn read_process_name(pid: u32) -> std::io::Result<Option<String>> {
     if written_bytes < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(c_char_slice_to_string(&buffer))
+    Ok(c_char_slice_to_string_bounded(&buffer, max_bytes))
 }
 
-fn read_executable_path(pid: u32) -> std::io::Result<Option<PathBuf>> {
+fn read_executable_path_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Option<PathBuf>> {
     let pid = pid_to_c_int(pid)?;
     let buffer_len = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
-        .expect("PROC_PIDPATHINFO_MAXSIZE must fit usize");
+        .expect("PROC_PIDPATHINFO_MAXSIZE must fit usize")
+        .min(max_bytes);
+    if buffer_len == 0 {
+        return Ok(None);
+    }
     let mut buffer = vec![0_u8; buffer_len];
     let written_bytes = unsafe {
         // SAFETY: buffer is valid for one proc_pidpath write and is not retained.
@@ -1101,6 +1704,10 @@ fn read_executable_path(pid: u32) -> std::io::Result<Option<PathBuf>> {
 }
 
 fn read_command_line(pid: u32) -> std::io::Result<Option<String>> {
+    read_command_line_bounded(pid, crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES)
+}
+
+fn read_command_line_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Option<String>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid_to_c_int(pid)?];
     let mut buffer_len = 0_usize;
     let result = unsafe {
@@ -1121,10 +1728,20 @@ fn read_command_line(pid: u32) -> std::io::Result<Option<String>> {
     if buffer_len == 0 {
         return Ok(None);
     }
-    if buffer_len > MAX_PROCARGS_BYTES {
+    let final_max = max_bytes.min(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES);
+    let native_max = final_max
+        .checked_add(crate::observation::EXECUTABLE_PATH_MAX_BYTES)
+        .and_then(|value| value.checked_add(size_of::<libc::c_int>() + 2))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "argument size overflow")
+        })?;
+    if buffer_len > native_max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("process arguments exceed {MAX_PROCARGS_BYTES} byte cap"),
+            format!(
+                "process arguments exceed {} byte cap",
+                crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES
+            ),
         ));
     }
 
@@ -1145,10 +1762,15 @@ fn read_command_line(pid: u32) -> std::io::Result<Option<String>> {
         return Err(std::io::Error::last_os_error());
     }
     buffer.truncate(buffer_len);
-    Ok(decode_procargs2(&buffer))
+    Ok(decode_procargs2_bounded(&buffer, final_max))
 }
 
+#[cfg(test)]
 fn decode_procargs2(bytes: &[u8]) -> Option<String> {
+    decode_procargs2_bounded(bytes, crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES)
+}
+
+fn decode_procargs2_bounded(bytes: &[u8], final_max: usize) -> Option<String> {
     let argc_bytes = bytes.get(..size_of::<libc::c_int>())?;
     let argument_count = libc::c_int::from_ne_bytes(
         argc_bytes
@@ -1166,7 +1788,9 @@ fn decode_procargs2(bytes: &[u8]) -> Option<String> {
         data = &data[1..];
     }
 
-    let mut argv = Vec::new();
+    let mut final_bytes = 0usize;
+    let mut accepted_arguments = 0usize;
+    let argv_data = data;
     for _ in 0..argument_count {
         if data.is_empty() {
             break;
@@ -1177,7 +1801,14 @@ fn decode_procargs2(bytes: &[u8]) -> Option<String> {
             .unwrap_or(data.len());
         let arg = &data[..end];
         if !arg.is_empty() {
-            argv.push(String::from_utf8_lossy(arg).into_owned());
+            let argument_bytes = crate::observation::lossy_utf8_len(arg)?;
+            final_bytes = final_bytes
+                .checked_add(usize::from(accepted_arguments != 0))?
+                .checked_add(argument_bytes)?;
+            if final_bytes > final_max {
+                return None;
+            }
+            accepted_arguments = accepted_arguments.checked_add(1)?;
         }
         data = &data[end..];
         while data.first() == Some(&0) {
@@ -1185,10 +1816,37 @@ fn decode_procargs2(bytes: &[u8]) -> Option<String> {
         }
     }
 
-    if argv.is_empty() {
+    if accepted_arguments == 0 {
         None
     } else {
-        Some(argv.join(" "))
+        let mut value = String::new();
+        value.try_reserve_exact(final_bytes).ok()?;
+        let mut data = argv_data;
+        let mut written_arguments = 0usize;
+        for _ in 0..argument_count {
+            if data.is_empty() {
+                break;
+            }
+            let end = data
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(data.len());
+            let argument = &data[..end];
+            if !argument.is_empty() {
+                if written_arguments != 0 {
+                    value.push(' ');
+                }
+                crate::observation::push_utf8_lossy(&mut value, argument);
+                written_arguments += 1;
+            }
+            data = &data[end..];
+            while data.first() == Some(&0) {
+                data = &data[1..];
+            }
+        }
+        debug_assert_eq!(written_arguments, accepted_arguments);
+        debug_assert_eq!(value.len(), final_bytes);
+        Some(value)
     }
 }
 
@@ -1196,29 +1854,49 @@ fn process_name_from_bsd_info(info: &libc::proc_bsdinfo) -> Option<String> {
     c_char_slice_to_string(&info.pbi_name).or_else(|| c_char_slice_to_string(&info.pbi_comm))
 }
 
-fn process_start_time_marker_from_bsd_info(info: &libc::proc_bsdinfo) -> u64 {
-    info.pbi_start_tvsec
-        .saturating_mul(1_000_000)
-        .saturating_add(info.pbi_start_tvusec)
+fn process_name_from_bsd_info_bounded(
+    info: &libc::proc_bsdinfo,
+    max_bytes: usize,
+) -> Option<String> {
+    c_char_slice_to_string_bounded(&info.pbi_name, max_bytes)
+        .or_else(|| c_char_slice_to_string_bounded(&info.pbi_comm, max_bytes))
+}
+
+fn process_start_time_marker_from_bsd_info(
+    info: &libc::proc_bsdinfo,
+) -> Result<ProcessStartMarker, crate::observation::ProcessMarkerError> {
+    let microseconds = u32::try_from(info.pbi_start_tvusec)
+        .map_err(|_| crate::observation::ProcessMarkerError::InvalidMicroseconds)?;
+    ProcessStartMarker::macos(info.pbi_start_tvsec, microseconds)
 }
 
 fn c_char_slice_to_string(bytes: &[libc::c_char]) -> Option<String> {
+    c_char_slice_to_string_bounded(bytes, usize::MAX)
+}
+
+fn c_char_slice_to_string_bounded(bytes: &[libc::c_char], max_bytes: usize) -> Option<String> {
     let ptr = bytes.as_ptr();
     if ptr.is_null() || bytes.first().copied() == Some(0) {
         return None;
     }
 
     let nul_index = bytes.iter().position(|byte| *byte == 0)?;
+    if nul_index == 0 || nul_index > max_bytes {
+        return None;
+    }
     let text = unsafe {
         // SAFETY: nul_index proves there is a NUL terminator inside bytes, and ptr
         // points to the start of that same live buffer.
         CStr::from_ptr(ptr)
     };
-    let text = text.to_string_lossy();
-    if nul_index == 0 || text.is_empty() {
+    let bytes = text.to_bytes();
+    let decoded_len = crate::observation::lossy_utf8_len(bytes)?;
+    if decoded_len == 0 || decoded_len > max_bytes {
         None
     } else {
-        Some(text.into_owned())
+        let mut text = String::with_capacity(decoded_len);
+        crate::observation::push_utf8_lossy(&mut text, bytes);
+        Some(text)
     }
 }
 
@@ -1282,13 +1960,24 @@ fn platform_error(operation: &'static str, detail: String) -> CollectorError {
 mod tests {
     use std::mem::{MaybeUninit, size_of};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
 
     use super::{
-        In4In6Addr, InSocketAddress, InSockinfo, InSockinfoV4, InSockinfoV6, SocketFdinfo,
-        SocketProtocolInfo, TSI_S_LISTEN, TcpSockinfo, decode_port, decode_procargs2,
-        socket_record_from_info,
+        In4In6Addr, InSocketAddress, InSockinfo, InSockinfoV4, InSockinfoV6, ProcessMetadata,
+        SocketFdinfo, SocketProtocolInfo, SocketScanLoss, TSI_S_LISTEN, TcpSockinfo,
+        collect_pid_socket_records_from_fds, decode_port, decode_procargs2,
+        decode_procargs2_bounded, fd_list_is_complete, fd_record_count,
+        fresh_process_evidence_from_reads, list_process_fds_with_reader, native_pass_from_records,
+        process_ids_with_reader, process_observation_from_metadata, retain_socket_record,
+        socket_record_from_info, sorted_owner_is_new,
     };
     use crate::model::{Protocol, SocketState};
+    use crate::observation::{
+        EvidenceImpact, Ipv6Scope, MetadataCompleteness, OwnerCompleteness, PlatformSocketToken,
+    };
+    use crate::process_evidence::ProcessEvidenceError;
+    use crate::tree::TreeProcessOps;
 
     fn zeroed_socket_fdinfo() -> SocketFdinfo {
         unsafe {
@@ -1296,6 +1985,44 @@ mod tests {
             // tests zero them before filling the fields relevant to record parsing.
             MaybeUninit::<SocketFdinfo>::zeroed().assume_init()
         }
+    }
+
+    #[test]
+    fn prepare_thaw_records_the_identity_used_by_production_continuation() {
+        let marker =
+            crate::observation::ProcessStartMarker::macos(1, 0).expect("test marker is valid");
+        let mut ops = super::MacosTreeOps::new();
+
+        ops.prepare_thaw(42, Some(marker));
+
+        assert_eq!(ops.verified_markers.get(&42), Some(&marker));
+    }
+
+    #[test]
+    fn continuation_guard_refuses_a_pid_without_a_verified_marker() {
+        let ops = super::MacosTreeOps::new();
+
+        assert_eq!(
+            ops.recheck_marker(42),
+            Err(crate::tree::TreeSignalResult::Denied)
+        );
+    }
+
+    #[test]
+    fn shared_socket_owner_dedup_scales_with_sorted_owner_count() {
+        let mut owners = Vec::new();
+        for pid in 1..=32_768 {
+            if sorted_owner_is_new(&owners, pid) {
+                owners.push(pid);
+            }
+            if sorted_owner_is_new(&owners, pid) {
+                owners.push(pid);
+            }
+        }
+
+        assert_eq!(owners.len(), 32_768);
+        assert_eq!(owners.first(), Some(&1));
+        assert_eq!(owners.last(), Some(&32_768));
     }
 
     fn in_sockinfo_v4(port: u16, addr: Ipv4Addr) -> InSockinfo {
@@ -1382,7 +2109,9 @@ mod tests {
             },
         };
 
-        let record = socket_record_from_info(18422, &info).expect("listen socket is kept");
+        let record = socket_record_from_info(18422, &info)
+            .expect("valid fdinfo")
+            .expect("listen socket is kept");
 
         assert_eq!(record.protocol, Protocol::Tcp);
         assert_eq!(record.state, SocketState::Listen);
@@ -1410,7 +2139,10 @@ mod tests {
             },
         };
 
-        assert_eq!(socket_record_from_info(18422, &info), None);
+        assert_eq!(
+            socket_record_from_info(18422, &info).expect("valid fdinfo"),
+            None
+        );
     }
 
     #[test]
@@ -1424,13 +2156,218 @@ mod tests {
             pri_in: in_sockinfo_v6(5353, Ipv6Addr::LOCALHOST),
         };
 
-        let record = socket_record_from_info(902, &info).expect("udp socket is kept");
+        let record = socket_record_from_info(902, &info)
+            .expect("valid fdinfo")
+            .expect("udp socket is kept");
 
         assert_eq!(record.protocol, Protocol::Udp);
         assert_eq!(record.state, SocketState::Bound);
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 5353);
         assert_eq!(record.pid, 902);
+        assert_eq!(record.ipv6_ifindex, 0);
+
+        let pass = native_pass_from_records(
+            &[record],
+            vec![vec![902]],
+            std::collections::BTreeSet::new(),
+            0,
+        )
+        .expect("zero native scope is representable");
+        assert_eq!(
+            pass.sockets[0].endpoint.ipv6_scope,
+            Some(Ipv6Scope::Unscoped)
+        );
+    }
+
+    #[test]
+    fn ipv6_socket_retains_native_interface_index() {
+        let mut info = zeroed_socket_fdinfo();
+        info.psi.soi_protocol = libc::IPPROTO_UDP;
+        info.psi.soi_family = libc::AF_INET6;
+        info.psi.soi_kind = super::SOCKINFO_IN;
+        let mut native = in_sockinfo_v6(5353, Ipv6Addr::LOCALHOST);
+        native.insi_v6.in6_ifindex = 7;
+        info.psi.soi_proto = SocketProtocolInfo { pri_in: native };
+
+        let record = socket_record_from_info(902, &info)
+            .expect("valid scoped IPv6 fdinfo")
+            .expect("UDP socket is kept");
+        let pass = native_pass_from_records(
+            &[record],
+            vec![vec![902]],
+            std::collections::BTreeSet::new(),
+            0,
+        )
+        .expect("scoped native pass is valid");
+
+        assert_eq!(
+            pass.sockets[0].endpoint.ipv6_scope,
+            Some(Ipv6Scope::interface_index(7).unwrap())
+        );
+    }
+
+    #[test]
+    fn native_pass_retains_socket_id_and_shared_owners() {
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            ipv6_ifindex: 0,
+            state: SocketState::Listen,
+            pid: 100,
+            socket_id: 0xCAFE,
+        };
+
+        let pass = native_pass_from_records(
+            &[record],
+            vec![vec![100, 101]],
+            std::collections::BTreeSet::new(),
+            0,
+        )
+        .expect("native macOS pass is valid");
+
+        assert_eq!(
+            pass.sockets[0].token,
+            PlatformSocketToken::macos_socket_id(0xCAFE)
+        );
+        assert_eq!(pass.owners.owners_by_socket[0], [100, 101]);
+        assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
+        assert_eq!(
+            pass.owners.local_completeness,
+            [OwnerCompleteness::Complete]
+        );
+    }
+
+    #[test]
+    fn tokenless_same_endpoint_descriptors_remain_distinct_within_one_pid() {
+        let fds = [9, 10].map(|proc_fd| libc::proc_fdinfo {
+            proc_fd,
+            proc_fdtype: u32::try_from(libc::PROX_FDTYPE_SOCKET).unwrap(),
+        });
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            ipv6_ifindex: 0,
+            state: SocketState::Listen,
+            pid: 100,
+            socket_id: 0,
+        };
+        let mut traversed = 0;
+
+        let (records, losses) =
+            collect_pid_socket_records_from_fds(100, &fds, &mut traversed, fds.len(), |_| {
+                Ok(Some(record.clone()))
+            })
+            .expect("tokenless descriptors collect");
+
+        assert_eq!(records, [record.clone(), record]);
+        assert!(losses.is_empty());
+    }
+
+    #[test]
+    fn tokenless_same_endpoint_sockets_do_not_merge_owners_across_pids() {
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            ipv6_ifindex: 0,
+            state: SocketState::Listen,
+            pid: 100,
+            socket_id: 0,
+        };
+        let mut records = Vec::new();
+        let mut owners = Vec::new();
+        let mut indexes = std::collections::HashMap::new();
+        let mut owner_edges = 0;
+
+        retain_socket_record(
+            &mut records,
+            &mut owners,
+            &mut indexes,
+            &mut owner_edges,
+            record.clone(),
+            100,
+        )
+        .expect("first tokenless socket is retained");
+        retain_socket_record(
+            &mut records,
+            &mut owners,
+            &mut indexes,
+            &mut owner_edges,
+            super::SocketRecord { pid: 101, ..record },
+            101,
+        )
+        .expect("second tokenless socket is retained");
+        let pass = native_pass_from_records(&records, owners, std::collections::BTreeSet::new(), 0)
+            .expect("tokenless sockets form a valid pass");
+
+        assert_eq!(pass.sockets.len(), 2);
+        assert!(pass.sockets.iter().all(|socket| socket.token.is_none()));
+        assert_eq!(pass.owners.owners_by_socket, [vec![100], vec![101]]);
+        assert!(indexes.is_empty());
+    }
+
+    #[test]
+    fn pid_scan_denial_is_socket_set_loss_not_owner_loss() {
+        let record = super::SocketRecord {
+            protocol: Protocol::Udp,
+            local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_port: 5353,
+            ipv6_ifindex: 0,
+            state: SocketState::Bound,
+            pid: 902,
+            socket_id: 77,
+        };
+
+        let pass = native_pass_from_records(
+            &[record],
+            vec![vec![902]],
+            [SocketScanLoss::PermissionDenied(42)].into_iter().collect(),
+            0,
+        )
+        .expect("permission loss remains representable");
+
+        assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
+        assert_eq!(
+            pass.owners.local_completeness,
+            [OwnerCompleteness::Complete]
+        );
+        assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
+        assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
+        assert_eq!(
+            pass.owners.evidence_gaps[0].impact,
+            EvidenceImpact::SocketSet
+        );
+    }
+
+    #[test]
+    fn socket_scan_losses_are_bounded_at_the_native_pass_source() {
+        let mut losses = std::collections::BTreeSet::new();
+        let mut omitted = 0u64;
+        for pid in 1..=u32::try_from(crate::observation::EVIDENCE_GAPS_MAX).unwrap() {
+            super::retain_socket_scan_loss(
+                &mut losses,
+                &mut omitted,
+                SocketScanLoss::Disappeared(pid),
+            );
+        }
+        assert_eq!(losses.len(), crate::observation::EVIDENCE_GAPS_MAX);
+        assert_eq!(omitted, 0);
+
+        super::retain_socket_scan_loss(
+            &mut losses,
+            &mut omitted,
+            SocketScanLoss::Disappeared(u32::MAX),
+        );
+        let pass = native_pass_from_records(&[], Vec::new(), losses, omitted)
+            .expect("bounded socket losses remain observable");
+        assert_eq!(
+            pass.owners.evidence_gaps.len(),
+            crate::observation::EVIDENCE_GAPS_MAX
+        );
+        assert_eq!(pass.owners.omitted_evidence_gap_count, 1);
     }
 
     #[test]
@@ -1443,7 +2380,9 @@ mod tests {
             pri_in: in_sockinfo_v6(3000, Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
         };
 
-        let record = socket_record_from_info(18422, &info).expect("mapped socket is kept");
+        let record = socket_record_from_info(18422, &info)
+            .expect("valid fdinfo")
+            .expect("mapped socket is kept");
 
         assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(record.local_port, 3000);
@@ -1474,34 +2413,324 @@ mod tests {
     }
 
     #[test]
-    fn tree_snapshot_row_maps_parent_and_start_marker_from_bsd_info() {
-        let mut info = unsafe {
-            // SAFETY: proc_bsdinfo is a plain-data C struct; the test zeroes it
-            // and then sets only the fields the conversion reads.
-            MaybeUninit::<libc::proc_bsdinfo>::zeroed().assume_init()
+    fn procargs2_seam_enforces_one_mib_final_utf8_boundary() {
+        let max = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
+        let exact_argument = vec![b'x'; max];
+        let exact = procargs2(1, b"", &[&exact_argument]);
+        assert_eq!(
+            decode_procargs2_bounded(&exact, max)
+                .as_deref()
+                .map(str::len),
+            Some(max)
+        );
+
+        let oversized_argument = vec![b'x'; max + 1];
+        let oversized = procargs2(1, b"", &[&oversized_argument]);
+        assert_eq!(decode_procargs2_bounded(&oversized, max), None);
+    }
+
+    #[test]
+    fn procargs2_join_budget_counts_separators_and_lossy_utf8_exactly() {
+        let exact = procargs2(3, b"", &[b"ab", &[0xff], b"cd"]);
+        assert_eq!(
+            decode_procargs2_bounded(&exact, 9).as_deref(),
+            Some("ab � cd")
+        );
+        assert_eq!(decode_procargs2_bounded(&exact, 8), None);
+    }
+
+    #[test]
+    fn procargs2_many_arguments_refuse_before_joining_over_budget_output() {
+        let arguments = vec![b"x".as_slice(); 65_536];
+        let bytes = procargs2(65_536, b"", &arguments);
+        assert_eq!(decode_procargs2_bounded(&bytes, 31), None);
+    }
+
+    #[test]
+    fn malformed_socket_fdinfo_cannot_silently_hide_a_socket() {
+        let mut info = zeroed_socket_fdinfo();
+        info.psi.soi_protocol = libc::IPPROTO_TCP;
+        info.psi.soi_family = libc::AF_INET;
+        info.psi.soi_kind = super::SOCKINFO_TCP;
+        info.psi.soi_proto = SocketProtocolInfo {
+            pri_tcp: TcpSockinfo {
+                tcpsi_ini: in_sockinfo_v4(0, Ipv4Addr::LOCALHOST),
+                tcpsi_state: TSI_S_LISTEN,
+                tcpsi_timer: [0; 4],
+                tcpsi_mss: 0,
+                tcpsi_flags: 0,
+                rfu_1: 0,
+                tcpsi_tp: 0,
+            },
         };
+        let fds = [libc::proc_fdinfo {
+            proc_fd: 9,
+            proc_fdtype: u32::try_from(libc::PROX_FDTYPE_SOCKET).unwrap(),
+        }];
+        let mut traversed = 0;
+
+        let (_, losses) = collect_pid_socket_records_from_fds(42, &fds, &mut traversed, 1, |_| {
+            socket_record_from_info(42, &info)
+        })
+        .expect("malformed per-FD data is retained as socket-set loss");
+
+        assert_eq!(
+            losses,
+            [SocketScanLoss::Malformed(42)].into_iter().collect()
+        );
+        let pass =
+            native_pass_from_records(&[], Vec::new(), losses, 0).expect("loss is representable");
+        assert_eq!(
+            pass.owners.evidence_gaps[0].impact,
+            EvidenceImpact::SocketSet
+        );
+    }
+
+    #[test]
+    fn malformed_or_truncated_fd_enumeration_is_not_accepted() {
+        let record_size = size_of::<libc::proc_fdinfo>();
+        assert_eq!(
+            fd_record_count(record_size - 1, record_size)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            fd_record_count(record_size * 2, record_size)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(!fd_list_is_complete(16, 16));
+        assert!(fd_list_is_complete(15, 16));
+    }
+
+    #[test]
+    fn production_pid_reader_accepts_exact_maximum_on_attempt_three() {
+        let max = crate::observation::CANDIDATE_PROCESS_IDS_MAX;
+        let initial = max / 2 - super::PROCESS_LIST_GROWTH_MARGIN;
+        let mut attempts = Vec::new();
+
+        let pids = process_ids_with_reader(|buffer, _| {
+            let Some(buffer) = buffer else {
+                return Ok(libc::c_int::try_from(initial).unwrap());
+            };
+            attempts.push(buffer.len());
+            if attempts.len() < 3 {
+                return Ok(libc::c_int::try_from(buffer.len()).unwrap());
+            }
+            for (index, pid) in buffer[..max].iter_mut().rev().enumerate() {
+                *pid = libc::pid_t::try_from(index + 1).unwrap();
+            }
+            Ok(libc::c_int::try_from(max).unwrap())
+        })
+        .expect("the exact production PID maximum is accepted");
+
+        assert_eq!(attempts, [max / 2, max, max + 1]);
+        assert_eq!(pids.len(), max);
+        assert_eq!(pids.first(), Some(&1));
+        assert_eq!(pids.last(), Some(&u32::try_from(max).unwrap()));
+    }
+
+    #[test]
+    fn production_pid_reader_refuses_max_plus_one_before_allocation() {
+        let max = crate::observation::CANDIDATE_PROCESS_IDS_MAX;
+        let mut buffer_reads = 0;
+
+        let error = process_ids_with_reader(|buffer, _| {
+            if buffer.is_some() {
+                buffer_reads += 1;
+            }
+            Ok(libc::c_int::try_from(max + 1).unwrap())
+        })
+        .expect_err("one PID beyond the production maximum is refused");
+
+        assert_eq!(buffer_reads, 0);
+        assert!(error.to_string().contains("PID cap"));
+    }
+
+    #[test]
+    fn production_fd_reader_accepts_exact_maximum_on_attempt_three() {
+        let max = super::MAX_PROCESS_FDS;
+        let initial = max / 2 - super::FD_LIST_GROWTH_MARGIN;
+        let record_size = size_of::<libc::proc_fdinfo>();
+        let mut attempts = Vec::new();
+
+        let fds = list_process_fds_with_reader(|buffer, _| {
+            let Some(buffer) = buffer else {
+                return Ok(libc::c_int::try_from(initial * record_size).unwrap());
+            };
+            attempts.push(buffer.len());
+            if attempts.len() < 3 {
+                return Ok(libc::c_int::try_from(std::mem::size_of_val(buffer)).unwrap());
+            }
+            for (index, fd) in buffer[..max].iter_mut().enumerate() {
+                fd.proc_fd = libc::c_int::try_from(index).unwrap();
+            }
+            Ok(libc::c_int::try_from(max * record_size).unwrap())
+        })
+        .expect("the exact production per-process FD maximum is accepted");
+
+        assert_eq!(attempts, [max / 2, max, max + 1]);
+        assert_eq!(fds.len(), max);
+        assert_eq!(fds.first().map(|fd| fd.proc_fd), Some(0));
+        assert_eq!(
+            fds.last().map(|fd| fd.proc_fd),
+            Some(libc::c_int::try_from(max - 1).unwrap())
+        );
+    }
+
+    #[test]
+    fn production_fd_reader_refuses_max_plus_one_before_allocation() {
+        let max = super::MAX_PROCESS_FDS;
+        let record_size = size_of::<libc::proc_fdinfo>();
+        let mut buffer_reads = 0;
+
+        let error = list_process_fds_with_reader(|buffer, _| {
+            if buffer.is_some() {
+                buffer_reads += 1;
+            }
+            Ok(libc::c_int::try_from((max + 1) * record_size).unwrap())
+        })
+        .expect_err("one FD beyond the production maximum is refused");
+
+        assert_eq!(buffer_reads, 0);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("descriptor cap"));
+    }
+
+    #[test]
+    fn aggregate_fd_limit_counts_every_entry_before_socket_filtering() {
+        let regular_fd_type = 0;
+        let fds = [
+            libc::proc_fdinfo {
+                proc_fd: 1,
+                proc_fdtype: regular_fd_type,
+            },
+            libc::proc_fdinfo {
+                proc_fd: 2,
+                proc_fdtype: regular_fd_type,
+            },
+        ];
+        let mut traversed = 0;
+        let mut socket_reads = 0;
+        collect_pid_socket_records_from_fds(7, &fds, &mut traversed, 2, |_| {
+            socket_reads += 1;
+            Ok(None)
+        })
+        .expect("the exact aggregate maximum is accepted");
+        assert_eq!(traversed, 2);
+        assert_eq!(socket_reads, 0);
+
+        let error = collect_pid_socket_records_from_fds(8, &fds[..1], &mut traversed, 2, |_| {
+            socket_reads += 1;
+            Ok(None)
+        })
+        .expect_err("maximum plus one is rejected before socket filtering");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(traversed, 3);
+        assert_eq!(socket_reads, 0);
+    }
+
+    #[test]
+    fn fresh_tree_evidence_rejects_zero_marker_and_marker_name_race() {
+        let mut before = zeroed_bsd_info();
+        let mut after = zeroed_bsd_info();
+        assert_eq!(
+            fresh_process_evidence_from_reads(7, &before, "worker".to_owned(), &after),
+            Err(ProcessEvidenceError::IdentityChanged { pid: 7 })
+        );
+
+        before.pbi_start_tvsec = 10;
+        after.pbi_start_tvsec = 11;
+        assert_eq!(
+            fresh_process_evidence_from_reads(7, &before, "new-name".to_owned(), &after),
+            Err(ProcessEvidenceError::IdentityChanged { pid: 7 })
+        );
+    }
+
+    #[test]
+    fn fresh_name_adapter_accepts_exact_4k_and_refuses_empty_and_max_plus_one() {
+        let mut before = zeroed_bsd_info();
+        before.pbi_start_tvsec = 10;
+        let after = before;
+        let limit = crate::observation::PROTECTION_NAME_MAX_BYTES;
+
+        let exact = fresh_process_evidence_from_reads(7, &before, "x".repeat(limit), &after)
+            .expect("exact 4 KiB name");
+        assert_eq!(exact.name.len(), limit);
+        assert_eq!(
+            fresh_process_evidence_from_reads(7, &before, String::new(), &after),
+            Err(ProcessEvidenceError::NameMissing { pid: 7 })
+        );
+        assert_eq!(
+            fresh_process_evidence_from_reads(7, &before, "x".repeat(limit + 1), &after),
+            Err(ProcessEvidenceError::NameOversized {
+                pid: 7,
+                bytes: limit + 1
+            })
+        );
+    }
+
+    #[test]
+    fn bsd_start_marker_rejects_invalid_microseconds() {
+        let mut info = zeroed_bsd_info();
+        info.pbi_start_tvsec = 10;
+        info.pbi_start_tvusec = 1_000_000;
+        assert_eq!(
+            super::process_start_time_marker_from_bsd_info(&info),
+            Err(crate::observation::ProcessMarkerError::InvalidMicroseconds)
+        );
+    }
+
+    #[test]
+    fn non_utf8_executable_path_is_null_and_metadata_partial() {
+        let observation = process_observation_from_metadata(ProcessMetadata {
+            process_name: Some("worker".to_owned()),
+            executable_path: Some(PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))),
+            partial: false,
+            ..ProcessMetadata::default()
+        });
+
+        assert!(observation.executable_path.is_none());
+        assert_eq!(
+            observation.metadata_completeness,
+            MetadataCompleteness::Partial
+        );
+    }
+
+    fn zeroed_bsd_info() -> libc::proc_bsdinfo {
+        unsafe {
+            // SAFETY: proc_bsdinfo is a plain-data C struct used as a test fixture.
+            MaybeUninit::<libc::proc_bsdinfo>::zeroed().assume_init()
+        }
+    }
+
+    #[test]
+    fn tree_snapshot_row_maps_parent_and_start_marker_from_bsd_info() {
+        let mut info = zeroed_bsd_info();
         info.pbi_ppid = 100;
         info.pbi_pgid = 4242;
         info.pbi_start_tvsec = 1_700_000_000;
         info.pbi_start_tvusec = 250_000;
 
-        let row = super::tree_process_info_from_bsd(4242, &info, "node".to_owned());
+        let row = super::tree_process_info_from_bsd(4242, &info, "node".to_owned())
+            .expect("valid BSD info");
 
         assert_eq!(row.pid, 4242);
         assert_eq!(row.parent_pid, Some(100));
         assert_eq!(row.process_name.as_deref(), Some("node"));
         assert_eq!(row.process_group, Some(4242));
-        // Seconds and microseconds fold into one marker so equal-second reuse
-        // of a PID still changes identity.
         assert_eq!(
             row.start_time_marker,
-            Some(1_700_000_000 * 1_000_000 + 250_000)
+            crate::observation::ProcessStartMarker::macos(1_700_000_000, 250_000).ok()
         );
 
         // A launchd/kernel-rooted process reports parent PID 0, which must map
         // to "no parent", never to a real PID 0 edge.
         info.pbi_ppid = 0;
-        let row = super::tree_process_info_from_bsd(1, &info, "launchd".to_owned());
+        let row = super::tree_process_info_from_bsd(1, &info, "launchd".to_owned())
+            .expect("valid BSD info");
         assert_eq!(row.parent_pid, None);
     }
 

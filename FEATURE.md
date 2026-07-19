@@ -128,7 +128,9 @@ and documentation:
   completeness of `Complete`, `Partial { reason }`, or `Raced`. An empty complete
   set means `NoOwnerObserved`; an empty partial set does not claim that no owner
   exists. Hidden ownership that cannot be tied to one endpoint is a snapshot gap,
-  not a fabricated per-socket owner.
+  not a fabricated per-socket owner. On Linux, socket-local `Complete` means the
+  attributable `/proc/<pid>/fd` owner edges for that inode were complete; it does
+  not prove that an unreadable process is not a same-inode co-holder.
 - A platform socket token is a typed optional opaque value such as `LinuxInode`
   or `MacOsSocketId`. No synthetic token is created on a platform that does not
   expose one. Linux `/proc/net` inodes and macOS `socket_info.soi_so` values may
@@ -338,11 +340,13 @@ authorized security-test target under this plan.
 Residual risks that must remain documented are polling blind spots between
 snapshots, a successful probe losing a later bind race, unavailable information
 outside the current namespace or host stack, OS/API behavior that differs across
-versions, and the remaining macOS interval between final identity check and
-signal delivery. A kernel API or stdout consumer may also block a synchronous OS
-call beyond an application-controlled duration; the implementation bounds
-retained memory and side effects but does not claim a portable write deadline.
-These risks may not be described as proven absence or future availability.
+versions, a Linux unreadable process sharing a visible socket inode, the private
+Windows Job Object freeze ABI changing semantics, and the remaining macOS
+interval between final identity check and signal delivery. A kernel API or stdout
+consumer may also block a synchronous OS call beyond an application-controlled
+duration; the implementation bounds retained memory and side effects but does
+not claim a portable write deadline. These risks may not be described as proven
+absence or future availability.
 
 ### 0.7 Resource bounds
 
@@ -478,7 +482,7 @@ deadlines use injected clocks; tests do not sleep until a real deadline.
 | Tree/group members | Missing/zero-member target refused | 256 tree and 512 group accepted | Member 257/513 refused before delivery |
 | Group `--yes` members | Empty group refused | Eight accepted when warning-free | Ninth requires interactive confirmation |
 | Unix freeze passes | Stable first pass accepted | Convergence on pass eight accepted | Pass nine never starts; all frozen members are thaw-attempted |
-| Windows tree sweep passes | Stable first sweep accepted | Convergence on sweep eight accepted | Sweep nine never starts and post-commit partiality is reported |
+| Windows tree sweep passes | Stable first sweep accepted | Convergence on sweep eight accepted across the pre-freeze and frozen phases combined | Sweep nine never starts and post-commit partiality is reported |
 | Confirmation input | Empty fails confirmation | 128 UTF-8 bytes accepted when otherwise valid | Byte 129 rejected and input remains untruncated |
 | Post-kill settle | Zero attempts is impossible for a requested settle | Port disappearance on attempt ten succeeds | Attempt eleven never starts; timeout remains truthful |
 | Windows single-process wait | Zero-time probe remains nonblocking | Exit at the five-second deadline succeeds | No wait beyond the shared deadline; survivor is unconfirmed |
@@ -668,6 +672,12 @@ during each owner scan. If that loss cannot be attributed to a socket inode, add
 the endpoint-null `owner_attribution_incomplete` gap, set global owner
 completeness to partial, and disable globally complete ownership claims; do not
 change socket-local completeness or label an arbitrary unowned socket as hidden.
+This deliberately preserves unprivileged port kill, but `/proc` cannot prove that
+the unreadable PID does not share an inode with a visible owner. Port mode may
+therefore terminate one genuine attributable owner while an undiscovered
+same-inode co-holder keeps the port bound; the post-kill visibility check reports
+that survivor condition. This is an accepted availability limitation, not proof
+of unique kernel-wide ownership.
 macOS and Windows apply the equivalent rule when a native process-first or
 owner-table step loses unattributable rows.
 
@@ -699,7 +709,7 @@ no owner is attributable. Projection indexes are capped at 262,144 rows
 independently of raw socket count and never duplicate owned metadata. Kill
 resolution may display an unverified PID but must refuse delivery unless fresh
 revalidation establishes verified process identity, complete confirmed-endpoint
-ownership, and complete fresh protection evidence.
+attributed ownership, and complete fresh protection evidence.
 
 The kill path is the highest-risk migration surface. Preserve this safety order
 explicitly:
@@ -720,15 +730,33 @@ tree, and group kill tests are named migration criteria, not incidental coverage
 Mutation confirmation must first cover ownership loss, PID reuse, endpoint
 movement, newly protected targets, and signal non-delivery on every refusal.
 
+Destructive target authority is normatively mode-aware. PID selection requires
+proof that the exact verified PID/start-marker identity owns every endpoint
+carried by the confirmation and that no target-local socket-set or ownership
+evidence gap invalidates those endpoints. Global unattributable ownership loss
+does not select a different identity and does not by itself block PID or port
+mode. PID selection requires complete target-local evidence for its preselected
+identity. Port selection may establish one identity from complete attributable
+matching-endpoint owner sets, but any observed ambiguity, unverified matching
+owner, matching-endpoint ownership gap, or applicable socket-set gap still
+refuses. Linux cannot exclude the same-inode hidden co-holder described above;
+the selected PID is still a verified genuine owner, but it is not claimed to be
+the only kernel-wide holder. This preserves unprivileged port kill when unrelated
+host processes are unreadable without guessing a PID that was not observed as an
+owner. Implementations and tests must not replace these rules with one global
+owner-completeness gate.
+An omitted evidence gap has lost the impact and locality needed to prove it
+unrelated; any nonzero omitted-gap count therefore blocks both destructive modes.
+
 ### Stage 1 gate
 
-- [ ] Core invariants are represented in types or checked at internal boundaries.
-- [ ] Operational errors do not panic.
-- [ ] Every collection path is bounded.
-- [ ] Existing commands pass unchanged regression tests.
-- [ ] Kill revalidation ordering and signal non-delivery remain proven by unit,
+- [x] Core invariants are represented in types or checked at internal boundaries.
+- [x] Operational errors do not panic.
+- [x] Every collection path is bounded.
+- [x] Existing commands pass unchanged regression tests.
+- [x] Kill revalidation ordering and signal non-delivery remain proven by unit,
       contract, integration, and mutation-confirmed tests.
-- [ ] Unit tests cover stable, partial, denied, raced, duplicate, zero, maximum,
+- [x] Unit tests cover stable, partial, denied, raced, duplicate, zero, maximum,
       and maximum-plus-one observations.
 
 ## Stage 2: Complete Native Collection
@@ -854,14 +882,12 @@ Permanent limitations are part of the contract:
 - IP Helper owner-table rows remain socket-set evidence even when process
   identity or metadata reads fail. Such failure affects ownership or metadata,
   not the existence of the socket row.
-- The current `sysinfo` metadata snapshot is not considered bounded merely
-  because results are truncated afterward and is not approved for the new
-  collector. Replace it with the bounded native sources frozen in the Stage 2
-  matrix. Enumerate at most 131,072 fixed-size Toolhelp rows; allocate name,
+- The former `sysinfo` metadata snapshot was not considered bounded merely
+  because results were truncated afterward and has been replaced by bounded
+  native sources. Enumerate at most 131,072 fixed-size Toolhelp rows; allocate name,
   path, and command-line buffers only after per-value and aggregate budget checks;
   use at most three changing-size attempts per native read. Keep IP Helper as the
-  socket authority. Remove `sysinfo` after all existing Windows behavior is
-  migrated and covered; no provisional unbounded metadata path may remain.
+  socket authority. No provisional unbounded metadata path may remain.
 
 ### 2.4 Shared state mapping
 
@@ -876,7 +902,7 @@ retains all states for watch and why.
 - [ ] Permission and scope gaps remain visible.
 - [ ] Native fixture tests cover every documented state and malformed tables.
 - [ ] Every platform enforces process-metadata limits before allocation; Windows
-      has either a proven bounded `sysinfo` path or bounded native replacement.
+      uses its bounded native replacement.
 - [ ] Linux, macOS, and Windows CI compile and run their collector tests.
 - [ ] Release-mode feasibility measurements confirm the 100 ms watch minimum or
       Stage 0 is reopened before named endpoints and public commands begin.
@@ -2025,8 +2051,8 @@ Pin:
   with explicit null/partial behavior above each cap.
 - Linux migration from 16 KiB truncation to complete-through-1-MiB/null-above-cap
   behavior; no truncated command-line prefix reaches legacy JSON.
-- Windows metadata allocation is rejected before exceeding PID, per-value, or
-  64 MiB aggregate limits whether `sysinfo` is retained or replaced.
+- Windows native metadata allocation is rejected before exceeding PID, per-value,
+  or 64 MiB aggregate limits.
 - Per-event and per-verdict evidence/gap caps with truthful omitted counts.
 - Per-native-read retry limits and aggregate owner-edge/identity-read limits.
 

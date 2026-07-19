@@ -15,7 +15,9 @@ use crate::config::Config;
 use crate::display::sanitize;
 use crate::docker;
 use crate::input::Action;
-use crate::model::{DockerPortContext, PortEntry, ProcessContext, Protocol, SortMode};
+use crate::model::{
+    DockerPortContext, PortEntry, PortEntryView, ProcessContext, Protocol, SortMode,
+};
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
@@ -26,7 +28,7 @@ use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::tree;
 
-type RefreshResult = Result<Vec<PortEntry>, collector::CollectorError>;
+type RefreshResult = Result<crate::observation::NetworkSnapshot, collector::CollectorError>;
 type ContextResult = ProcessContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 type TreePreviewResult = Result<tree::ProcessTreeTarget, String>;
@@ -80,6 +82,17 @@ struct RowKey {
 
 impl From<&PortEntry> for RowKey {
     fn from(entry: &PortEntry) -> Self {
+        Self {
+            pid: entry.pid,
+            protocol: entry.protocol,
+            local_addr: entry.local_addr,
+            local_port: entry.local_port,
+        }
+    }
+}
+
+impl From<PortEntryView<'_>> for RowKey {
+    fn from(entry: PortEntryView<'_>) -> Self {
         Self {
             pid: entry.pid,
             protocol: entry.protocol,
@@ -192,8 +205,8 @@ impl ForceKillConfirmation {
 /// The mutable guts of the TUI.
 #[derive(Debug)]
 pub(crate) struct App {
-    all_rows: Vec<PortEntry>,
-    rows: Vec<PortEntry>,
+    row_descriptors: Vec<crate::observation::PortEntryDescriptor>,
+    visible_row_indices: Vec<usize>,
     selected_index: Option<usize>,
     filter_text: String,
     search_mode: bool,
@@ -201,6 +214,7 @@ pub(crate) struct App {
     hide_system_processes: bool,
     force_kill_confirmation: ForceKillConfirmation,
     protected_processes: Vec<String>,
+    network_snapshot: Option<crate::observation::NetworkSnapshot>,
     selected_context_key: Option<RowKey>,
     selected_process_context: Option<ProcessContext>,
     context_worker: Option<ContextWorker>,
@@ -236,23 +250,28 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn new_fake(config: &Config) -> Self {
-        let rows = FakeCollector
-            .collect()
+        let snapshot = FakeCollector
+            .collect(crate::observation::MetadataProfile::LegacyList)
             .expect("fake collection cannot fail");
-        Self::from_rows(rows, config)
+        Self::from_snapshot(snapshot, config)
     }
 
     #[cfg(test)]
     fn from_rows(rows: Vec<PortEntry>, config: &Config) -> Self {
+        Self::from_snapshot(crate::observation::snapshot_from_test_rows(rows), config)
+    }
+
+    #[cfg(test)]
+    fn from_snapshot(snapshot: crate::observation::NetworkSnapshot, config: &Config) -> Self {
         let mut app = Self::empty(config, Instant::now());
-        app.apply_successful_snapshot(rows, Instant::now());
+        app.apply_network_snapshot(snapshot, Instant::now());
         app
     }
 
     fn empty(config: &Config, now: Instant) -> Self {
         Self {
-            all_rows: Vec::new(),
-            rows: Vec::new(),
+            row_descriptors: Vec::new(),
+            visible_row_indices: Vec::new(),
             selected_index: None,
             filter_text: String::new(),
             search_mode: false,
@@ -260,6 +279,7 @@ impl App {
             hide_system_processes: config.hide_system_processes,
             force_kill_confirmation: ForceKillConfirmation::from_config(config.confirm_force_kill),
             protected_processes: config.protected_processes.clone(),
+            network_snapshot: None,
             selected_context_key: None,
             selected_process_context: None,
             context_worker: None,
@@ -283,7 +303,10 @@ impl App {
     /// Collect one snapshot on the calling thread. Used only for the initial
     /// load in [`App::new`]; every refresh after that runs through the worker.
     fn refresh_blocking(&mut self) {
-        self.finish_refresh_attempt(collector::collect_ports(), Instant::now());
+        self.finish_snapshot_refresh_attempt(
+            collector::collect_snapshot(crate::observation::MetadataProfile::LegacyList),
+            Instant::now(),
+        );
     }
 
     pub(crate) fn refresh(&mut self) {
@@ -299,7 +322,9 @@ impl App {
         match thread::Builder::new()
             .name("kickoutchi-refresh".to_owned())
             .spawn(move || {
-                let _ = sender.send(collector::collect_ports());
+                let _ = sender.send(collector::collect_snapshot(
+                    crate::observation::MetadataProfile::LegacyList,
+                ));
             }) {
             Ok(_handle) => {
                 self.refresh_worker = Some(RefreshWorker {
@@ -328,7 +353,7 @@ impl App {
 
         self.refresh_worker = None;
         if !stale {
-            self.finish_refresh_attempt(result, Instant::now());
+            self.finish_snapshot_refresh_attempt(result, Instant::now());
         }
     }
 
@@ -379,6 +404,47 @@ impl App {
         }
     }
 
+    fn finish_snapshot_refresh_attempt(&mut self, result: RefreshResult, completed_at: Instant) {
+        self.last_refresh_attempt = completed_at;
+        match result {
+            Ok(snapshot) => self.apply_network_snapshot(snapshot, completed_at),
+            Err(error) => self.latest_error = Some(error.to_string()),
+        }
+    }
+
+    fn apply_network_snapshot(
+        &mut self,
+        snapshot: crate::observation::NetworkSnapshot,
+        now: Instant,
+    ) {
+        let descriptors = match snapshot.port_entry_descriptors(&self.protected_processes) {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                self.latest_error = Some(error.to_string());
+                return;
+            }
+        };
+        let selected_key = self.selected_row().map(RowKey::from);
+        let fallback_index = self.selected_index.unwrap_or(0);
+        if let Some(worker) = self.refresh_worker.as_mut() {
+            worker.stale = true;
+        }
+        self.network_snapshot = Some(snapshot);
+        self.row_descriptors = descriptors;
+        self.last_successful_refresh = Some(now);
+        self.latest_error = None;
+        if let Some(worker) = self.context_worker.as_mut() {
+            worker.stale = true;
+        }
+        self.context_request_state = ContextRequestState::Idle;
+        self.selected_context_key = None;
+        self.selected_process_context = None;
+        self.rebuild_visible_rows_preserving(selected_key, fallback_index);
+        if self.modal == Modal::Details {
+            self.load_selected_process_context();
+        }
+    }
+
     pub(crate) fn refresh_due(&self, refresh_interval: Duration) -> bool {
         self.refresh_due_at(Instant::now(), refresh_interval)
     }
@@ -421,20 +487,48 @@ impl App {
         refresh_interval.saturating_sub(now.saturating_duration_since(self.last_refresh_attempt))
     }
 
-    pub(crate) fn rows(&self) -> &[PortEntry] {
-        &self.rows
+    pub(crate) fn rows(&self) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
+        self.visible_row_indices
+            .iter()
+            .map(|&index| self.row_view(index).expect("visible row index is valid"))
+    }
+
+    pub(crate) fn rows_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
+        self.visible_row_indices[range]
+            .iter()
+            .map(|&index| self.row_view(index).expect("visible row index is valid"))
     }
 
     pub(crate) fn total_row_count(&self) -> usize {
-        self.all_rows.len()
+        self.row_count()
     }
 
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.selected_index
     }
 
-    pub(crate) fn selected_row(&self) -> Option<&PortEntry> {
-        self.selected_index.and_then(|index| self.rows.get(index))
+    pub(crate) fn selected_row(&self) -> Option<PortEntryView<'_>> {
+        self.selected_index
+            .and_then(|index| self.visible_row_indices.get(index))
+            .and_then(|&index| self.row_view(index))
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_descriptors.len()
+    }
+
+    fn row_view(&self, index: usize) -> Option<PortEntryView<'_>> {
+        let snapshot = self.network_snapshot.as_ref()?;
+        self.row_descriptors
+            .get(index)
+            .map(|descriptor| snapshot.port_entry_view(descriptor))
+    }
+
+    fn all_views(&self) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
+        (0..self.row_count()).map(|index| self.row_view(index).expect("row index is valid"))
     }
 
     pub(crate) fn selected_process_context(&self) -> Option<&ProcessContext> {
@@ -539,7 +633,7 @@ impl App {
         let Some(index) = self.selected_index else {
             return;
         };
-        let max_index = self.rows.len().saturating_sub(1);
+        let max_index = self.visible_row_indices.len().saturating_sub(1);
         self.selected_index = Some((index + 1).min(max_index));
     }
 
@@ -562,7 +656,7 @@ impl App {
         self.search_mode = false;
         self.kill_status = None;
 
-        let Some(entry) = self.selected_row().cloned() else {
+        let Some(entry) = self.selected_row() else {
             self.kill_status = Some("no selected process to terminate".to_owned());
             return;
         };
@@ -574,17 +668,14 @@ impl App {
             self.kill_status = Some(format!("unsafe PID blocked: {}", reason.message()));
             return;
         }
-
         let context = self.selected_process_context().cloned();
         if context.is_none() {
             self.load_selected_process_context();
         }
 
-        let target = KillTarget::from_entries(
-            pid,
-            self.all_rows.iter().filter(|row| row.pid == Some(pid)),
-            context.as_ref(),
-        );
+        let target = self
+            .kill_target_with_optional_context(pid, context.as_ref())
+            .expect("the selected PID has at least one row");
         // `yes` is always false here: the interactive TUI has no `--yes`, so the
         // shared policy can only ever hand back `Some(_)` (a confirmation to
         // satisfy). The `None` arm is the CLI's `--yes` "skip confirmation" path
@@ -744,7 +835,7 @@ impl App {
             return;
         }
 
-        let Some(entry) = self.selected_row().cloned() else {
+        let Some(entry) = self.selected_row() else {
             self.kill_status = Some("no selected process to terminate".to_owned());
             return;
         };
@@ -756,21 +847,20 @@ impl App {
             self.kill_status = Some(format!("unsafe PID blocked: {}", reason.message()));
             return;
         }
+        let platform = entry.platform;
 
         let context = self.selected_process_context().cloned();
         if context.is_none() {
             self.load_selected_process_context();
         }
 
-        let target = KillTarget::from_entries(
-            pid,
-            self.all_rows.iter().filter(|row| row.pid == Some(pid)),
-            context.as_ref(),
-        );
+        let target = self
+            .kill_target_with_optional_context(pid, context.as_ref())
+            .expect("the selected PID has at least one row");
 
         self.tree_confirmation = Some(TreeKillConfirmation::new(target, mode));
         self.modal = Modal::ConfirmTreeKill;
-        self.spawn_tree_preview_worker(pid, entry.platform);
+        self.spawn_tree_preview_worker(pid, platform);
     }
 
     /// Enumerate the tree off-thread: the full process-table scan must never
@@ -987,9 +1077,17 @@ impl App {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn execute_tree_kill_confirmation(&mut self) {
+        let Some(pid) = self
+            .tree_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.target.pid)
+        else {
+            return;
+        };
         let mut ops = host_tree_ops();
         self.execute_tree_kill_confirmation_with(
-            collector::collect_ports,
+            || collector::collect_kill_ports(Some(pid), None),
+            || collector::collect_target_ports(Some(pid), None),
             platform::collect_process_context,
             &mut ops,
         );
@@ -1001,12 +1099,14 @@ impl App {
     /// and now, but every gate must re-pass against reality, and the root must
     /// still be exactly the confirmed process.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn execute_tree_kill_confirmation_with<CollectPorts, CollectContext, Ops>(
+    fn execute_tree_kill_confirmation_with<CollectKillPorts, CollectPorts, CollectContext, Ops>(
         &mut self,
+        mut collect_kill_ports: CollectKillPorts,
         mut collect_ports: CollectPorts,
         mut collect_context: CollectContext,
         ops: &mut Ops,
     ) where
+        CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
         CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
         CollectContext: FnMut(u32) -> ProcessContext,
         Ops: tree::TreeProcessOps,
@@ -1037,7 +1137,7 @@ impl App {
             return;
         }
 
-        let mut fresh_rows = match collect_ports() {
+        let mut fresh_rows = match collect_kill_ports() {
             Ok(rows) => rows,
             Err(error) => {
                 self.latest_error = Some(error.to_string());
@@ -1121,32 +1221,47 @@ impl App {
     }
 
     fn execute_kill_confirmation(&mut self) {
+        let Some(pid) = self
+            .kill_confirmation
+            .as_ref()
+            .map(|confirmation| confirmation.target.pid)
+        else {
+            return;
+        };
         self.execute_kill_confirmation_with(
+            || collector::collect_kill_ports(Some(pid), None),
             collector::collect_ports,
             platform::collect_process_context,
             process::prepare_termination,
-            process::terminate_handle,
+            process::terminate_handle_checked,
         );
     }
 
-    fn execute_kill_confirmation_with<CollectPorts, CollectContext, Prepare, Terminate, Handle>(
+    fn execute_kill_confirmation_with<
+        CollectKillPorts,
+        CollectVisibilityPorts,
+        CollectContext,
+        Prepare,
+        Terminate,
+        Handle,
+    >(
         &mut self,
-        mut collect_ports: CollectPorts,
+        mut collect_kill_ports: CollectKillPorts,
+        mut collect_visibility_ports: CollectVisibilityPorts,
         mut collect_context: CollectContext,
         mut prepare: Prepare,
         mut terminate: Terminate,
     ) where
-        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        CollectVisibilityPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
         CollectContext: FnMut(u32) -> ProcessContext,
         Prepare: FnMut(u32) -> Result<Handle, TerminationOutcome>,
-        Terminate: FnMut(&Handle, KillMode) -> TerminationOutcome,
+        Terminate: FnMut(&Handle, &KillTarget, &[String], KillMode) -> TerminationOutcome,
     {
         let Some(confirmation) = self.kill_confirmation.take() else {
             return;
         };
-        if confirmation.target.process_start_time_marker.is_none()
-            && self.process_context_loading_for_pid(confirmation.target.pid)
-        {
+        if self.process_context_loading_for_pid(confirmation.target.pid) {
             self.kill_confirmation = Some(KillConfirmation {
                 error: Some("still reading process metadata; retry once it finishes".to_owned()),
                 ..confirmation
@@ -1172,13 +1287,13 @@ impl App {
                 // claiming a refresh that may not have happened. Other prepare
                 // failures leave the process running, so there's nothing to drop.
                 if matches!(outcome, TerminationOutcome::AlreadyExited) {
-                    self.finish_refresh_attempt(collect_ports(), Instant::now());
+                    self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
                 }
                 return;
             }
         };
 
-        let mut fresh_rows = match collect_ports() {
+        let mut fresh_rows = match collect_kill_ports() {
             Ok(rows) => rows,
             Err(error) => {
                 self.latest_error = Some(error.to_string());
@@ -1202,12 +1317,27 @@ impl App {
                     confirmation.mode,
                     &outcome,
                 ));
-                self.apply_successful_snapshot(fresh_rows, Instant::now());
+                self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
                 return;
             }
         };
-
-        let outcome = terminate(&handle, confirmation.mode);
+        if let Err(outcome) =
+            process::validate_single_delivery_evidence(&confirmation.target, &target)
+        {
+            self.kill_status = Some(termination_status_line(
+                &confirmation.target,
+                confirmation.mode,
+                &outcome,
+            ));
+            self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
+            return;
+        }
+        let outcome = terminate(
+            &handle,
+            &target,
+            &self.protected_processes,
+            confirmation.mode,
+        );
         self.kill_status = Some(termination_status_line(
             &target,
             confirmation.mode,
@@ -1217,39 +1347,35 @@ impl App {
         // The status reports only the signal result; a failed re-collect shows up
         // as the standard error line rather than letting the status overclaim a
         // refresh that did not run.
-        self.finish_refresh_attempt(collect_ports(), Instant::now());
+        self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
     }
 
-    fn apply_successful_snapshot(&mut self, mut rows: Vec<PortEntry>, now: Instant) {
-        // Installing a snapshot here makes it the authoritative view. If an older
-        // worker is still running, keep its receiver installed so `refresh` cannot
-        // start another scan, but discard that stale result when it eventually
-        // lands. `poll_refresh` clears the worker before applying fresh results.
-        if let Some(worker) = self.refresh_worker.as_mut() {
-            worker.stale = true;
+    fn apply_successful_snapshot(&mut self, rows: Vec<PortEntry>, now: Instant) {
+        #[cfg(not(test))]
+        {
+            let _ = (rows, now);
+            self.refresh();
         }
-        mark_protected(&mut rows, &self.protected_processes);
-        self.all_rows = rows;
-        self.last_successful_refresh = Some(now);
-        self.latest_error = None;
-        if let Some(worker) = self.context_worker.as_mut() {
-            worker.stale = true;
-        }
-        self.context_request_state = ContextRequestState::Idle;
-        self.selected_context_key = None;
-        self.selected_process_context = None;
-        self.rebuild_visible_rows();
-        if self.modal == Modal::Details {
-            self.load_selected_process_context();
+        #[cfg(test)]
+        {
+            self.apply_network_snapshot(crate::observation::snapshot_from_test_rows(rows), now);
         }
     }
 
     fn rebuild_visible_rows(&mut self) {
         let selected_key = self.selected_row().map(RowKey::from);
         let fallback_index = self.selected_index.unwrap_or(0);
+        self.rebuild_visible_rows_preserving(selected_key, fallback_index);
+    }
 
-        match query::query_entries(
-            &self.all_rows,
+    fn rebuild_visible_rows_preserving(
+        &mut self,
+        selected_key: Option<RowKey>,
+        fallback_index: usize,
+    ) {
+        let views = self.all_views().collect::<Vec<_>>();
+        let query_result = query::query_view_indices(
+            &views,
             QueryOptions {
                 port: None,
                 process: None,
@@ -1257,18 +1383,17 @@ impl App {
                 sort_mode: self.sort_mode,
                 hide_system_processes: self.hide_system_processes,
             },
-        ) {
-            Ok(result) => {
-                self.rows = result.entries;
-                self.filter_error = None;
-            }
-            Err(error) => {
-                self.rows.clear();
-                self.filter_error = Some(error.to_string());
-            }
-        }
-
-        self.selected_index = preserved_selection(&self.rows, selected_key, fallback_index);
+        );
+        let (visible_row_indices, filter_error) = match query_result {
+            Ok(result) => (result.indices, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let selected_index =
+            preserved_selection(&views, &visible_row_indices, selected_key, fallback_index);
+        drop(views);
+        self.visible_row_indices = visible_row_indices;
+        self.filter_error = filter_error;
+        self.selected_index = selected_index;
     }
 
     fn load_selected_process_context(&mut self) {
@@ -1294,9 +1419,27 @@ impl App {
         self.selected_context_key = None;
         self.selected_process_context = None;
 
-        let Some(entry) = self.selected_row().cloned() else {
+        let Some(view) = self.selected_row() else {
             self.context_request_state = ContextRequestState::Idle;
             return;
+        };
+        let entry = PortEntry {
+            protocol: view.protocol,
+            local_addr: view.local_addr,
+            local_port: view.local_port,
+            state: view.state,
+            pid: view.pid,
+            process_name: view.process_name.map(Into::into),
+            executable_path: view.executable_path.map(Into::into),
+            command_line: view.command_line.map(Into::into),
+            parent_pid: view.parent_pid,
+            parent_process_name: view.parent_process_name.map(Into::into),
+            child_pids: Vec::new(),
+            protected: view.protected,
+            platform: view.platform,
+            permission: view.permission,
+            process_identity: view.process_identity,
+            ipv6_scope: view.ipv6_scope,
         };
         let key = RowKey::from(&entry);
         let (sender, receiver) = mpsc::channel();
@@ -1338,12 +1481,20 @@ impl App {
     }
 
     fn kill_target_with_context(&self, pid: u32, context: &ProcessContext) -> Option<KillTarget> {
-        let rows = self
-            .all_rows
-            .iter()
+        self.kill_target_with_optional_context(pid, Some(context))
+    }
+
+    fn kill_target_with_optional_context(
+        &self,
+        pid: u32,
+        context: Option<&ProcessContext>,
+    ) -> Option<KillTarget> {
+        let mut rows = self
+            .all_views()
             .filter(|row| row.pid == Some(pid))
-            .collect::<Vec<_>>();
-        (!rows.is_empty()).then(|| KillTarget::from_entries(pid, rows, Some(context)))
+            .peekable();
+        rows.peek()?;
+        Some(KillTarget::from_entry_views(pid, rows, context))
     }
 
     fn apply_context_target_to_confirmations(&mut self, mut target: KillTarget) {
@@ -1456,8 +1607,13 @@ fn collect_tree_preview(
         platform,
         tree::MAX_TREE_PROCESSES,
     )
-    .map_err(|tree::TreePlanError::RootMissing| {
-        "root process is no longer running; nothing to terminate".to_owned()
+    .map_err(|error| match error {
+        tree::TreePlanError::RootMissing => {
+            "root process is no longer running; nothing to terminate".to_owned()
+        }
+        tree::TreePlanError::SnapshotLimitExceeded { limit } => {
+            format!("process snapshot exceeds the bounded {limit}-PID index")
+        }
     })
 }
 
@@ -1490,7 +1646,7 @@ fn fresh_tree_gates<Ops: tree::TreeProcessOps>(
         fresh_root.platform,
         tree::MAX_TREE_PROCESSES,
     )
-    .map_err(|tree::TreePlanError::RootMissing| tree::TreeKillOutcome::RootAlreadyExited)?;
+    .map_err(tree::plan_error_outcome)?;
     tree::preflight_outcome(&fresh_preview)?;
     tree::root_protection_outcome(&fresh_preview, confirmation.target.protected)?;
     Ok(())
@@ -1509,6 +1665,14 @@ fn tree_kill_status_line(
 
     let delivery = mode.delivery_label(root.platform);
     match outcome {
+        TreeKillOutcome::ThawFailed { pids, .. } => format!(
+            "cleanup failed for PID(s) {}; they may remain stopped and require SIGCONT",
+            tree::format_pid_list(pids),
+        ),
+        TreeKillOutcome::Completed(report) if !report.thaw_failed.is_empty() => format!(
+            "sent {delivery}, but PID(s) {} may remain stopped because SIGCONT failed",
+            tree::format_pid_list(&report.thaw_failed),
+        ),
         TreeKillOutcome::Completed(report)
             if report.denied.is_empty() && report.already_exited == 0 =>
         {
@@ -1642,6 +1806,9 @@ fn termination_status_line(
             target.identity(),
             sanitize(error),
         ),
+        TerminationOutcome::ThawFailed { pid, .. } => format!(
+            "cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+        ),
     }
 }
 
@@ -1650,19 +1817,22 @@ pub(crate) fn kill_command_text(target: &KillTarget, mode: KillMode) -> String {
 }
 
 fn preserved_selection(
-    rows: &[PortEntry],
+    rows: &[PortEntryView<'_>],
+    visible_row_indices: &[usize],
     selected_key: Option<RowKey>,
     fallback_index: usize,
 ) -> Option<usize> {
-    if rows.is_empty() {
+    if visible_row_indices.is_empty() {
         return None;
     }
     if let Some(key) = selected_key
-        && let Some(index) = rows.iter().position(|row| RowKey::from(row) == key)
+        && let Some(index) = visible_row_indices
+            .iter()
+            .position(|&index| RowKey::from(rows[index]) == key)
     {
         return Some(index);
     }
-    Some(fallback_index.min(rows.len() - 1))
+    Some(fallback_index.min(visible_row_indices.len() - 1))
 }
 
 #[cfg(test)]
@@ -1690,7 +1860,7 @@ mod tests {
             local_port: port,
             state: SocketState::Listen,
             pid: Some(u32::from(port)),
-            process_name: name.map(str::to_owned),
+            process_name: name.map(Into::into),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -1699,6 +1869,12 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid: u32::from(port),
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
     }
 
@@ -1716,7 +1892,7 @@ mod tests {
             local_port: port,
             state: SocketState::Listen,
             pid,
-            process_name: Some(name.to_owned()),
+            process_name: Some(name.into()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -1725,6 +1901,12 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: pid.map(|pid| crate::observation::ProcessIdentity {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
     }
 
@@ -1739,7 +1921,10 @@ mod tests {
 
     fn context(start_time_ticks: u64) -> ProcessContext {
         ProcessContext {
-            process_start_time_marker: Some(start_time_ticks),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(
+                start_time_ticks,
+            )
+            .ok(),
             ..ProcessContext::default()
         }
     }
@@ -1774,11 +1959,7 @@ mod tests {
     }
 
     fn set_confirmation_start_time(app: &mut App, start_time_ticks: u64) {
-        app.kill_confirmation
-            .as_mut()
-            .expect("confirmation must be open")
-            .target
-            .process_start_time_marker = Some(start_time_ticks);
+        finish_selected_context(app, context(start_time_ticks));
     }
 
     #[test]
@@ -1804,7 +1985,7 @@ mod tests {
     fn starts_sorted_and_selects_first_row() {
         let app = app_with_rows(vec![entry(5173, Some("vite")), entry(3000, Some("node"))]);
 
-        assert_eq!(app.rows()[0].local_port, 3000);
+        assert_eq!(app.rows().next().map(|row| row.local_port), Some(3000));
         assert_eq!(app.selected_index(), Some(0));
         assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
     }
@@ -1917,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn terminate_confirmation_gets_identity_from_background_context() {
+    fn terminate_confirmation_keeps_snapshot_identity_while_context_loads() {
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
 
         app.apply_action(Action::RequestTerminate);
@@ -1926,7 +2107,7 @@ mod tests {
         assert_eq!(
             app.kill_confirmation()
                 .and_then(|confirmation| confirmation.target.process_start_time_marker),
-            None,
+            crate::observation::ProcessStartMarker::linux(55).ok(),
         );
 
         finish_selected_context(&mut app, context(55));
@@ -1934,7 +2115,7 @@ mod tests {
         assert_eq!(
             app.kill_confirmation()
                 .and_then(|confirmation| confirmation.target.process_start_time_marker),
-            Some(55),
+            crate::observation::ProcessStartMarker::linux(55).ok(),
         );
     }
 
@@ -2146,28 +2327,30 @@ mod tests {
         set_confirmation_start_time(&mut app, 55);
         let fresh_before_signal = vec![entry(3000, Some("node"))];
         let fresh_after_signal = Vec::new();
-        let mut collect_calls = 0;
+        let mut kill_collect_calls = 0;
+        let mut visibility_collect_calls = 0;
         let mut terminated = None;
 
         app.execute_kill_confirmation_with(
             || {
-                collect_calls += 1;
-                if collect_calls == 1 {
-                    Ok(fresh_before_signal.clone())
-                } else {
-                    Ok(fresh_after_signal.clone())
-                }
+                kill_collect_calls += 1;
+                Ok(fresh_before_signal.clone())
+            },
+            || {
+                visibility_collect_calls += 1;
+                Ok(fresh_after_signal.clone())
             },
             |_| context(55),
             Ok::<u32, TerminationOutcome>,
-            |pid, mode| {
+            |pid, _target, _protected, mode| {
                 terminated = Some((*pid, mode));
                 TerminationOutcome::Success
             },
         );
 
         assert_eq!(terminated, Some((3000, KillMode::Terminate)));
-        assert_eq!(collect_calls, 2);
+        assert_eq!(kill_collect_calls, 1);
+        assert_eq!(visibility_collect_calls, 1);
         assert_eq!(app.rows().len(), 0);
         assert_eq!(app.modal(), Modal::None);
         assert!(
@@ -2181,14 +2364,21 @@ mod tests {
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
         app.apply_action(Action::RequestTerminate);
         set_confirmation_start_time(&mut app, 55);
-        let fresh_rows = vec![entry(3000, Some("node"))];
+        let mut stale = entry(3000, Some("node"));
+        stale.process_identity = Some(crate::observation::ProcessIdentity {
+            pid: 3000,
+            start_marker: crate::observation::ProcessStartMarker::linux(99)
+                .expect("test marker is nonzero"),
+        });
+        let fresh_rows = vec![stale];
         let mut terminated = false;
 
         app.execute_kill_confirmation_with(
             || Ok(fresh_rows.clone()),
+            || Ok(fresh_rows.clone()),
             |_| context(99),
             Ok::<u32, TerminationOutcome>,
-            |_pid, _mode| {
+            |_pid, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -2216,13 +2406,14 @@ mod tests {
         let mut terminated = false;
 
         app.execute_kill_confirmation_with(
+            || panic!("prepare failure must not run authoritative collection"),
             || {
                 collect_calls += 1;
                 Ok(fresh_after_exit.clone())
             },
             |_| context(55),
             |_pid| -> Result<u32, TerminationOutcome> { Err(TerminationOutcome::AlreadyExited) },
-            |_handle: &u32, _mode| {
+            |_handle: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
             },
@@ -2261,21 +2452,25 @@ mod tests {
         set_confirmation_start_time(&mut app, 55);
         let fresh_before_signal = vec![entry(3000, Some("node"))];
         let fresh_after_signal: Vec<PortEntry> = Vec::new();
-        let mut collect_calls = 0;
+        let mut kill_collect_calls = 0;
+        let mut visibility_collect_calls = 0;
 
         app.execute_kill_confirmation_with(
             || {
-                collect_calls += 1;
-                if collect_calls == 1 {
-                    Ok(fresh_before_signal.clone())
-                } else {
-                    Ok(fresh_after_signal.clone())
-                }
+                kill_collect_calls += 1;
+                Ok(fresh_before_signal.clone())
+            },
+            || {
+                visibility_collect_calls += 1;
+                Ok(fresh_after_signal.clone())
             },
             |_| context(55),
             Ok::<u32, TerminationOutcome>,
-            |_pid, _mode| TerminationOutcome::Success,
+            |_pid, _target, _protected, _mode| TerminationOutcome::Success,
         );
+
+        assert_eq!(kill_collect_calls, 1);
+        assert_eq!(visibility_collect_calls, 1);
 
         // The kill went through and the freed port is gone.
         assert_eq!(app.rows().len(), 0);
@@ -2284,12 +2479,15 @@ mod tests {
         assert!(app.refresh_in_progress());
         app.apply_action(Action::Refresh);
         stale_sender
-            .send(Ok(vec![entry(3000, Some("node"))]))
+            .send(crate::collector::Collector::collect(
+                &crate::collector::FakeCollector,
+                crate::observation::MetadataProfile::LegacyList,
+            ))
             .expect("stale worker receiver must stay installed");
 
         app.poll_refresh();
         assert!(!app.refresh_in_progress());
-        assert!(app.rows().iter().all(|row| row.local_port != 3000));
+        assert!(app.rows().all(|row| row.local_port != 3000));
     }
 
     #[test]
@@ -2303,7 +2501,7 @@ mod tests {
         assert!(app.search_mode());
         assert_eq!(app.filter_text(), "vi");
         assert_eq!(app.rows().len(), 1);
-        assert_eq!(app.rows()[0].local_port, 5173);
+        assert_eq!(app.rows().next().map(|row| row.local_port), Some(5173));
 
         app.apply_action(Action::CancelSearch);
 
@@ -2313,17 +2511,39 @@ mod tests {
     }
 
     #[test]
+    fn details_and_actions_use_filtered_rows_with_nonzero_backing_indices() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node")), entry(5173, Some("vite"))]);
+        app.apply_action(Action::StartSearch);
+        for ch in "vite".chars() {
+            app.apply_action(Action::SearchAppend(ch));
+        }
+        assert_eq!(app.visible_row_indices, [1]);
+        assert_eq!(app.selected_row().map(|row| row.local_port), Some(5173));
+
+        app.apply_action(Action::OpenDetails);
+        assert_eq!(app.modal(), Modal::Details);
+        app.apply_action(Action::CloseModal);
+        app.apply_action(Action::RequestTerminate);
+
+        assert_eq!(
+            app.kill_confirmation()
+                .map(|confirmation| confirmation.target.ports[0].local_port),
+            Some(5173),
+        );
+    }
+
+    #[test]
     fn sort_cycle_preserves_selected_row_when_possible() {
         let mut app = app_with_rows(vec![entry(3000, Some("zed")), entry(5173, Some("alpha"))]);
-        app.apply_action(Action::MoveDown);
-        assert_eq!(app.selected_row().map(|row| row.local_port), Some(5173));
+        assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
 
         app.apply_action(Action::CycleSort);
         app.apply_action(Action::CycleSort);
         app.apply_action(Action::CycleSort);
 
         assert_eq!(app.sort_mode(), SortMode::Process);
-        assert_eq!(app.selected_row().map(|row| row.local_port), Some(5173));
+        assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
+        assert_eq!(app.selected_index, Some(1));
     }
 
     #[test]
@@ -2454,14 +2674,16 @@ mod tests {
             stale: false,
         });
         sender
-            .send(Ok(vec![entry(5173, Some("vite"))]))
+            .send(crate::collector::Collector::collect(
+                &crate::collector::FakeCollector,
+                crate::observation::MetadataProfile::LegacyList,
+            ))
             .expect("test refresh result must send");
 
         app.poll_refresh();
 
         assert!(!app.refresh_in_progress());
-        assert_eq!(app.rows().len(), 1);
-        assert_eq!(app.rows()[0].local_port, 5173);
+        assert!(app.rows().any(|row| row.local_port == 5173));
         assert_eq!(app.latest_error(), None);
     }
 
@@ -2469,15 +2691,20 @@ mod tests {
     fn protected_names_are_marked_from_config() {
         let app = app_with_rows(vec![entry(5432, Some("postgres"))]);
 
-        assert!(app.rows()[0].protected);
+        assert!(app.rows().next().is_some_and(|row| row.protected));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod tree_kill {
         use super::{App, Modal, app_with_rows, context, entry, mpsc};
         use crate::app::{TreeConfirmStage, TreePreviewWorker, TreeSubmitVerdict};
+        use crate::collector::{Collector, FakeCollector};
         use crate::input::Action;
         use crate::model::Platform;
+        use crate::observation::{
+            EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot, OwnerCompleteness,
+            SnapshotCompleteness,
+        };
         use crate::process::KillMode;
         use crate::tree::{
             ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult, plan_process_tree,
@@ -2491,7 +2718,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some(name.to_owned()),
-                start_time_marker: Some(marker),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(marker).ok(),
                 owner_uid: None,
                 process_group: None,
             }
@@ -2536,12 +2763,14 @@ mod tests {
                 TreeSignalResult::Delivered
             }
 
-            fn cont(&mut self, _pid: u32) {}
+            fn cont(&mut self, _pid: u32) -> TreeSignalResult {
+                TreeSignalResult::Delivered
+            }
 
             fn prepare_delivery(
                 &mut self,
                 _pid: u32,
-                _verified_start_marker: Option<u64>,
+                _verified_start_marker: Option<crate::observation::ProcessStartMarker>,
             ) -> TreeSignalResult {
                 TreeSignalResult::Delivered
             }
@@ -2557,7 +2786,66 @@ mod tests {
                 .as_mut()
                 .expect("tree confirmation must be open")
                 .target
-                .process_start_time_marker = Some(start_time_ticks);
+                .process_start_time_marker =
+                crate::observation::ProcessStartMarker::linux(start_time_ticks).ok();
+        }
+
+        fn authoritative_snapshot() -> NetworkSnapshot {
+            let mut snapshot = FakeCollector
+                .collect(MetadataProfile::Display)
+                .expect("fake snapshot collects");
+            snapshot.completeness = SnapshotCompleteness::Complete;
+            snapshot.owner_completeness = OwnerCompleteness::Complete;
+            snapshot
+                .evidence_gaps
+                .retain(|gap| gap.impact != EvidenceImpact::SocketSet);
+            for socket in &mut snapshot.sockets {
+                socket.owner_completeness = OwnerCompleteness::Complete;
+            }
+            snapshot
+        }
+
+        fn assert_authoritative_snapshot_refuses_before_tree_signals(snapshot: &NetworkSnapshot) {
+            let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+            app.apply_action(Action::RequestTreeTerminate);
+            set_tree_confirmation_start_time(&mut app, 55);
+            let infos = vec![tree_info(3000, Some(1), "node", 55)];
+            app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+            let mut ops = FakeTreeOps::new(infos);
+
+            app.execute_tree_kill_confirmation_with(
+                || crate::collector::kill_ports_from_snapshot(snapshot, Some(3000), None),
+                || panic!("authoritative refusal must not visibility-poll ports"),
+                |_| context(55),
+                &mut ops,
+            );
+
+            assert!(ops.stops.is_empty(), "refusal must precede every stop");
+            assert!(
+                ops.delivered.is_empty(),
+                "refusal must precede every delivery"
+            );
+            assert!(
+                app.kill_status()
+                    .is_some_and(|status| status.contains("no termination was sent")),
+                "{:?}",
+                app.kill_status(),
+            );
+        }
+
+        #[test]
+        fn authority_refusal_precedes_tui_tree_signals() {
+            let mut snapshot = authoritative_snapshot();
+            snapshot
+                .sockets
+                .iter_mut()
+                .find(|socket| socket.local_endpoint.port.get() == 3000)
+                .expect("fixture has port 3000")
+                .owner_completeness =
+                OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
+                    .expect("one reason fits");
+
+            assert_authoritative_snapshot_refuses_before_tree_signals(&snapshot);
         }
 
         #[test]
@@ -2749,6 +3037,7 @@ mod tests {
 
             app.execute_tree_kill_confirmation_with(
                 || Ok(fresh_rows.clone()),
+                || panic!("protected-root refusal must not visibility-poll ports"),
                 |_| context(55),
                 &mut ops,
             );
@@ -2840,12 +3129,19 @@ mod tests {
             set_tree_confirmation_start_time(&mut app, 55);
             let infos = vec![tree_info(3000, Some(1), "node", 55)];
             app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
-            let fresh_rows = vec![entry(3000, Some("node"))];
+            let mut reused = entry(3000, Some("node"));
+            reused.process_identity = Some(crate::observation::ProcessIdentity {
+                pid: 3000,
+                start_marker: crate::observation::ProcessStartMarker::linux(99)
+                    .expect("test marker is nonzero"),
+            });
+            let fresh_rows = vec![reused];
             let mut ops = FakeTreeOps::new(infos);
 
-            // The fresh context reports a different start marker: a reused PID.
+            // The authoritative fresh row reports a different start marker: a reused PID.
             app.execute_tree_kill_confirmation_with(
                 || Ok(fresh_rows.clone()),
+                || panic!("identity refusal must not visibility-poll ports"),
                 |_| context(99),
                 &mut ops,
             );
@@ -2878,6 +3174,7 @@ mod tests {
 
             app.execute_tree_kill_confirmation_with(
                 || Ok(fresh_rows.clone()),
+                || panic!("preflight refusal must not visibility-poll ports"),
                 |_| context(55),
                 &mut ops,
             );
@@ -2907,13 +3204,10 @@ mod tests {
             let mut ops = FakeTreeOps::new(infos);
 
             app.execute_tree_kill_confirmation_with(
+                || Ok(fresh_rows.clone()),
                 || {
                     collect_calls += 1;
-                    if collect_calls == 1 {
-                        Ok(fresh_rows.clone())
-                    } else {
-                        Ok(Vec::new())
-                    }
+                    Ok(Vec::new())
                 },
                 |_| context(55),
                 &mut ops,
@@ -2930,6 +3224,7 @@ mod tests {
                 app.kill_status(),
             );
             // The post-kill refresh applied the freed table.
+            assert_eq!(collect_calls, 1);
             assert_eq!(app.rows().len(), 0);
         }
     }

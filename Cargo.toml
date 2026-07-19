@@ -72,12 +72,7 @@ libc = "0.2.177"
 [target.'cfg(windows)'.dependencies]
 # Windows collection uses IP Helper directly, and termination uses process
 # handles so the signal target cannot wander off after confirmation.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
-
-# Windows process metadata is intentionally snapshot-based: one refresh builds a
-# process map, and socket rows only look up into it instead of poking every PID
-# one at a time.
-sysinfo = "0.38.4"
+windows-sys = { version = "0.61.2", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [lints.clippy]
 pedantic = "warn"

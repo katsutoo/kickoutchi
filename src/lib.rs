@@ -22,9 +22,11 @@ mod input;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod inspect;
 mod model;
+mod observation;
 mod output;
 mod platform;
 mod process;
+mod process_evidence;
 mod protection;
 mod query;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first

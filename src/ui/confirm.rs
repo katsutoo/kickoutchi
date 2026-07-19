@@ -493,7 +493,7 @@ mod tests {
             local_port: 3000,
             state: SocketState::Listen,
             pid: Some(18422),
-            process_name: Some("node".to_owned()),
+            process_name: Some("node".into()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -502,6 +502,12 @@ mod tests {
             protected,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid: 18422,
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         };
         KillTarget::from_entries(18422, [&row], None)
     }
@@ -515,7 +521,7 @@ mod tests {
                 local_port: 3000 + offset,
                 state: SocketState::Listen,
                 pid: Some(18422),
-                process_name: Some("node".to_owned()),
+                process_name: Some("node".into()),
                 executable_path: None,
                 command_line: None,
                 parent_pid: None,
@@ -524,6 +530,12 @@ mod tests {
                 protected: false,
                 platform: Platform::Linux,
                 permission: PermissionStatus::Full,
+                process_identity: Some(crate::observation::ProcessIdentity {
+                    pid: 18422,
+                    start_marker: crate::observation::ProcessStartMarker::linux(55)
+                        .expect("test marker is nonzero"),
+                }),
+                ipv6_scope: None,
             })
             .collect::<Vec<_>>();
         KillTarget::from_entries(18422, rows.iter(), None)
@@ -608,7 +620,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("node".to_owned()),
-                start_time_marker: Some(55),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
                 owner_uid: None,
                 process_group: None,
             },
@@ -618,7 +630,7 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("worker".to_owned()),
-                start_time_marker: Some(56),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(56).ok(),
                 owner_uid: None,
                 process_group: None,
             },
@@ -658,7 +670,7 @@ mod tests {
             unverified_parent_pid: None,
             parent_process_name: None,
             process_name: Some("node".to_owned()),
-            start_time_marker: Some(55),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
             owner_uid: None,
             process_group: None,
         }];
@@ -669,7 +681,8 @@ mod tests {
                 unverified_parent_pid: None,
                 parent_process_name: None,
                 process_name: Some("worker".to_owned()),
-                start_time_marker: Some(u64::from(pid)),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid))
+                    .ok(),
                 owner_uid: None,
                 process_group: None,
             });

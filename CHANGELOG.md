@@ -19,10 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reworked collection behind the existing list, TUI, inspect, and kill surfaces
+  around one bounded, consistency-checked snapshot. Unprivileged `kill --port`
+  remains supported when the selected endpoint has one verified owner; unrelated
+  unreadable host processes no longer turn the flagship port-kill path into a
+  root-only operation, while observed target-local ambiguity still refuses. On
+  Linux, an unreadable same-inode co-holder can remain undiscovered and keep the
+  port bound after the visible genuine owner is terminated; post-kill polling
+  reports that accepted limitation.
+- Windows tree kill now freezes the committed Job Object for its final bounded
+  validation sweep through private information class 18, closing the
+  descendant-spawn window before whole-job termination. An empty disposable job
+  proves freeze/thaw support before target assignment. Freeze or final-validation
+  failure withholds whole-job delivery, attempts thaw when required, and
+  preserves primary, secondary, cleanup, and verified fallback outcomes.
 - Pinned `socket2` 0.6.5 with its empty default feature set for future exact bind
   probes. Its dependency graph, license, MSRV, unsafe call surface, binary-size
-  impact, and Linux, macOS, and Windows behavior passed supply-chain and native
-  CI review before implementation work begins.
+  impact, and Linux, macOS, and Windows behavior were reviewed and accepted
+  before probe implementation.
 - Reorganized the CLI implementation into focused list, single-process kill,
   and scoped tree/group kill modules without changing command behavior, and
   documented the host-byte-order handling used by the Linux socket parser.

@@ -23,7 +23,14 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::display::sanitize;
-use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, Protocol};
+use crate::model::{
+    PermissionStatus, Platform, PortEntry, PortEntryView, ProcessContext, Protocol,
+};
+use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
+use crate::process_evidence::{
+    ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
+};
+use crate::protection::is_protected_process_name;
 
 pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 
@@ -133,6 +140,11 @@ pub(crate) enum TerminationOutcome {
     TargetChanged,
     UnsafePid(UnsafePidReason),
     UnknownFailure(String),
+    #[allow(dead_code, reason = "constructed only by Unix thaw handling")]
+    ThawFailed {
+        pid: u32,
+        prior: Box<TerminationOutcome>,
+    },
 }
 
 #[derive(Debug)]
@@ -143,7 +155,7 @@ pub(crate) struct TerminationHandle {
     #[cfg(windows)]
     process_handle: OwnedHandle,
     #[cfg(target_os = "macos")]
-    process_start_time_marker: u64,
+    process_start_time_marker: ProcessStartMarker,
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     _unsupported: (),
 }
@@ -164,12 +176,78 @@ pub(crate) struct KillTarget {
     pub(crate) system_process: bool,
     pub(crate) ports: Vec<KillTargetPort>,
     pub(crate) owner_uid: Option<u32>,
-    pub(crate) process_start_time_marker: Option<u64>,
+    pub(crate) process_start_time_marker: Option<ProcessStartMarker>,
     pub(crate) child_count: usize,
     pub(crate) children_truncated: bool,
 }
 
 impl KillTarget {
+    pub(crate) fn from_entry_views<'a>(
+        pid: u32,
+        entries: impl IntoIterator<Item = PortEntryView<'a>>,
+        context: Option<&ProcessContext>,
+    ) -> Self {
+        let mut process_name = None;
+        let mut platform = Platform::Linux;
+        let mut permission = PermissionStatus::Full;
+        let mut protected = false;
+        let mut system_process = false;
+        let mut ports = Vec::new();
+        let mut process_identity: Option<ProcessIdentity> = None;
+        let mut identity_consistent = true;
+        let mut saw_entry = false;
+        for entry in entries {
+            saw_entry = true;
+            assert_eq!(
+                entry.pid,
+                Some(pid),
+                "kill target row PID must match target PID"
+            );
+            if process_name.is_none() {
+                process_name = entry.process_name.map(str::to_owned);
+            }
+            platform = entry.platform;
+            if entry.permission == PermissionStatus::Partial {
+                permission = PermissionStatus::Partial;
+            }
+            protected |= entry.protected;
+            system_process |= entry.is_system_process();
+            if let Some(identity) = entry.process_identity {
+                identity_consistent &= identity.pid == pid
+                    && process_identity.is_none_or(|existing| existing == identity);
+                process_identity.get_or_insert(identity);
+            } else {
+                identity_consistent = false;
+            }
+            ports.push(KillTargetPort {
+                protocol: entry.protocol,
+                local_addr: entry.local_addr,
+                local_port: entry.local_port,
+                ipv6_scope: entry.ipv6_scope,
+            });
+        }
+        assert!(saw_entry, "kill target must contain at least one row");
+        ports.sort_unstable();
+        ports.dedup();
+        let children = context.map(|context| &context.children);
+        Self {
+            pid,
+            process_name,
+            platform,
+            permission,
+            protected,
+            system_process,
+            ports,
+            owner_uid: context.and_then(|context| context.owner_uid),
+            process_start_time_marker: identity_consistent
+                .then_some(process_identity)
+                .flatten()
+                .map(|identity| identity.start_marker),
+            child_count: children.map_or(0, |children| children.children.len()),
+            children_truncated: children.is_some_and(|children| children.truncated),
+        }
+    }
+
     pub(crate) fn from_entries<'a>(
         pid: u32,
         entries: impl IntoIterator<Item = &'a PortEntry>,
@@ -181,6 +259,8 @@ impl KillTarget {
         let mut protected = false;
         let mut system_process = false;
         let mut ports = Vec::new();
+        let mut process_identity: Option<ProcessIdentity> = None;
+        let mut identity_consistent = true;
         let mut saw_entry = false;
 
         for entry in entries {
@@ -191,7 +271,7 @@ impl KillTarget {
                 "kill target row PID must match target PID",
             );
             if process_name.is_none() {
-                process_name.clone_from(&entry.process_name);
+                process_name = entry.process_name.as_deref().map(str::to_owned);
             }
             platform = entry.platform;
             if entry.permission == PermissionStatus::Partial {
@@ -199,6 +279,13 @@ impl KillTarget {
             }
             protected |= entry.protected;
             system_process |= entry.is_system_process();
+            if let Some(identity) = entry.process_identity {
+                identity_consistent &= identity.pid == pid
+                    && process_identity.is_none_or(|existing| existing == identity);
+                process_identity.get_or_insert(identity);
+            } else {
+                identity_consistent = false;
+            }
             ports.push(KillTargetPort::from(entry));
         }
         // A kill target with no rows would carry an empty port set, and the
@@ -210,12 +297,7 @@ impl KillTarget {
         // through.
         assert!(saw_entry, "kill target must contain at least one row");
 
-        ports.sort_by(|left, right| {
-            left.local_port
-                .cmp(&right.local_port)
-                .then_with(|| left.protocol.cmp(&right.protocol))
-                .then_with(|| left.local_addr.cmp(&right.local_addr))
-        });
+        ports.sort_unstable();
         ports.dedup();
 
         let child_snapshot = context.map(|context| &context.children);
@@ -228,8 +310,10 @@ impl KillTarget {
             system_process,
             ports,
             owner_uid: context.and_then(|context| context.owner_uid),
-            process_start_time_marker: context
-                .and_then(|context| context.process_start_time_marker),
+            process_start_time_marker: identity_consistent
+                .then_some(process_identity)
+                .flatten()
+                .map(|identity| identity.start_marker),
             child_count: child_snapshot.map_or(0, |snapshot| snapshot.children.len()),
             children_truncated: child_snapshot.is_some_and(|snapshot| snapshot.truncated),
         }
@@ -395,11 +479,35 @@ fn scoped_warning_text(warning: &str, scope_clause: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KillTargetPort {
     pub(crate) protocol: Protocol,
     pub(crate) local_addr: IpAddr,
     pub(crate) local_port: u16,
+    pub(crate) ipv6_scope: Option<Ipv6Scope>,
+}
+
+impl Ord for KillTargetPort {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.local_port,
+            self.protocol,
+            self.local_addr,
+            self.ipv6_scope,
+        )
+            .cmp(&(
+                other.local_port,
+                other.protocol,
+                other.local_addr,
+                other.ipv6_scope,
+            ))
+    }
+}
+
+impl PartialOrd for KillTargetPort {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl KillTargetPort {
@@ -413,12 +521,30 @@ impl KillTargetPort {
     }
 }
 
+pub(crate) fn kill_target_has_port(ports: &[KillTargetPort], port: &KillTargetPort) -> bool {
+    kill_target_has_port_with(ports, port, || {})
+}
+
+fn kill_target_has_port_with(
+    ports: &[KillTargetPort],
+    port: &KillTargetPort,
+    mut compared: impl FnMut(),
+) -> bool {
+    ports
+        .binary_search_by(|candidate| {
+            compared();
+            candidate.cmp(port)
+        })
+        .is_ok()
+}
+
 impl From<&PortEntry> for KillTargetPort {
     fn from(entry: &PortEntry) -> Self {
         Self {
             protocol: entry.protocol,
             local_addr: entry.local_addr,
             local_port: entry.local_port,
+            ipv6_scope: entry.ipv6_scope,
         }
     }
 }
@@ -502,7 +628,7 @@ pub(crate) fn target_still_matches_confirmation(
     confirmed
         .ports
         .iter()
-        .all(|confirmed_port| fresh.ports.contains(confirmed_port))
+        .all(|confirmed_port| kill_target_has_port(&fresh.ports, confirmed_port))
 }
 
 /// True when a confirmed target port is still visible but its owning PID is no
@@ -517,9 +643,9 @@ pub(crate) fn confirmed_port_owner_unavailable(
     confirmed: &KillTarget,
     fresh_entries: &[PortEntry],
 ) -> bool {
-    fresh_entries
-        .iter()
-        .any(|entry| entry.pid.is_none() && confirmed.ports.contains(&KillTargetPort::from(entry)))
+    fresh_entries.iter().any(|entry| {
+        entry.pid.is_none() && kill_target_has_port(&confirmed.ports, &KillTargetPort::from(entry))
+    })
 }
 
 pub(crate) fn revalidate_confirmed_target(
@@ -534,7 +660,7 @@ pub(crate) fn revalidate_confirmed_target(
     let rows = fresh_entries
         .iter()
         .filter(|entry| entry.pid == Some(confirmed.pid))
-        .filter(|entry| confirmed.ports.contains(&KillTargetPort::from(*entry)))
+        .filter(|entry| kill_target_has_port(&confirmed.ports, &KillTargetPort::from(*entry)))
         .collect::<Vec<_>>();
     if rows.is_empty() {
         return Err(TerminationOutcome::TargetChanged);
@@ -548,6 +674,58 @@ pub(crate) fn revalidate_confirmed_target(
         return Err(TerminationOutcome::ProtectedProcess);
     }
     Ok(fresh)
+}
+
+pub(crate) fn validate_single_delivery_evidence(
+    confirmed: &KillTarget,
+    fresh: &KillTarget,
+) -> Result<(), TerminationOutcome> {
+    let expected_marker = confirmed
+        .process_start_time_marker
+        .ok_or(TerminationOutcome::TargetChanged)?;
+    let fresh_marker = fresh
+        .process_start_time_marker
+        .ok_or(TerminationOutcome::TargetChanged)?;
+    let fresh_name = fresh.process_name.clone().ok_or_else(|| {
+        TerminationOutcome::UnknownFailure(
+            "fresh process name evidence is missing; refusing termination".to_owned(),
+        )
+    })?;
+    let expected = ExpectedProcessEvidence {
+        pid: confirmed.pid,
+        start_marker: expected_marker,
+        name: confirmed.process_name.as_deref(),
+    };
+    let mut scope = ProcessEvidenceScope::new(1).map_err(single_evidence_outcome)?;
+    scope
+        .observe(
+            &expected,
+            Ok(FreshProcessEvidence {
+                pid: fresh.pid,
+                start_marker: fresh_marker,
+                name: fresh_name,
+            }),
+        )
+        .map_err(single_evidence_outcome)?;
+    scope.finish().map_err(single_evidence_outcome)
+}
+
+fn single_evidence_outcome(error: ProcessEvidenceError) -> TerminationOutcome {
+    match error {
+        ProcessEvidenceError::PermissionDenied { .. } => TerminationOutcome::PermissionDenied,
+        ProcessEvidenceError::IdentityChanged { .. } | ProcessEvidenceError::NameChanged { .. } => {
+            TerminationOutcome::TargetChanged
+        }
+        ProcessEvidenceError::Missing { .. }
+        | ProcessEvidenceError::NameMissing { .. }
+        | ProcessEvidenceError::NameOversized { .. }
+        | ProcessEvidenceError::IncompleteScope { .. }
+        | ProcessEvidenceError::MemberLimitExceeded { .. }
+        | ProcessEvidenceError::ByteLimitExceeded { .. } => TerminationOutcome::UnknownFailure(
+            "fresh bounded process identity/name evidence is incomplete; refusing termination"
+                .to_owned(),
+        ),
+    }
 }
 
 pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
@@ -579,12 +757,54 @@ pub(crate) fn prepare_termination(pid: u32) -> Result<TerminationHandle, Termina
     prepare_termination_platform(pid)
 }
 
-pub(crate) fn terminate_handle(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
-    debug_assert!(
-        unsafe_pid_reason(handle.pid()).is_none(),
-        "prepared termination handles must never target unsafe PIDs"
-    );
-    terminate_handle_platform(handle, mode)
+pub(crate) fn terminate_handle_checked(
+    handle: &TerminationHandle,
+    target: &KillTarget,
+    protected_names: &[String],
+    mode: KillMode,
+) -> TerminationOutcome {
+    debug_assert_eq!(handle.pid(), target.pid);
+    terminate_handle_checked_platform(handle, target, protected_names, mode)
+}
+
+fn check_final_evidence(
+    target: &KillTarget,
+    protected_names: &[String],
+    fresh: Result<FreshProcessEvidence, ProcessEvidenceError>,
+) -> Result<(), TerminationOutcome> {
+    let expected = ExpectedProcessEvidence {
+        pid: target.pid,
+        start_marker: target
+            .process_start_time_marker
+            .ok_or(TerminationOutcome::TargetChanged)?,
+        name: target.process_name.as_deref(),
+    };
+    let mut scope = ProcessEvidenceScope::new(1).map_err(single_evidence_outcome)?;
+    let fresh = scope
+        .observe(&expected, fresh)
+        .map_err(single_evidence_outcome)?;
+    scope.finish().map_err(single_evidence_outcome)?;
+    if is_protected_process_name(target.platform, &fresh.name, protected_names) && !target.protected
+    {
+        return Err(TerminationOutcome::ProtectedProcess);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn outcome_after_thaw(
+    pid: u32,
+    prior: TerminationOutcome,
+    thaw: crate::tree::TreeSignalResult,
+) -> TerminationOutcome {
+    if thaw == crate::tree::TreeSignalResult::Denied {
+        TerminationOutcome::ThawFailed {
+            pid,
+            prior: Box::new(prior),
+        }
+    } else {
+        prior
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -625,37 +845,60 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
 }
 
 #[cfg(target_os = "macos")]
-fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
+fn terminate_handle_checked_platform(
+    handle: &TerminationHandle,
+    target: &KillTarget,
+    protected_names: &[String],
+    mode: KillMode,
+) -> TerminationOutcome {
+    if target.process_start_time_marker != Some(handle.process_start_time_marker) {
+        return TerminationOutcome::TargetChanged;
+    }
     let pid = match pid_to_macos_pid(handle.pid) {
         Ok(pid) => pid,
         Err(outcome) => return outcome,
     };
+    let stop = unsafe {
+        // SAFETY: pid is range checked and SIGSTOP has no pointer arguments.
+        libc::kill(pid, libc::SIGSTOP)
+    };
+    if stop != 0 {
+        return macos_signal_outcome("kill(SIGSTOP)", &std::io::Error::last_os_error());
+    }
+    if let Err(outcome) = check_final_evidence(
+        target,
+        protected_names,
+        crate::platform::macos::fresh_process_evidence(handle.pid),
+    ) {
+        return outcome_after_thaw(handle.pid, outcome, macos_cont_if_matches(handle));
+    }
     let signal = match mode {
         KillMode::Terminate => libc::SIGTERM,
         KillMode::Force => libc::SIGKILL,
     };
-
-    // macOS has no pidfd equivalent, so the best native guard is a final process
-    // identity read immediately before kill(2). If the PID wandered off and came
-    // back wearing another process' face, the start marker catches it here.
-    match crate::platform::macos::process_start_time_marker(handle.pid) {
-        Some(marker) if marker == handle.process_start_time_marker => {}
-        Some(_) => return TerminationOutcome::TargetChanged,
-        None if !macos_process_exists(pid) => return TerminationOutcome::AlreadyExited,
-        None => return TerminationOutcome::OwnershipUnavailable,
-    }
-
     let result = unsafe {
-        // SAFETY: pid was range-checked to pid_t, signal is one of the two
-        // supported constants, and kill(2) writes no Rust-managed memory.
+        // SAFETY: pid is range checked and signal is one of two fixed values.
         libc::kill(pid, signal)
     };
-    if result == 0 {
-        return TerminationOutcome::Success;
+    let outcome = if result == 0 {
+        TerminationOutcome::Success
+    } else {
+        macos_signal_outcome("kill", &std::io::Error::last_os_error())
+    };
+    if mode == KillMode::Terminate || outcome != TerminationOutcome::Success {
+        return outcome_after_thaw(handle.pid, outcome, macos_cont_if_matches(handle));
     }
+    outcome
+}
 
-    let error = std::io::Error::last_os_error();
-    macos_signal_outcome("kill", &error)
+#[cfg(target_os = "macos")]
+fn macos_cont_if_matches(handle: &TerminationHandle) -> crate::tree::TreeSignalResult {
+    if crate::platform::macos::process_start_time_marker(handle.pid)
+        != Some(handle.process_start_time_marker)
+    {
+        return crate::tree::TreeSignalResult::Denied;
+    }
+    tree_cont(handle.pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -734,16 +977,60 @@ fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, Terminati
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> TerminationOutcome {
+fn terminate_handle_checked_platform(
+    handle: &TerminationHandle,
+    target: &KillTarget,
+    protected_names: &[String],
+    mode: KillMode,
+) -> TerminationOutcome {
+    if let Err(outcome) = linux_pidfd_signal(handle, libc::SIGSTOP) {
+        return outcome;
+    }
+    if let Err(outcome) = check_final_evidence(
+        target,
+        protected_names,
+        crate::platform::linux::fresh_process_evidence(handle.pid),
+    ) {
+        return outcome_after_thaw(
+            handle.pid,
+            outcome,
+            tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
+        );
+    }
     let signal = match mode {
         KillMode::Terminate => libc::SIGTERM,
         KillMode::Force => libc::SIGKILL,
     };
+    let outcome = linux_pidfd_signal(handle, signal)
+        .map_or_else(|outcome| outcome, |()| TerminationOutcome::Success);
+    if mode == KillMode::Terminate || outcome != TerminationOutcome::Success {
+        return outcome_after_thaw(
+            handle.pid,
+            outcome,
+            tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
+        );
+    }
+    outcome
+}
 
-    // SAFETY: pidfd is an open descriptor from pidfd_open, signal is one of the
-    // two constants this module supports, siginfo is null by pidfd_send_signal(2)
-    // convention, and flags is zero. No Rust-managed memory is written.
+#[cfg(target_os = "linux")]
+fn tree_signal_result_from_outcome(
+    result: &Result<(), TerminationOutcome>,
+) -> crate::tree::TreeSignalResult {
+    match result {
+        Ok(()) => crate::tree::TreeSignalResult::Delivered,
+        Err(TerminationOutcome::AlreadyExited) => crate::tree::TreeSignalResult::NotFound,
+        Err(_) => crate::tree::TreeSignalResult::Denied,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pidfd_signal(
+    handle: &TerminationHandle,
+    signal: libc::c_int,
+) -> Result<(), TerminationOutcome> {
     let result = unsafe {
+        // SAFETY: pidfd is owned for this call; signal is a fixed process signal.
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             handle.pidfd.as_raw_fd(),
@@ -753,11 +1040,13 @@ fn terminate_handle_platform(handle: &TerminationHandle, mode: KillMode) -> Term
         )
     };
     if result == 0 {
-        return TerminationOutcome::Success;
+        Ok(())
+    } else {
+        Err(outcome_from_errno(
+            "pidfd_send_signal",
+            &std::io::Error::last_os_error(),
+        ))
     }
-
-    let error = std::io::Error::last_os_error();
-    outcome_from_errno("pidfd_send_signal", &error)
 }
 
 /// Send `SIGSTOP` to a PID for the process-tree freeze.
@@ -775,8 +1064,8 @@ pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
 /// terminating signal and to thaw the tree on any abort, so callers ignore the
 /// result — a `SIGCONT` to a process that already died is a harmless no-op.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn tree_cont(pid: u32) {
-    let _ = tree_send_signal(pid, libc::SIGCONT);
+pub(crate) fn tree_cont(pid: u32) -> crate::tree::TreeSignalResult {
+    tree_send_signal(pid, libc::SIGCONT)
 }
 
 /// macOS delivery preparation: probe that the stopped process still exists.
@@ -992,6 +1281,75 @@ fn terminate_handle_platform(handle: &TerminationHandle, _mode: KillMode) -> Ter
 }
 
 #[cfg(windows)]
+fn terminate_handle_checked_platform(
+    handle: &TerminationHandle,
+    target: &KillTarget,
+    protected_names: &[String],
+    mode: KillMode,
+) -> TerminationOutcome {
+    let fresh = windows_fresh_process_evidence(handle);
+    if let Err(outcome) = check_final_evidence(target, protected_names, fresh) {
+        return outcome;
+    }
+    terminate_handle_platform(handle, mode)
+}
+
+#[cfg(windows)]
+fn windows_fresh_process_evidence(
+    handle: &TerminationHandle,
+) -> Result<FreshProcessEvidence, ProcessEvidenceError> {
+    use windows_sys::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+    const CODE_UNITS: usize = crate::observation::PROTECTION_NAME_MAX_BYTES / 2;
+
+    let marker =
+        crate::platform::windows::process_start_time_marker_from_handle(&handle.process_handle)
+            .ok_or(ProcessEvidenceError::Missing { pid: handle.pid })?;
+    let mut buffer = [0_u16; CODE_UNITS];
+    let mut length = u32::try_from(buffer.len()).expect("fixed evidence buffer fits u32");
+    let result = unsafe {
+        // SAFETY: the prepared process handle remains owned and the fixed buffer
+        // is valid for `length` UTF-16 writes.
+        QueryFullProcessImageNameW(
+            handle.process_handle.as_raw_handle(),
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &raw mut length,
+        )
+    };
+    if result == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(if windows_error_code(&error) == Some(ERROR_ACCESS_DENIED) {
+            ProcessEvidenceError::PermissionDenied { pid: handle.pid }
+        } else {
+            ProcessEvidenceError::Missing { pid: handle.pid }
+        });
+    }
+    let code_units =
+        native_utf16_prefix(&buffer, length).ok_or(ProcessEvidenceError::NameOversized {
+            pid: handle.pid,
+            bytes: usize::try_from(length)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(2),
+        })?;
+    let path = String::from_utf16_lossy(code_units);
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or(ProcessEvidenceError::NameMissing { pid: handle.pid })?;
+    Ok(FreshProcessEvidence {
+        pid: handle.pid,
+        start_marker: marker,
+        name,
+    })
+}
+
+#[cfg(windows)]
+fn native_utf16_prefix(buffer: &[u16], reported_length: u32) -> Option<&[u16]> {
+    buffer.get(..usize::try_from(reported_length).ok()?)
+}
+
+#[cfg(windows)]
 const WINDOWS_TERMINATE_EXIT_CODE: u32 = 1;
 #[cfg(windows)]
 const WINDOWS_TERMINATE_WAIT_MS: u32 = 5_000;
@@ -1121,23 +1479,45 @@ fn terminate_handle_platform(_handle: &TerminationHandle, _mode: KillMode) -> Te
     )
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn terminate_handle_checked_platform(
+    handle: &TerminationHandle,
+    _target: &KillTarget,
+    _protected_names: &[String],
+    mode: KillMode,
+) -> TerminationOutcome {
+    terminate_handle_platform(handle, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::outcome_after_thaw;
     use super::{
-        ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
-        confirmation_input_matches, confirmation_requirement, revalidate_confirmed_target,
-        target_still_matches_confirmation, unsafe_pid_reason,
+        ConfirmationRequirement, KillMode, KillTarget, KillTargetPort, TerminationOutcome,
+        UnsafePidReason, confirmation_input_matches, confirmation_requirement,
+        kill_target_has_port_with, revalidate_confirmed_target, target_still_matches_confirmation,
+        unsafe_pid_reason,
     };
     #[cfg(windows)]
-    use super::{windows_api_outcome, windows_still_active_exit_code};
+    use super::{native_utf16_prefix, windows_api_outcome, windows_still_active_exit_code};
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
         Protocol, SocketState,
     };
     #[cfg(windows)]
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_windows_native_name_length_fails_closed_without_panicking() {
+        let buffer = [0_u16; 4];
+        assert_eq!(native_utf16_prefix(&buffer, 5), None);
+        assert_eq!(native_utf16_prefix(&buffer, u32::MAX), None);
+        assert_eq!(native_utf16_prefix(&buffer, 4), Some(buffer.as_slice()));
+    }
 
     fn entry(port: u16, protocol: Protocol) -> PortEntry {
         PortEntry {
@@ -1149,7 +1529,7 @@ mod tests {
                 Protocol::Udp => SocketState::Bound,
             },
             pid: Some(18422),
-            process_name: Some("node".to_owned()),
+            process_name: Some("node".into()),
             executable_path: None,
             command_line: None,
             parent_pid: None,
@@ -1158,16 +1538,62 @@ mod tests {
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
+            process_identity: Some(crate::observation::ProcessIdentity {
+                pid: 18422,
+                start_marker: crate::observation::ProcessStartMarker::linux(55)
+                    .expect("test marker is nonzero"),
+            }),
+            ipv6_scope: None,
         }
+    }
+
+    #[test]
+    fn maximum_port_membership_uses_logarithmic_comparisons() {
+        let ports = (u16::MIN..=u16::MAX)
+            .map(|local_port| KillTargetPort {
+                protocol: Protocol::Tcp,
+                local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                local_port,
+                ipv6_scope: None,
+            })
+            .collect::<Vec<_>>();
+        let target = *ports.last().expect("maximum fixture is non-empty");
+        let mut comparisons = 0usize;
+
+        assert!(kill_target_has_port_with(&ports, &target, || {
+            comparisons += 1;
+        }));
+        assert!(
+            comparisons <= 17,
+            "binary search used {comparisons} comparisons"
+        );
     }
 
     fn context(start_time_ticks: u64) -> ProcessContext {
         ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_marker: Some(start_time_ticks),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(
+                start_time_ticks,
+            )
+            .ok(),
             children: ChildProcessSnapshot::default(),
             docker: None,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn single_process_thaw_failure_is_typed() {
+        let outcome = outcome_after_thaw(
+            42,
+            TerminationOutcome::TargetChanged,
+            crate::tree::TreeSignalResult::Denied,
+        );
+        assert!(matches!(
+            outcome,
+            TerminationOutcome::ThawFailed { pid: 42, prior }
+                if *prior == TerminationOutcome::TargetChanged
+        ));
     }
 
     #[test]
@@ -1179,7 +1605,7 @@ mod tests {
         ];
         let context = ProcessContext {
             owner_uid: Some(1000),
-            process_start_time_marker: Some(55),
+            process_start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
             children: ChildProcessSnapshot {
                 children: vec![ChildProcess {
                     pid: 18423,
@@ -1376,7 +1802,7 @@ mod tests {
         );
 
         let mut changed_name = entry(3000, Protocol::Tcp);
-        changed_name.process_name = Some("other".to_owned());
+        changed_name.process_name = Some("other".into());
         assert_eq!(
             revalidate_confirmed_target(&confirmed, &[changed_name], Some(&context(55))),
             Err(TerminationOutcome::TargetChanged),
@@ -1400,7 +1826,12 @@ mod tests {
     fn revalidation_rejects_pid_reuse_with_changed_start_time() {
         let confirmed_row = entry(3000, Protocol::Tcp);
         let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
-        let fresh_row = entry(3000, Protocol::Tcp);
+        let mut fresh_row = entry(3000, Protocol::Tcp);
+        fresh_row.process_identity = Some(crate::observation::ProcessIdentity {
+            pid: 18422,
+            start_marker: crate::observation::ProcessStartMarker::linux(99)
+                .expect("test marker is nonzero"),
+        });
 
         assert_eq!(
             revalidate_confirmed_target(&confirmed, &[fresh_row], Some(&context(99))),
@@ -1409,10 +1840,32 @@ mod tests {
     }
 
     #[test]
+    fn revalidation_rejects_ipv6_interface_scope_movement() {
+        let mut confirmed_row = entry(3000, Protocol::Tcp);
+        confirmed_row.local_addr = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        confirmed_row.ipv6_scope = Some(
+            crate::observation::Ipv6Scope::interface_index(2)
+                .expect("test interface index is valid"),
+        );
+        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let mut moved = confirmed_row;
+        moved.ipv6_scope = Some(
+            crate::observation::Ipv6Scope::interface_index(3)
+                .expect("test interface index is valid"),
+        );
+
+        assert_eq!(
+            revalidate_confirmed_target(&confirmed, &[moved], Some(&context(55))),
+            Err(TerminationOutcome::TargetChanged),
+        );
+    }
+
+    #[test]
     fn revalidation_rejects_missing_start_time_identity() {
         let confirmed_row = entry(3000, Protocol::Tcp);
         let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
-        let fresh_row = entry(3000, Protocol::Tcp);
+        let mut fresh_row = entry(3000, Protocol::Tcp);
+        fresh_row.process_identity = None;
 
         assert_eq!(
             revalidate_confirmed_target(&confirmed, &[fresh_row], None),
