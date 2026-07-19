@@ -5,8 +5,51 @@
 Updated 2026-07-19 from the current worktree after reproducing the independent
 retest findings. This document does not rely on the previous Stage 1 review.
 
+The clean remediation baseline and current checked-out commit are both
+`ffdb71212c0482a1d806c6c1a0a2a538a4b80462`. The uncommitted remediation patch,
+including untracked files but excluding this review record, has SHA-256
+`24d6f1eff19eee463d7a018efd9889f57d7bb5c6d8d5c6d5e592aec0218177a3` when
+serialized by `git diff --cached --binary` from a temporary index based on that
+commit. This identifies the locally verified patch without claiming that it is
+a Git commit.
+
 Host runtime: Linux x86_64. Windows and macOS changes were cross-compiled and
 strictly linted, but were not executed on native hosts in this retest.
+
+## Remediation Results
+
+- The frozen contract now defines typed optional Linux TCP timer evidence,
+  semantic UDP `Bound` rows, strict watch interval/duration parsing, clock
+  failure behavior, snapshot JSON projection rules, probe side effects, and
+  replacement certainty.
+- Linux process identity parsing operates on bounded bytes and parses only the
+  ASCII numeric tail of `/proc/<pid>/stat`; a non-UTF-8 `comm` no longer aborts
+  a valid identity read.
+- Restricted or incomplete procfs enumeration makes global ownership partial.
+  Directory-entry errors fail closed rather than silently producing false
+  completeness.
+- Destructive authority accepts only TCP `Listen` and UDP `Bound` rows, so
+  Stage 2 transitional and established TCP observations cannot become kill
+  targets through legacy projection.
+- CLI, configuration, and multiline startup diagnostics remove terminal control
+  sequences while preserving useful line layout. Real-binary regressions cover
+  hostile CLI and configuration input.
+- Final process identity or protection-name drift is an operational failure with
+  zero signal delivery. TUI post-kill handling now schedules one authoritative
+  refresh rather than performing a redundant legacy collection first.
+- macOS native FD reads reserve only the remaining aggregate allowance and
+  reject returned lengths outside the supplied buffer.
+- Docker polling, cleanup, and stdout/stderr draining share bounded deadlines.
+  Published-port segment 65 is rejected, and retained-match truncation starts
+  only at match nine.
+- `SECURITY.md` now documents private reporting and sensitive-output handling.
+  README timing claims without reproducible raw evidence were removed, and a
+  checked-in release-artifact benchmark protocol and sampler were added.
+- README configuration, exit-code, JSON privacy, target, checksum, and AUR
+  documentation was corrected. Local task descriptions no longer overstate CI
+  equivalence.
+- CI checkout is pinned to a full action commit. Release verification now checks
+  formatting and strict native-target Clippy before publishing artifacts.
 
 ## Corrected Guarantees
 
@@ -188,8 +231,8 @@ Passed on Linux x86_64:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features
-  419 unit tests passed
-  21 Linux test-harness cases passed, including 2 helper dispatch cases
+  429 unit tests passed
+  22 Linux test-harness cases passed, including 2 helper dispatch cases
   capability-required IPv6 and isolated namespace contracts executed and passed
   4 socket2 contract tests passed
 cargo test --locked --all-features --doc
@@ -206,10 +249,15 @@ Cross-target compile/lint evidence:
 cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings
 cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
 cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings
-cargo check --target x86_64-pc-windows-gnu --all-targets --all-features
-cargo check --target x86_64-apple-darwin --all-targets --all-features
-cargo check --target aarch64-apple-darwin --all-targets --all-features
 ```
+
+Native CI chronology: GitHub Actions run
+[`29689761890`](https://github.com/nuggocto/kickoutchi/actions/runs/29689761890)
+executed against exact commit
+`ffdb71212c0482a1d806c6c1a0a2a538a4b80462` from 2026-07-19 13:53 UTC through
+13:55 UTC. Its Linux, macOS, Windows, and Supply Chain jobs all passed. That run
+establishes the clean baseline only; it predates this uncommitted remediation
+patch and therefore is not native-CI evidence for the patch.
 
 ## Mutation Confirmation
 
@@ -247,17 +295,18 @@ restored before the full verification run:
 Verdict: PASS for Stage 1 on the current Linux worktree. Recommendation: proceed
 to Stage 2; this is not a release recommendation.
 
-The release binaries were rebuilt with:
+Development artifacts using the release profile were rebuilt with:
 
 ```text
 cargo build --locked --profile dist --all-features --bin kickoutchi --bin kick
 ```
 
-The resulting `target/dist/kick` artifact was exercised through `--version`, `--help`,
-human `list`, structured `list --json`, and a no-match port query. Structured
+The resulting non-release `target/dist/kick` artifact was exercised through `--version`, `--help`,
+human `list`, and structured `list --json`. Structured
 output remained a clean top-level array with all 14 legacy fields. Human output
-retained its existing columns, and the no-match query returned only its expected
-diagnostic. The Linux real-binary contract suite additionally exercised actual
+retained its existing columns. Hostile CLI and configuration arguments were
+also checked byte-for-byte; neither output contained terminal escape bytes. The
+Linux real-binary contract suite additionally exercised actual
 TCP/UDP collection, single termination, tree/group termination, refusal cleanup,
 late forks, and port disappearance. A real port-selected termination in isolated
 user, network, and PID namespaces with a private `/proc` delivered `SIGTERM` and
@@ -267,38 +316,28 @@ from these release-profile smoke checks.
 Current `dist` artifact SHA-256 values:
 
 ```text
-5bfd98b31df2dd671c6c6a1f811af2fb7d9d6dfdb709b873cd7613c76a1cb550  target/dist/kick
-c2e232574b1c9732761ad171e882963cb48b2b47d38a66a7846be198e844112f  target/dist/kickoutchi
+ec8f34763cdf59c933e689e1b2c3348946e381cc3b1ad0ed43cc81375ac4f23c  target/dist/kick
+583ccee81046a8ebfc006b911d4d1f3d25b15d4ecf86de73d3b8248230b74c48  target/dist/kickoutchi
 ```
 
-## Stage 1 Performance Check
+## Benchmark Evidence Correction
 
-This is a directional implementation check, not the deferred release benchmark.
-Baseline `3b6698b` and the current worktree were built into clean `dist` release
-artifacts on an AMD Ryzen AI MAX+ 395, Linux 7.1.3, Rust 1.95.0. After eight
-warmups per artifact, 200 runs per artifact were interleaved in a fixed seeded
-order. The workload was `kick list --json` against the same live host socket
-table; all 400 measured runs exited successfully.
+The previous Stage 1 latency table and artifact-size comparison are withdrawn.
+Their cited raw sample file is absent, so the measurements cannot be audited and
+must not be used as acceptance evidence.
 
-| Metric | `HEAD` | Stage 1 | Ratio |
-| --- | ---: | ---: | ---: |
-| p50 | 7.617 ms | 13.668 ms | 1.79x |
-| p95 | 9.427 ms | 16.369 ms | 1.74x |
-| p99 | 10.039 ms | 16.982 ms | 1.69x |
+The checked-in sampler was smoke-tested against the current release-profile
+`target/dist/kick` artifact with two warmups and 20 successful invocations. Its
+TSV correctly recorded the source commit, dirty-worktree status, artifact hash,
+toolchain, kernel, parameters, and one nanosecond latency per invocation. This
+verifies harness operation only; no percentile or regression claim is made from
+the smoke run.
 
-The added cost matches the required two-pass consistency model. The observed p99
-remains below the future 100 ms watch floor on this machine, but Stage 2 must
-repeat its required release-mode feasibility measurement after full native
-collection is implemented. Host activity and a changing live socket table make
-these numbers directional rather than a release baseline.
-
-The `target/dist/kick` artifact changed from 2,999,136 to 3,242,976 bytes:
-+243,840 bytes, or approximately 8.13%. `kickoutchi` changed from 2,999,144 to
-3,242,984 bytes. Peak RSS was not remeasured because GNU `time` is unavailable
-on this host; explicit allocation bounds and exact boundary tests remain the
-primary memory-safety evidence. Raw latency samples for this audit are retained
-at `/tmp/opencode/kickoutchi-stage1-benchmark.tsv`. The final release benchmark
-remains deferred.
+Stage 2 must still perform the documented release-mode feasibility measurement
+after full native collection exists, including workload counts, host state,
+p50/p95/p99/max, failures, and peak RSS. The final release benchmark remains a
+separate interleaved baseline/candidate gate with preserved ordering seed and raw
+samples.
 
 ## Remaining Evidence Gap
 
@@ -309,6 +348,12 @@ control flow, partial-transition cleanup, bounded convergence, and reporting;
 native Windows CI remains required to establish the private ABI on the target
 host. macOS raw-PID behavior and changing-size native reads likewise remain
 dependent on native CI despite cross-target compilation.
+
+Because this remediation is still uncommitted, no native CI run can yet belong
+to its exact patch identity. Stage 2 implementation may proceed from the locally
+verified patch. This is not an interim release point: the eventual atomic `1.3.0`
+release still requires every stage and final gate in `FEATURE.md`, including
+Linux, macOS, Windows, and supply-chain CI on the exact release commit.
 
 Full native collection of non-listening TCP states and Darwin ABI validation
 remain Stage 2 gates. Early Stage 2 adapter work exists in this worktree but is

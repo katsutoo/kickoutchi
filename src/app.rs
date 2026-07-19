@@ -392,6 +392,7 @@ impl App {
         self.start_pending_process_context_request();
     }
 
+    #[cfg(test)]
     fn finish_refresh_attempt(
         &mut self,
         result: Result<Vec<PortEntry>, collector::CollectorError>,
@@ -1175,7 +1176,7 @@ impl App {
                 &outcome,
             ));
             if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
-                self.finish_refresh_attempt(collect_ports(), Instant::now());
+                self.refresh_after_kill(&mut collect_ports);
             }
             return;
         }
@@ -1201,7 +1202,7 @@ impl App {
         // Best-effort post-kill refresh so freed ports drop from the table; a
         // failed re-collect shows as the standard error line rather than the
         // status overclaiming a refresh that did not run.
-        self.finish_refresh_attempt(collect_ports(), Instant::now());
+        self.refresh_after_kill(&mut collect_ports);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1216,7 +1217,7 @@ impl App {
     {
         self.kill_status = Some(tree_kill_status_line(target, mode, outcome));
         if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
-            self.finish_refresh_attempt(collect_ports(), Instant::now());
+            self.refresh_after_kill(collect_ports);
         }
     }
 
@@ -1287,7 +1288,7 @@ impl App {
                 // claiming a refresh that may not have happened. Other prepare
                 // failures leave the process running, so there's nothing to drop.
                 if matches!(outcome, TerminationOutcome::AlreadyExited) {
-                    self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
+                    self.refresh_after_kill(&mut collect_visibility_ports);
                 }
                 return;
             }
@@ -1317,7 +1318,7 @@ impl App {
                     confirmation.mode,
                     &outcome,
                 ));
-                self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
+                self.refresh_after_kill(&mut collect_visibility_ports);
                 return;
             }
         };
@@ -1329,7 +1330,7 @@ impl App {
                 confirmation.mode,
                 &outcome,
             ));
-            self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
+            self.refresh_after_kill(&mut collect_visibility_ports);
             return;
         }
         let outcome = terminate(
@@ -1347,9 +1348,23 @@ impl App {
         // The status reports only the signal result; a failed re-collect shows up
         // as the standard error line rather than letting the status overclaim a
         // refresh that did not run.
-        self.finish_refresh_attempt(collect_visibility_ports(), Instant::now());
+        self.refresh_after_kill(&mut collect_visibility_ports);
     }
 
+    fn refresh_after_kill<CollectPorts>(&mut self, collect_ports: &mut CollectPorts)
+    where
+        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+    {
+        #[cfg(not(test))]
+        {
+            let _ = collect_ports;
+            self.refresh();
+        }
+        #[cfg(test)]
+        self.finish_refresh_attempt(collect_ports(), Instant::now());
+    }
+
+    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
     fn apply_successful_snapshot(&mut self, rows: Vec<PortEntry>, now: Instant) {
         #[cfg(not(test))]
         {

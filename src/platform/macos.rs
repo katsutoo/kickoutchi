@@ -1035,7 +1035,8 @@ fn collect_pid_socket_records(
     pid: u32,
     aggregate_fd_entries: &mut usize,
 ) -> Result<(Vec<SocketRecord>, BTreeSet<SocketScanLoss>), std::io::Error> {
-    let fds = list_process_fds(pid)?;
+    let remaining = FILE_DESCRIPTOR_ENTRIES_MAX.saturating_sub(*aggregate_fd_entries);
+    let fds = list_process_fds(pid, remaining)?;
     collect_pid_socket_records_from_fds(
         pid,
         &fds,
@@ -1351,33 +1352,39 @@ where
     ))
 }
 
-fn list_process_fds(pid: u32) -> std::io::Result<Vec<libc::proc_fdinfo>> {
+fn list_process_fds(pid: u32, max_entries: usize) -> std::io::Result<Vec<libc::proc_fdinfo>> {
     let pid = pid_to_c_int(pid)?;
-    list_process_fds_with_reader(|buffer, buffer_bytes| {
-        let buffer = if let Some(buffer) = buffer {
-            buffer.as_mut_ptr().cast::<c_void>()
-        } else {
-            unsafe {
-                // SAFETY: __error returns this thread's errno slot. Clearing it lets a
-                // zero-byte successful FD list differ from libproc's zero-on-error result.
-                *libc::__error() = 0;
+    list_process_fds_with_reader(
+        |buffer, buffer_bytes| {
+            let buffer = if let Some(buffer) = buffer {
+                buffer.as_mut_ptr().cast::<c_void>()
+            } else {
+                unsafe {
+                    // SAFETY: __error returns this thread's errno slot. Clearing it lets a
+                    // zero-byte successful FD list differ from libproc's zero-on-error result.
+                    *libc::__error() = 0;
+                }
+                std::ptr::null_mut()
+            };
+            let written_bytes = unsafe {
+                // SAFETY: a null buffer is the sizing call. Otherwise buffer owns
+                // buffer_bytes bytes and libproc does not retain the pointer.
+                libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buffer, buffer_bytes)
+            };
+            if written_bytes < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(written_bytes)
             }
-            std::ptr::null_mut()
-        };
-        let written_bytes = unsafe {
-            // SAFETY: a null buffer is the sizing call. Otherwise buffer owns
-            // buffer_bytes bytes and libproc does not retain the pointer.
-            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buffer, buffer_bytes)
-        };
-        if written_bytes < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(written_bytes)
-        }
-    })
+        },
+        max_entries,
+    )
 }
 
-fn list_process_fds_with_reader<Read>(mut read: Read) -> std::io::Result<Vec<libc::proc_fdinfo>>
+fn list_process_fds_with_reader<Read>(
+    mut read: Read,
+    max_entries: usize,
+) -> std::io::Result<Vec<libc::proc_fdinfo>>
 where
     Read: FnMut(Option<&mut [libc::proc_fdinfo]>, libc::c_int) -> std::io::Result<libc::c_int>,
 {
@@ -1400,13 +1407,14 @@ where
     let needed_bytes =
         usize::try_from(needed_bytes).expect("non-negative proc_pidinfo byte count must fit usize");
     let initial_count = fd_record_count(needed_bytes, usize::MAX)?;
-    if initial_count > MAX_PROCESS_FDS {
+    let max_entries = max_entries.min(MAX_PROCESS_FDS);
+    if initial_count > max_entries {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
+            format!("fd list exceeds {max_entries} descriptor allowance"),
         ));
     }
-    let sentinel_capacity = MAX_PROCESS_FDS.saturating_add(1);
+    let sentinel_capacity = max_entries.saturating_add(1);
     let mut capacity = initial_count
         .saturating_add(FD_LIST_GROWTH_MARGIN)
         .min(sentinel_capacity);
@@ -1415,7 +1423,7 @@ where
         if capacity > sentinel_capacity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
+                format!("fd list exceeds {max_entries} descriptor allowance"),
             ));
         }
         let buffer_bytes = checked_io_buffer_len::<libc::proc_fdinfo>(capacity)?;
@@ -1440,10 +1448,10 @@ where
             written_bytes,
             usize::try_from(buffer_bytes).expect("positive c_int fits usize"),
         )?;
-        if count > MAX_PROCESS_FDS {
+        if count > max_entries {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("fd list exceeds {MAX_PROCESS_FDS} descriptor cap"),
+                format!("fd list exceeds {max_entries} descriptor allowance"),
             ));
         }
         if fd_list_is_complete(count, fds.len()) {
@@ -1699,6 +1707,7 @@ fn read_executable_path_bounded(pid: u32, max_bytes: usize) -> std::io::Result<O
 
     let written_bytes = usize::try_from(written_bytes)
         .expect("non-negative proc_pidpath byte count must fit usize");
+    let written_bytes = checked_returned_buffer_len(written_bytes, buffer.len(), "proc_pidpath")?;
     buffer.truncate(written_bytes);
     Ok(Some(PathBuf::from(OsStr::from_bytes(&buffer))))
 }
@@ -1761,8 +1770,23 @@ fn read_command_line_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Opti
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let buffer_len = checked_returned_buffer_len(buffer_len, buffer.len(), "KERN_PROCARGS2")?;
     buffer.truncate(buffer_len);
     Ok(decode_procargs2_bounded(&buffer, final_max))
+}
+
+fn checked_returned_buffer_len(
+    returned: usize,
+    capacity: usize,
+    api: &'static str,
+) -> std::io::Result<usize> {
+    if returned > capacity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{api} returned more bytes than its supplied buffer"),
+        ));
+    }
+    Ok(returned)
 }
 
 #[cfg(test)]
@@ -1966,8 +1990,8 @@ mod tests {
     use super::{
         In4In6Addr, InSocketAddress, InSockinfo, InSockinfoV4, InSockinfoV6, ProcessMetadata,
         SocketFdinfo, SocketProtocolInfo, SocketScanLoss, TSI_S_LISTEN, TcpSockinfo,
-        collect_pid_socket_records_from_fds, decode_port, decode_procargs2,
-        decode_procargs2_bounded, fd_list_is_complete, fd_record_count,
+        checked_returned_buffer_len, collect_pid_socket_records_from_fds, decode_port,
+        decode_procargs2, decode_procargs2_bounded, fd_list_is_complete, fd_record_count,
         fresh_process_evidence_from_reads, list_process_fds_with_reader, native_pass_from_records,
         process_ids_with_reader, process_observation_from_metadata, retain_socket_record,
         socket_record_from_info, sorted_owner_is_new,
@@ -2556,19 +2580,22 @@ mod tests {
         let record_size = size_of::<libc::proc_fdinfo>();
         let mut attempts = Vec::new();
 
-        let fds = list_process_fds_with_reader(|buffer, _| {
-            let Some(buffer) = buffer else {
-                return Ok(libc::c_int::try_from(initial * record_size).unwrap());
-            };
-            attempts.push(buffer.len());
-            if attempts.len() < 3 {
-                return Ok(libc::c_int::try_from(std::mem::size_of_val(buffer)).unwrap());
-            }
-            for (index, fd) in buffer[..max].iter_mut().enumerate() {
-                fd.proc_fd = libc::c_int::try_from(index).unwrap();
-            }
-            Ok(libc::c_int::try_from(max * record_size).unwrap())
-        })
+        let fds = list_process_fds_with_reader(
+            |buffer, _| {
+                let Some(buffer) = buffer else {
+                    return Ok(libc::c_int::try_from(initial * record_size).unwrap());
+                };
+                attempts.push(buffer.len());
+                if attempts.len() < 3 {
+                    return Ok(libc::c_int::try_from(std::mem::size_of_val(buffer)).unwrap());
+                }
+                for (index, fd) in buffer[..max].iter_mut().enumerate() {
+                    fd.proc_fd = libc::c_int::try_from(index).unwrap();
+                }
+                Ok(libc::c_int::try_from(max * record_size).unwrap())
+            },
+            max,
+        )
         .expect("the exact production per-process FD maximum is accepted");
 
         assert_eq!(attempts, [max / 2, max, max + 1]);
@@ -2586,17 +2613,51 @@ mod tests {
         let record_size = size_of::<libc::proc_fdinfo>();
         let mut buffer_reads = 0;
 
-        let error = list_process_fds_with_reader(|buffer, _| {
-            if buffer.is_some() {
-                buffer_reads += 1;
-            }
-            Ok(libc::c_int::try_from((max + 1) * record_size).unwrap())
-        })
+        let error = list_process_fds_with_reader(
+            |buffer, _| {
+                if buffer.is_some() {
+                    buffer_reads += 1;
+                }
+                Ok(libc::c_int::try_from((max + 1) * record_size).unwrap())
+            },
+            max,
+        )
         .expect_err("one FD beyond the production maximum is refused");
 
         assert_eq!(buffer_reads, 0);
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("descriptor cap"));
+        assert!(error.to_string().contains("descriptor allowance"));
+    }
+
+    #[test]
+    fn aggregate_fd_allowance_refuses_before_native_buffer_allocation() {
+        let record_size = size_of::<libc::proc_fdinfo>();
+        let mut buffer_reads = 0;
+
+        let error = list_process_fds_with_reader(
+            |buffer, _| {
+                if buffer.is_some() {
+                    buffer_reads += 1;
+                }
+                Ok(libc::c_int::try_from(record_size).unwrap())
+            },
+            0,
+        )
+        .expect_err("one FD beyond the remaining aggregate allowance is refused");
+
+        assert_eq!(buffer_reads, 0);
+        assert!(error.to_string().contains("allowance"));
+    }
+
+    #[test]
+    fn native_returned_lengths_accept_capacity_and_reject_capacity_plus_one() {
+        assert_eq!(
+            checked_returned_buffer_len(64, 64, "native_test").expect("exact capacity"),
+            64
+        );
+        let error = checked_returned_buffer_len(65, 64, "native_test")
+            .expect_err("capacity plus one is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

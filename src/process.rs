@@ -714,7 +714,10 @@ fn single_evidence_outcome(error: ProcessEvidenceError) -> TerminationOutcome {
     match error {
         ProcessEvidenceError::PermissionDenied { .. } => TerminationOutcome::PermissionDenied,
         ProcessEvidenceError::IdentityChanged { .. } | ProcessEvidenceError::NameChanged { .. } => {
-            TerminationOutcome::TargetChanged
+            TerminationOutcome::UnknownFailure(
+                "fresh process identity or protection name changed; refusing termination"
+                    .to_owned(),
+            )
         }
         ProcessEvidenceError::Missing { .. }
         | ProcessEvidenceError::NameMissing { .. }

@@ -16,8 +16,19 @@ Website: <https://kickoutchi.com>
 - **Git** if you are cloning the repository or using `cargo install --git`.
 - **Linux 5.3+** for safe termination through `pidfd`; listing ports works on
   older kernels too.
-- **Windows** with the normal Rust C++ build tooling available.
-- **macOS** with normal developer tooling available.
+- **Windows or macOS source builds** need their normal native Rust developer
+  tooling.
+
+Published release archives target:
+
+| Platform | Release targets | Notes |
+| --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | GNU libc; Linux 5.3+ required for termination |
+| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Intel and Apple Silicon |
+| Windows | `x86_64-pc-windows-msvc` | x64 only; ARM64 is not shipped |
+
+Other Rust targets may build from source but are not release-supported until
+they are added to the native test and artifact matrix.
 
 ## What It Does
 
@@ -55,36 +66,12 @@ Website: <https://kickoutchi.com>
 
 ## Performance
 
-The following is a local reference measurement, not a cross-platform promise.
-It used the packaged `x86_64-unknown-linux-gnu` v1.2.0 release-candidate binary,
-not a debug build or `cargo run`, and completed 2,000 successful end-to-end
-invocations.
-
-| Reference host | Value |
-| --- | --- |
-| CPU | AMD Ryzen AI MAX+ 395 with Radeon 8060S |
-| CPU topology | 16 cores / 32 threads, boost enabled, up to 5.19 GHz |
-| CPU cache | 16 MiB L2, 64 MiB L3 |
-| Memory | 64 GiB installed (62 GiB usable) |
-| OS | Arch Linux, Linux 7.0.10-arch1-1, x86_64 |
-| Artifact | Packaged `x86_64-unknown-linux-gnu` release binary |
-| Samples | 2,000 successful runs |
-
-| Result | Value |
-| --- | ---: |
-| Median (p50) startup latency | 10.836 ms |
-| p95 startup latency | 12.289 ms |
-| p99 startup latency | 12.831 ms |
-| p99 minus median | 1.995 ms |
-| Peak resident memory (RSS) | 14.45 MiB |
-
-Half of the measured invocations completed within 10.836 ms, 95% within
-12.289 ms, and 99% within 12.831 ms. The roughly 2 ms spread from median to p99
-shows consistent startup on this host, but it should not be read as a latency
-guarantee. CPU power state, kernel and filesystem caches, terminal behavior,
-background load, and especially the number of processes, file descriptors, and
-open sockets can all change collection time. Windows and macOS use different
-native collectors and were not represented by this Linux measurement.
+Performance depends strongly on process, descriptor, and socket counts. The
+previous exact local timing table was removed because its raw samples and
+harness were not retained, so it could not be independently reproduced. The
+repository now carries the release-artifact sampling protocol in
+[`benchmarks/README.md`](benchmarks/README.md). Results are reported only when
+their raw samples, workload, artifact hash, and environment remain available.
 
 ## Install
 
@@ -120,6 +107,21 @@ installer once to get `kickoutchi-update`; later upgrades can use the updater.
 Every release also includes direct archives for Linux, macOS, and Windows, plus
 matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
 nervous, grab the archive, check the hash, and run `kickoutchi` or `kick`.
+
+On Linux or macOS, verify an archive downloaded beside `sha256.sum` with:
+
+```sh
+sha256sum --ignore-missing --check sha256.sum
+```
+
+On Windows PowerShell, compare the published sidecar value with:
+
+```powershell
+(Get-FileHash .\kickoutchi-*.zip -Algorithm SHA256).Hash.ToLower()
+```
+
+Checksums downloaded from the same GitHub Release detect corruption; they are
+not an independent signature or provenance proof.
 
 macOS users can install from the Homebrew tap (one formula, both `kickoutchi`
 and `kick`):
@@ -158,9 +160,8 @@ nix profile install github:nuggocto/kickoutchi
 The flake is locked in the repository for reproducible builds; release commits
 update `flake.lock` deliberately instead of floating silently with nixpkgs.
 
-The AUR package is not published yet because new AUR account creation is
-currently unavailable. After publication, Arch users will be able to install it
-with:
+The AUR package is not published yet. After a maintainer publishes it, Arch
+users will be able to install it with:
 
 ```sh
 yay -S kickoutchi-bin
@@ -170,7 +171,7 @@ The AUR templates live in `packaging/arch/` for maintainers who want to build or
 review the package locally before publication. They are pinned to the latest
 published GitHub Release assets and checksums; bumped only after each release's
 assets exist, never against placeholders. Publication will proceed when AUR
-account creation becomes available again.
+package maintenance is assigned.
 
 Then use either binary name:
 
@@ -212,6 +213,48 @@ require stronger confirmation.
 ```sh
 cargo install --path . --locked
 ```
+
+## Configuration
+
+The default config is `~/.config/kickoutchi/config.toml` on Linux and the
+platform config directory returned by the OS on macOS and Windows. Use
+`--config FILE` to select another file. Unknown keys and files above 64 KiB are
+rejected.
+
+```toml
+refresh_interval_seconds = 3
+default_sort = "port"
+hide_system_processes = false
+confirm_force_kill = true
+protected_processes = ["redis-server"]
+```
+
+`refresh_interval_seconds` is `1..=3600`. `default_sort` is one of `port`,
+`pid`, `protocol`, `process`, `parent`, or `scope`. Configured protected names
+extend rather than replace the built-in safety list.
+
+## Exit Codes
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Command completed successfully |
+| 1 | Operational or internal failure |
+| 2 | Invalid arguments |
+| 3 | Valid query had no match or requested endpoint was unavailable |
+| 4 | Permissions prevented a reliable answer |
+| 5 | Kill was cancelled |
+| 6 | A protected process requires confirmation |
+
+## Structured Output And Privacy
+
+`list --json` is the stable legacy top-level array used by scripts. It may
+contain process names, executable paths, and complete command lines; command
+lines can contain tokens or other secrets. Treat JSON output as sensitive and
+redact it before sharing. Human terminal output is sanitized independently and
+does not imply that structured values are safe to publish.
+
+Report suspected vulnerabilities privately as described in
+[`SECURITY.md`](SECURITY.md).
 
 ## Platform Notes
 

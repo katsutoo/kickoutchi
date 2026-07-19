@@ -273,6 +273,64 @@ impl PartialOrd for SocketState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(dead_code, reason = "Stage 2 populates frozen Linux TCP timer values")]
+pub(crate) enum TcpTimerKind {
+    None,
+    Retransmit,
+    Other,
+    TimeWait,
+    ZeroWindowProbe,
+    Unknown(u32),
+}
+
+#[allow(dead_code, reason = "Stage 2 maps Linux native timer codes")]
+impl TcpTimerKind {
+    pub(crate) const fn from_linux_native(native_code: u32) -> Self {
+        match native_code {
+            0 => Self::None,
+            1 => Self::Retransmit,
+            2 => Self::Other,
+            3 => Self::TimeWait,
+            4 => Self::ZeroWindowProbe,
+            code => Self::Unknown(code),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TcpTimerObservation {
+    pub(crate) kind: TcpTimerKind,
+    pub(crate) native_code: Option<u32>,
+    pub(crate) raw_ticks: u64,
+    pub(crate) estimated_remaining_milliseconds: Option<u64>,
+}
+
+#[allow(dead_code, reason = "Stage 2 reads Linux native timer fields")]
+impl TcpTimerObservation {
+    pub(crate) fn from_linux_native(
+        native_code: u32,
+        raw_ticks: u64,
+        clock_ticks_per_second: Option<u64>,
+    ) -> Self {
+        let estimated_remaining_milliseconds = clock_ticks_per_second
+            .filter(|ticks| *ticks != 0)
+            .and_then(|ticks| {
+                let numerator = u128::from(raw_ticks)
+                    .checked_mul(1_000)?
+                    .checked_add(u128::from(ticks) - 1)?;
+                u64::try_from(numerator / u128::from(ticks)).ok()
+            });
+        let kind = TcpTimerKind::from_linux_native(native_code);
+        Self {
+            native_code: matches!(kind, TcpTimerKind::Unknown(_)).then_some(native_code),
+            kind,
+            raw_ticks,
+            estimated_remaining_milliseconds,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(dead_code, reason = "some frozen codes are emitted by later stages")]
 pub(crate) enum EvidenceGapCode {
     OwnerPermissionDenied,
@@ -375,6 +433,7 @@ pub(crate) enum OwnerObservation {
 pub(crate) struct SocketObservation {
     pub(crate) local_endpoint: EndpointIdentity,
     pub(crate) state: SocketState,
+    pub(crate) timer: Option<TcpTimerObservation>,
     pub(crate) owners: Vec<OwnerObservation>,
     pub(crate) owner_completeness: OwnerCompleteness,
     pub(crate) socket_token: Option<PlatformSocketToken>,
@@ -569,6 +628,7 @@ pub(crate) fn snapshot_from_test_rows(rows: Vec<PortEntry>) -> NetworkSnapshot {
                 LegacySocketState::Listen => SocketState::Listen,
                 LegacySocketState::Bound => SocketState::Bound,
             },
+            timer: None,
             owner_completeness: if owners.is_empty() {
                 OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
                     .expect("one reason fits")
@@ -1683,6 +1743,7 @@ fn materialize_sockets(
         sockets.push(SocketObservation {
             local_endpoint: native.endpoint.clone(),
             state: native.state,
+            timer: None,
             owners,
             owner_completeness: if local_raced {
                 OwnerCompleteness::Raced
@@ -2546,6 +2607,46 @@ mod tests {
                 SocketState::Unknown(2),
                 SocketState::Unknown(9)
             ]
+        );
+    }
+
+    #[test]
+    fn linux_tcp_timer_mapping_and_ceiling_conversion_are_frozen() {
+        let expected = [
+            TcpTimerKind::None,
+            TcpTimerKind::Retransmit,
+            TcpTimerKind::Other,
+            TcpTimerKind::TimeWait,
+            TcpTimerKind::ZeroWindowProbe,
+        ];
+        for (native, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                TcpTimerKind::from_linux_native(u32::try_from(native).expect("small code")),
+                expected
+            );
+        }
+        assert_eq!(
+            TcpTimerKind::from_linux_native(255),
+            TcpTimerKind::Unknown(255)
+        );
+
+        let timer = TcpTimerObservation::from_linux_native(1, 1, Some(128));
+        assert_eq!(timer.kind, TcpTimerKind::Retransmit);
+        assert_eq!(timer.native_code, None);
+        assert_eq!(timer.raw_ticks, 1);
+        assert_eq!(timer.estimated_remaining_milliseconds, Some(8));
+        assert_eq!(
+            TcpTimerObservation::from_linux_native(255, 1, Some(100)).native_code,
+            Some(255)
+        );
+        assert_eq!(
+            TcpTimerObservation::from_linux_native(3, u64::MAX, Some(1))
+                .estimated_remaining_milliseconds,
+            None
+        );
+        assert_eq!(
+            TcpTimerObservation::from_linux_native(0, 0, None).estimated_remaining_milliseconds,
+            None
         );
     }
 

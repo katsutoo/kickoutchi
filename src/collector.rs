@@ -12,21 +12,19 @@ use std::time::SystemTime;
 
 use thiserror::Error;
 
-use crate::model::PortEntry;
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
-use crate::model::Protocol;
+use crate::model::{PortEntry, Protocol};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::observation::process_read_metadata_bytes;
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 use crate::observation::{
     EndpointIdentity, EvidenceGap, Ipv6Scope, MetadataCompleteness, ProcessIdentity,
     ProcessObservation, ProcessStartMarker, SocketObservation,
-    SocketState as ObservationSocketState,
 };
 use crate::observation::{
     EvidenceGapCode, EvidenceImpact, MetadataProfile, NativeObservationPass, NetworkSnapshot,
     ObservationError, ObservationScope, ObservationSource, OwnerCompleteness, ProcessRead,
-    SnapshotCompleteness, collect_consistent, project_legacy, project_legacy_target,
+    SnapshotCompleteness, SocketState as ObservationSocketState, collect_consistent,
+    project_legacy, project_legacy_target,
 };
 
 /// What went wrong during a collection pass.
@@ -148,6 +146,13 @@ pub(crate) fn kill_ports_from_snapshot(
     let mut has_permission_refusal = false;
     let mut has_partial_refusal = snapshot.omitted_evidence_gap_count != 0;
     for socket in &snapshot.sockets {
+        if !matches!(
+            (socket.local_endpoint.protocol, socket.state),
+            (Protocol::Tcp, ObservationSocketState::Listen)
+                | (Protocol::Udp, ObservationSocketState::Bound)
+        ) {
+            continue;
+        }
         let matches_port = port.is_some_and(|port| socket.local_endpoint.port.get() == port);
         let matches_pid = pid.is_some_and(|pid| {
             socket.owners.iter().any(|owner| {
@@ -495,6 +500,7 @@ fn fake_snapshot(profile: MetadataProfile) -> Result<NetworkSnapshot, Observatio
         sockets.push(SocketObservation {
             local_endpoint: endpoint,
             state: fixture.state,
+            timer: None,
             owners,
             owner_completeness: if fixture.pid.is_some() {
                 OwnerCompleteness::Complete
@@ -739,6 +745,33 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.local_addr.is_ipv6()));
         // The collector never pre-marks protection — that's config's job.
         assert!(entries.iter().all(|entry| !entry.protected));
+    }
+
+    #[test]
+    fn destructive_authority_ignores_non_legacy_socket_states() {
+        let mut snapshot = FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake collection succeeds");
+        let mut established = snapshot
+            .sockets
+            .iter()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("fixture has target listener")
+            .clone();
+        established.state = crate::observation::SocketState::Established;
+        established.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                .expect("one reason fits");
+        established.owners = vec![OwnerObservation::UnverifiedPid {
+            pid: 29_999,
+            reason: UnverifiedOwnerReason::PermissionDenied,
+        }];
+        snapshot.sockets.push(established);
+
+        let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
+            .expect("established connection cannot invalidate listener authority");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.state == SocketState::Listen));
     }
 
     #[test]

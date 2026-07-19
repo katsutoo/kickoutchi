@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This section tracks implementation of the atomic `1.3.0` feature release in
+`FEATURE.md`. Named endpoints, `watch`, and `why` will not be released separately
+or before every implementation stage and final release gate is complete.
+
 ### Added
 
-- A reviewed implementation contract and dependency record for the next minor release,
+- A reviewed implementation contract and dependency record for the `1.3.0` release,
   covering the shared observation model, serialized schemas, platform evidence,
   resource limits, threat model, and boundary-test plan for named endpoints,
   `watch`, and `why`.
@@ -40,6 +44,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reorganized the CLI implementation into focused list, single-process kill,
   and scoped tree/group kill modules without changing command behavior, and
   documented the host-byte-order handling used by the Linux socket parser.
+- Froze Linux TCP timer evidence and UDP-bound semantics before full native-state
+  collection, and clarified watch interval, clock-failure, replacement, and full
+  snapshot filtering contracts.
+- Replaced the unreproducible historical README timing table with a checked-in
+  release-artifact sampling protocol and documented the exact shipped target
+  matrix, configuration, exit codes, checksum limits, and structured-output
+  privacy.
+
+### Fixed
+
+- Linux process identity now parses the bounded ASCII tail of `/proc/<pid>/stat`
+  from bytes, so a valid non-UTF-8 `comm` cannot abort collection. Restricted or
+  incomplete procfs PID enumeration now marks global ownership partial instead
+  of producing a false complete empty owner set.
+- Destructive authority ignores non-listening TCP states, preserving existing
+  kill semantics when Stage 2 retains established and transitional connections.
+- CLI, config, and startup diagnostics sanitize terminal controls and bidi
+  formatting before output. Changed final protection evidence now exits as an
+  operational failure while still proving zero signal delivery.
+- TUI post-kill refresh schedules one authoritative snapshot instead of first
+  materializing and discarding a complete legacy projection.
+- macOS FD reads enforce the remaining aggregate allowance before allocation and
+  reject native returned lengths beyond their supplied buffers.
+- Docker cleanup and dual-stream draining use bounded shared deadlines; segment
+  65 rejects its row and match truncation starts only when a ninth match exists.
+
+### Security
+
+- Added a private vulnerability-reporting policy and documented the sensitivity
+  of command lines exposed by the legacy JSON compatibility interface.
 
 ## [1.2.0] - 2026-07-11
 

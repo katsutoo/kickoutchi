@@ -1,3 +1,23 @@
+#[test]
+fn cli_and_config_errors_sanitize_terminal_controls() {
+    let argument = std::process::Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        .args(["list", "--sort", "evil\u{202e}value"])
+        .output()
+        .expect("invalid argument command runs");
+    assert_eq!(argument.status.code(), Some(2));
+    let stderr = String::from_utf8(argument.stderr).expect("stderr is UTF-8");
+    assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+
+    let config = std::process::Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        .args(["--config", "missing\x1b]0;spoof\x07.toml", "list"])
+        .output()
+        .expect("missing config command runs");
+    assert_eq!(config.status.code(), Some(1));
+    let stderr = String::from_utf8(config.stderr).expect("stderr is UTF-8");
+    assert!(!stderr.contains('\x1b'), "{stderr:?}");
+    assert!(!stderr.contains('\x07'), "{stderr:?}");
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;

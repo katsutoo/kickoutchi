@@ -1209,7 +1209,7 @@ mod tests {
             },
         );
 
-        assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(reason, ExitReason::Failure);
         assert_eq!(*events.borrow(), ["prepare", "collect"]);
     }
 

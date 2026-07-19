@@ -81,13 +81,13 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
           rustup default "$RUST_VERSION"
       - name: Install and select Rust 1.95.0 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup toolchain install $env:RUST_VERSION --profile minimal --component rustfmt --component clippy
           if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
           rustup default $env:RUST_VERSION
           if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
@@ -101,6 +101,12 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      - name: Check formatting
+        if: matrix.name == 'Linux'
+        run: cargo fmt --all --check
+      - name: Run strict Clippy
+        if: matrix.name != 'Supply Chain'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run tests (Linux capabilities required)
         if: matrix.name == 'Linux'
         run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features

@@ -25,6 +25,7 @@ const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 // (Docker Desktop shims, credential helpers) can hold the write end open
 // indefinitely, and an unbounded join would hang with it.
 const DOCKER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const DOCKER_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const DOCKER_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 const DOCKER_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
 const DOCKER_OUTPUT_DRAIN_WORKERS_MAX: usize = 8;
@@ -424,30 +425,36 @@ fn run_command_bounded_with_capacity(
 
     let deadline = Instant::now() + timeout;
     let status = loop {
+        let now = Instant::now();
+        if now >= deadline {
+            terminate_and_reap(&mut child);
+            let drain_deadline = Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT;
+            let _ = finish_output_drain_before(&stdout_worker, "stdout", drain_deadline);
+            let _ = finish_output_drain_before(&stderr_worker, "stderr", drain_deadline);
+            debug!("docker CLI timed out during port enrichment");
+            return None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
             Ok(None) => {
-                terminate_and_reap(&mut child);
-                let _ = finish_output_drain(&stdout_worker, "stdout");
-                let _ = finish_output_drain(&stderr_worker, "stderr");
-                debug!("docker CLI timed out during port enrichment");
-                return None;
+                thread::sleep(
+                    Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
+                );
             }
             Err(error) => {
                 terminate_and_reap(&mut child);
-                let _ = finish_output_drain(&stdout_worker, "stdout");
-                let _ = finish_output_drain(&stderr_worker, "stderr");
+                let drain_deadline = Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT;
+                let _ = finish_output_drain_before(&stdout_worker, "stdout", drain_deadline);
+                let _ = finish_output_drain_before(&stderr_worker, "stderr", drain_deadline);
                 debug!(%error, "docker CLI wait failed during port enrichment");
                 return None;
             }
         }
     };
 
-    let stdout = finish_output_drain(&stdout_worker, "stdout")?;
-    let stderr = finish_output_drain(&stderr_worker, "stderr")?;
+    let drain_deadline = Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT;
+    let stdout = finish_output_drain_before(&stdout_worker, "stdout", drain_deadline)?;
+    let stderr = finish_output_drain_before(&stderr_worker, "stderr", drain_deadline)?;
     if stdout.exceeded || stderr.exceeded {
         debug!(
             stdout_exceeded = stdout.exceeded,
@@ -513,11 +520,21 @@ fn read_output_bounded(
     Ok(BoundedOutput { bytes, exceeded })
 }
 
+#[cfg(test)]
 fn finish_output_drain(
     worker: &mpsc::Receiver<io::Result<BoundedOutput>>,
     stream: &'static str,
 ) -> Option<BoundedOutput> {
-    match worker.recv_timeout(DOCKER_OUTPUT_DRAIN_TIMEOUT) {
+    finish_output_drain_before(worker, stream, Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT)
+}
+
+fn finish_output_drain_before(
+    worker: &mpsc::Receiver<io::Result<BoundedOutput>>,
+    stream: &'static str,
+    deadline: Instant,
+) -> Option<BoundedOutput> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match worker.recv_timeout(remaining) {
         Ok(Ok(output)) => Some(output),
         Ok(Err(error)) => {
             debug!(%error, stream, "docker CLI output drain failed");
@@ -542,7 +559,27 @@ fn finish_output_drain(
 
 fn terminate_and_reap(child: &mut std::process::Child) {
     let _ = child.kill();
-    let _ = child.wait();
+    let deadline = Instant::now() + DOCKER_REAP_TIMEOUT;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            debug!(
+                pid = child.id(),
+                "docker CLI did not become reapable before cleanup deadline"
+            );
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
+            ),
+            Err(error) => {
+                debug!(%error, pid = child.id(), "docker CLI cleanup wait failed");
+                return;
+            }
+        }
+    }
 }
 
 fn docker_context_from_ps_output(entry: &PortEntry, output: &str) -> Option<DockerPortContext> {
@@ -570,6 +607,10 @@ fn docker_context_from_ps_output(entry: &PortEntry, output: &str) -> Option<Dock
             if contains_container_match(&containers, &row.id, entry, container_port) {
                 continue;
             }
+            if containers.len() >= DOCKER_MATCHES_MAX {
+                truncated = true;
+                break 'rows;
+            }
             containers.push(DockerContainerPort {
                 id: row.id.clone(),
                 name: row.name.clone(),
@@ -579,10 +620,6 @@ fn docker_context_from_ps_output(entry: &PortEntry, output: &str) -> Option<Dock
                 container_port,
                 protocol: entry.protocol,
             });
-            if containers.len() >= DOCKER_MATCHES_MAX {
-                truncated = true;
-                break 'rows;
-            }
         }
     }
 
@@ -692,11 +729,17 @@ fn label_value(labels: &str, key: &str) -> Option<String> {
 }
 
 fn parse_published_ports(ports: &str) -> Vec<PublishedPort> {
-    ports
-        .split(',')
+    let mut segments = ports.split(',');
+    let parsed = segments
+        .by_ref()
         .take(DOCKER_PORT_SEGMENTS_MAX)
         .filter_map(|segment| parse_published_port_segment(segment.trim()))
-        .collect()
+        .collect::<Vec<_>>();
+    if segments.next().is_some() {
+        Vec::new()
+    } else {
+        parsed
+    }
 }
 
 fn parse_published_port_segment(segment: &str) -> Option<PublishedPort> {
@@ -827,11 +870,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DOCKER_OUTPUT_MAX_BYTES, DrainCapacity, TEST_ELEVATION_OVERRIDE,
-        docker_container_ls_with_runner, docker_context_from_ps_output, finish_output_drain,
-        host_addr_matches, looks_like_docker_owner, parse_published_ports, read_output_bounded,
-        run_command_bounded_with, run_command_bounded_with_capacity, should_try_docker_enrichment,
-        spawn_output_drain,
+        DOCKER_MATCHES_MAX, DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity,
+        TEST_ELEVATION_OVERRIDE, docker_container_ls_with_runner, docker_context_from_ps_output,
+        finish_output_drain, host_addr_matches, looks_like_docker_owner, parse_published_ports,
+        read_output_bounded, run_command_bounded_with, run_command_bounded_with_capacity,
+        should_try_docker_enrichment, spawn_output_drain,
     };
     use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
 
@@ -1151,6 +1194,48 @@ mod tests {
         assert_eq!(ports[0].protocol, Protocol::Tcp);
         assert_eq!(ports[1].host_addr, Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
         assert_eq!(ports[1].protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn published_port_segment_limit_rejects_the_first_excess_segment() {
+        let segment = "0.0.0.0:5432->5432/tcp";
+        let exact = std::iter::repeat_n(segment, DOCKER_PORT_SEGMENTS_MAX)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_published_ports(&exact).len(),
+            DOCKER_PORT_SEGMENTS_MAX
+        );
+
+        let over = format!("{exact},{segment}");
+        assert!(parse_published_ports(&over).is_empty());
+    }
+
+    #[test]
+    fn docker_match_truncation_starts_only_at_match_nine() {
+        let row = entry(
+            5432,
+            Protocol::Tcp,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "docker-proxy",
+        );
+        let output = (0..=DOCKER_MATCHES_MAX)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"container-{index}","Names":"db-{index}","Ports":"0.0.0.0:5432->5432/tcp","Labels":""}}"#
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let exact = docker_context_from_ps_output(&row, &output[..DOCKER_MATCHES_MAX].join("\n"))
+            .expect("eight matches are retained");
+        assert_eq!(exact.containers.len(), DOCKER_MATCHES_MAX);
+        assert!(!exact.truncated);
+
+        let over = docker_context_from_ps_output(&row, &output.join("\n"))
+            .expect("the first eight matches remain available");
+        assert_eq!(over.containers.len(), DOCKER_MATCHES_MAX);
+        assert!(over.truncated);
     }
 
     #[test]

@@ -34,7 +34,7 @@ kick list
 
 When a new tag ships, update `pkgver` and the checksums in `PKGBUILD` only after the `cargo-dist` GitHub Release assets exist. Do not use placeholder checksums or `SKIP` for the AUR package metadata.
 
-For a new release, keep the package metadata pinned to the latest published assets until the new GitHub Release assets and checksums exist. Publishing to AUR still waits until account creation is open again.
+For a new release, keep the package metadata pinned to the latest published assets until the new GitHub Release assets and checksums exist. Initial AUR publication remains pending until package maintenance is assigned.
 
 The required update order is: run/publish the release with `cargo-dist`, download or read the generated checksums from the release assets, update `pkgver`/`source`/`provides`/`sha256sums`, regenerate `.SRCINFO`, then build locally.
 

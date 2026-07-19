@@ -21,10 +21,24 @@ pub(crate) const REPLACEMENT: char = '�';
 ///   so names cannot hide or reorder text in a terminal prompt.
 /// - Everything else is preserved, including visible Unicode.
 pub(crate) fn sanitize(text: &str) -> String {
+    sanitize_with_layout(text, false)
+}
+
+/// Sanitize untrusted terminal output while retaining intentional line breaks.
+/// This is for whole diagnostics and help text, not table cells or prompts.
+pub(crate) fn sanitize_multiline(text: &str) -> String {
+    sanitize_with_layout(text, true)
+}
+
+fn sanitize_with_layout(text: &str, preserve_newlines: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
 
     while let Some(ch) = chars.next() {
+        if ch == '\n' && preserve_newlines {
+            out.push('\n');
+            continue;
+        }
         if ch == '\t' || ch == '\n' || ch == '\r' {
             out.push(' ');
             continue;
@@ -117,7 +131,7 @@ pub(crate) fn is_display_spoofing_format(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize;
+    use super::{sanitize, sanitize_multiline};
 
     #[test]
     fn leaves_clean_text_unchanged() {
@@ -142,6 +156,14 @@ mod tests {
         assert_eq!(sanitize("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(sanitize("\x1b[1;31mbold red\x1b[m"), "bold red");
         assert_eq!(sanitize("\x1b]0;title\x07after"), "after");
+    }
+
+    #[test]
+    fn multiline_diagnostics_keep_layout_but_remove_terminal_controls() {
+        assert_eq!(
+            sanitize_multiline("error: bad\u{202e}value\n  help\x1b]0;title\x07 here\n"),
+            "error: bad�value\n  help here\n"
+        );
     }
 
     #[test]

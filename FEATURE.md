@@ -77,8 +77,9 @@ The release is complete only when all of the following are true:
   where the platform exposes it.
 - Why evaluates exact protocol/address/port targets and labels every conclusion
   as proven, estimated, heuristic, or unknown.
-- Linux, macOS, and Windows retain every socket state exposed by the supported
-  native collection path.
+- Linux, macOS, and Windows retain every TCP state exposed by the supported
+  native collection path and every UDP endpoint exposed as bound. Native UDP
+  status fields are not treated as a portable lifecycle-state vocabulary.
 - Observation scope, permissions, races, and unavailable platform fields are
   represented explicitly.
 - Human output, JSON, NDJSON, filters, config, and exit codes are documented and
@@ -140,11 +141,27 @@ and documentation:
 - TCP state values are `Closed`, `Listen`, `SynSent`, `SynReceived`,
   `Established`, `FinWait1`, `FinWait2`, `CloseWait`, `Closing`, `LastAck`,
   `TimeWait`, `DeleteTcb`, `NewSynReceived`, or `Unknown(native_code)`. UDP uses
-  `Bound` or `Unknown(native_code)`. Platform-specific known states remain valid
-  shared values even when another platform never emits them.
+  `Bound`. A platform UDP status field may be retained later as separate native
+  evidence, but this release does not reinterpret it as a TCP-style lifecycle
+  state. Platform-specific known TCP states remain valid shared values even when
+  another platform never emits them.
 - The state order is the TCP order listed above, followed by UDP `Bound`, then
   `Unknown` ordered by native numeric code. This order is public wherever state
   sorting affects serialized or human output.
+- A Linux TCP timer observation is optional and separate from socket state. It
+  contains `kind`, `native_code`, `raw_ticks`, and
+  `estimated_remaining_milliseconds`. Known kinds are `none`, `retransmit`,
+  `other`, `time_wait`, and `zero_window_probe`, mapping Linux `/proc/net/tcp*`
+  timer-active values `0..=4`; every other value is `unknown` and retains its
+  unsigned native code. `raw_ticks` is the unsigned hexadecimal `tm->when`
+  value. The estimate is present only when `_SC_CLK_TCK` returns a positive
+  value representable as `u64`; it is
+  `ceil(raw_ticks * 1000 / clock_ticks_per_second)` milliseconds using checked
+  `u128` arithmetic followed by checked conversion to `u64`. Overflow or an
+  unavailable clock rate leaves the estimate null while retaining kind and raw
+  ticks. The estimate has `Estimated` certainty and is never a release-time or
+  future-bindability promise. Non-Linux and UDP sockets have no timer
+  observation in this release.
 - A snapshot records collection start and completion wall-clock times. Monotonic
   time is internal and is used for polling, duration, and retry arithmetic.
 - A snapshot has global owner-attribution completeness of `Complete`, `Partial`,
@@ -331,6 +348,7 @@ authorized security-test target under this plan.
 | Large tables, metadata, labels, or diffs exhaust resources | The Stage 0.7 limits, checked capacity arithmetic, streaming writers, and no retry-until-success | Zero, maximum, and maximum-plus-one tests |
 | Watch accumulates unbounded state or spawns Docker repeatedly | Retain two snapshots and one bounded batch; never invoke Docker in the loop | Long-run and injected-failure tests |
 | Bind probes interfere with one another or leak sockets | Sequential probes, RAII-owned sockets, bind then immediate drop, and no listen/send/receive | Native cleanup and rebind tests |
+| A bind probe transiently denies the endpoint to an unrelated local binder | Keep each sequential RAII socket alive only through option setup and bind-result capture; document that `why` is diagnostic but not side-effect-free | Concurrent controlled-binder QA and help-text review |
 | Shell or argument injection reaches Docker or another executable | No shell; fixed executable plus structured arguments; Docker remains optional evidence | Source-to-sink review and hostile-input tests |
 | PATH substitution changes the Docker executable | PATH resolution is intentional only at proven ordinary privilege; skip when privilege is elevated or uncertain; treat output as non-authoritative and invoke at most once in why | Privilege/PATH unit tests and QA with Docker absent |
 | A special config file, stalled filesystem, or stalled output consumer blocks synchronous I/O | Retain byte/memory caps, stream output without accumulation, and document host-OS backpressure as residual risk | Bounded-reader and early-closing consumer tests |
@@ -338,7 +356,9 @@ authorized security-test target under this plan.
 | Dependency compromise or known unsoundness reaches release artifacts | Locked dependency, advisory applicability review, cargo-deny policy, native builds, and checksum verification | Recorded dependency and artifact review |
 
 Residual risks that must remain documented are polling blind spots between
-snapshots, a successful probe losing a later bind race, unavailable information
+snapshots, a successful probe losing a later bind race, the probe itself briefly
+occupying a successfully bound endpoint and racing another local binder,
+unavailable information
 outside the current namespace or host stack, OS/API behavior that differs across
 versions, a Linux unreadable process sharing a visible socket inode, the private
 Windows Job Object freeze ABI changing semantics, and the remaining macOS
@@ -561,6 +581,7 @@ pub enum Ipv6Scope {
 pub struct SocketObservation {
     pub local_endpoint: EndpointIdentity,
     pub state: SocketState,
+    pub timer: Option<TcpTimerObservation>,
     pub owners: Vec<OwnerObservation>,
     pub owner_completeness: OwnerCompleteness,
     pub socket_token: Option<PlatformSocketToken>,
@@ -822,14 +843,19 @@ Permanent limitations are part of the contract:
   `SynReceived`, `FinWait1`, `FinWait2`, `TimeWait`, `Closed`, `CloseWait`,
   `LastAck`, `Listen`, `Closing`, and `NewSynReceived`; preserve every other
   value as `Unknown(native_code)`.
-- Retain UDP-bound observations.
+- Treat every retained Linux UDP row as the semantic state `Bound`. The `/proc`
+  `st` token remains syntactically required so malformed rows fail, but it is not
+  a portable UDP lifecycle state and no portable UDP lifecycle vocabulary is
+  promised in this release.
 - Preserve socket inode as an optional native token.
 - Parse timer fields with checked, bounded integer conversion.
 - Retain TCP timer kind and raw ticks at capture. Convert to an estimated
-  duration only when `_SC_CLK_TCK` returns a positive representable value. The
-  estimate is quantized and race-prone, applies only to the represented TCP
-  kernel timer, and never promises socket release or future bindability. UDP
-  timer semantics are not promised in this release.
+  duration using the Stage 0.1 typed timer and checked ceiling conversion only
+  when `_SC_CLK_TCK` returns a positive representable value. The estimate is
+  quantized and race-prone, applies only to the represented TCP kernel timer,
+  and never promises socket release or future bindability. Malformed timer kind
+  or tick text fails the collection attempt; an unknown numeric kind remains
+  `unknown(native_code)`. UDP timer semantics are not promised in this release.
 - Read process start ticks from `/proc/<pid>/stat`.
 - Report current network namespace scope.
 - Track denied or vanished FD scans. Claim `NoOwnerObserved` only when the owner
@@ -1036,7 +1062,9 @@ Event kinds:
 
 Rules:
 
-- Changed verified start markers prove process replacement.
+- Changed verified start markers prove process replacement only under the
+  exact-one, complete-single-owner rule below. Other identity changes remain
+  heuristic or silent as that rule specifies.
 - A failed collection emits `collection_gap` and never fabricated releases.
 - Recovery compares against the last valid snapshot.
 - Respawn wording remains heuristic unless identity and parent evidence prove it.
@@ -1099,10 +1127,13 @@ Inject collector, monotonic clock, wall clock, sleeper, cancellation source, and
 writer. Keep only the previous valid snapshot and the current bounded event
 batch. Stream events and discard them after writing.
 
-- Clamp interval to `100ms..=60s`.
+- Reject intervals outside `100ms..=60s`; never silently clamp them.
 - Default interval to `1s`.
 - Run until Ctrl-C when duration is absent. Validate explicit duration in
-  `100ms..=7d` with checked arithmetic.
+  `100ms..=7d` with checked arithmetic. Duration and interval tokens are one
+  unsigned decimal integer followed immediately by exactly one lowercase suffix
+  from `ms`, `s`, `m`, `h`, or `d`. Signs, decimals, whitespace, uppercase
+  suffixes, and compound forms such as `1m30s` are rejected.
 - Allow a budget of three consecutive collection failures after a valid
   baseline. Emit one gap per failure and wait the requested interval before
   retrying. The third consecutive failure exhausts the budget and exits `1`
@@ -1123,6 +1154,12 @@ batch. Stream events and discard them after writing.
 An initial collection failure writes one sanitized diagnostic to stderr, emits
 no baseline or NDJSON record, and exits `1`. After a baseline, every failed poll
 emits and flushes its typed `collection_gap` before retry or termination.
+
+A wall-clock read failure is the exception because a conforming watch record
+cannot fabricate its required observation timestamps. Whether it occurs before
+or after a baseline, write one sanitized stderr diagnostic, emit no NDJSON
+record for that attempt, and exit `1` immediately. It does not consume the
+ordinary three-failure collection budget.
 
 An initial snapshot that is `Raced` or has a `SocketSet` gap is not a valid
 baseline and follows the same no-record exit-`1` behavior.
@@ -1630,6 +1667,13 @@ exactly `[]\n`.
 `list --snapshot-json` is mutually exclusive with `--json` and emits one
 versioned object:
 
+Snapshot mode is a complete within-scope observation, not a legacy visible-row
+projection. It rejects `--port`, `--process`, `--filter`, and `--sort` as invalid
+argument combinations before collection. It ignores
+`hide_system_processes` because hidden display rows must not remove sockets or
+process evidence from a full snapshot. Validated labels still apply because
+they annotate rather than filter observations.
+
 ```text
 {
   schema: "kickoutchi.snapshot",
@@ -1646,6 +1690,14 @@ versioned object:
   sockets: [{
     endpoint: Endpoint,
     state: SocketState,
+    timer: {
+      kind: "none" | "retransmit" | "other" | "time_wait" |
+            "zero_window_probe" | "unknown",
+      native_code: unsigned integer | null,
+      raw_ticks: unsigned integer,
+      estimated_remaining_milliseconds: unsigned integer | null,
+      certainty: "estimated"
+    } | null,
     owners: OwnerSet,
     socket_token: {
       kind: "linux_inode" | "macos_socket_id",

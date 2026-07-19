@@ -41,24 +41,39 @@ use std::io;
 use std::process::ExitCode;
 
 use clap::Parser;
+use clap::error::ErrorKind as ClapErrorKind;
 
 use crate::cli::{Cli, ExitReason};
 use crate::config::Config;
+use crate::display::sanitize_multiline;
 
 /// Run Kickoutchi and hand back the process exit code.
 ///
-/// `Cli::parse` bails out on its own for usage errors (code 2, per our exit
-/// contract) and for `--help`/`--version`, so everything below this line is
-/// already working with validated arguments.
+/// Argument errors are rendered here rather than by clap's process-exiting
+/// helper so untrusted argv text passes through the terminal sanitizer.
 #[must_use]
 pub fn run() -> ExitCode {
     init_tracing();
-    let args = Cli::parse();
+    let args = match Cli::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let rendered = sanitize_multiline(&error.to_string());
+            if matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            ) {
+                print!("{rendered}");
+                return ExitReason::Success.into();
+            }
+            eprint!("{rendered}");
+            return ExitReason::InvalidArguments.into();
+        }
+    };
 
     let mut config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: {error}");
+            eprintln!("error: {}", sanitize_multiline(&error.to_string()));
             return ExitReason::Failure.into();
         }
     };
@@ -90,7 +105,7 @@ fn run_tui(config: &Config) -> ExitCode {
             // also writes to stderr, so logging the same error here would print
             // it twice. Internal diagnostics go through tracing (see the
             // Drop/panic restore path); fatal user-facing output uses eprintln.
-            eprintln!("error: {error}");
+            eprintln!("error: {}", sanitize_multiline(&error.to_string()));
             ExitReason::Failure.into()
         }
     }

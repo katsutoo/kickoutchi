@@ -48,11 +48,21 @@ description = "Run cargo-deny policy checks"
 run = "cargo deny check"
 
 [tasks.check]
-description = "Run the local CI-equivalent checks"
+description = "Run host checks; capability-gated Linux contracts may skip"
 run = [
   "cargo fmt --all --check",
   "cargo clippy --locked --all-targets --all-features -- -D warnings",
   "cargo test --locked --all-features",
+  "cargo deny check",
+]
+
+[tasks.check-linux-gate]
+description = "Run the capability-required Linux CI gate"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --locked --all-targets --all-features -- -D warnings",
+  "KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features",
+  "cargo test --locked --all-features --doc",
   "cargo deny check",
 ]
 

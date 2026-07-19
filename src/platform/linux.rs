@@ -347,6 +347,7 @@ struct SocketRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OwnerScanLoss {
+    EnumerationIncomplete,
     PermissionDenied(u32),
     Disappeared(u32),
     Unattributable(u32),
@@ -417,18 +418,23 @@ fn native_pass_from_records(
     let omitted_evidence_gap_count = owner_scan.omitted_loss_count;
     for loss in owner_scan.losses {
         let (pid, code, message) = match loss {
+            OwnerScanLoss::EnumerationIncomplete => (
+                None,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "process visibility or enumeration was incomplete before socket ownership could be attributed",
+            ),
             OwnerScanLoss::PermissionDenied(pid) => (
-                pid,
+                Some(pid),
                 EvidenceGapCode::OwnerPermissionDenied,
                 "permission denied before the PID's socket ownership could be attributed",
             ),
             OwnerScanLoss::Disappeared(pid) => (
-                pid,
+                Some(pid),
                 EvidenceGapCode::OwnerDisappeared,
                 "PID disappeared before its socket ownership could be attributed",
             ),
             OwnerScanLoss::Unattributable(pid) => (
-                pid,
+                Some(pid),
                 EvidenceGapCode::OwnerAttributionIncomplete,
                 "a PID file-descriptor entry could not be attributed to a socket",
             ),
@@ -438,7 +444,7 @@ fn native_pass_from_records(
             EvidenceImpact::Ownership,
             code,
             None,
-            Some(pid),
+            pid,
             message,
         ));
     }
@@ -588,21 +594,11 @@ fn read_socket_table(path: &Path, optional: bool) -> Result<Option<String>, Coll
 }
 
 fn read_bounded_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
-    let limit = u64::try_from(max_bytes)
-        .expect("/proc read byte limit must fit in u64")
-        .saturating_add(1);
-    let mut text = String::new();
-    File::open(path)?.take(limit).read_to_string(&mut text)?;
-    if text.len() > max_bytes {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("file exceeds {max_bytes} byte read limit"),
-        ));
-    }
-    Ok(text)
+    String::from_utf8(read_bounded_bytes(path, max_bytes)?)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
 }
 
-fn read_bounded_lossy_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+fn read_bounded_bytes(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
     let limit = u64::try_from(max_bytes)
         .expect("/proc read byte limit must fit in u64")
         .saturating_add(1);
@@ -614,6 +610,11 @@ fn read_bounded_lossy_text(path: &Path, max_bytes: usize) -> std::io::Result<Str
             format!("file exceeds {max_bytes} byte read limit"),
         ));
     }
+    Ok(bytes)
+}
+
+fn read_bounded_lossy_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let bytes = read_bounded_bytes(path, max_bytes)?;
     let decoded_len = crate::observation::lossy_utf8_len(&bytes).ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "decoded text length overflow")
     })?;
@@ -778,11 +779,10 @@ fn collect_socket_owners_detailed(
         return Ok(OwnerScanResult::default());
     }
 
-    let pids = process_ids_with_limit(proc_root, max_process_ids).map_err(|source| {
-        CollectorError::Read {
-            path: proc_root.to_path_buf(),
-            source,
-        }
+    let (pids, enumeration_incomplete) = owner_process_ids_with_limit(proc_root, max_process_ids)
+        .map_err(|source| CollectorError::Read {
+        path: proc_root.to_path_buf(),
+        source,
     })?;
 
     // Walk every PID's file descriptors, no early exit. A single listening socket
@@ -799,6 +799,9 @@ fn collect_socket_owners_detailed(
         omitted_loss_count: 0,
         owner_edges: 0,
     };
+    if enumeration_incomplete || proc_visibility_restricted(proc_root) {
+        result.record_loss(OwnerScanLoss::EnumerationIncomplete);
+    }
     let mut fd_entries_visited = 0;
     for pid in pids {
         scan_pid_socket_owners(
@@ -820,7 +823,34 @@ fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
 fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pids.len() >= max_process_ids {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("process list exceeds {max_process_ids} PID cap"),
+            ));
+        }
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+fn owner_process_ids_with_limit(
+    proc_root: &Path,
+    max_process_ids: usize,
+) -> std::io::Result<(Vec<u32>, bool)> {
+    let mut pids = Vec::new();
+    let mut incomplete = false;
+    for entry in fs::read_dir(proc_root)? {
         let Ok(entry) = entry else {
+            incomplete = true;
             continue;
         };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -838,7 +868,30 @@ fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::
         pids.push(pid);
     }
     pids.sort_unstable();
-    Ok(pids)
+    Ok((pids, incomplete))
+}
+
+fn proc_visibility_restricted(proc_root: &Path) -> bool {
+    let Ok(mounts) = read_bounded_text(&proc_root.join("mounts"), MAX_STATUS_BYTES) else {
+        return false;
+    };
+    let proc_root = proc_root.as_os_str().as_bytes();
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next();
+        let mount_point = fields.next();
+        let filesystem = fields.next();
+        let options = fields.next();
+        mount_point.is_some_and(|value| value.as_bytes() == proc_root)
+            && filesystem == Some("proc")
+            && options.is_some_and(|value| {
+                value.split(',').any(|option| {
+                    option
+                        .strip_prefix("hidepid=")
+                        .is_some_and(|mode| mode != "0" && mode != "off")
+                })
+            })
+    })
 }
 
 #[cfg(test)]
@@ -1455,8 +1508,8 @@ fn read_tree_process_name(process_dir: &Path) -> Result<Option<String>, Collecto
 }
 
 fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
-    let text = match read_stat_text(path) {
-        Ok(text) => text,
+    let bytes = match read_stat_bytes(path) {
+        Ok(bytes) => bytes,
         Err(error) if process_vanished(&error) => return Ok(None),
         Err(source) => {
             return Err(CollectorError::Read {
@@ -1470,7 +1523,7 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
     // hole in the member set, exactly like a missing start marker would be a
     // hole in identity verification. Group 0 is the kernel's own group — never
     // a valid target — and maps to "no targetable group" rather than an error.
-    let start_time_marker = parse_process_start_time_ticks(&text)
+    let start_time_marker = parse_process_start_time_ticks(&bytes)
         .and_then(|ticks| {
             ProcessStartMarker::linux(ticks)
                 .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
@@ -1479,7 +1532,7 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
             path: path.to_path_buf(),
             source,
         })?;
-    let Some(process_group) = parse_process_group_id(&text) else {
+    let Some(process_group) = parse_process_group_id(&bytes) else {
         return Err(CollectorError::Read {
             path: path.to_path_buf(),
             source: std::io::Error::new(ErrorKind::InvalidData, "process group is unreadable"),
@@ -1491,19 +1544,15 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
     }))
 }
 
-fn read_stat_text(path: &Path) -> std::io::Result<String> {
-    read_bounded_text(path, MAX_STAT_BYTES)
+fn read_stat_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded_bytes(path, MAX_STAT_BYTES)
 }
 
 /// Process group ID from `/proc/<pid>/stat`: field 5 overall, so the third
 /// token after the `") "` comm terminator (state, ppid, pgrp).
-fn parse_process_group_id(text: &str) -> Option<u32> {
-    let (_before_comm_end, after_comm_end) = text.rsplit_once(") ")?;
-    after_comm_end
-        .split_whitespace()
-        .nth(2)?
-        .parse::<u32>()
-        .ok()
+fn parse_process_group_id(bytes: &[u8]) -> Option<u32> {
+    let value = stat_field(bytes, 2).ok()?;
+    std::str::from_utf8(value).ok()?.parse::<u32>().ok()
 }
 
 fn process_ancestor_pids_from(proc_root: &Path, pid: u32) -> HashSet<u32> {
@@ -1537,28 +1586,38 @@ fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
 }
 
 fn read_process_start_time_ticks(path: &Path) -> std::io::Result<u64> {
-    parse_process_start_time_ticks(&read_bounded_text(path, MAX_STAT_BYTES)?)
+    parse_process_start_time_ticks(&read_bounded_bytes(path, MAX_STAT_BYTES)?)
 }
 
-fn parse_process_start_time_ticks(text: &str) -> std::io::Result<u64> {
+fn parse_process_start_time_ticks(bytes: &[u8]) -> std::io::Result<u64> {
     // `/proc/<pid>/stat` is `pid (comm) state ...`, and comm is an unescaped task
     // name that can itself contain `)` and even `) `. Every field after comm is a
     // single char or an integer and holds no parens, so the *last* `") "` in the
     // line is always the real comm terminator. Splitting from the right is what
     // keeps this robust against a process named e.g. `ev) il`; a first/left split
     // would be fooled by a paren inside comm.
-    let (_before_comm_end, after_comm_end) = text.rsplit_once(") ").ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidData, "missing process-name terminator")
-    })?;
     // Once comm is stripped the fields are 1-indexed from `state` (field 3), so
     // start time (field 22) is the 20th token here — nth(19), zero-indexed.
-    let start_time = after_comm_end
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "missing process start time"))?;
+    let start_time = stat_field(bytes, 19)?;
+    let start_time = std::str::from_utf8(start_time)
+        .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))?;
     start_time
         .parse::<u64>()
         .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))
+}
+
+fn stat_field(bytes: &[u8], index: usize) -> std::io::Result<&[u8]> {
+    let comm_end = bytes
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "missing process-name terminator")
+        })?;
+    bytes[comm_end + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(index)
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "missing process stat field"))
 }
 
 fn parse_process_status(text: &str) -> std::io::Result<ProcessStatus> {
@@ -1674,10 +1733,11 @@ mod tests {
         OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord, append_sorted_owner,
         bounded_scope_identifier, collect_child_processes_from, collect_pid_socket_owners,
         collect_process_context_from, collect_related_process_hints_from, collect_socket_owners,
-        collect_socket_records, collect_tree_process_infos, decode_cmdline,
-        native_pass_from_records, parse_process_group_id, parse_process_start_time_ticks,
-        parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
-        read_bounded_text, read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
+        collect_socket_owners_detailed, collect_socket_records, collect_tree_process_infos,
+        decode_cmdline, native_pass_from_records, parse_process_group_id,
+        parse_process_start_time_ticks, parse_process_status, parse_socket_inode,
+        parse_socket_line, parse_socket_table, proc_visibility_restricted, read_bounded_text,
+        read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
         read_process_metadata_bounded, read_process_status,
     };
     use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
@@ -2197,8 +2257,8 @@ mod tests {
         // Field 5 (pgrp) is the third token after the comm terminator; the
         // right-split keeps a paren-laden comm from shifting it.
         let text = "1234 (node worker) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 0 0 987654\n";
-        assert_eq!(parse_process_group_id(text), Some(4242));
-        assert_eq!(parse_process_group_id("garbage with no comm"), None);
+        assert_eq!(parse_process_group_id(text.as_bytes()), Some(4242));
+        assert_eq!(parse_process_group_id(b"garbage with no comm"), None);
 
         // Group kill derives membership from the group ID, so the snapshot
         // read fails closed: a stat whose group token is unreadable while the
@@ -2237,7 +2297,7 @@ mod tests {
     fn process_start_time_is_read_from_stat_field_22() {
         let text = stat_text(1234, "node worker", 1, 987_654);
 
-        let start_time = parse_process_start_time_ticks(&text)
+        let start_time = parse_process_start_time_ticks(text.as_bytes())
             .expect("valid stat text must expose process start time");
 
         assert_eq!(start_time, 987_654);
@@ -2251,10 +2311,59 @@ mod tests {
         // paren in `ev) il` as the terminator and parse the wrong field.
         let text = stat_text(1234, "ev) il", 1, 987_654);
 
-        let start_time =
-            parse_process_start_time_ticks(&text).expect("paren-laden comm must still parse");
+        let start_time = parse_process_start_time_ticks(text.as_bytes())
+            .expect("paren-laden comm must still parse");
 
         assert_eq!(start_time, 987_654);
+    }
+
+    #[test]
+    fn process_identity_parsing_ignores_non_utf8_comm_bytes() {
+        let text = stat_text(1234, "node", 1, 987_654);
+        let mut bytes = text.into_bytes();
+        let name = bytes
+            .windows(4)
+            .position(|window| window == b"node")
+            .expect("fixture contains comm");
+        bytes[name] = 0xff;
+
+        assert_eq!(
+            parse_process_start_time_ticks(&bytes).expect("numeric tail remains authoritative"),
+            987_654
+        );
+        assert_eq!(parse_process_group_id(&bytes), Some(0));
+
+        let proc_root = temp_proc_root("non-utf8-stat");
+        let stat = proc_root.join("stat");
+        fs::write(&stat, &bytes).expect("non-UTF-8 stat fixture");
+        assert!(super::read_native_process_marker(&stat).is_ok());
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn restricted_proc_visibility_makes_global_ownership_partial() {
+        let proc_root = temp_proc_root("hidepid-owner-scan");
+        fs::write(
+            proc_root.join("mounts"),
+            format!(
+                "proc {} proc rw,nosuid,nodev,hidepid=2 0 0\n",
+                proc_root.display()
+            ),
+        )
+        .expect("mount fixture");
+        assert!(proc_visibility_restricted(&proc_root));
+
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([7]), 4, 4)
+            .expect("restricted empty scan remains evidence");
+        assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
+        let pass = native_pass_from_records(&[], scan).expect("loss is representable");
+        assert!(matches!(
+            pass.owners.global_completeness,
+            OwnerCompleteness::Partial { .. }
+        ));
+        assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
     }
 
     #[test]
