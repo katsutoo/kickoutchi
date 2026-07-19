@@ -2520,7 +2520,7 @@ mod macos {
     }
 
     #[test]
-    fn macos_tree_kill_by_port_removes_root_and_child() {
+    fn macos_tree_kill_by_pid_removes_root_owned_port_and_child() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard { pid: child_pid };
@@ -2532,7 +2532,7 @@ mod macos {
         assert!(stdout(&before).contains(root_pid_text.as_str()));
 
         let killed = kickoutchi_with_stdin(
-            &["kill", "--port", port_text.as_str(), "--tree"],
+            &["kill", "--pid", root_pid_text.as_str(), "--tree"],
             Some("tree\n"),
         );
 
