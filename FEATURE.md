@@ -2410,8 +2410,9 @@ contract.
 Add a non-intrusive notification when a newer Kickoutchi release is available:
 
 - Never block startup on a network request.
-- Check in the background at most once per configured cache interval, initially
-  proposed as 24 hours.
+- Check in the background at most once every seven days. Persist the last attempt
+  so offline or failed checks cannot cause a network request on every startup.
+- When no newer applicable release exists, update the cache and show no message.
 - Show a status notice rather than a modal or forced prompt.
 - Never install an update automatically.
 - Never contaminate normal stdout, legacy JSON, snapshot JSON, or watch NDJSON.
