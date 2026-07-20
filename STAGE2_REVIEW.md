@@ -2,11 +2,11 @@
 
 ## Status
 
-Stage 2 implementation is complete in the current worktree. Linux runtime
-verification, cross-target compilation/linting, security review, test-quality
-review, and the release-mode feasibility measurement pass. The Stage 2 gate
-remains open only for Linux, macOS, and Windows native CI on the exact committed
-implementation SHA; cross-target checks do not replace native execution.
+Stage 2 is complete. Linux runtime verification, native Linux, macOS, and
+Windows CI, security review, test-quality review, and the release-mode
+feasibility measurement pass. Native CI run
+`https://github.com/nuggocto/kickoutchi/actions/runs/29762998321` passed on exact
+implementation commit `1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`.
 
 The implementation baseline is commit
 `93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The optimized benchmark artifact
@@ -84,13 +84,18 @@ git diff --check
 The Linux run passed 437 unit tests, 22 real-binary CLI contracts, and four
 `socket2` contracts. Documentation tests contain no doctests and passed.
 
-Passed cross-target strict Clippy:
+Passed cross-target strict Clippy locally:
 
 ```text
 cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets --all-features -- -D warnings
 cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
 cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings
 ```
+
+GitHub Actions then compiled, linted, and ran the native test suite on Linux,
+macOS, and Windows for exact implementation commit
+`1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`. The same run passed the supply-chain
+job and `cargo deny check`.
 
 Native fixture coverage includes every documented state, unknown states,
 malformed and truncated table data, exact and first-excess bounds, third-attempt
@@ -140,11 +145,8 @@ interleaved baseline/candidate release benchmark remain later gates.
 
 ## QA Verdict
 
-- Linux Stage 2 scope: PASS.
-- macOS and Windows runtime scope: BLOCKED locally by host platform; native CI is
-  required.
+- Linux, macOS, and Windows Stage 2 scope: PASS.
 - Release recommendation: no recommendation. This is an internal implementation
   stage, not a release candidate.
 
-Stage 3 must not begin as a completed gate until native CI passes the collector
-tests on Linux, macOS, and Windows for the exact committed Stage 2 SHA.
+The native collection gate is complete. Stage 3 may proceed.
