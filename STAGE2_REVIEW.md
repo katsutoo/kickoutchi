@@ -9,10 +9,10 @@ remains open only for Linux, macOS, and Windows native CI on the exact committed
 implementation SHA; cross-target checks do not replace native execution.
 
 The implementation baseline is commit
-`90508619e7e39cf7d34b7d9272ce4d5af02759d6`. The optimized benchmark artifact
+`93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The optimized benchmark artifact
 was built from that commit plus the product-source patch identified in the raw
 sample file as
-`947fe196b39c7243095c69fe975d1900baa6308c363c3035cd727664c9a55202`.
+`d42b6c6c28168d6d6b41d934b3d28e68220139f2557ae69e5c4b7ce57bc3072e`.
 
 ## Implemented Contract
 
@@ -110,11 +110,11 @@ and makes no cross-machine performance claim.
 
 - Workload: optimized `target/dist/kick list --json`, which runs full native
   collection and then the legacy projection.
-- Host workload at capture: 606 processes, 3,486 visible descriptor entries,
-  55 native `/proc/net` data rows, and 24 projected JSON rows.
+- Host workload at capture: 608 processes, 3,460 visible descriptor entries,
+  73 native `/proc/net` data rows, and 26 projected JSON rows.
 - Host: AMD Ryzen AI MAX+ 395, 16 cores/32 threads, 62 GiB RAM, Linux
   7.1.3-arch1-2 x86_64, Rust 1.95.0, AC power online.
-- Concurrent load snapshot: 3.19 / 2.66 / 2.65 load average.
+- Concurrent load snapshot: 2.51 / 2.65 / 2.63 load average.
 - Build: `cargo build --locked --profile dist --all-features --bin kickoutchi
   --bin kick`; thin LTO through the repository `dist` profile.
 - Artifact: `target/dist/kick`, 3,246,224 bytes, SHA-256
@@ -123,15 +123,15 @@ and makes no cross-machine performance claim.
   zero failures. Python `time.monotonic_ns()` measures each bounded private
   snapshot of the optimized artifact; latency and RSS workloads were run
   separately.
-- p50: 31.846 ms.
-- p95: 32.324 ms.
-- p99: 32.530 ms.
-- observed maximum: 63.864 ms.
-- Peak RSS: 21,684 KiB from 20 successful independent invocations, measured by
+- p50: 31.962 ms.
+- p95: 32.340 ms.
+- p99: 32.590 ms.
+- observed maximum: 63.777 ms.
+- Peak RSS: 21,764 KiB from 20 successful independent invocations, measured by
   Linux `wait4` accounting through Python `resource.getrusage`.
 - Raw samples: `benchmarks/native-collection-feasibility-2026-07-20.tsv`, 15,271
   bytes, SHA-256
-  `82285f5b8c96814cb2c6b9245e725ee3cc2d70ed3c5508ed4c66cf35f4096b30`.
+  `e71df2abe2c670e8de0fe416e2b5aebe7bccdb63b71ac33b2860030e6b1fe948`.
 
 The observed p99 and maximum remain below the frozen 100 ms minimum watch
 interval. The margin is sufficient for this host workload, so Stage 0 does not

@@ -3153,7 +3153,7 @@ mod tests {
         info.psi.soi_proto = SocketProtocolInfo {
             pri_tcp: TcpSockinfo {
                 tcpsi_ini: in_sockinfo_v4(0, Ipv4Addr::LOCALHOST),
-                tcpsi_state: TSI_S_LISTEN,
+                tcpsi_state: -1,
                 tcpsi_timer: [0; 4],
                 tcpsi_mss: 0,
                 tcpsi_flags: 0,
@@ -3410,7 +3410,7 @@ mod tests {
             Ok(None)
         })
         .expect_err("maximum plus one is rejected before socket filtering");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
         assert_eq!(traversed, 3);
         assert_eq!(socket_reads, 0);
     }
