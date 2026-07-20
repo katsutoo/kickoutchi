@@ -219,7 +219,7 @@ impl PlatformSocketToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code, reason = "Stage 2 constructs the remaining frozen states")]
+#[allow(dead_code, reason = "some native states are host-specific")]
 pub(crate) enum SocketState {
     Closed,
     Listen,
@@ -273,7 +273,7 @@ impl PartialOrd for SocketState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(dead_code, reason = "Stage 2 populates frozen Linux TCP timer values")]
+#[allow(dead_code, reason = "TCP timer kinds are Linux-specific")]
 pub(crate) enum TcpTimerKind {
     None,
     Retransmit,
@@ -283,7 +283,7 @@ pub(crate) enum TcpTimerKind {
     Unknown(u32),
 }
 
-#[allow(dead_code, reason = "Stage 2 maps Linux native timer codes")]
+#[allow(dead_code, reason = "native timer mapping is Linux-specific")]
 impl TcpTimerKind {
     pub(crate) const fn from_linux_native(native_code: u32) -> Self {
         match native_code {
@@ -305,7 +305,7 @@ pub(crate) struct TcpTimerObservation {
     pub(crate) estimated_remaining_milliseconds: Option<u64>,
 }
 
-#[allow(dead_code, reason = "Stage 2 reads Linux native timer fields")]
+#[allow(dead_code, reason = "native timer fields are Linux-specific")]
 impl TcpTimerObservation {
     pub(crate) fn from_linux_native(
         native_code: u32,
@@ -331,7 +331,7 @@ impl TcpTimerObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(dead_code, reason = "some frozen codes are emitted by later stages")]
+#[allow(dead_code, reason = "not every evidence code is emitted on every host")]
 pub(crate) enum EvidenceGapCode {
     OwnerPermissionDenied,
     OwnerAttributionIncomplete,
@@ -447,10 +447,7 @@ pub(crate) enum SnapshotCompleteness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "derived in Stage 1 and consumed by watch in Stage 3"
-)]
+#[allow(dead_code, reason = "derived from snapshots for watch consumers")]
 pub(crate) enum DiffReadiness {
     Unsafe,
     SocketMultiplicityOnly,
@@ -458,7 +455,7 @@ pub(crate) enum DiffReadiness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code, reason = "limitations are host and stage specific")]
+#[allow(dead_code, reason = "limitations are host and capability specific")]
 pub(crate) enum ScopeLimitation {
     OtherNetworkNamespacesExcluded,
     ProcessFirstSocketVisibilityLimited,
@@ -669,10 +666,7 @@ pub(crate) struct PortEntryDescriptor {
 }
 
 impl NetworkSnapshot {
-    #[allow(
-        dead_code,
-        reason = "derived in Stage 1 and consumed by watch in Stage 3"
-    )]
+    #[allow(dead_code, reason = "derived from snapshots for watch consumers")]
     pub(crate) fn diff_readiness(&self, endpoint: &EndpointIdentity) -> DiffReadiness {
         if self.completeness == SnapshotCompleteness::Raced
             || self.omitted_evidence_gap_count != 0
@@ -895,11 +889,35 @@ pub(crate) enum ObservationError {
     ScopeLimitationLimitExceeded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 pub(crate) struct NativeSocketObservation {
     pub(crate) endpoint: EndpointIdentity,
     pub(crate) state: SocketState,
+    pub(crate) timer: Option<TcpTimerObservation>,
     pub(crate) token: Option<PlatformSocketToken>,
+}
+
+impl PartialEq for NativeSocketObservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint && self.state == other.state && self.token == other.token
+    }
+}
+
+impl Eq for NativeSocketObservation {}
+
+impl Ord for NativeSocketObservation {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.endpoint
+            .cmp(&other.endpoint)
+            .then_with(|| self.state.cmp(&other.state))
+            .then_with(|| self.token.cmp(&other.token))
+    }
+}
+
+impl PartialOrd for NativeSocketObservation {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1104,6 +1122,7 @@ fn collect_pass<S: ObservationSource>(
                     &associations.local_completeness[*right],
                 )
             })
+            .then_with(|| sockets[*left].timer.cmp(&sockets[*right].timer))
     });
     let mut socket_slots = sockets.into_iter().map(Some).collect::<Vec<_>>();
     let mut owner_slots = std::mem::take(&mut associations.owners_by_socket)
@@ -1743,7 +1762,7 @@ fn materialize_sockets(
         sockets.push(SocketObservation {
             local_endpoint: native.endpoint.clone(),
             state: native.state,
-            timer: None,
+            timer: native.timer,
             owners,
             owner_completeness: if local_raced {
                 OwnerCompleteness::Raced
@@ -2207,6 +2226,7 @@ mod tests {
         NativeSocketObservation {
             endpoint: endpoint(port),
             state: SocketState::Listen,
+            timer: None,
             token: PlatformSocketToken::linux_inode(u64::from(port)),
         }
     }
@@ -2688,11 +2708,69 @@ mod tests {
     }
 
     #[test]
+    fn timer_changes_do_not_create_socket_races_and_pass_b_is_retained() {
+        let mut pass_a = socket(80);
+        pass_a.timer = Some(TcpTimerObservation::from_linux_native(1, 20, Some(100)));
+        let mut pass_b = pass_a.clone();
+        pass_b.timer = Some(TcpTimerObservation::from_linux_native(1, 10, Some(100)));
+        let mut source = FakeSource::new(vec![
+            Step::Clock(10),
+            Step::Sockets(vec![pass_a]),
+            Step::Owners(owners(&[&[]])),
+            Step::Sockets(vec![pass_b]),
+            Step::Owners(owners(&[&[]])),
+            Step::Clock(20),
+        ]);
+
+        let snapshot = collect_consistent_with_limits(
+            &mut source,
+            scope(),
+            MetadataProfile::Display,
+            limits(1),
+        )
+        .expect("timer-only movement remains a stable socket observation");
+
+        assert_eq!(snapshot.completeness, SnapshotCompleteness::Complete);
+        assert_eq!(
+            snapshot.sockets[0].timer,
+            Some(TcpTimerObservation::from_linux_native(1, 10, Some(100)))
+        );
+    }
+
+    #[test]
+    fn duplicate_timer_rows_have_deterministic_timer_order() {
+        let mut earlier = socket(80);
+        earlier.token = None;
+        earlier.timer = Some(TcpTimerObservation::from_linux_native(1, 20, Some(100)));
+        let mut later = earlier.clone();
+        later.timer = Some(TcpTimerObservation::from_linux_native(1, 10, Some(100)));
+        let mut source = FakeSource::new(stable_steps(vec![earlier, later], &[&[], &[]]));
+
+        let snapshot = collect_consistent_with_limits(
+            &mut source,
+            scope(),
+            MetadataProfile::Display,
+            limits(2),
+        )
+        .expect("duplicate timer rows collect deterministically");
+
+        assert_eq!(
+            snapshot
+                .sockets
+                .iter()
+                .map(|socket| socket.timer.expect("fixture timer").raw_ticks)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
+    }
+
+    #[test]
     fn platform_socket_tokens_survive_collection() {
         let linux = socket(80);
         let macos = NativeSocketObservation {
             endpoint: endpoint(81),
             state: SocketState::Listen,
+            timer: None,
             token: PlatformSocketToken::macos_socket_id(0xCAFE),
         };
         let mut source = FakeSource::new(stable_steps(

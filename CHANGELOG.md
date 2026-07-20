@@ -7,9 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This section tracks implementation of the atomic `1.3.0` feature release in
-`FEATURE.md`. Named endpoints, `watch`, and `why` will not be released separately
-or before every implementation stage and final release gate is complete.
+Named endpoints, `watch`, and `why` are planned to ship together in the atomic
+`1.3.0` release rather than as separately released partial features.
 
 ### Added
 
@@ -47,6 +46,14 @@ or before every implementation stage and final release gate is complete.
 - Froze Linux TCP timer evidence and UDP-bound semantics before full native-state
   collection, and clarified watch interval, clock-failure, replacement, and full
   snapshot filtering contracts.
+- Completed native full-state collection for Linux, macOS, and Windows while
+  preserving the listener/bound-only legacy and destructive projections. Unknown
+  native states retain their numeric code, and Linux snapshots retain typed TCP
+  timer evidence without treating timer movement as socket replacement.
+- Strengthened Darwin ABI validation with exact LP64 layout and offset checks,
+  made process-first enumeration loss explicit socket-set evidence, and added
+  complete raw IP Helper table fixtures for every Windows address-family and
+  protocol combination.
 - Replaced the unreproducible historical README timing table with a checked-in
   release-artifact sampling protocol and documented the exact shipped target
   matrix, configuration, exit codes, checksum limits, and structured-output
@@ -59,7 +66,8 @@ or before every implementation stage and final release gate is complete.
   incomplete procfs PID enumeration now marks global ownership partial instead
   of producing a false complete empty owner set.
 - Destructive authority ignores non-listening TCP states, preserving existing
-  kill semantics when Stage 2 retains established and transitional connections.
+  kill semantics while native snapshots retain established and transitional
+  connections.
 - CLI, config, and startup diagnostics sanitize terminal controls and bidi
   formatting before output. Changed final protection evidence now exits as an
   operational failure while still proving zero signal delivery.

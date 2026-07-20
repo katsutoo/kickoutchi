@@ -554,7 +554,7 @@ mod tests {
     use crate::observation::{
         EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot,
         ObservationError, OwnerCompleteness, OwnerObservation, SnapshotCompleteness,
-        UnverifiedOwnerReason, project_legacy,
+        UnverifiedOwnerReason, project_legacy, project_legacy_pids,
     };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::observation::{NativeObservationPass, ObservationSource};
@@ -752,26 +752,61 @@ mod tests {
         let mut snapshot = FakeCollector
             .collect(MetadataProfile::Display)
             .expect("fake collection succeeds");
-        let mut established = snapshot
+        let template = snapshot
             .sockets
             .iter()
             .find(|socket| socket.local_endpoint.port.get() == 3000)
             .expect("fixture has target listener")
             .clone();
-        established.state = crate::observation::SocketState::Established;
-        established.owner_completeness =
-            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
-                .expect("one reason fits");
-        established.owners = vec![OwnerObservation::UnverifiedPid {
-            pid: 29_999,
-            reason: UnverifiedOwnerReason::PermissionDenied,
-        }];
-        snapshot.sockets.push(established);
+        let non_legacy_states = [
+            crate::observation::SocketState::Closed,
+            crate::observation::SocketState::SynSent,
+            crate::observation::SocketState::SynReceived,
+            crate::observation::SocketState::Established,
+            crate::observation::SocketState::FinWait1,
+            crate::observation::SocketState::FinWait2,
+            crate::observation::SocketState::CloseWait,
+            crate::observation::SocketState::Closing,
+            crate::observation::SocketState::LastAck,
+            crate::observation::SocketState::TimeWait,
+            crate::observation::SocketState::DeleteTcb,
+            crate::observation::SocketState::NewSynReceived,
+            crate::observation::SocketState::Unknown(255),
+        ];
+        for state in non_legacy_states {
+            let mut socket = template.clone();
+            socket.state = state;
+            socket.owner_completeness =
+                OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                    .expect("one reason fits");
+            socket.owners = vec![OwnerObservation::UnverifiedPid {
+                pid: 29_999,
+                reason: UnverifiedOwnerReason::PermissionDenied,
+            }];
+            snapshot.sockets.push(socket);
+        }
 
         let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
-            .expect("established connection cannot invalidate listener authority");
+            .expect("non-legacy states cannot invalidate listener authority");
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|row| row.state == SocketState::Listen));
+        assert!(
+            kill_ports_from_snapshot(&snapshot, Some(29_999), None)
+                .expect("non-legacy states cannot become PID kill targets")
+                .is_empty()
+        );
+        assert!(
+            project_legacy(&snapshot)
+                .expect("legacy projection")
+                .iter()
+                .all(|row| matches!(row.state, SocketState::Listen | SocketState::Bound))
+        );
+        let pids = std::collections::BTreeSet::from([29_999]);
+        assert!(
+            project_legacy_pids(&snapshot, &pids)
+                .expect("PID projection")
+                .is_empty()
+        );
     }
 
     #[test]

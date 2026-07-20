@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -19,10 +19,14 @@ use windows_sys::Wdk::System::Threading::{
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NO_DATA,
-    ERROR_NO_MORE_FILES, ERROR_SUCCESS, FILETIME, INVALID_HANDLE_VALUE, UNICODE_STRING,
+    ERROR_NO_MORE_FILES, ERROR_SUCCESS, FILETIME, INVALID_HANDLE_VALUE, STATUS_BUFFER_OVERFLOW,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE_LISTEN, MIB_TCP6ROW_OWNER_PID,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE_CLOSE_WAIT, MIB_TCP_STATE_CLOSED,
+    MIB_TCP_STATE_CLOSING, MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_FIN_WAIT1,
+    MIB_TCP_STATE_FIN_WAIT2, MIB_TCP_STATE_LAST_ACK, MIB_TCP_STATE_LISTEN, MIB_TCP_STATE_SYN_RCVD,
+    MIB_TCP_STATE_SYN_SENT, MIB_TCP_STATE_TIME_WAIT, MIB_TCP6ROW_OWNER_PID,
     MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
     MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
     UDP_TABLE_OWNER_PID,
@@ -39,7 +43,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::collector::{Collector, CollectorError};
 use crate::diagnostic;
 use crate::model::{
-    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint, SocketState,
+    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint,
 };
 use crate::observation::NativeObservationPass;
 use crate::observation::{
@@ -48,7 +52,7 @@ use crate::observation::{
     NativeSocketObservation, NetworkSnapshot, OPTIONAL_METADATA_MAX_BYTES, ObservationScope,
     ObservationScopeKind, OwnerAssociations, OwnerCompleteness, PROCESS_COMMAND_LINE_MAX_BYTES,
     PROCESS_NAME_MAX_BYTES, ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker,
-    SOCKET_OBSERVATIONS_MAX, ScopeLimitation, UnverifiedOwnerReason,
+    SOCKET_OBSERVATIONS_MAX, ScopeLimitation, SocketState, UnverifiedOwnerReason,
 };
 use crate::tree::TreeProcessInfo;
 
@@ -76,46 +80,47 @@ impl Collector for WindowsCollector {
 
 impl WindowsCollector {
     fn collect_native_pass() -> Result<NativeObservationPass, CollectorError> {
-        let records = collect_socket_records()?;
-        let mut owner_pids = HashSet::new();
-        for record in &records {
-            if !owner_pids.contains(&record.pid) && owner_pids.len() >= CANDIDATE_PROCESS_IDS_MAX {
-                return Err(
-                    crate::observation::ObservationError::ProcessIdentityLimitExceeded.into(),
-                );
-            }
-            owner_pids.insert(record.pid);
-        }
-        let mut sockets = Vec::with_capacity(records.len());
-        let mut owners_by_socket = Vec::with_capacity(records.len());
-        for record in records {
-            sockets.push(NativeSocketObservation {
-                endpoint: crate::observation::EndpointIdentity::new(
-                    record.protocol,
-                    record.local_addr,
-                    u32::from(record.local_port),
-                    record.ipv6_scope,
-                )
-                .map_err(|_| crate::observation::ObservationError::NativeDataMalformed)?,
-                state: match record.state {
-                    SocketState::Listen => crate::observation::SocketState::Listen,
-                    SocketState::Bound => crate::observation::SocketState::Bound,
-                },
-                token: None,
-            });
-            owners_by_socket.push(vec![record.pid]);
-        }
-        Ok(NativeObservationPass {
-            owners: OwnerAssociations {
-                owners_by_socket,
-                local_completeness: vec![OwnerCompleteness::Complete; sockets.len()],
-                global_completeness: OwnerCompleteness::Complete,
-                evidence_gaps: Vec::new(),
-                omitted_evidence_gap_count: 0,
-            },
-            sockets,
-        })
+        native_pass_from_records(collect_socket_records()?)
     }
+}
+
+fn native_pass_from_records(
+    records: Vec<SocketRecord>,
+) -> Result<NativeObservationPass, CollectorError> {
+    let mut owner_pids = HashSet::new();
+    for record in &records {
+        if !owner_pids.contains(&record.pid) && owner_pids.len() >= CANDIDATE_PROCESS_IDS_MAX {
+            return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
+        }
+        owner_pids.insert(record.pid);
+    }
+    let mut sockets = Vec::with_capacity(records.len());
+    let mut owners_by_socket = Vec::with_capacity(records.len());
+    for record in records {
+        sockets.push(NativeSocketObservation {
+            endpoint: crate::observation::EndpointIdentity::new(
+                record.protocol,
+                record.local_addr,
+                u32::from(record.local_port),
+                record.ipv6_scope,
+            )
+            .map_err(|_| crate::observation::ObservationError::NativeDataMalformed)?,
+            state: record.state,
+            timer: None,
+            token: None,
+        });
+        owners_by_socket.push(vec![record.pid]);
+    }
+    Ok(NativeObservationPass {
+        owners: OwnerAssociations {
+            owners_by_socket,
+            local_completeness: vec![OwnerCompleteness::Complete; sockets.len()],
+            global_completeness: OwnerCompleteness::Complete,
+            evidence_gaps: Vec::new(),
+            omitted_evidence_gap_count: 0,
+        },
+        sockets,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,42 +679,79 @@ fn query_process_path(handle: &OwnedHandle, max_bytes: usize) -> Option<PathBuf>
 }
 
 fn query_process_command_line(handle: &OwnedHandle, max_bytes: usize) -> Option<String> {
-    let mut required_bytes = 0u32;
-    unsafe {
-        // SAFETY: the null probe has zero capacity and writes only required_bytes.
+    query_process_command_line_with(max_bytes, |buffer, capacity, required| unsafe {
+        // SAFETY: the caller supplies either a null probe or a writable buffer of
+        // `capacity` bytes, plus a valid required-length output pointer.
         NtQueryInformationProcess(
             handle.as_raw_handle(),
             ProcessCommandLineInformation,
-            std::ptr::null_mut(),
-            0,
-            &raw mut required_bytes,
-        );
-    }
-    let required = usize::try_from(required_bytes).ok()?;
+            buffer,
+            capacity,
+            required,
+        )
+    })
+}
+
+fn query_process_command_line_with(
+    max_bytes: usize,
+    mut query: impl FnMut(*mut c_void, u32, *mut u32) -> i32,
+) -> Option<String> {
     let final_max = max_bytes.min(PROCESS_COMMAND_LINE_MAX_BYTES);
     let native_max = size_of::<UNICODE_STRING>().checked_add(final_max.checked_mul(2)?)?;
-    if required < size_of::<UNICODE_STRING>() || required > native_max {
+    let mut required_bytes = 0u32;
+    let probe_status = query(std::ptr::null_mut(), 0, &raw mut required_bytes);
+    if probe_status >= 0 || !is_resize_status(probe_status) {
         return None;
     }
-    // UNICODE_STRING contains a pointer and therefore needs pointer alignment;
-    // a u16 allocation is not sufficiently aligned on 64-bit Windows.
-    let mut buffer = vec![0_u64; required.div_ceil(size_of::<u64>())];
-    let status = unsafe {
-        // SAFETY: buffer owns required_bytes writable bytes and the API does not
-        // retain either pointer.
-        NtQueryInformationProcess(
-            handle.as_raw_handle(),
-            ProcessCommandLineInformation,
+    for _ in 0..NATIVE_RESIZE_ATTEMPTS_MAX {
+        let required = usize::try_from(required_bytes).ok()?;
+        if required < size_of::<UNICODE_STRING>() || required > native_max {
+            return None;
+        }
+        // UNICODE_STRING contains a pointer and therefore needs pointer
+        // alignment; a u16 allocation is insufficient on 64-bit Windows.
+        let words = required.div_ceil(size_of::<u64>());
+        let mut buffer = Vec::<u64>::new();
+        buffer.try_reserve_exact(words).ok()?;
+        buffer.resize(words, 0);
+        let allocated_bytes = buffer.len().checked_mul(size_of::<u64>())?;
+        let capacity = u32::try_from(allocated_bytes).ok()?;
+        let status = query(
             buffer.as_mut_ptr().cast(),
-            required_bytes,
+            capacity,
             &raw mut required_bytes,
-        )
-    };
-    if status < 0 {
+        );
+        if status >= 0 {
+            let returned_bytes = usize::try_from(required_bytes).ok()?;
+            if returned_bytes < size_of::<UNICODE_STRING>() || returned_bytes > allocated_bytes {
+                return None;
+            }
+            return decode_command_line_buffer(&buffer, returned_bytes, final_max);
+        }
+        if !is_resize_status(status) {
+            return None;
+        }
+    }
+    None
+}
+
+const fn is_resize_status(status: i32) -> bool {
+    status == STATUS_BUFFER_OVERFLOW
+        || status == STATUS_BUFFER_TOO_SMALL
+        || status == STATUS_INFO_LENGTH_MISMATCH
+}
+
+fn decode_command_line_buffer(
+    buffer: &[u64],
+    returned_bytes: usize,
+    final_max: usize,
+) -> Option<String> {
+    if returned_bytes < size_of::<UNICODE_STRING>() {
         return None;
     }
     let unicode = unsafe {
-        // SAFETY: the successful API call initialized the leading UNICODE_STRING.
+        // SAFETY: u64 storage satisfies UNICODE_STRING alignment, and the caller
+        // established that the initialized prefix contains the complete header.
         &*buffer.as_ptr().cast::<UNICODE_STRING>()
     };
     let byte_length = usize::from(unicode.Length);
@@ -719,7 +761,7 @@ fn query_process_command_line(handle: &OwnedHandle, max_bytes: usize) -> Option<
     let buffer_start = buffer.as_ptr() as usize;
     let start = (unicode.Buffer as usize).checked_sub(buffer_start)?;
     let end = start.checked_add(byte_length)?;
-    if start % 2 != 0 || end > buffer.len().checked_mul(size_of::<u64>())? {
+    if start % align_of::<u16>() != 0 || end > returned_bytes {
         return None;
     }
     let code_units = unsafe {
@@ -1076,12 +1118,25 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
     hints
 }
 
+type SocketTableCollector = fn(&mut Vec<SocketRecord>) -> Result<(), CollectorError>;
+const SOCKET_TABLE_COLLECTORS: [SocketTableCollector; 4] = [
+    collect_tcp4_records,
+    collect_tcp6_records,
+    collect_udp4_records,
+    collect_udp6_records,
+];
+
 fn collect_socket_records() -> Result<Vec<SocketRecord>, CollectorError> {
+    collect_socket_records_with(&SOCKET_TABLE_COLLECTORS)
+}
+
+fn collect_socket_records_with(
+    collectors: &[SocketTableCollector],
+) -> Result<Vec<SocketRecord>, CollectorError> {
     let mut records = Vec::new();
-    collect_tcp4_records(&mut records)?;
-    collect_tcp6_records(&mut records)?;
-    collect_udp4_records(&mut records)?;
-    collect_udp6_records(&mut records)?;
+    for collector in collectors {
+        collector(&mut records)?;
+    }
     Ok(records)
 }
 
@@ -1098,13 +1153,7 @@ fn collect_tcp4_records(records: &mut Vec<SocketRecord>) -> Result<(), Collector
             0,
         )
     })?;
-    if table.is_empty() {
-        return Ok(());
-    }
-
-    let rows = tcp4_rows(&table)?;
-    extend_socket_records(records, rows.iter().filter_map(tcp4_record))?;
-    Ok(())
+    append_tcp4_table(records, &table)
 }
 
 fn collect_tcp6_records(records: &mut Vec<SocketRecord>) -> Result<(), CollectorError> {
@@ -1119,13 +1168,7 @@ fn collect_tcp6_records(records: &mut Vec<SocketRecord>) -> Result<(), Collector
             0,
         )
     })?;
-    if table.is_empty() {
-        return Ok(());
-    }
-
-    let rows = tcp6_rows(&table)?;
-    extend_socket_records(records, rows.iter().filter_map(tcp6_record))?;
-    Ok(())
+    append_tcp6_table(records, &table)
 }
 
 fn collect_udp4_records(records: &mut Vec<SocketRecord>) -> Result<(), CollectorError> {
@@ -1133,13 +1176,7 @@ fn collect_udp4_records(records: &mut Vec<SocketRecord>) -> Result<(), Collector
         // SAFETY: IP Helper writes at most `*size` bytes to the caller-owned buffer.
         GetExtendedUdpTable(buffer, size, 0, u32::from(AF_INET), UDP_TABLE_OWNER_PID, 0)
     })?;
-    if table.is_empty() {
-        return Ok(());
-    }
-
-    let rows = udp4_rows(&table)?;
-    extend_socket_records(records, rows.iter().map(udp4_record))?;
-    Ok(())
+    append_udp4_table(records, &table)
 }
 
 fn collect_udp6_records(records: &mut Vec<SocketRecord>) -> Result<(), CollectorError> {
@@ -1147,21 +1184,52 @@ fn collect_udp6_records(records: &mut Vec<SocketRecord>) -> Result<(), Collector
         // SAFETY: see the IPv4 UDP call above; only the address family changes.
         GetExtendedUdpTable(buffer, size, 0, u32::from(AF_INET6), UDP_TABLE_OWNER_PID, 0)
     })?;
+    append_udp6_table(records, &table)
+}
+
+fn append_tcp4_table(records: &mut Vec<SocketRecord>, table: &[u32]) -> Result<(), CollectorError> {
     if table.is_empty() {
         return Ok(());
     }
+    extend_socket_records(records, tcp4_rows(table)?.iter().map(tcp4_record))
+}
 
-    let rows = udp6_rows(&table)?;
-    extend_socket_records(records, rows.iter().map(udp6_record))?;
-    Ok(())
+fn append_tcp6_table(records: &mut Vec<SocketRecord>, table: &[u32]) -> Result<(), CollectorError> {
+    if table.is_empty() {
+        return Ok(());
+    }
+    extend_socket_records(records, tcp6_rows(table)?.iter().map(tcp6_record))
+}
+
+fn append_udp4_table(records: &mut Vec<SocketRecord>, table: &[u32]) -> Result<(), CollectorError> {
+    if table.is_empty() {
+        return Ok(());
+    }
+    extend_socket_records(records, udp4_rows(table)?.iter().map(udp4_record))
+}
+
+fn append_udp6_table(records: &mut Vec<SocketRecord>, table: &[u32]) -> Result<(), CollectorError> {
+    if table.is_empty() {
+        return Ok(());
+    }
+    extend_socket_records(records, udp6_rows(table)?.iter().map(udp6_record))
 }
 
 fn extend_socket_records(
     records: &mut Vec<SocketRecord>,
-    incoming: impl IntoIterator<Item = SocketRecord>,
+    incoming: impl IntoIterator<Item = Result<SocketRecord, CollectorError>>,
+) -> Result<(), CollectorError> {
+    extend_socket_records_with_limit(records, incoming, SOCKET_OBSERVATIONS_MAX)
+}
+
+fn extend_socket_records_with_limit(
+    records: &mut Vec<SocketRecord>,
+    incoming: impl IntoIterator<Item = Result<SocketRecord, CollectorError>>,
+    limit: usize,
 ) -> Result<(), CollectorError> {
     for record in incoming {
-        if records.len() >= SOCKET_OBSERVATIONS_MAX {
+        let record = record?;
+        if records.len() >= limit {
             return Err(
                 crate::observation::ObservationError::SocketObservationLimitExceeded.into(),
             );
@@ -1289,6 +1357,21 @@ fn table_rows<'a, Row>(
     }
 
     let count = usize::try_from(buffer[0]).expect("Windows table row count must fit usize");
+    if count > SOCKET_OBSERVATIONS_MAX {
+        return Err(crate::observation::ObservationError::SocketObservationLimitExceeded.into());
+    }
+    let row_address = (buffer.as_ptr() as usize)
+        .checked_add(row_offset_bytes)
+        .ok_or_else(|| CollectorError::Platform {
+            operation,
+            detail: "table row address overflows usize".to_owned(),
+        })?;
+    if row_offset_bytes < size_of::<u32>() || row_address % align_of::<Row>() != 0 {
+        return Err(CollectorError::Platform {
+            operation,
+            detail: "table row payload is misaligned".to_owned(),
+        });
+    }
     let required = checked_table_byte_len(operation, count, size_of::<Row>(), row_offset_bytes)?;
     if required > buffer_bytes {
         return Err(CollectorError::Platform {
@@ -1330,52 +1413,66 @@ fn checked_table_byte_len(
         })
 }
 
-fn tcp4_record(row: &MIB_TCPROW_OWNER_PID) -> Option<SocketRecord> {
-    (row.dwState == u32::try_from(MIB_TCP_STATE_LISTEN).expect("TCP listen state fits u32")).then(
-        || SocketRecord {
-            protocol: Protocol::Tcp,
-            local_addr: IpAddr::V4(ipv4_addr(row.dwLocalAddr)),
-            local_port: decode_port(row.dwLocalPort),
-            ipv6_scope: None,
-            state: SocketState::Listen,
-            pid: row.dwOwningPid,
-        },
-    )
+fn tcp4_record(row: &MIB_TCPROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    Ok(SocketRecord {
+        protocol: Protocol::Tcp,
+        local_addr: IpAddr::V4(ipv4_addr(row.dwLocalAddr)),
+        local_port: decode_port(row.dwLocalPort)?,
+        ipv6_scope: None,
+        state: mib_tcp_state(row.dwState),
+        pid: row.dwOwningPid,
+    })
 }
 
-fn tcp6_record(row: &MIB_TCP6ROW_OWNER_PID) -> Option<SocketRecord> {
-    (row.dwState == u32::try_from(MIB_TCP_STATE_LISTEN).expect("TCP listen state fits u32")).then(
-        || SocketRecord {
-            protocol: Protocol::Tcp,
-            local_addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
-            local_port: decode_port(row.dwLocalPort),
-            ipv6_scope: Some(ipv6_scope(row.dwLocalScopeId)),
-            state: SocketState::Listen,
-            pid: row.dwOwningPid,
-        },
-    )
+fn tcp6_record(row: &MIB_TCP6ROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    Ok(SocketRecord {
+        protocol: Protocol::Tcp,
+        local_addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+        local_port: decode_port(row.dwLocalPort)?,
+        ipv6_scope: Some(ipv6_scope(row.dwLocalScopeId)),
+        state: mib_tcp_state(row.dwState),
+        pid: row.dwOwningPid,
+    })
 }
 
-fn udp4_record(row: &MIB_UDPROW_OWNER_PID) -> SocketRecord {
-    SocketRecord {
+fn mib_tcp_state(native: u32) -> SocketState {
+    match i32::try_from(native).ok() {
+        Some(MIB_TCP_STATE_CLOSED) => SocketState::Closed,
+        Some(MIB_TCP_STATE_LISTEN) => SocketState::Listen,
+        Some(MIB_TCP_STATE_SYN_SENT) => SocketState::SynSent,
+        Some(MIB_TCP_STATE_SYN_RCVD) => SocketState::SynReceived,
+        Some(MIB_TCP_STATE_ESTAB) => SocketState::Established,
+        Some(MIB_TCP_STATE_FIN_WAIT1) => SocketState::FinWait1,
+        Some(MIB_TCP_STATE_FIN_WAIT2) => SocketState::FinWait2,
+        Some(MIB_TCP_STATE_CLOSE_WAIT) => SocketState::CloseWait,
+        Some(MIB_TCP_STATE_CLOSING) => SocketState::Closing,
+        Some(MIB_TCP_STATE_LAST_ACK) => SocketState::LastAck,
+        Some(MIB_TCP_STATE_TIME_WAIT) => SocketState::TimeWait,
+        Some(MIB_TCP_STATE_DELETE_TCB) => SocketState::DeleteTcb,
+        _ => SocketState::Unknown(native),
+    }
+}
+
+fn udp4_record(row: &MIB_UDPROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    Ok(SocketRecord {
         protocol: Protocol::Udp,
         local_addr: IpAddr::V4(ipv4_addr(row.dwLocalAddr)),
-        local_port: decode_port(row.dwLocalPort),
+        local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope: None,
         state: SocketState::Bound,
         pid: row.dwOwningPid,
-    }
+    })
 }
 
-fn udp6_record(row: &MIB_UDP6ROW_OWNER_PID) -> SocketRecord {
-    SocketRecord {
+fn udp6_record(row: &MIB_UDP6ROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    Ok(SocketRecord {
         protocol: Protocol::Udp,
         local_addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
-        local_port: decode_port(row.dwLocalPort),
+        local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope: Some(ipv6_scope(row.dwLocalScopeId)),
         state: SocketState::Bound,
         pid: row.dwOwningPid,
-    }
+    })
 }
 
 const fn ipv6_scope(scope_id: u32) -> Ipv6Scope {
@@ -1394,10 +1491,16 @@ fn encode_port_for_tests(port: u16) -> u32 {
     u32::from(port.to_be())
 }
 
-fn decode_port(raw: u32) -> u16 {
-    let port =
-        u16::try_from(raw & u32::from(u16::MAX)).expect("masked IP Helper port value must fit u16");
-    u16::from_be(port)
+fn decode_port(raw: u32) -> Result<u16, CollectorError> {
+    // IP Helper documents this DWORD as a network-order port consumed with
+    // ntohs, whose input is the low 16 bits; the upper bits are unspecified.
+    let port = u16::from_be(
+        u16::try_from(raw & u32::from(u16::MAX)).expect("masked IP Helper port value must fit u16"),
+    );
+    if port == 0 {
+        return Err(crate::observation::ObservationError::NativeDataMalformed.into());
+    }
+    Ok(port)
 }
 
 fn windows_api_error(operation: &'static str, code: u32) -> CollectorError {
@@ -1417,21 +1520,143 @@ fn windows_io_error_code(error: &std::io::Error) -> Option<u32> {
 mod tests {
     use super::{
         AcceptedParentEdge, MAX_CHILD_PROCESSES, ProcessApi, ProcessMetadata, ProcessOpenError,
-        ProcessSelection, ProcessSnapshot, accepted_parent_edge, checked_table_byte_len,
-        decode_command_line_utf16, decode_port, encode_port_for_tests, filetime_to_u64,
-        finish_bracketed_metadata, process_read_from_metadata, read_iphelper_table_with,
-        tcp4_record, tcp4_rows, tcp6_record, tcp6_rows, tree_process_infos_from_snapshot_with,
-        udp4_record, udp4_rows, udp6_record, udp6_rows,
+        ProcessSelection, ProcessSnapshot, accepted_parent_edge, append_tcp4_table,
+        append_tcp6_table, append_udp4_table, append_udp6_table, checked_table_byte_len,
+        collect_socket_records_with, decode_command_line_utf16, decode_port, encode_port_for_tests,
+        extend_socket_records_with_limit, filetime_to_u64, finish_bracketed_metadata,
+        mib_tcp_state, native_pass_from_records, process_read_from_metadata,
+        query_process_command_line_with, read_iphelper_table_with, tcp4_record, tcp4_rows,
+        tcp6_record, tcp6_rows, tree_process_infos_from_snapshot_with, udp4_record, udp4_rows,
+        udp6_record, udp6_rows,
     };
     use crate::collector::CollectorError;
-    use crate::model::{Protocol, SocketState};
+    use crate::model::Protocol;
     use crate::observation::{
-        Ipv6Scope, MetadataProfile, ProcessRead, ProcessStartMarker, UnverifiedOwnerReason,
+        Ipv6Scope, MetadataProfile, ObservationScope, ObservationScopeKind, OwnerObservation,
+        ProcessRead, ProcessStartMarker, ScopeLimitation, SocketState, UnverifiedOwnerReason,
     };
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::unnecessary_wraps,
+        reason = "four typed collector seams stay visible in one production-wiring test"
+    )]
+    fn socket_collection_orchestration_runs_all_four_tables_in_order() {
+        fn push_record(
+            records: &mut Vec<super::SocketRecord>,
+            protocol: Protocol,
+            local_addr: IpAddr,
+            local_port: u16,
+            state: SocketState,
+            pid: u32,
+        ) {
+            let ipv6_scope = local_addr.is_ipv6().then_some(Ipv6Scope::Unscoped);
+            records.push(super::SocketRecord {
+                protocol,
+                local_addr,
+                local_port,
+                ipv6_scope,
+                state,
+                pid,
+            });
+        }
+        fn tcp4(records: &mut Vec<super::SocketRecord>) -> Result<(), CollectorError> {
+            push_record(
+                records,
+                Protocol::Tcp,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                3000,
+                SocketState::Listen,
+                1,
+            );
+            Ok(())
+        }
+        fn tcp6(records: &mut Vec<super::SocketRecord>) -> Result<(), CollectorError> {
+            push_record(
+                records,
+                Protocol::Tcp,
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                3001,
+                SocketState::Established,
+                2,
+            );
+            Ok(())
+        }
+        fn udp4(records: &mut Vec<super::SocketRecord>) -> Result<(), CollectorError> {
+            push_record(
+                records,
+                Protocol::Udp,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                3002,
+                SocketState::Bound,
+                3,
+            );
+            Ok(())
+        }
+        fn udp6(records: &mut Vec<super::SocketRecord>) -> Result<(), CollectorError> {
+            push_record(
+                records,
+                Protocol::Udp,
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                3003,
+                SocketState::Bound,
+                4,
+            );
+            Ok(())
+        }
+
+        let records = collect_socket_records_with(&[tcp4, tcp6, udp4, udp6])
+            .expect("all table readers succeed");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.protocol, record.local_port))
+                .collect::<Vec<_>>(),
+            [
+                (Protocol::Tcp, 3000),
+                (Protocol::Tcp, 3001),
+                (Protocol::Udp, 3002),
+                (Protocol::Udp, 3003),
+            ]
+        );
+        assert!(std::ptr::fn_addr_eq(
+            super::SOCKET_TABLE_COLLECTORS[0],
+            super::collect_tcp4_records as super::SocketTableCollector,
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            super::SOCKET_TABLE_COLLECTORS[1],
+            super::collect_tcp6_records as super::SocketTableCollector,
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            super::SOCKET_TABLE_COLLECTORS[2],
+            super::collect_udp4_records as super::SocketTableCollector,
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            super::SOCKET_TABLE_COLLECTORS[3],
+            super::collect_udp6_records as super::SocketTableCollector,
+        ));
+
+        let mut aggregate = vec![records[0]];
+        let error = extend_socket_records_with_limit(
+            &mut aggregate,
+            records[1..3].iter().copied().map(Ok),
+            2,
+        )
+        .expect_err("first row beyond the aggregate limit is refused");
+        assert!(matches!(
+            error,
+            CollectorError::Observation(
+                crate::observation::ObservationError::SocketObservationLimitExceeded
+            )
+        ));
+        assert_eq!(aggregate, records[..2]);
+    }
     use std::path::PathBuf;
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -1550,14 +1775,244 @@ mod tests {
         }
     }
 
+    struct RawTableFixture {
+        storage: Vec<u64>,
+        word_len: usize,
+    }
+
+    impl RawTableFixture {
+        fn words(&self) -> &[u32] {
+            unsafe {
+                // SAFETY: `storage` is initialized u64 memory, hence is aligned
+                // for u32. `word_len` was derived from its initialized byte span.
+                std::slice::from_raw_parts(self.storage.as_ptr().cast::<u32>(), self.word_len)
+            }
+        }
+    }
+
+    fn raw_table_fixture(
+        row_offset: usize,
+        row_size: usize,
+        row_align: usize,
+        write_row: impl FnOnce(*mut u32),
+    ) -> RawTableFixture {
+        assert_eq!(row_offset % size_of::<u32>(), 0);
+        let byte_len = row_offset.checked_add(row_size).unwrap();
+        assert_eq!(byte_len % size_of::<u32>(), 0);
+        let word_len = byte_len / size_of::<u32>();
+        let mut storage = vec![0_u64; byte_len.div_ceil(size_of::<u64>())];
+        let words = storage.as_mut_ptr().cast::<u32>();
+        unsafe {
+            // SAFETY: every concrete table has at least its u32 count header.
+            words.write(1);
+        }
+        let row_words = unsafe {
+            // SAFETY: `row_offset` is u32-aligned and falls within the allocation
+            // sized for the complete concrete row.
+            words.add(row_offset / size_of::<u32>())
+        };
+        assert_eq!((row_words as usize) % row_align, 0);
+        write_row(row_words);
+        RawTableFixture { storage, word_len }
+    }
+
     #[test]
     fn iphelper_zero_row_tables_are_legal() {
         let table = [0_u32];
+        let mut records = Vec::new();
 
         assert!(tcp4_rows(&table).unwrap().is_empty());
         assert!(tcp6_rows(&table).unwrap().is_empty());
         assert!(udp4_rows(&table).unwrap().is_empty());
         assert!(udp6_rows(&table).unwrap().is_empty());
+        append_tcp4_table(&mut records, &table).unwrap();
+        append_tcp6_table(&mut records, &table).unwrap();
+        append_udp4_table(&mut records, &table).unwrap();
+        append_udp6_table(&mut records, &table).unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn raw_tcp4_table_parses_and_converts_complete_row() {
+        let row = MIB_TCPROW_OWNER_PID {
+            dwState: 8,
+            dwLocalAddr: u32::from_ne_bytes([192, 0, 2, 17]),
+            dwLocalPort: encode_port_for_tests(44_321),
+            dwRemoteAddr: 0,
+            dwRemotePort: 0,
+            dwOwningPid: 1_001,
+        };
+        let offset = std::mem::offset_of!(super::MIB_TCPTABLE_OWNER_PID, table);
+        let fixture = raw_table_fixture(
+            offset,
+            size_of::<MIB_TCPROW_OWNER_PID>(),
+            std::mem::align_of::<MIB_TCPROW_OWNER_PID>(),
+            |row_words| unsafe {
+                // SAFETY: the helper checked alignment and reserved one complete
+                // MIB_TCPROW_OWNER_PID at this address.
+                row_words.cast::<MIB_TCPROW_OWNER_PID>().write(row);
+            },
+        );
+
+        let mut records = Vec::new();
+        append_tcp4_table(&mut records, fixture.words()).expect("valid TCPv4 table");
+        let pass = native_pass_from_records(records).expect("valid native pass");
+
+        assert_eq!(pass.sockets.len(), 1);
+        assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Tcp);
+        assert_eq!(
+            pass.sockets[0].endpoint.address,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 17))
+        );
+        assert_eq!(pass.sockets[0].endpoint.port.get(), 44_321);
+        assert_eq!(pass.sockets[0].endpoint.ipv6_scope, None);
+        assert_eq!(pass.sockets[0].state, SocketState::CloseWait);
+        assert_eq!(pass.owners.owners_by_socket, vec![vec![1_001]]);
+        assert!(
+            append_tcp4_table(
+                &mut Vec::new(),
+                &fixture.words()[..fixture.words().len() - 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_tcp6_table_parses_and_converts_complete_row() {
+        let address = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0, 0, 1);
+        let row = MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: address.octets(),
+            dwLocalScopeId: 19,
+            dwLocalPort: encode_port_for_tests(65_535),
+            ucRemoteAddr: [0; 16],
+            dwRemoteScopeId: 0,
+            dwRemotePort: 0,
+            dwState: 11,
+            dwOwningPid: 2_002,
+        };
+        let offset = std::mem::offset_of!(super::MIB_TCP6TABLE_OWNER_PID, table);
+        let fixture = raw_table_fixture(
+            offset,
+            size_of::<MIB_TCP6ROW_OWNER_PID>(),
+            std::mem::align_of::<MIB_TCP6ROW_OWNER_PID>(),
+            |row_words| unsafe {
+                // SAFETY: the helper checked alignment and reserved one complete
+                // MIB_TCP6ROW_OWNER_PID at this address.
+                row_words.cast::<MIB_TCP6ROW_OWNER_PID>().write(row);
+            },
+        );
+
+        let mut records = Vec::new();
+        append_tcp6_table(&mut records, fixture.words()).expect("valid TCPv6 table");
+        let pass = native_pass_from_records(records).expect("valid native pass");
+
+        assert_eq!(pass.sockets.len(), 1);
+        assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Tcp);
+        assert_eq!(pass.sockets[0].endpoint.address, IpAddr::V6(address));
+        assert_eq!(pass.sockets[0].endpoint.port.get(), 65_535);
+        assert_eq!(
+            pass.sockets[0].endpoint.ipv6_scope,
+            Some(Ipv6Scope::InterfaceIndex(
+                std::num::NonZeroU32::new(19).unwrap()
+            ))
+        );
+        assert_eq!(pass.sockets[0].state, SocketState::TimeWait);
+        assert_eq!(pass.owners.owners_by_socket, vec![vec![2_002]]);
+        assert!(
+            append_tcp6_table(
+                &mut Vec::new(),
+                &fixture.words()[..fixture.words().len() - 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_udp4_table_parses_and_converts_complete_row() {
+        let row = MIB_UDPROW_OWNER_PID {
+            dwLocalAddr: u32::from_ne_bytes([198, 51, 100, 23]),
+            dwLocalPort: encode_port_for_tests(53),
+            dwOwningPid: 3_003,
+        };
+        let offset = std::mem::offset_of!(super::MIB_UDPTABLE_OWNER_PID, table);
+        let fixture = raw_table_fixture(
+            offset,
+            size_of::<MIB_UDPROW_OWNER_PID>(),
+            std::mem::align_of::<MIB_UDPROW_OWNER_PID>(),
+            |row_words| unsafe {
+                // SAFETY: the helper checked alignment and reserved one complete
+                // MIB_UDPROW_OWNER_PID at this address.
+                row_words.cast::<MIB_UDPROW_OWNER_PID>().write(row);
+            },
+        );
+
+        let mut records = Vec::new();
+        append_udp4_table(&mut records, fixture.words()).expect("valid UDPv4 table");
+        let pass = native_pass_from_records(records).expect("valid native pass");
+
+        assert_eq!(pass.sockets.len(), 1);
+        assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Udp);
+        assert_eq!(
+            pass.sockets[0].endpoint.address,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23))
+        );
+        assert_eq!(pass.sockets[0].endpoint.port.get(), 53);
+        assert_eq!(pass.sockets[0].endpoint.ipv6_scope, None);
+        assert_eq!(pass.sockets[0].state, SocketState::Bound);
+        assert_eq!(pass.owners.owners_by_socket, vec![vec![3_003]]);
+        assert!(
+            append_udp4_table(
+                &mut Vec::new(),
+                &fixture.words()[..fixture.words().len() - 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_udp6_table_parses_and_converts_complete_row() {
+        let address = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+        let row = MIB_UDP6ROW_OWNER_PID {
+            ucLocalAddr: address.octets(),
+            dwLocalScopeId: 7,
+            dwLocalPort: encode_port_for_tests(5_353),
+            dwOwningPid: 4_004,
+        };
+        let offset = std::mem::offset_of!(super::MIB_UDP6TABLE_OWNER_PID, table);
+        let fixture = raw_table_fixture(
+            offset,
+            size_of::<MIB_UDP6ROW_OWNER_PID>(),
+            std::mem::align_of::<MIB_UDP6ROW_OWNER_PID>(),
+            |row_words| unsafe {
+                // SAFETY: the helper checked alignment and reserved one complete
+                // MIB_UDP6ROW_OWNER_PID at this address.
+                row_words.cast::<MIB_UDP6ROW_OWNER_PID>().write(row);
+            },
+        );
+
+        let mut records = Vec::new();
+        append_udp6_table(&mut records, fixture.words()).expect("valid UDPv6 table");
+        let pass = native_pass_from_records(records).expect("valid native pass");
+
+        assert_eq!(pass.sockets.len(), 1);
+        assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Udp);
+        assert_eq!(pass.sockets[0].endpoint.address, IpAddr::V6(address));
+        assert_eq!(pass.sockets[0].endpoint.port.get(), 5_353);
+        assert_eq!(
+            pass.sockets[0].endpoint.ipv6_scope,
+            Some(Ipv6Scope::InterfaceIndex(
+                std::num::NonZeroU32::new(7).unwrap()
+            ))
+        );
+        assert_eq!(pass.sockets[0].state, SocketState::Bound);
+        assert_eq!(pass.owners.owners_by_socket, vec![vec![4_004]]);
+        assert!(
+            append_udp6_table(
+                &mut Vec::new(),
+                &fixture.words()[..fixture.words().len() - 1]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1692,12 +2147,49 @@ mod tests {
     }
 
     #[test]
+    fn iphelper_rejects_successful_return_length_overclaim() {
+        let mut calls = 0;
+        let result = read_iphelper_table_with(
+            "test",
+            |buffer, size| {
+                calls += 1;
+                unsafe {
+                    // SAFETY: the reader supplies a valid size output pointer.
+                    *size = if buffer.is_null() { 4 } else { 8 };
+                }
+                if buffer.is_null() {
+                    super::ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    super::ERROR_SUCCESS
+                }
+            },
+            |words| vec![0_u32; words],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
     fn table_rows_reject_malicious_count_and_checked_arithmetic_overflow() {
         let malicious = [u32::MAX];
+        assert!(tcp4_rows(&malicious).is_err());
+        assert!(tcp6_rows(&malicious).is_err());
         assert!(udp4_rows(&malicious).is_err());
+        assert!(udp6_rows(&malicious).is_err());
 
         assert!(checked_table_byte_len("test", usize::MAX, 2, 0).is_err());
         assert!(checked_table_byte_len("test", 1, 2, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn all_iphelper_layouts_reject_truncated_one_row_fixtures() {
+        let truncated = [1_u32];
+
+        assert!(tcp4_rows(&truncated).is_err());
+        assert!(tcp6_rows(&truncated).is_err());
+        assert!(udp4_rows(&truncated).is_err());
+        assert!(udp6_rows(&truncated).is_err());
     }
 
     #[test]
@@ -1836,6 +2328,62 @@ mod tests {
             decode_command_line_utf16(&oversized, super::PROCESS_COMMAND_LINE_MAX_BYTES),
             None
         );
+    }
+
+    #[test]
+    fn command_line_native_read_succeeds_after_bounded_resize_retry() {
+        let header = size_of::<super::UNICODE_STRING>();
+        let final_bytes = header + 4;
+        let mut calls = 0;
+        let command_line = query_process_command_line_with(32, |buffer, _capacity, required| {
+            calls += 1;
+            unsafe {
+                // SAFETY: the seam provides a valid required-length pointer and
+                // the successful call provides the requested writable storage.
+                if buffer.is_null() {
+                    *required = u32::try_from(header + 2).unwrap();
+                    return super::STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if calls <= 3 {
+                    *required = u32::try_from(final_bytes).unwrap();
+                    return super::STATUS_BUFFER_TOO_SMALL;
+                }
+                let text = buffer
+                    .cast::<u64>()
+                    .add(header / size_of::<u64>())
+                    .cast::<u16>();
+                text.write(u16::from(b'o'));
+                text.add(1).write(u16::from(b'k'));
+                buffer
+                    .cast::<super::UNICODE_STRING>()
+                    .write(super::UNICODE_STRING {
+                        Length: 4,
+                        MaximumLength: 4,
+                        Buffer: text,
+                    });
+                *required = u32::try_from(final_bytes).unwrap();
+            }
+            0
+        });
+
+        assert_eq!(command_line.as_deref(), Some("ok"));
+        assert_eq!(calls, 4, "one probe plus three data attempts");
+    }
+
+    #[test]
+    fn command_line_native_read_never_makes_a_fourth_data_attempt() {
+        let mut calls = 0;
+        let result = query_process_command_line_with(32, |_buffer, _capacity, required| {
+            calls += 1;
+            unsafe {
+                // SAFETY: the seam provides a valid required-length pointer.
+                *required = u32::try_from(size_of::<super::UNICODE_STRING>() + 2).unwrap();
+            }
+            super::STATUS_INFO_LENGTH_MISMATCH
+        });
+
+        assert_eq!(result, None);
+        assert_eq!(calls, 4, "one probe plus exactly three data attempts");
     }
 
     #[test]
@@ -2024,7 +2572,7 @@ mod tests {
             dwOwningPid: 18422,
         };
 
-        let record = tcp4_record(&row).expect("listen rows are kept");
+        let record = tcp4_record(&row).expect("valid TCP row");
 
         assert_eq!(record.protocol, Protocol::Tcp);
         assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -2034,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp4_non_listen_row_is_ignored() {
+    fn tcp4_non_listen_row_is_retained() {
         let row = MIB_TCPROW_OWNER_PID {
             dwState: 5,
             dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
@@ -2044,7 +2592,10 @@ mod tests {
             dwOwningPid: 18422,
         };
 
-        assert_eq!(tcp4_record(&row), None);
+        assert_eq!(
+            tcp4_record(&row).expect("valid TCP row").state,
+            SocketState::Established
+        );
     }
 
     #[test]
@@ -2060,12 +2611,130 @@ mod tests {
             dwOwningPid: 77,
         };
 
-        let record = tcp6_record(&row).expect("listen rows are kept");
+        let record = tcp6_record(&row).expect("valid TCP row");
 
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 8080);
         assert_eq!(record.ipv6_scope, Some(Ipv6Scope::Unscoped));
         assert_eq!(record.pid, 77);
+    }
+
+    #[test]
+    fn tcp6_row_preserves_nonzero_scope_id() {
+        let row = MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: Ipv6Addr::LOCALHOST.octets(),
+            dwLocalScopeId: u32::MAX,
+            dwLocalPort: encode_port_for_tests(8080),
+            ucRemoteAddr: [0; 16],
+            dwRemoteScopeId: 0,
+            dwRemotePort: 0,
+            dwState: u32::try_from(MIB_TCP_STATE_LISTEN).unwrap(),
+            dwOwningPid: 77,
+        };
+
+        assert_eq!(
+            tcp6_record(&row).expect("valid TCP row").ipv6_scope,
+            Some(Ipv6Scope::InterfaceIndex(
+                std::num::NonZeroU32::new(u32::MAX).unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn every_documented_mib_tcp_state_maps_to_shared_state() {
+        let cases = [
+            (1, SocketState::Closed),
+            (2, SocketState::Listen),
+            (3, SocketState::SynSent),
+            (4, SocketState::SynReceived),
+            (5, SocketState::Established),
+            (6, SocketState::FinWait1),
+            (7, SocketState::FinWait2),
+            (8, SocketState::CloseWait),
+            (9, SocketState::Closing),
+            (10, SocketState::LastAck),
+            (11, SocketState::TimeWait),
+            (12, SocketState::DeleteTcb),
+        ];
+
+        for (native, expected) in cases {
+            assert_eq!(mib_tcp_state(native), expected, "native state {native}");
+        }
+    }
+
+    #[test]
+    fn every_other_mib_tcp_state_preserves_its_native_code() {
+        for native in [0, 13, 100, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(mib_tcp_state(native), SocketState::Unknown(native));
+        }
+    }
+
+    #[test]
+    fn owner_table_row_survives_without_process_enrichment() {
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 443,
+            ipv6_scope: None,
+            state: SocketState::Established,
+            pid: 77,
+        };
+
+        let pass = native_pass_from_records(vec![record]).expect("owner row is authoritative");
+
+        assert_eq!(pass.sockets.len(), 1);
+        assert_eq!(pass.sockets[0].state, SocketState::Established);
+        assert_eq!(pass.sockets[0].timer, None);
+        assert_eq!(pass.owners.owners_by_socket, vec![vec![77]]);
+    }
+
+    #[test]
+    fn owner_table_row_survives_process_identity_failure_in_snapshot() {
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 443,
+            ipv6_scope: None,
+            state: SocketState::Established,
+            pid: 77,
+        };
+        let pass = native_pass_from_records(vec![record]).expect("owner row is authoritative");
+        let scope = ObservationScope::new(
+            ObservationScopeKind::CurrentHostNetworkStack,
+            None,
+            [ScopeLimitation::WslNetworkStackExcluded],
+        )
+        .unwrap();
+
+        let snapshot = crate::collector::collect_native_snapshot(
+            MetadataProfile::Display,
+            scope,
+            |_| Ok(pass.clone()),
+            |pids, _, _| {
+                Ok(pids
+                    .iter()
+                    .copied()
+                    .map(|pid| {
+                        (
+                            pid,
+                            ProcessRead::Unverified(UnverifiedOwnerReason::PermissionDenied),
+                        )
+                    })
+                    .collect())
+            },
+        )
+        .expect("identity failure is row-local");
+
+        assert_eq!(snapshot.sockets.len(), 1);
+        assert_eq!(snapshot.sockets[0].state, SocketState::Established);
+        assert_eq!(
+            snapshot.sockets[0].owners,
+            vec![OwnerObservation::UnverifiedPid {
+                pid: 77,
+                reason: UnverifiedOwnerReason::PermissionDenied,
+            }]
+        );
+        assert!(snapshot.processes.is_empty());
     }
 
     #[test]
@@ -2082,15 +2751,22 @@ mod tests {
             dwOwningPid: 903,
         };
 
-        assert_eq!(udp4_record(&udp4).state, SocketState::Bound);
-        assert_eq!(udp4_record(&udp4).local_port, 5353);
-        assert_eq!(udp6_record(&udp6).state, SocketState::Bound);
-        assert_eq!(udp6_record(&udp6).local_port, 5355);
+        let udp4 = udp4_record(&udp4).expect("valid UDP row");
+        let udp6 = udp6_record(&udp6).expect("valid UDP row");
+        assert_eq!(udp4.state, SocketState::Bound);
+        assert_eq!(udp4.local_port, 5353);
+        assert_eq!(udp6.state, SocketState::Bound);
+        assert_eq!(udp6.local_port, 5355);
     }
 
     #[test]
-    fn port_decoding_ignores_unused_high_bits() {
-        assert_eq!(decode_port(0xDEAD_0000 | encode_port_for_tests(3000)), 3000);
+    fn port_decoding_uses_documented_low_word_and_rejects_zero() {
+        assert_eq!(decode_port(encode_port_for_tests(3000)).unwrap(), 3000);
+        assert_eq!(
+            decode_port(0xDEAD_0000 | encode_port_for_tests(3000)).unwrap(),
+            3000
+        );
+        assert!(decode_port(0).is_err());
     }
 
     #[test]

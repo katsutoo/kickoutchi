@@ -923,14 +923,14 @@ retains all states for watch and why.
 
 ### Stage 2 gate
 
-- [ ] All native values map to a shared state or `Unknown(native_code)`.
-- [ ] All unsafe code has reviewed safety contracts.
-- [ ] Permission and scope gaps remain visible.
-- [ ] Native fixture tests cover every documented state and malformed tables.
-- [ ] Every platform enforces process-metadata limits before allocation; Windows
+- [x] All native values map to a shared state or `Unknown(native_code)`.
+- [x] All unsafe code has reviewed safety contracts.
+- [x] Permission and scope gaps remain visible.
+- [x] Native fixture tests cover every documented state and malformed tables.
+- [x] Every platform enforces process-metadata limits before allocation; Windows
       uses its bounded native replacement.
 - [ ] Linux, macOS, and Windows CI compile and run their collector tests.
-- [ ] Release-mode feasibility measurements confirm the 100 ms watch minimum or
+- [x] Release-mode feasibility measurements confirm the 100 ms watch minimum or
       Stage 0 is reopened before named endpoints and public commands begin.
 
 ## Stage 3: Implement Named Endpoints

@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::collector::{Collector, CollectorError};
 use crate::diagnostic;
 use crate::model::{
-    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint, SocketState,
+    ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint,
 };
 use crate::observation::{
     CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EndpointIdentity, EvidenceGap,
@@ -28,7 +28,7 @@ use crate::observation::{
     OwnerCompleteness, PROCESS_NAME_MAX_BYTES, PlatformSocketToken, ProcessIdentity,
     ProcessObservation, ProcessRead, ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES,
     ScopeLimitation, SnapshotCompleteness, SocketState as ObservationSocketState,
-    UnverifiedOwnerReason,
+    TcpTimerObservation, UnverifiedOwnerReason,
 };
 use crate::process::{
     TreeDeliveryHandle, tree_cont, tree_cont_handle, tree_deliver_handle,
@@ -38,14 +38,13 @@ use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
 
 const PROC_ROOT: &str = "/proc";
-const TCP_LISTEN_STATE: &str = "0A";
 // `/proc/net/{tcp,udp}{,6}` is one row per socket and read on every refresh, so
 // it's bounded like every other /proc read here. The cap is deliberately generous
 // (~100k sockets), but a socket table is the one /proc file we must not silently
 // truncate: dropping bytes drops whole socket rows, i.e. real open ports. So
 // `read_bounded_text` fails closed past this cap — the scan surfaces a clear
 // error instead of a short, misleading table.
-const MAX_CMDLINE_BYTES: usize = 16 * 1024;
+const MAX_CMDLINE_BYTES: usize = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
 // `/proc/<pid>/status` and `/proc/<pid>/stat` are kernel-generated and read
 // on every refresh, so they are bounded like every other /proc read here —
 // and the reads fail closed past the cap rather than silently truncating,
@@ -144,26 +143,47 @@ impl Collector for LinuxCollector {
             |_profile| self.collect_native_pass(),
             |pids, profile, remaining| self.read_native_processes(pids, profile, remaining),
         )?;
-        if scope_read_failed {
-            let gap = EvidenceGap::new(
-                EvidenceImpact::Scope,
-                EvidenceGapCode::NativeFieldUnavailable,
-                None,
-                None,
-                "current network namespace identifier is unavailable",
+        if snapshot
+            .sockets
+            .iter()
+            .any(|socket| socket.local_endpoint.ipv6_scope == Some(Ipv6Scope::Unavailable))
+        {
+            push_snapshot_gap(
+                &mut snapshot,
+                EvidenceGap::new(
+                    EvidenceImpact::Scope,
+                    EvidenceGapCode::NativeFieldUnavailable,
+                    None,
+                    None,
+                    "IPv6 scope identifiers are unavailable from Linux procfs socket rows",
+                ),
             );
-            if snapshot.evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
-                snapshot.evidence_gaps.push(gap);
-                snapshot.evidence_gaps.sort();
-            } else {
-                snapshot.omitted_evidence_gap_count =
-                    snapshot.omitted_evidence_gap_count.saturating_add(1);
-            }
-            if snapshot.completeness != SnapshotCompleteness::Raced {
-                snapshot.completeness = SnapshotCompleteness::Partial;
-            }
+        }
+        if scope_read_failed {
+            push_snapshot_gap(
+                &mut snapshot,
+                EvidenceGap::new(
+                    EvidenceImpact::Scope,
+                    EvidenceGapCode::NativeFieldUnavailable,
+                    None,
+                    None,
+                    "current network namespace identifier is unavailable",
+                ),
+            );
         }
         Ok(snapshot)
+    }
+}
+
+fn push_snapshot_gap(snapshot: &mut NetworkSnapshot, gap: EvidenceGap) {
+    if snapshot.evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+        snapshot.evidence_gaps.push(gap);
+        snapshot.evidence_gaps.sort();
+    } else {
+        snapshot.omitted_evidence_gap_count = snapshot.omitted_evidence_gap_count.saturating_add(1);
+    }
+    if snapshot.completeness != SnapshotCompleteness::Raced {
+        snapshot.completeness = SnapshotCompleteness::Partial;
     }
 }
 
@@ -201,14 +221,22 @@ impl LinuxCollector {
             self.limits.process_ids,
             self.limits.fd_entries,
         )?;
-        let projected_rows = records.iter().try_fold(0usize, |count, record| {
-            count.checked_add(
-                owner_scan
-                    .owners
-                    .get(&record.inode)
-                    .map_or(1, |owners| owners.len().max(1)),
-            )
-        });
+        let projected_rows = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    ObservationSocketState::Listen | ObservationSocketState::Bound
+                )
+            })
+            .try_fold(0usize, |count, record| {
+                count.checked_add(
+                    owner_scan
+                        .owners
+                        .get(&record.inode)
+                        .map_or(1, |owners| owners.len().max(1)),
+                )
+            });
         if projected_rows.is_none_or(|count| count > self.limits.port_entries) {
             return Err(resource_cap_error(
                 &self.proc_root,
@@ -341,7 +369,8 @@ struct SocketRecord {
     protocol: Protocol,
     local_addr: IpAddr,
     local_port: u16,
-    state: SocketState,
+    state: ObservationSocketState,
+    timer: Option<TcpTimerObservation>,
     inode: u64,
 }
 
@@ -398,10 +427,8 @@ fn native_pass_from_records(
         })?;
         sockets.push(NativeSocketObservation {
             endpoint,
-            state: match record.state {
-                SocketState::Listen => ObservationSocketState::Listen,
-                SocketState::Bound => ObservationSocketState::Bound,
-            },
+            state: record.state,
+            timer: record.timer,
             token: PlatformSocketToken::linux_inode(record.inode),
         });
         owners_by_socket.push(
@@ -415,7 +442,7 @@ fn native_pass_from_records(
 
     let mut reasons = BTreeSet::new();
     let mut evidence_gaps = Vec::with_capacity(owner_scan.losses.len());
-    let omitted_evidence_gap_count = owner_scan.omitted_loss_count;
+    let mut omitted_evidence_gap_count = owner_scan.omitted_loss_count;
     for loss in owner_scan.losses {
         let (pid, code, message) = match loss {
             OwnerScanLoss::EnumerationIncomplete => (
@@ -440,13 +467,12 @@ fn native_pass_from_records(
             ),
         };
         reasons.insert(code);
-        evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::Ownership,
-            code,
-            None,
-            pid,
-            message,
-        ));
+        let gap = EvidenceGap::new(EvidenceImpact::Ownership, code, None, pid, message);
+        if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+            evidence_gaps.push(gap);
+        } else {
+            omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
+        }
     }
     let global_completeness = OwnerCompleteness::partial(reasons)?;
     // PID/fd traversal losses have no endpoint provenance. They reduce only
@@ -479,8 +505,14 @@ enum SocketParseError {
     InvalidIpv6Address { value: String },
     #[error("invalid port {value}")]
     InvalidPort { value: String },
+    #[error("invalid socket state {value}")]
+    InvalidState { value: String },
+    #[error("invalid TCP timer {value}")]
+    InvalidTcpTimer { value: String },
     #[error("invalid inode {value}")]
     InvalidInode { value: String },
+    #[error("socket observation limit exceeded")]
+    SocketObservationLimitExceeded,
 }
 
 #[derive(Debug, Default)]
@@ -529,6 +561,7 @@ fn collect_socket_records_bounded(
     proc_root: &Path,
     max_records: usize,
 ) -> Result<Vec<SocketRecord>, CollectorError> {
+    let clock_ticks_per_second = linux_clock_ticks_per_second();
     let tables = [
         SocketTable {
             relative_path: "net/tcp",
@@ -562,13 +595,23 @@ fn collect_socket_records_bounded(
         let Some(text) = read_socket_table(&path, table.optional)? else {
             continue;
         };
-        let parsed =
-            parse_socket_table(&text, table.protocol, table.address_family).map_err(|error| {
-                CollectorError::Read {
-                    path: path.clone(),
-                    source: std::io::Error::new(ErrorKind::InvalidData, error),
-                }
-            })?;
+        let remaining = max_records.saturating_sub(records.len());
+        let parsed = parse_socket_table(
+            &text,
+            table.protocol,
+            table.address_family,
+            clock_ticks_per_second,
+            remaining,
+        )
+        .map_err(|error| match error {
+            SocketParseError::SocketObservationLimitExceeded => CollectorError::Observation(
+                crate::observation::ObservationError::SocketObservationLimitExceeded,
+            ),
+            error => CollectorError::Read {
+                path: path.clone(),
+                source: std::io::Error::new(ErrorKind::InvalidData, error),
+            },
+        })?;
         for record in parsed {
             if records.len() >= max_records {
                 return Err(resource_cap_error(
@@ -633,13 +676,18 @@ fn parse_socket_table(
     text: &str,
     protocol: Protocol,
     address_family: AddressFamily,
+    clock_ticks_per_second: Option<u64>,
+    max_records: usize,
 ) -> Result<Vec<SocketRecord>, SocketParseError> {
     let mut records = Vec::new();
     for (line_index, line) in text.lines().enumerate().skip(1) {
         if line.trim().is_empty() {
             continue;
         }
-        match parse_socket_line(line, protocol, address_family) {
+        if records.len() >= max_records {
+            return Err(SocketParseError::SocketObservationLimitExceeded);
+        }
+        match parse_socket_line(line, protocol, address_family, clock_ticks_per_second) {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(error) => {
@@ -655,16 +703,38 @@ fn parse_socket_line(
     line: &str,
     protocol: Protocol,
     address_family: AddressFamily,
+    clock_ticks_per_second: Option<u64>,
 ) -> Result<Option<SocketRecord>, SocketParseError> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let local = *fields.get(1).ok_or(SocketParseError::MissingField {
+    let mut fields = line.split_whitespace();
+    let _slot = fields
+        .next()
+        .ok_or(SocketParseError::MissingField { field: "sl" })?;
+    let local = fields.next().ok_or(SocketParseError::MissingField {
         field: "local_address",
     })?;
-    let state_hex = *fields
-        .get(3)
+    let _remote = fields.next().ok_or(SocketParseError::MissingField {
+        field: "remote_address",
+    })?;
+    let state_hex = fields
+        .next()
         .ok_or(SocketParseError::MissingField { field: "st" })?;
-    let inode_hex = *fields
-        .get(9)
+    let _queues = fields.next().ok_or(SocketParseError::MissingField {
+        field: "tx_queue:rx_queue",
+    })?;
+    let timer_text = fields.next().ok_or(SocketParseError::MissingField {
+        field: "tr:tm->when",
+    })?;
+    let _retransmits = fields
+        .next()
+        .ok_or(SocketParseError::MissingField { field: "retrnsmt" })?;
+    let _uid = fields
+        .next()
+        .ok_or(SocketParseError::MissingField { field: "uid" })?;
+    let _timeout = fields
+        .next()
+        .ok_or(SocketParseError::MissingField { field: "timeout" })?;
+    let inode_hex = fields
+        .next()
         .ok_or(SocketParseError::MissingField { field: "inode" })?;
 
     let (addr_hex, port_hex) =
@@ -683,12 +753,17 @@ fn parse_socket_line(
         .map_err(|_| SocketParseError::InvalidInode {
             value: inode_hex.to_owned(),
         })?;
-    if protocol == Protocol::Tcp && state_hex != TCP_LISTEN_STATE {
-        return Ok(None);
-    }
+    let native_state =
+        u32::from_str_radix(state_hex, 16).map_err(|_| SocketParseError::InvalidState {
+            value: state_hex.to_owned(),
+        })?;
     let state = match protocol {
-        Protocol::Tcp => SocketState::Listen,
-        Protocol::Udp => SocketState::Bound,
+        Protocol::Tcp => linux_tcp_state(native_state),
+        Protocol::Udp => ObservationSocketState::Bound,
+    };
+    let timer = match protocol {
+        Protocol::Tcp => Some(parse_tcp_timer(timer_text, clock_ticks_per_second)?),
+        Protocol::Udp => None,
     };
 
     Ok(Some(SocketRecord {
@@ -696,8 +771,59 @@ fn parse_socket_line(
         local_addr,
         local_port,
         state,
+        timer,
         inode,
     }))
+}
+
+const fn linux_tcp_state(native_state: u32) -> ObservationSocketState {
+    match native_state {
+        0x01 => ObservationSocketState::Established,
+        0x02 => ObservationSocketState::SynSent,
+        0x03 => ObservationSocketState::SynReceived,
+        0x04 => ObservationSocketState::FinWait1,
+        0x05 => ObservationSocketState::FinWait2,
+        0x06 => ObservationSocketState::TimeWait,
+        0x07 => ObservationSocketState::Closed,
+        0x08 => ObservationSocketState::CloseWait,
+        0x09 => ObservationSocketState::LastAck,
+        0x0A => ObservationSocketState::Listen,
+        0x0B => ObservationSocketState::Closing,
+        0x0C => ObservationSocketState::NewSynReceived,
+        code => ObservationSocketState::Unknown(code),
+    }
+}
+
+fn parse_tcp_timer(
+    value: &str,
+    clock_ticks_per_second: Option<u64>,
+) -> Result<TcpTimerObservation, SocketParseError> {
+    let (kind, raw_ticks) =
+        value
+            .split_once(':')
+            .ok_or_else(|| SocketParseError::InvalidTcpTimer {
+                value: value.to_owned(),
+            })?;
+    let native_code =
+        u32::from_str_radix(kind, 16).map_err(|_| SocketParseError::InvalidTcpTimer {
+            value: value.to_owned(),
+        })?;
+    let raw_ticks =
+        u64::from_str_radix(raw_ticks, 16).map_err(|_| SocketParseError::InvalidTcpTimer {
+            value: value.to_owned(),
+        })?;
+    Ok(TcpTimerObservation::from_linux_native(
+        native_code,
+        raw_ticks,
+        clock_ticks_per_second,
+    ))
+}
+
+fn linux_clock_ticks_per_second() -> Option<u64> {
+    // SAFETY: sysconf reads process-global configuration for a valid constant and
+    // does not dereference pointers or retain caller-owned memory.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(ticks).ok().filter(|ticks| *ticks != 0)
 }
 
 fn decode_addr(hex: &str, address_family: AddressFamily) -> Result<IpAddr, SocketParseError> {
@@ -1737,15 +1863,15 @@ mod tests {
         decode_cmdline, native_pass_from_records, parse_process_group_id,
         parse_process_start_time_ticks, parse_process_status, parse_socket_inode,
         parse_socket_line, parse_socket_table, proc_visibility_restricted, read_bounded_text,
-        read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
+        read_cmdline, read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
         read_process_metadata_bounded, read_process_status,
     };
-    use crate::model::{PermissionStatus, Platform, Protocol, SocketState};
+    use crate::model::{PermissionStatus, Platform, Protocol};
     use crate::observation::{
         CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EvidenceGapCode, EvidenceImpact,
         FILE_DESCRIPTOR_ENTRIES_MAX, OwnerCompleteness, PROCESS_NAME_MAX_BYTES,
-        PlatformSocketToken, SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness,
-        UnverifiedOwnerReason,
+        PlatformSocketToken, SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness, SocketState,
+        TcpTimerKind, UnverifiedOwnerReason,
     };
 
     #[test]
@@ -1806,8 +1932,12 @@ mod tests {
         "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
 
     fn row(local: &str, state: &str, inode: u64) -> String {
+        row_with_timer(local, state, "00:00000000", inode)
+    }
+
+    fn row_with_timer(local: &str, state: &str, timer: &str, inode: u64) -> String {
         format!(
-            "   0: {local} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000 1000 0 {inode} 1 0000000000000000 100 0 0 10 0"
+            "   0: {local} 00000000:0000 {state} 00000000:00000000 {timer} 00000000 1000 0 {inode} 1 0000000000000000 100 0 0 10 0"
         )
     }
 
@@ -1922,6 +2052,7 @@ mod tests {
             &row("0100007F:0BB8", "0A", 12_345),
             Protocol::Tcp,
             AddressFamily::Ipv4,
+            Some(100),
         )
         .expect("valid row")
         .expect("listen row is kept");
@@ -1934,15 +2065,35 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_listening_tcp_rows() {
-        let record = parse_socket_line(
-            &row("0100007F:0BB8", "01", 12_345),
-            Protocol::Tcp,
-            AddressFamily::Ipv4,
-        )
-        .expect("valid row");
+    fn retains_and_maps_every_linux_tcp_state_and_unknown_codes() {
+        let cases = [
+            ("01", SocketState::Established),
+            ("02", SocketState::SynSent),
+            ("03", SocketState::SynReceived),
+            ("04", SocketState::FinWait1),
+            ("05", SocketState::FinWait2),
+            ("06", SocketState::TimeWait),
+            ("07", SocketState::Closed),
+            ("08", SocketState::CloseWait),
+            ("09", SocketState::LastAck),
+            ("0A", SocketState::Listen),
+            ("0B", SocketState::Closing),
+            ("0C", SocketState::NewSynReceived),
+            ("00", SocketState::Unknown(0)),
+            ("FFFFFFFF", SocketState::Unknown(u32::MAX)),
+        ];
 
-        assert_eq!(record, None);
+        for (native, expected) in cases {
+            let record = parse_socket_line(
+                &row("0100007F:0BB8", native, 12_345),
+                Protocol::Tcp,
+                AddressFamily::Ipv4,
+                Some(100),
+            )
+            .expect("numeric TCP state is valid")
+            .expect("every TCP state is retained");
+            assert_eq!(record.state, expected, "native state {native}");
+        }
     }
 
     #[test]
@@ -1951,6 +2102,7 @@ mod tests {
             &row("00000000:14E9", "07", 902),
             Protocol::Udp,
             AddressFamily::Ipv4,
+            Some(100),
         )
         .expect("valid row")
         .expect("udp row is kept");
@@ -1959,6 +2111,92 @@ mod tests {
         assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(record.local_port, 5353);
         assert_eq!(record.state, SocketState::Bound);
+        assert_eq!(record.timer, None);
+    }
+
+    #[test]
+    fn rejects_malformed_or_out_of_range_udp_state() {
+        for state in ["not-hex", "100000000"] {
+            let error = parse_socket_line(
+                &row("00000000:14E9", state, 902),
+                Protocol::Udp,
+                AddressFamily::Ipv4,
+                Some(100),
+            )
+            .expect_err("UDP st must be bounded hexadecimal");
+            assert_eq!(
+                error,
+                SocketParseError::InvalidState {
+                    value: state.to_owned()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parses_known_and_unknown_tcp_timers_with_checked_estimates() {
+        let known = [
+            ("00", TcpTimerKind::None),
+            ("01", TcpTimerKind::Retransmit),
+            ("02", TcpTimerKind::Other),
+            ("03", TcpTimerKind::TimeWait),
+            ("04", TcpTimerKind::ZeroWindowProbe),
+        ];
+        for (native, expected_kind) in known {
+            let record = parse_socket_line(
+                &row_with_timer("0100007F:0BB8", "01", &format!("{native}:00000001"), 7),
+                Protocol::Tcp,
+                AddressFamily::Ipv4,
+                Some(3),
+            )
+            .expect("known timer parses")
+            .expect("TCP row is retained");
+            let timer = record.timer.expect("TCP rows carry timer evidence");
+            assert_eq!(timer.kind, expected_kind);
+            assert_eq!(timer.native_code, None);
+            assert_eq!(timer.raw_ticks, 1);
+            assert_eq!(timer.estimated_remaining_milliseconds, Some(334));
+        }
+
+        let unknown = parse_socket_line(
+            &row_with_timer("0100007F:0BB8", "01", "FFFFFFFF:0000000A", 7),
+            Protocol::Tcp,
+            AddressFamily::Ipv4,
+            None,
+        )
+        .expect("bounded unknown timer parses")
+        .expect("TCP row is retained")
+        .timer
+        .expect("TCP rows carry timer evidence");
+        assert_eq!(unknown.kind, TcpTimerKind::Unknown(u32::MAX));
+        assert_eq!(unknown.native_code, Some(u32::MAX));
+        assert_eq!(unknown.raw_ticks, 10);
+        assert_eq!(unknown.estimated_remaining_milliseconds, None);
+    }
+
+    #[test]
+    fn rejects_malformed_or_out_of_range_tcp_timer_fields() {
+        for timer in [
+            "00",
+            "x:00000001",
+            "100000000:00000001",
+            "00:x",
+            "00:10000000000000000",
+        ] {
+            let error = parse_socket_line(
+                &row_with_timer("0100007F:0BB8", "01", timer, 7),
+                Protocol::Tcp,
+                AddressFamily::Ipv4,
+                Some(100),
+            )
+            .expect_err("malformed timer text must fail the table");
+            assert_eq!(
+                error,
+                SocketParseError::InvalidTcpTimer {
+                    value: timer.to_owned()
+                }
+            );
+        }
     }
 
     #[test]
@@ -1967,6 +2205,7 @@ mod tests {
             &row("00000000000000000000000001000000:1F90", "0A", 55),
             Protocol::Tcp,
             AddressFamily::Ipv6,
+            Some(100),
         )
         .expect("valid row")
         .expect("listen row is kept");
@@ -1981,6 +2220,7 @@ mod tests {
             &row("0000000000000000FFFF00000100007F:0BB8", "0A", 55),
             Protocol::Tcp,
             AddressFamily::Ipv6,
+            Some(100),
         )
         .expect("valid row")
         .expect("listen row is kept");
@@ -2015,7 +2255,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_rows_with_specific_errors() {
-        let missing = parse_socket_line("0:", Protocol::Tcp, AddressFamily::Ipv4)
+        let missing = parse_socket_line("0:", Protocol::Tcp, AddressFamily::Ipv4, Some(100))
             .expect_err("missing fields must be rejected");
         assert_eq!(
             missing,
@@ -2028,6 +2268,7 @@ mod tests {
             &row("not-an-address", "0A", 1),
             Protocol::Tcp,
             AddressFamily::Ipv4,
+            Some(100),
         )
         .expect_err("missing address separator must be rejected");
         assert_eq!(
@@ -2041,6 +2282,7 @@ mod tests {
             &row("0100007F:ZZZZ", "0A", 1),
             Protocol::Tcp,
             AddressFamily::Ipv4,
+            Some(100),
         )
         .expect_err("bad port must be rejected");
         assert_eq!(
@@ -2058,10 +2300,27 @@ mod tests {
             row("0100007F:0BB8", "0A", 1),
             row("0100007F:1770", "01", 2),
         );
-        let error = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4)
+        let error = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 8)
             .expect_err("an authoritative table with a malformed row must fail");
 
         assert!(matches!(error, SocketParseError::MissingField { .. }));
+    }
+
+    #[test]
+    fn table_parser_refuses_the_first_row_past_its_retention_limit() {
+        let text = format!(
+            "{HEADER}\n{}\n{}\n",
+            row("0100007F:0BB8", "0A", 1),
+            row("0100007F:1770", "01", 2),
+        );
+        let exact = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 2)
+            .expect("exact socket retention limit is accepted");
+        assert_eq!(exact.len(), 2);
+
+        assert_eq!(
+            parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 1,),
+            Err(SocketParseError::SocketObservationLimitExceeded)
+        );
     }
 
     #[test]
@@ -2191,12 +2450,12 @@ mod tests {
         assert_eq!(limit, 1024 * 1024);
 
         fs::write(&path, vec![b'x'; limit]).expect("exact-limit command fixture");
-        let (command, partial) = read_cmdline_bounded(&path, limit).expect("exact limit reads");
+        let (command, partial) = read_cmdline(&path).expect("authoritative exact limit reads");
         assert_eq!(command.as_deref().map(str::len), Some(limit));
         assert!(!partial);
 
         fs::write(&path, vec![b'x'; limit + 1]).expect("oversized command fixture");
-        let (command, partial) = read_cmdline_bounded(&path, limit).expect("over limit is typed");
+        let (command, partial) = read_cmdline(&path).expect("authoritative over limit is typed");
         assert_eq!(command, None);
         assert!(partial);
 
@@ -2520,6 +2779,13 @@ mod tests {
             snapshot.sockets[0].socket_token,
             PlatformSocketToken::linux_inode(77)
         );
+        assert_eq!(
+            snapshot.sockets[0]
+                .timer
+                .expect("TCP timer is retained")
+                .kind,
+            TcpTimerKind::None
+        );
         assert!(snapshot.sockets[0].owners.is_empty());
         assert_eq!(snapshot.owner_completeness, OwnerCompleteness::Complete);
         assert_eq!(
@@ -2527,6 +2793,139 @@ mod tests {
             OwnerCompleteness::Complete
         );
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn native_snapshot_retains_full_tcp_state_and_timer_before_legacy_projection() {
+        let proc_root = temp_proc_root("native-full-state");
+        write_socket_table(
+            &proc_root,
+            "net/tcp",
+            &[
+                row_with_timer("0100007F:0BB8", "01", "01:0000000A", 77),
+                row_with_timer("0100007F:0BB9", "02", "FF:0000000A", 78),
+                row("0100007F:0BBA", "03", 79),
+                row("0100007F:0BBB", "04", 80),
+                row("0100007F:0BBC", "05", 81),
+                row("0100007F:0BBD", "06", 82),
+                row("0100007F:0BBE", "07", 83),
+                row("0100007F:0BBF", "08", 84),
+                row("0100007F:0BC0", "09", 85),
+                row("0100007F:0BC1", "0A", 86),
+                row("0100007F:0BC2", "0B", 87),
+                row("0100007F:0BC3", "0C", 88),
+                row("0100007F:0BC4", "FF", 89),
+            ],
+        );
+        write_socket_table(&proc_root, "net/udp", &[]);
+
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("full-state native snapshot collects");
+
+        let established = snapshot
+            .sockets
+            .iter()
+            .find(|socket| socket.state == crate::observation::SocketState::Established)
+            .expect("established row survives the platform bridge");
+        assert_eq!(established.local_endpoint.port.get(), 3000);
+        assert_eq!(
+            established.timer.expect("nonzero timer survives").kind,
+            TcpTimerKind::Retransmit
+        );
+        let timer = established.timer.expect("nonzero timer survives");
+        assert_eq!(timer.native_code, None);
+        assert_eq!(timer.raw_ticks, 10);
+        assert!(timer.estimated_remaining_milliseconds.is_some());
+
+        let syn_sent = snapshot
+            .sockets
+            .iter()
+            .find(|socket| socket.state == crate::observation::SocketState::SynSent)
+            .expect("SYN-SENT row survives the platform bridge");
+        let unknown_timer = syn_sent.timer.expect("unknown timer survives");
+        assert_eq!(unknown_timer.kind, TcpTimerKind::Unknown(255));
+        assert_eq!(unknown_timer.native_code, Some(255));
+        assert_eq!(unknown_timer.raw_ticks, 10);
+        assert!(unknown_timer.estimated_remaining_milliseconds.is_some());
+
+        let retained_states = snapshot
+            .sockets
+            .iter()
+            .map(|socket| socket.state)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            retained_states,
+            [
+                crate::observation::SocketState::Closed,
+                crate::observation::SocketState::Listen,
+                crate::observation::SocketState::SynSent,
+                crate::observation::SocketState::SynReceived,
+                crate::observation::SocketState::Established,
+                crate::observation::SocketState::FinWait1,
+                crate::observation::SocketState::FinWait2,
+                crate::observation::SocketState::CloseWait,
+                crate::observation::SocketState::Closing,
+                crate::observation::SocketState::LastAck,
+                crate::observation::SocketState::TimeWait,
+                crate::observation::SocketState::NewSynReceived,
+                crate::observation::SocketState::Unknown(255),
+            ]
+            .into_iter()
+            .collect()
+        );
+        let legacy = crate::observation::project_legacy(&snapshot).expect("legacy projection fits");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].local_port, 3009);
+        assert_eq!(legacy[0].state, crate::model::SocketState::Listen);
+
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn unavailable_ipv6_scope_adds_exactly_one_scope_gap() {
+        let proc_root = temp_proc_root("ipv6-scope-gap");
+        write_socket_table(&proc_root, "net/tcp", &[]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_socket_table(
+            &proc_root,
+            "net/tcp6",
+            &[
+                row("00000000000000000000000001000000:0BB8", "01", 11),
+                row("00000000000000000000000001000000:0BB9", "02", 12),
+            ],
+        );
+        write_socket_table(&proc_root, "net/udp6", &[]);
+        fs::create_dir_all(proc_root.join("self/ns")).expect("test namespace directory");
+        std::os::unix::fs::symlink("net:[42]", proc_root.join("self/ns/net"))
+            .expect("test namespace identifier");
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("IPv6 scope loss remains a partial snapshot");
+
+        assert_eq!(
+            snapshot
+                .evidence_gaps
+                .iter()
+                .filter(|gap| {
+                    gap.code == EvidenceGapCode::NativeFieldUnavailable
+                        && gap.impact == EvidenceImpact::Scope
+                        && gap.endpoint.is_none()
+                })
+                .count(),
+            1
+        );
+        assert_eq!(snapshot.sockets.len(), 2);
+        assert_eq!(snapshot.completeness, SnapshotCompleteness::Partial);
+        assert!(snapshot.evidence_gaps.iter().all(|gap| {
+            gap.code != EvidenceGapCode::NativeFieldUnavailable
+                || gap.impact == EvidenceImpact::Scope
+        }));
+        fs::remove_dir_all(proc_root).expect("test proc root cleanup");
     }
 
     #[test]
@@ -2567,6 +2966,7 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
+            timer: None,
             inode: 77,
         };
         let pass = native_pass_from_records(
@@ -2599,6 +2999,7 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
+            timer: None,
             inode: 77,
         };
         let pass = native_pass_from_records(
