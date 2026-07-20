@@ -2,12 +2,11 @@
 
 ## Status
 
-Stage 2 is reopened. Native CI run
-`https://github.com/nuggocto/kickoutchi/actions/runs/29762998321` passed on exact
-implementation commit `1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`, but a subsequent
-source and contract review found completeness and native endpoint conversion
-defects not covered by that run. Remediation and new exact-commit native CI are
-required before Stage 3 proceeds.
+Stage 2 is complete. Native CI run
+`https://github.com/nuggocto/kickoutchi/actions/runs/29779361235` passed on exact
+remediation commit `4ba7fe3c2a614b0e9da5bf7bc003aa8c0183eff8`, including Linux,
+macOS, Windows, and supply-chain jobs. The subsequent independent review found
+no remaining actionable correctness, security, test-quality, or contract issue.
 
 The implementation baseline is commit
 `93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The optimized benchmark artifact
@@ -113,10 +112,11 @@ cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features 
 cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings
 ```
 
-GitHub Actions then compiled, linted, and ran the native test suite on Linux,
-macOS, and Windows for exact implementation commit
-`1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`. The same run passed the supply-chain
-job and `cargo deny check`.
+GitHub Actions compiled, linted, and ran the native test suite on Linux, macOS,
+and Windows for exact remediation commit
+`4ba7fe3c2a614b0e9da5bf7bc003aa8c0183eff8`. Run
+`https://github.com/nuggocto/kickoutchi/actions/runs/29779361235` also passed the
+supply-chain job and `cargo deny check`.
 
 Native fixture coverage includes every documented state, unknown states,
 malformed and truncated table data, exact and first-excess bounds, third-attempt
@@ -166,9 +166,8 @@ interleaved baseline/candidate release benchmark remain later gates.
 
 ## QA Verdict
 
-- Linux, macOS, and Windows Stage 2 scope: REMEDIATION IN PROGRESS.
+- Linux, macOS, and Windows Stage 2 scope: PASS.
 - Release recommendation: no recommendation. This is an internal implementation
   stage, not a release candidate.
 
-The native collection gate is open. Stage 3 must not proceed until remediation
-and exact-commit native CI pass.
+The native collection gate is complete. Stage 3 may proceed.

@@ -956,7 +956,7 @@ retains all states for watch and why.
 - [x] Native fixture tests cover every documented state and malformed tables.
 - [x] Every platform enforces process-metadata limits before allocation; Windows
       uses its bounded native replacement.
-- [ ] Linux, macOS, and Windows CI compile and run their collector tests after
+- [x] Linux, macOS, and Windows CI compile and run their collector tests after
       the completeness and native endpoint remediation.
 - [x] Release-mode feasibility measurements confirm the 100 ms watch minimum or
       Stage 0 is reopened before named endpoints and public commands begin.
