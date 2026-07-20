@@ -15,8 +15,9 @@ measured files more precisely than a dirty-worktree commit ID would.
 - The authoritative model is one bounded `NetworkSnapshot`; legacy rows borrow
   from it and never use a second collector.
 - Endpoint identity includes a three-state IPv6 scope. Linux's selected procfs
-  source marks every IPv6 scope unavailable; macOS and Windows retain native
-  interface indexes.
+  source and macOS's selected libproc interpretation mark every IPv6 scope
+  unavailable; Windows retains native interface indexes after network-byte-order
+  conversion.
 - A raced result retains pass B of the second complete attempt as non-authoritative
   evidence and cannot produce event or bindability claims.
 - Snapshot and owner completeness have total derivation rules.

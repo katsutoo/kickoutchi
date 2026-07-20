@@ -47,12 +47,13 @@ use crate::model::{
 };
 use crate::observation::NativeObservationPass;
 use crate::observation::{
-    CANDIDATE_PROCESS_IDS_MAX, EXECUTABLE_PATH_MAX_BYTES, Ipv6Scope, MetadataCompleteness,
-    MetadataOmission, MetadataProfile, NATIVE_RESIZE_ATTEMPTS_MAX, NATIVE_SOCKET_TABLE_MAX_BYTES,
-    NativeSocketObservation, NetworkSnapshot, OPTIONAL_METADATA_MAX_BYTES, ObservationScope,
-    ObservationScopeKind, OwnerAssociations, OwnerCompleteness, PROCESS_COMMAND_LINE_MAX_BYTES,
-    PROCESS_NAME_MAX_BYTES, ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker,
-    SOCKET_OBSERVATIONS_MAX, ScopeLimitation, SocketState, UnverifiedOwnerReason,
+    CANDIDATE_PROCESS_IDS_MAX, EXECUTABLE_PATH_MAX_BYTES, EvidenceGap, EvidenceGapCode,
+    EvidenceImpact, Ipv6Scope, MetadataCompleteness, MetadataOmission, MetadataProfile,
+    NATIVE_RESIZE_ATTEMPTS_MAX, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation,
+    NetworkSnapshot, OPTIONAL_METADATA_MAX_BYTES, ObservationScope, ObservationScopeKind,
+    OwnerAssociations, OwnerCompleteness, PROCESS_COMMAND_LINE_MAX_BYTES, PROCESS_NAME_MAX_BYTES,
+    ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker, SOCKET_OBSERVATIONS_MAX,
+    ScopeLimitation, SocketState, UnverifiedOwnerReason,
 };
 use crate::tree::TreeProcessInfo;
 
@@ -89,35 +90,67 @@ fn native_pass_from_records(
 ) -> Result<NativeObservationPass, CollectorError> {
     let mut owner_pids = HashSet::new();
     for record in &records {
-        if !owner_pids.contains(&record.pid) && owner_pids.len() >= CANDIDATE_PROCESS_IDS_MAX {
+        let Some(pid) = record.pid else {
+            continue;
+        };
+        if !owner_pids.contains(&pid) && owner_pids.len() >= CANDIDATE_PROCESS_IDS_MAX {
             return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
         }
-        owner_pids.insert(record.pid);
+        owner_pids.insert(pid);
     }
     let mut sockets = Vec::with_capacity(records.len());
     let mut owners_by_socket = Vec::with_capacity(records.len());
+    let mut local_completeness = Vec::with_capacity(records.len());
+    let mut evidence_gaps = Vec::new();
+    let mut omitted_evidence_gap_count = 0_u64;
+    let mut ownership_partial = false;
     for record in records {
+        let endpoint = crate::observation::EndpointIdentity::new(
+            record.protocol,
+            record.local_addr,
+            u32::from(record.local_port),
+            record.ipv6_scope,
+        )
+        .map_err(|_| crate::observation::ObservationError::NativeDataMalformed)?;
+        if let Some(pid) = record.pid {
+            owners_by_socket.push(vec![pid]);
+            local_completeness.push(OwnerCompleteness::Complete);
+        } else {
+            ownership_partial = true;
+            owners_by_socket.push(Vec::new());
+            local_completeness.push(OwnerCompleteness::partial([
+                EvidenceGapCode::OwnerAttributionIncomplete,
+            ])?);
+            if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+                evidence_gaps.push(EvidenceGap::new(
+                    EvidenceImpact::Ownership,
+                    EvidenceGapCode::OwnerAttributionIncomplete,
+                    Some(endpoint.clone()),
+                    None,
+                    "IP Helper reported that the UDP endpoint owner is unavailable",
+                ));
+            } else {
+                omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
+            }
+        }
         sockets.push(NativeSocketObservation {
-            endpoint: crate::observation::EndpointIdentity::new(
-                record.protocol,
-                record.local_addr,
-                u32::from(record.local_port),
-                record.ipv6_scope,
-            )
-            .map_err(|_| crate::observation::ObservationError::NativeDataMalformed)?,
+            endpoint,
             state: record.state,
             timer: None,
             token: None,
         });
-        owners_by_socket.push(vec![record.pid]);
     }
     Ok(NativeObservationPass {
         owners: OwnerAssociations {
             owners_by_socket,
-            local_completeness: vec![OwnerCompleteness::Complete; sockets.len()],
-            global_completeness: OwnerCompleteness::Complete,
-            evidence_gaps: Vec::new(),
-            omitted_evidence_gap_count: 0,
+            local_completeness,
+            global_completeness: if ownership_partial {
+                OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?
+            } else {
+                OwnerCompleteness::Complete
+            },
+            evidence_gaps,
+            omitted_evidence_gap_count,
         },
         sockets,
     })
@@ -130,7 +163,7 @@ struct SocketRecord {
     local_port: u16,
     ipv6_scope: Option<Ipv6Scope>,
     state: SocketState,
-    pid: u32,
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -177,10 +210,59 @@ trait ProcessApi {
     fn marker_from_handle(&mut self, handle: &Self::Handle) -> Option<ProcessStartMarker>;
     fn marker_for_pid(&mut self, pid: u32) -> Option<ProcessStartMarker>;
     fn name(&mut self, pid: u32, max_bytes: usize) -> Option<String>;
+    fn name_exceeds_budget(&mut self, pid: u32, max_bytes: usize) -> bool;
     fn path(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<PathBuf>;
     fn command_line(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<String>;
     #[cfg(test)]
     fn observe_retained_handle_count(&mut self, _count: usize) {}
+}
+
+struct RelationFailureTrackingApi<'a, Api> {
+    inner: &'a mut Api,
+    relation_failed: bool,
+}
+
+impl<Api: ProcessApi> ProcessApi for RelationFailureTrackingApi<'_, Api> {
+    type Handle = Api::Handle;
+
+    fn enumerate_relations(&mut self) -> Result<HashMap<u32, Option<u32>>, CollectorError> {
+        let result = self.inner.enumerate_relations();
+        self.relation_failed |= result.is_err();
+        result
+    }
+
+    fn open_process(&mut self, pid: u32) -> Result<Self::Handle, ProcessOpenError> {
+        self.inner.open_process(pid)
+    }
+
+    fn marker_from_handle(&mut self, handle: &Self::Handle) -> Option<ProcessStartMarker> {
+        self.inner.marker_from_handle(handle)
+    }
+
+    fn marker_for_pid(&mut self, pid: u32) -> Option<ProcessStartMarker> {
+        self.inner.marker_for_pid(pid)
+    }
+
+    fn name(&mut self, pid: u32, max_bytes: usize) -> Option<String> {
+        self.inner.name(pid, max_bytes)
+    }
+
+    fn name_exceeds_budget(&mut self, pid: u32, max_bytes: usize) -> bool {
+        self.inner.name_exceeds_budget(pid, max_bytes)
+    }
+
+    fn path(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<PathBuf> {
+        self.inner.path(handle, max_bytes)
+    }
+
+    fn command_line(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<String> {
+        self.inner.command_line(handle, max_bytes)
+    }
+
+    #[cfg(test)]
+    fn observe_retained_handle_count(&mut self, count: usize) {
+        self.inner.observe_retained_handle_count(count);
+    }
 }
 
 #[derive(Default)]
@@ -209,6 +291,13 @@ impl ProcessApi for RealProcessApi {
 
     fn name(&mut self, pid: u32, max_bytes: usize) -> Option<String> {
         decode_toolhelp_name(self.names.get(&pid)?, max_bytes)
+    }
+
+    fn name_exceeds_budget(&mut self, pid: u32, max_bytes: usize) -> bool {
+        self.names
+            .get(&pid)
+            .and_then(toolhelp_name_utf8_len)
+            .is_some_and(|length| length > max_bytes)
     }
 
     fn path(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<PathBuf> {
@@ -363,26 +452,30 @@ impl ProcessSnapshot {
                     .then_some(second_parent_pid)
                     .flatten();
                 let recorded_parent_pid = second_parent_pid.or(first_parent_pid);
+                let parent_name_budget = metadata_budget.saturating_sub(retained_bytes);
                 let (parent_pid, parent_process_name) = parent_pid
                     .and_then(|parent_pid| {
                         query_verified_parent(
                             api,
                             parent_pid,
                             before,
-                            metadata_budget.saturating_sub(retained_bytes),
+                            parent_name_budget,
                             retained_chunk_handles,
                             &mut parent_names,
                         )
-                        .map(|parent| (Some(parent_pid), parent.name))
+                        .map(|parent| (Some(parent_pid), Some(parent)))
                     })
                     .unwrap_or((None, None));
+                budget_omitted |= parent_process_name
+                    .as_ref()
+                    .is_some_and(|parent| parent.name_budget_exceeded);
                 let mut metadata = ProcessMetadata {
                     process_name,
                     executable_path: path.take(),
                     command_line: None,
                     parent_pid,
                     unverified_parent_pid: recorded_parent_pid.filter(|_| parent_pid.is_none()),
-                    parent_process_name,
+                    parent_process_name: parent_process_name.and_then(|parent| parent.name),
                     start_time_marker: Some(before),
                     identity_reason: None,
                     partial: false,
@@ -408,7 +501,7 @@ impl ProcessSnapshot {
                     PROCESS_COMMAND_LINE_MAX_BYTES,
                     metadata_budget,
                 );
-                metadata.partial = metadata.process_name.is_none()
+                metadata.partial |= metadata.process_name.is_none()
                     || metadata.executable_path.is_none()
                     || parent_relation_changed
                     || metadata.unverified_parent_pid.is_some()
@@ -602,8 +695,10 @@ fn open_query_process(pid: u32) -> Result<OwnedHandle, ProcessOpenError> {
     })
 }
 
+#[derive(Clone)]
 struct VerifiedParent {
     name: Option<String>,
+    name_budget_exceeded: bool,
 }
 
 fn query_verified_parent<Api: ProcessApi>(
@@ -612,7 +707,7 @@ fn query_verified_parent<Api: ProcessApi>(
     child_marker: ProcessStartMarker,
     max_bytes: usize,
     retained_chunk_handles: usize,
-    names: &mut HashMap<ProcessIdentity, Option<String>>,
+    names: &mut HashMap<ProcessIdentity, VerifiedParent>,
 ) -> Option<VerifiedParent> {
     let marker = api.marker_for_pid(parent_pid)?;
     if marker >= child_marker {
@@ -623,12 +718,7 @@ fn query_verified_parent<Api: ProcessApi>(
         start_marker: marker,
     };
     if let Some(name) = names.get(&identity) {
-        return Some(VerifiedParent {
-            name: name
-                .as_ref()
-                .filter(|name| name.len() <= max_bytes.min(PROCESS_NAME_MAX_BYTES))
-                .cloned(),
-        });
+        return Some(verified_parent_for_budget(name, max_bytes));
     }
     let handle = api.open_process(parent_pid).ok()?;
     debug_assert!(retained_chunk_handles < RETAINED_PROCESS_HANDLES_MAX);
@@ -642,12 +732,34 @@ fn query_verified_parent<Api: ProcessApi>(
     let name = (name_budget != 0)
         .then(|| api.name(parent_pid, name_budget))
         .flatten();
+    let name_budget_exceeded = name.is_none()
+        && name_budget < PROCESS_NAME_MAX_BYTES
+        && api.name_exceeds_budget(parent_pid, name_budget);
     let after = api.marker_from_handle(&handle)?;
     let current = api.marker_for_pid(parent_pid)?;
     (before == after && after == current).then(|| {
-        names.insert(identity, name.clone());
-        VerifiedParent { name }
+        let parent = VerifiedParent {
+            name,
+            name_budget_exceeded,
+        };
+        names.insert(identity, parent.clone());
+        parent
     })
+}
+
+fn verified_parent_for_budget(parent: &VerifiedParent, max_bytes: usize) -> VerifiedParent {
+    if parent
+        .name
+        .as_ref()
+        .is_some_and(|name| name.len() > max_bytes)
+    {
+        VerifiedParent {
+            name: None,
+            name_budget_exceeded: true,
+        }
+    } else {
+        parent.clone()
+    }
 }
 
 fn query_process_path(handle: &OwnedHandle, max_bytes: usize) -> Option<PathBuf> {
@@ -787,6 +899,22 @@ fn decode_toolhelp_name(code_units: &[u16; 260], final_max: usize) -> Option<Str
     decode_utf16_bounded(&code_units[..end], final_max)
 }
 
+fn toolhelp_name_utf8_len(code_units: &[u16; 260]) -> Option<usize> {
+    let end = code_units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(code_units.len());
+    if end == 0 {
+        return None;
+    }
+    std::char::decode_utf16(code_units[..end].iter().copied()).try_fold(
+        0usize,
+        |length, decoded| {
+            length.checked_add(decoded.unwrap_or(char::REPLACEMENT_CHARACTER).len_utf8())
+        },
+    )
+}
+
 fn decode_utf16_bounded(code_units: &[u16], final_max: usize) -> Option<String> {
     let mut final_bytes = 0usize;
     for decoded in std::char::decode_utf16(code_units.iter().copied()) {
@@ -845,8 +973,24 @@ fn read_process_observations(
     profile: MetadataProfile,
     optional_metadata_bytes_remaining: usize,
 ) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
+    read_process_observations_with(
+        &mut RealProcessApi::default(),
+        sorted_pids,
+        profile,
+        optional_metadata_bytes_remaining,
+    )
+}
+
+fn read_process_observations_with<Api: ProcessApi>(
+    api: &mut Api,
+    sorted_pids: &[u32],
+    profile: MetadataProfile,
+    optional_metadata_bytes_remaining: usize,
+) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
+    if sorted_pids.len() > CANDIDATE_PROCESS_IDS_MAX {
+        return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
+    }
     if profile == MetadataProfile::IdentityOnly {
-        let mut api = RealProcessApi::default();
         return Ok(sorted_pids
             .iter()
             .copied()
@@ -866,11 +1010,24 @@ fn read_process_observations(
             .collect());
     }
 
-    let mut snapshot = ProcessSnapshot::collect_with_budget(
-        profile,
-        ProcessSelection::Exact(sorted_pids),
-        optional_metadata_bytes_remaining,
-    )?;
+    let (snapshot, relation_failed) = {
+        let mut tracking_api = RelationFailureTrackingApi {
+            inner: api,
+            relation_failed: false,
+        };
+        let snapshot = ProcessSnapshot::collect_with(
+            &mut tracking_api,
+            profile,
+            ProcessSelection::Exact(sorted_pids),
+            optional_metadata_bytes_remaining,
+        );
+        (snapshot, tracking_api.relation_failed)
+    };
+    let mut snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(_) if relation_failed => return direct_partial_process_reads(api, sorted_pids),
+        Err(error) => return Err(error),
+    };
     Ok(sorted_pids
         .iter()
         .copied()
@@ -879,6 +1036,40 @@ fn read_process_observations(
                 ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable),
                 process_read_from_metadata,
             );
+            (pid, read)
+        })
+        .collect())
+}
+
+fn direct_partial_process_reads<Api: ProcessApi>(
+    api: &mut Api,
+    sorted_pids: &[u32],
+) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
+    if sorted_pids.len() > CANDIDATE_PROCESS_IDS_MAX {
+        return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
+    }
+    Ok(sorted_pids
+        .iter()
+        .copied()
+        .map(|pid| {
+            let read = match api.open_process(pid) {
+                Ok(handle) => api.marker_from_handle(&handle).map_or(
+                    ProcessRead::Unverified(UnverifiedOwnerReason::IdentityUnavailable),
+                    |marker| ProcessRead::Verified {
+                        marker,
+                        observation: ProcessObservation {
+                            name: None,
+                            executable_path: None,
+                            command_line: None,
+                            parent_pid: None,
+                            parent_process_name: None,
+                            metadata_omission: None,
+                            metadata_completeness: MetadataCompleteness::Partial,
+                        },
+                    },
+                ),
+                Err(error) => ProcessRead::Unverified(unverified_reason_for_open(error)),
+            };
             (pid, read)
         })
         .collect())
@@ -1420,18 +1611,22 @@ fn tcp4_record(row: &MIB_TCPROW_OWNER_PID) -> Result<SocketRecord, CollectorErro
         local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope: None,
         state: mib_tcp_state(row.dwState),
-        pid: row.dwOwningPid,
+        pid: Some(row.dwOwningPid),
     })
 }
 
 fn tcp6_record(row: &MIB_TCP6ROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    let (local_addr, ipv6_scope) = canonicalize_ipv6_local(
+        Ipv6Addr::from(row.ucLocalAddr),
+        ipv6_scope(u32::from_be(row.dwLocalScopeId)),
+    );
     Ok(SocketRecord {
         protocol: Protocol::Tcp,
-        local_addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+        local_addr,
         local_port: decode_port(row.dwLocalPort)?,
-        ipv6_scope: Some(ipv6_scope(row.dwLocalScopeId)),
+        ipv6_scope,
         state: mib_tcp_state(row.dwState),
-        pid: row.dwOwningPid,
+        pid: Some(row.dwOwningPid),
     })
 }
 
@@ -1460,19 +1655,30 @@ fn udp4_record(row: &MIB_UDPROW_OWNER_PID) -> Result<SocketRecord, CollectorErro
         local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope: None,
         state: SocketState::Bound,
-        pid: row.dwOwningPid,
+        pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
     })
 }
 
 fn udp6_record(row: &MIB_UDP6ROW_OWNER_PID) -> Result<SocketRecord, CollectorError> {
+    let (local_addr, ipv6_scope) = canonicalize_ipv6_local(
+        Ipv6Addr::from(row.ucLocalAddr),
+        ipv6_scope(u32::from_be(row.dwLocalScopeId)),
+    );
     Ok(SocketRecord {
         protocol: Protocol::Udp,
-        local_addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
+        local_addr,
         local_port: decode_port(row.dwLocalPort)?,
-        ipv6_scope: Some(ipv6_scope(row.dwLocalScopeId)),
+        ipv6_scope,
         state: SocketState::Bound,
-        pid: row.dwOwningPid,
+        pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
     })
+}
+
+fn canonicalize_ipv6_local(address: Ipv6Addr, scope: Ipv6Scope) -> (IpAddr, Option<Ipv6Scope>) {
+    address.to_ipv4_mapped().map_or_else(
+        || (IpAddr::V6(address), Some(scope)),
+        |address| (IpAddr::V4(address), None),
+    )
 }
 
 const fn ipv6_scope(scope_id: u32) -> Ipv6Scope {
@@ -1525,15 +1731,17 @@ mod tests {
         collect_socket_records_with, decode_command_line_utf16, decode_port, encode_port_for_tests,
         extend_socket_records_with_limit, filetime_to_u64, finish_bracketed_metadata,
         mib_tcp_state, native_pass_from_records, process_read_from_metadata,
-        query_process_command_line_with, read_iphelper_table_with, tcp4_record, tcp4_rows,
-        tcp6_record, tcp6_rows, tree_process_infos_from_snapshot_with, udp4_record, udp4_rows,
-        udp6_record, udp6_rows,
+        query_process_command_line_with, read_iphelper_table_with, read_process_observations_with,
+        tcp4_record, tcp4_rows, tcp6_record, tcp6_rows, tree_process_infos_from_snapshot_with,
+        udp4_record, udp4_rows, udp6_record, udp6_rows,
     };
     use crate::collector::CollectorError;
     use crate::model::Protocol;
     use crate::observation::{
-        Ipv6Scope, MetadataProfile, ObservationScope, ObservationScopeKind, OwnerObservation,
-        ProcessRead, ProcessStartMarker, ScopeLimitation, SocketState, UnverifiedOwnerReason,
+        EvidenceGapCode, EvidenceImpact, Ipv6Scope, MetadataCompleteness, MetadataOmission,
+        MetadataProfile, ObservationScope, ObservationScopeKind, OwnerCompleteness,
+        OwnerObservation, ProcessRead, ProcessStartMarker, ScopeLimitation, SocketState,
+        UnverifiedOwnerReason,
     };
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::c_void;
@@ -1562,7 +1770,7 @@ mod tests {
                 local_port,
                 ipv6_scope,
                 state,
-                pid,
+                pid: Some(pid),
             });
         }
         fn tcp4(records: &mut Vec<super::SocketRecord>) -> Result<(), CollectorError> {
@@ -1683,6 +1891,8 @@ mod tests {
     struct FakeProcessApi {
         relations: Vec<HashMap<u32, Option<u32>>>,
         enumeration_count: usize,
+        failed_enumerations: HashSet<usize>,
+        refused_enumerations: HashSet<usize>,
         open_errors: HashMap<u32, ProcessOpenError>,
         markers: HashMap<u32, u64>,
         marker_reads: HashMap<u32, VecDeque<u64>>,
@@ -1724,10 +1934,23 @@ mod tests {
         type Handle = u32;
 
         fn enumerate_relations(&mut self) -> Result<HashMap<u32, Option<u32>>, CollectorError> {
+            let call = self.enumeration_count;
+            self.enumeration_count += 1;
+            if self.failed_enumerations.contains(&call) {
+                return Err(CollectorError::Platform {
+                    operation: "CreateToolhelp32Snapshot",
+                    detail: "injected failure".to_owned(),
+                });
+            }
+            if self.refused_enumerations.contains(&call) {
+                return Err(
+                    crate::observation::ObservationError::ProcessIdentityLimitExceeded.into(),
+                );
+            }
             let index = self
                 .enumeration_count
+                .saturating_sub(1)
                 .min(self.relations.len().saturating_sub(1));
-            self.enumeration_count += 1;
             Ok(self.relations.get(index).cloned().unwrap_or_default())
         }
 
@@ -1754,6 +1977,12 @@ mod tests {
             self.metadata_reads.push(("name", pid, max_bytes));
             let name = self.names.get(&pid)?;
             (name.len() <= max_bytes).then(|| name.clone())
+        }
+
+        fn name_exceeds_budget(&mut self, pid: u32, max_bytes: usize) -> bool {
+            self.names
+                .get(&pid)
+                .is_some_and(|name| name.len() > max_bytes)
         }
 
         fn path(&mut self, handle: &Self::Handle, max_bytes: usize) -> Option<PathBuf> {
@@ -1882,7 +2111,7 @@ mod tests {
         let address = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0, 0, 1);
         let row = MIB_TCP6ROW_OWNER_PID {
             ucLocalAddr: address.octets(),
-            dwLocalScopeId: 19,
+            dwLocalScopeId: 19_u32.to_be(),
             dwLocalPort: encode_port_for_tests(65_535),
             ucRemoteAddr: [0; 16],
             dwRemoteScopeId: 0,
@@ -1928,11 +2157,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_udp4_table_parses_and_converts_complete_row() {
+    fn raw_udp4_table_retains_row_when_owner_is_unavailable() {
         let row = MIB_UDPROW_OWNER_PID {
             dwLocalAddr: u32::from_ne_bytes([198, 51, 100, 23]),
             dwLocalPort: encode_port_for_tests(53),
-            dwOwningPid: 3_003,
+            dwOwningPid: 0,
         };
         let offset = std::mem::offset_of!(super::MIB_UDPTABLE_OWNER_PID, table);
         let fixture = raw_table_fixture(
@@ -1959,7 +2188,12 @@ mod tests {
         assert_eq!(pass.sockets[0].endpoint.port.get(), 53);
         assert_eq!(pass.sockets[0].endpoint.ipv6_scope, None);
         assert_eq!(pass.sockets[0].state, SocketState::Bound);
-        assert_eq!(pass.owners.owners_by_socket, vec![vec![3_003]]);
+        assert_eq!(pass.owners.owners_by_socket, vec![Vec::<u32>::new()]);
+        assert!(matches!(
+            pass.owners.local_completeness.as_slice(),
+            [OwnerCompleteness::Partial { reasons }]
+                if reasons == &[EvidenceGapCode::OwnerAttributionIncomplete]
+        ));
         assert!(
             append_udp4_table(
                 &mut Vec::new(),
@@ -1970,13 +2204,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_udp6_table_parses_and_converts_complete_row() {
+    fn raw_udp6_table_retains_row_when_owner_is_unavailable() {
         let address = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
         let row = MIB_UDP6ROW_OWNER_PID {
             ucLocalAddr: address.octets(),
-            dwLocalScopeId: 7,
+            dwLocalScopeId: 7_u32.to_be(),
             dwLocalPort: encode_port_for_tests(5_353),
-            dwOwningPid: 4_004,
+            dwOwningPid: 0,
         };
         let offset = std::mem::offset_of!(super::MIB_UDP6TABLE_OWNER_PID, table);
         let fixture = raw_table_fixture(
@@ -2005,7 +2239,16 @@ mod tests {
             ))
         );
         assert_eq!(pass.sockets[0].state, SocketState::Bound);
-        assert_eq!(pass.owners.owners_by_socket, vec![vec![4_004]]);
+        assert_eq!(pass.owners.owners_by_socket, vec![Vec::<u32>::new()]);
+        assert_eq!(pass.owners.evidence_gaps.len(), 1);
+        assert_eq!(
+            pass.owners.evidence_gaps[0].code,
+            EvidenceGapCode::OwnerAttributionIncomplete
+        );
+        assert_eq!(
+            pass.owners.evidence_gaps[0].impact,
+            EvidenceImpact::Ownership
+        );
         assert!(
             append_udp6_table(
                 &mut Vec::new(),
@@ -2214,6 +2457,111 @@ mod tests {
         }
     }
 
+    fn assert_socket_relation_fallback(failed_call: usize, row_bound_refusal: bool) {
+        let record = super::SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 443,
+            ipv6_scope: None,
+            state: SocketState::Listen,
+            pid: Some(7),
+        };
+        let pass = native_pass_from_records(vec![record]).expect("valid socket pass");
+        let scope = ObservationScope::new(
+            ObservationScopeKind::CurrentHostNetworkStack,
+            None,
+            [ScopeLimitation::WslNetworkStackExcluded],
+        )
+        .unwrap();
+        let mut api = FakeProcessApi::stable(HashMap::from([(7, None)]));
+        if row_bound_refusal {
+            api.refused_enumerations.insert(failed_call);
+        } else {
+            api.failed_enumerations.insert(failed_call);
+        }
+
+        let snapshot = crate::collector::collect_native_snapshot(
+            MetadataProfile::Display,
+            scope,
+            |_| Ok(pass.clone()),
+            |pids, profile, budget| read_process_observations_with(&mut api, pids, profile, budget),
+        )
+        .expect("relation loss is metadata-local");
+
+        assert_eq!(snapshot.sockets.len(), 1);
+        assert!(matches!(
+            snapshot.sockets[0].owners.as_slice(),
+            [OwnerObservation::Verified(identity)] if identity.pid == 7
+        ));
+        assert_eq!(snapshot.processes.len(), 1);
+        let metadata = snapshot.processes.values().next().unwrap();
+        assert_eq!(
+            metadata.metadata_completeness,
+            MetadataCompleteness::Partial
+        );
+        assert_eq!(metadata.name, None);
+        assert_eq!(metadata.executable_path, None);
+        assert_eq!(metadata.command_line, None);
+        assert_eq!(metadata.parent_pid, None);
+        assert_eq!(metadata.parent_process_name, None);
+        assert_eq!(metadata.metadata_omission, None);
+        assert_eq!(api.enumeration_count, failed_call + 1);
+    }
+
+    #[test]
+    fn first_relation_enumeration_failure_keeps_authoritative_socket_rows() {
+        assert_socket_relation_fallback(0, false);
+    }
+
+    #[test]
+    fn second_relation_row_bound_refusal_keeps_authoritative_socket_rows() {
+        assert_socket_relation_fallback(1, true);
+    }
+
+    #[test]
+    fn tree_style_snapshot_keeps_toolhelp_enumeration_failure_fatal() {
+        let mut api = FakeProcessApi::stable(HashMap::from([(7, None)]));
+        api.failed_enumerations.insert(0);
+
+        let error = ProcessSnapshot::collect_with(
+            &mut api,
+            MetadataProfile::Display,
+            ProcessSelection::All,
+            super::OPTIONAL_METADATA_MAX_BYTES,
+        )
+        .expect_err("shared process snapshots must remain fail-closed");
+
+        assert!(matches!(
+            error,
+            CollectorError::Platform {
+                operation: "CreateToolhelp32Snapshot",
+                ..
+            }
+        ));
+        assert_eq!(api.enumeration_count, 1);
+    }
+
+    #[test]
+    fn socket_relation_fallback_preserves_per_pid_failure_reason() {
+        let mut api = FakeProcessApi::stable(HashMap::from([(7, None)]));
+        api.failed_enumerations.insert(0);
+        api.open_errors
+            .insert(7, ProcessOpenError::PermissionDenied);
+
+        let reads = read_process_observations_with(
+            &mut api,
+            &[7],
+            MetadataProfile::Display,
+            super::OPTIONAL_METADATA_MAX_BYTES,
+        )
+        .expect("relation failure uses direct PID reads");
+
+        assert_eq!(
+            reads[&7],
+            ProcessRead::Unverified(UnverifiedOwnerReason::PermissionDenied)
+        );
+    }
+
     #[test]
     fn process_handles_are_retained_in_bounded_chunks() {
         let count = u32::try_from(super::PROCESS_HANDLE_CHUNK_MAX + 1).unwrap();
@@ -2257,6 +2605,122 @@ mod tests {
 
         assert!(!api.path_budgets.is_empty());
         assert!(api.path_budgets.iter().all(|budget| *budget <= 7));
+    }
+
+    #[test]
+    fn parent_name_budget_marks_exact_fit_and_first_excess_truthfully() {
+        fn collect_with_parent_budget(budget: usize) -> ProcessMetadata {
+            let relations = HashMap::from([(1, None), (7, Some(1))]);
+            let mut api = FakeProcessApi::stable(relations);
+            api.names.insert(7, String::new());
+            api.paths.insert(7, PathBuf::new());
+            api.names.insert(1, "parent".to_owned());
+            ProcessSnapshot::collect_with(
+                &mut api,
+                MetadataProfile::Display,
+                ProcessSelection::Exact(&[7]),
+                budget,
+            )
+            .expect("parent metadata collection succeeds")
+            .processes
+            .remove(&7)
+            .unwrap()
+        }
+
+        let exact = collect_with_parent_budget("parent".len());
+        assert_eq!(exact.parent_process_name.as_deref(), Some("parent"));
+        assert!(!exact.budget_omitted);
+
+        for budget in ["parent".len() - 1, 0] {
+            let omitted = process_read_from_metadata(collect_with_parent_budget(budget));
+            let ProcessRead::Verified { observation, .. } = omitted else {
+                panic!("stable identity remains verified");
+            };
+            assert_eq!(observation.parent_process_name, None);
+            assert_eq!(
+                observation.metadata_omission,
+                Some(MetadataOmission::BudgetExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_parent_lookup_failure_is_not_reported_as_budget_exhaustion() {
+        let relations = HashMap::from([(1, None), (7, Some(1))]);
+        let mut api = FakeProcessApi::stable(relations);
+        api.open_errors
+            .insert(1, ProcessOpenError::PermissionDenied);
+
+        let metadata = ProcessSnapshot::collect_with(
+            &mut api,
+            MetadataProfile::Display,
+            ProcessSelection::Exact(&[7]),
+            super::OPTIONAL_METADATA_MAX_BYTES,
+        )
+        .expect("parent lookup failure remains row-local")
+        .processes
+        .remove(&7)
+        .unwrap();
+        let ProcessRead::Verified { observation, .. } = process_read_from_metadata(metadata) else {
+            panic!("child identity remains verified");
+        };
+
+        assert_eq!(observation.parent_pid, None);
+        assert_eq!(observation.parent_process_name, None);
+        assert_eq!(observation.metadata_omission, None);
+        assert_eq!(
+            observation.metadata_completeness,
+            MetadataCompleteness::Partial
+        );
+    }
+
+    #[test]
+    fn unavailable_parent_name_under_low_budget_is_not_budget_exhaustion() {
+        let relations = HashMap::from([(1, None), (7, Some(1))]);
+        let mut api = FakeProcessApi::stable(relations);
+        api.names.insert(7, String::new());
+        api.paths.insert(7, PathBuf::new());
+        api.names.remove(&1);
+
+        let metadata = ProcessSnapshot::collect_with(
+            &mut api,
+            MetadataProfile::Display,
+            ProcessSelection::Exact(&[7]),
+            1,
+        )
+        .expect("unavailable parent name remains row-local")
+        .processes
+        .remove(&7)
+        .unwrap();
+        let ProcessRead::Verified { observation, .. } = process_read_from_metadata(metadata) else {
+            panic!("child identity remains verified");
+        };
+
+        assert_eq!(observation.parent_pid, Some(1));
+        assert_eq!(observation.parent_process_name, None);
+        assert_eq!(observation.metadata_omission, None);
+        assert_eq!(
+            observation.metadata_completeness,
+            MetadataCompleteness::Partial
+        );
+    }
+
+    #[test]
+    fn cached_parent_name_respects_each_childs_remaining_budget() {
+        let cached = super::VerifiedParent {
+            name: Some("parent".to_owned()),
+            name_budget_exceeded: false,
+        };
+
+        let exact = super::verified_parent_for_budget(&cached, 6);
+        assert_eq!(exact.name.as_deref(), Some("parent"));
+        assert!(!exact.name_budget_exceeded);
+
+        for budget in [5, 0] {
+            let omitted = super::verified_parent_for_budget(&cached, budget);
+            assert_eq!(omitted.name, None);
+            assert!(omitted.name_budget_exceeded);
+        }
     }
 
     #[test]
@@ -2578,7 +3042,7 @@ mod tests {
         assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(record.local_port, 3000);
         assert_eq!(record.state, SocketState::Listen);
-        assert_eq!(record.pid, 18422);
+        assert_eq!(record.pid, Some(18422));
     }
 
     #[test]
@@ -2616,14 +3080,14 @@ mod tests {
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 8080);
         assert_eq!(record.ipv6_scope, Some(Ipv6Scope::Unscoped));
-        assert_eq!(record.pid, 77);
+        assert_eq!(record.pid, Some(77));
     }
 
     #[test]
     fn tcp6_row_preserves_nonzero_scope_id() {
         let row = MIB_TCP6ROW_OWNER_PID {
             ucLocalAddr: Ipv6Addr::LOCALHOST.octets(),
-            dwLocalScopeId: u32::MAX,
+            dwLocalScopeId: u32::MAX.to_be(),
             dwLocalPort: encode_port_for_tests(8080),
             ucRemoteAddr: [0; 16],
             dwRemoteScopeId: 0,
@@ -2638,6 +3102,35 @@ mod tests {
                 std::num::NonZeroU32::new(u32::MAX).unwrap()
             ))
         );
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_rows_become_unscoped_ipv4_endpoints() {
+        let mapped = Ipv4Addr::new(192, 0, 2, 44).to_ipv6_mapped();
+        let tcp = MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: mapped.octets(),
+            dwLocalScopeId: 12_u32.to_be(),
+            dwLocalPort: encode_port_for_tests(8080),
+            ucRemoteAddr: [0; 16],
+            dwRemoteScopeId: 0,
+            dwRemotePort: 0,
+            dwState: u32::try_from(MIB_TCP_STATE_LISTEN).unwrap(),
+            dwOwningPid: 77,
+        };
+        let udp = MIB_UDP6ROW_OWNER_PID {
+            ucLocalAddr: mapped.octets(),
+            dwLocalScopeId: 13_u32.to_be(),
+            dwLocalPort: encode_port_for_tests(8081),
+            dwOwningPid: 78,
+        };
+
+        let tcp = tcp6_record(&tcp).expect("valid mapped TCPv6 row");
+        let udp = udp6_record(&udp).expect("valid mapped UDPv6 row");
+
+        assert_eq!(tcp.local_addr, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)));
+        assert_eq!(tcp.ipv6_scope, None);
+        assert_eq!(udp.local_addr, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)));
+        assert_eq!(udp.ipv6_scope, None);
     }
 
     #[test]
@@ -2677,7 +3170,7 @@ mod tests {
             local_port: 443,
             ipv6_scope: None,
             state: SocketState::Established,
-            pid: 77,
+            pid: Some(77),
         };
 
         let pass = native_pass_from_records(vec![record]).expect("owner row is authoritative");
@@ -2696,7 +3189,7 @@ mod tests {
             local_port: 443,
             ipv6_scope: None,
             state: SocketState::Established,
-            pid: 77,
+            pid: Some(77),
         };
         let pass = native_pass_from_records(vec![record]).expect("owner row is authoritative");
         let scope = ObservationScope::new(
@@ -2733,6 +3226,71 @@ mod tests {
                 pid: 77,
                 reason: UnverifiedOwnerReason::PermissionDenied,
             }]
+        );
+        assert!(snapshot.processes.is_empty());
+    }
+
+    #[test]
+    fn ownerless_udp_snapshot_retains_endpoint_without_reading_pid_zero() {
+        let udp4 = udp4_record(&MIB_UDPROW_OWNER_PID {
+            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+            dwLocalPort: encode_port_for_tests(5353),
+            dwOwningPid: 0,
+        })
+        .expect("valid ownerless UDPv4 row");
+        let udp6 = udp6_record(&MIB_UDP6ROW_OWNER_PID {
+            ucLocalAddr: Ipv6Addr::LOCALHOST.octets(),
+            dwLocalScopeId: 0,
+            dwLocalPort: encode_port_for_tests(5355),
+            dwOwningPid: 0,
+        })
+        .expect("valid ownerless UDPv6 row");
+        let pass =
+            native_pass_from_records(vec![udp4, udp6]).expect("ownerless UDP rows are retained");
+        let scope = ObservationScope::new(
+            ObservationScopeKind::CurrentHostNetworkStack,
+            None,
+            [ScopeLimitation::WslNetworkStackExcluded],
+        )
+        .unwrap();
+        let mut process_reads = 0;
+
+        let snapshot = crate::collector::collect_native_snapshot(
+            MetadataProfile::Display,
+            scope,
+            |_| Ok(pass.clone()),
+            |pids, _, _| {
+                process_reads += 1;
+                assert!(pids.is_empty(), "PID 0 must not become an owner edge");
+                Ok(std::collections::BTreeMap::new())
+            },
+        )
+        .expect("ownerless UDP snapshot remains valid");
+
+        assert_eq!(process_reads, 2);
+        assert_eq!(snapshot.sockets.len(), 2);
+        assert!(
+            snapshot
+                .sockets
+                .iter()
+                .all(|socket| socket.owners.is_empty())
+        );
+        assert!(
+            snapshot.sockets.iter().all(|socket| matches!(
+                socket.owner_completeness,
+                OwnerCompleteness::Partial { .. }
+            ))
+        );
+        assert!(
+            snapshot
+                .sockets
+                .iter()
+                .all(|socket| snapshot.evidence_gaps.iter().any(|gap| {
+                    gap.code == EvidenceGapCode::OwnerAttributionIncomplete
+                        && gap.impact == EvidenceImpact::Ownership
+                        && gap.endpoint.as_ref() == Some(&socket.local_endpoint)
+                        && gap.pid.is_none()
+                }))
         );
         assert!(snapshot.processes.is_empty());
     }

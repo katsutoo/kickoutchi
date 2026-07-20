@@ -2,17 +2,18 @@
 
 ## Status
 
-Stage 2 is complete. Linux runtime verification, native Linux, macOS, and
-Windows CI, security review, test-quality review, and the release-mode
-feasibility measurement pass. Native CI run
+Stage 2 is reopened. Native CI run
 `https://github.com/nuggocto/kickoutchi/actions/runs/29762998321` passed on exact
-implementation commit `1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`.
+implementation commit `1ff24cd18042e36c6b520ad2fc2f7b38b9930d87`, but a subsequent
+source and contract review found completeness and native endpoint conversion
+defects not covered by that run. Remediation and new exact-commit native CI are
+required before Stage 3 proceeds.
 
 The implementation baseline is commit
 `93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The optimized benchmark artifact
-was built from that commit plus the product-source patch identified in the raw
-sample file as
-`d42b6c6c28168d6d6b41d934b3d28e68220139f2557ae69e5c4b7ce57bc3072e`.
+was rebuilt from current `HEAD` `8fe4fca234169219d42132486f2658dc248a4a0c`
+plus the product-source patch identified in the raw sample file as
+`2531ec1a4fcaed58ad94964c1dbb309d2cda924ddde475d999f224cd533d2093`.
 
 ## Implemented Contract
 
@@ -26,16 +27,19 @@ sample file as
   timer rows are canonically ordered.
 - Linux emits one endpoint-null Scope gap when retained IPv6 rows lack native
   scope identifiers and continues to declare the current network namespace.
-- macOS retains process-visible TCP/UDP rows, native interface indexes, and
-  opaque `soi_so` tokens. Conflicting facts for one token and process/descriptor
+- macOS retains process-visible TCP/UDP rows and opaque `soi_so` tokens. Its
+  selected libproc interpretation marks IPv6 scope unavailable and emits one
+  endpoint-null Scope gap. Conflicting facts for one token and process/descriptor
   scan losses remain `SocketSet` evidence. Expected unbound port-zero descriptors
   are outside endpoint observations rather than global malformed-data gaps.
 - Darwin LP64 sizes, alignments, field offsets, constants, and TCP state codes
   are asserted for both release architectures. Native reads validate lengths,
   counts, alignment, and bounded changing-size attempts before interpretation.
 - Windows retains all four extended owner-table forms, creation-time process
-  identity, native scope IDs, bounded Toolhelp metadata, and authoritative rows
-  whose process enrichment fails. Flexible-array payloads are length/alignment
+  identity, network-to-host converted scope IDs, bounded Toolhelp metadata, and
+  authoritative rows whose process enrichment fails. Ownerless UDP rows remain
+  partial endpoints, and Toolhelp failure in socket-owner enrichment falls back
+  to direct bounded identity reads. Flexible-array payloads are length/alignment
   checked before slice construction.
 - Existing list, TUI, and destructive projections remain limited to TCP
   `Listen` and UDP `Bound`; established and transitional rows cannot become kill
@@ -59,6 +63,23 @@ Independent security, architecture, and test-quality reviews found and closed:
 - Benchmark artifact and sample-input path replacement races weakening evidence
   provenance.
 
+The reopened review additionally found and remediated:
+
+- macOS zero-plus-errno libproc count failures becoming complete empty results.
+- Linux ancestor PID namespace owners being absent from ownership completeness.
+- macOS retaining an unsupported IPv6 scope field as an interface index.
+- Windows decoding `dwLocalScopeId` without network-byte-order conversion.
+- Windows Toolhelp relation failure aborting authoritative socket rows.
+- Windows UDP PID zero becoming a process-owner edge.
+- Windows IPv4-mapped IPv6 rows retaining a noncanonical address and scope.
+- Linux accepting empty, garbage, or headerless socket-table input.
+- macOS and Windows parent-name budget exhaustion lacking exact boundary
+  evidence and truthful `budget_exceeded` classification.
+
+The Linux parser retest also caught and corrected a fixture-induced regression:
+real IPv4 and IPv6 procfs headers use `rem_address` and `remote_address`
+respectively. Validation remains strict and family-aware.
+
 Windows `dwLocalPort` intentionally follows the documented `ntohs` behavior and
 uses the low 16 bits of the DWORD; only decoded port zero is rejected. This was
 rechecked against Microsoft's `MIB_TCPROW_OWNER_PID` documentation after two
@@ -81,7 +102,7 @@ cargo deny check
 git diff --check
 ```
 
-The Linux run passed 437 unit tests, 22 real-binary CLI contracts, and four
+The current Linux run passes 442 unit tests, 22 real-binary CLI contracts, and four
 `socket2` contracts. Documentation tests contain no doctests and passed.
 
 Passed cross-target strict Clippy locally:
@@ -115,28 +136,28 @@ and makes no cross-machine performance claim.
 
 - Workload: optimized `target/dist/kick list --json`, which runs full native
   collection and then the legacy projection.
-- Host workload at capture: 608 processes, 3,460 visible descriptor entries,
-  73 native `/proc/net` data rows, and 26 projected JSON rows.
+- Host workload at capture: 576 processes, 3,078 visible descriptor entries,
+  45 native `/proc/net` data rows, and 22 projected JSON rows.
 - Host: AMD Ryzen AI MAX+ 395, 16 cores/32 threads, 62 GiB RAM, Linux
   7.1.3-arch1-2 x86_64, Rust 1.95.0, AC power online.
-- Concurrent load snapshot: 2.51 / 2.65 / 2.63 load average.
+- Concurrent load snapshot: 2.17 / 2.72 / 3.09 load average.
 - Build: `cargo build --locked --profile dist --all-features --bin kickoutchi
   --bin kick`; thin LTO through the repository `dist` profile.
-- Artifact: `target/dist/kick`, 3,246,224 bytes, SHA-256
-  `c31a325a08b511d1e1692b5f470a2e1055faa0d8c8fbcf4aeb3df78b0b991d66`.
+- Artifact: `target/dist/kick`, 3,248,464 bytes, SHA-256
+  `7184727cea04e447b52c2ffb4dc73ba7d7dfeb4e973942c7bf1f290d33e47509`.
 - Sampling: eight warmups, 1,000 bounded process invocations, 1,000 successes,
   zero failures. Python `time.monotonic_ns()` measures each bounded private
   snapshot of the optimized artifact; latency and RSS workloads were run
   separately.
-- p50: 31.962 ms.
-- p95: 32.340 ms.
-- p99: 32.590 ms.
-- observed maximum: 63.777 ms.
-- Peak RSS: 21,764 KiB from 20 successful independent invocations, measured by
+- p50: 31.758 ms.
+- p95: 32.214 ms.
+- p99: 32.701 ms.
+- observed maximum: 64.454 ms.
+- Peak RSS: 21,960 KiB from 20 successful independent invocations, measured by
   Linux `wait4` accounting through Python `resource.getrusage`.
 - Raw samples: `benchmarks/native-collection-feasibility-2026-07-20.tsv`, 15,271
   bytes, SHA-256
-  `e71df2abe2c670e8de0fe416e2b5aebe7bccdb63b71ac33b2860030e6b1fe948`.
+  `698c65f71cd90fbf9221c0a43d0af050e655c0eb2eab713a84d893431f62b06b`.
 
 The observed p99 and maximum remain below the frozen 100 ms minimum watch
 interval. The margin is sufficient for this host workload, so Stage 0 does not
@@ -145,8 +166,9 @@ interleaved baseline/candidate release benchmark remain later gates.
 
 ## QA Verdict
 
-- Linux, macOS, and Windows Stage 2 scope: PASS.
+- Linux, macOS, and Windows Stage 2 scope: REMEDIATION IN PROGRESS.
 - Release recommendation: no recommendation. This is an internal implementation
   stage, not a release candidate.
 
-The native collection gate is complete. Stage 3 may proceed.
+The native collection gate is open. Stage 3 must not proceed until remediation
+and exact-commit native CI pass.

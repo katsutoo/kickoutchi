@@ -71,7 +71,11 @@ impl Collector for MacosCollector {
         let scope = ObservationScope::new(
             ObservationScopeKind::CurrentHostProcessVisibleSockets,
             None,
-            [ScopeLimitation::ProcessFirstSocketVisibilityLimited],
+            [
+                ScopeLimitation::ProcessFirstSocketVisibilityLimited,
+                ScopeLimitation::Ipv6ScopeUnavailable,
+                ScopeLimitation::ScopedIpv6ExactMatchingUnavailable,
+            ],
         )?;
         crate::collector::collect_native_snapshot(
             profile,
@@ -191,7 +195,7 @@ impl MacosCollector {
         pid: u32,
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-        parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+        parent_names: &mut HashMap<ProcessIdentity, ParentNameRead>,
     ) -> ProcessRead {
         let info = match read_process_bsdinfo(pid) {
             Ok(info) => info,
@@ -355,7 +359,6 @@ struct SocketRecordKey {
     protocol: Protocol,
     local_addr: IpAddr,
     local_port: u16,
-    ipv6_ifindex: u16,
     socket_id: u64,
 }
 
@@ -364,7 +367,6 @@ struct SocketRecord {
     protocol: Protocol,
     local_addr: IpAddr,
     local_port: u16,
-    ipv6_ifindex: u16,
     state: ObservationSocketState,
     pid: u32,
     socket_id: u64,
@@ -376,7 +378,6 @@ impl SocketRecord {
             protocol: self.protocol,
             local_addr: self.local_addr,
             local_port: self.local_port,
-            ipv6_ifindex: self.ipv6_ifindex,
             socket_id: self.socket_id,
         }
     }
@@ -385,7 +386,6 @@ impl SocketRecord {
         self.protocol == other.protocol
             && self.local_addr == other.local_addr
             && self.local_port == other.local_port
-            && self.ipv6_ifindex == other.ipv6_ifindex
             && self.state == other.state
             && self.socket_id == other.socket_id
     }
@@ -404,7 +404,7 @@ fn native_pass_from_records(
     records: &[SocketRecord],
     owners_by_socket: Vec<Vec<u32>>,
     losses: BTreeSet<SocketScanLoss>,
-    omitted_evidence_gap_count: u64,
+    mut omitted_evidence_gap_count: u64,
 ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
     if records.len() != owners_by_socket.len() {
         return Err(crate::observation::ObservationError::NativeDataMalformed.into());
@@ -412,10 +412,10 @@ fn native_pass_from_records(
     let sockets = records
         .iter()
         .map(|record| {
-            let ipv6_scope = record.local_addr.is_ipv6().then(|| {
-                std::num::NonZeroU32::new(u32::from(record.ipv6_ifindex))
-                    .map_or(Ipv6Scope::Unscoped, Ipv6Scope::InterfaceIndex)
-            });
+            let ipv6_scope = record
+                .local_addr
+                .is_ipv6()
+                .then_some(Ipv6Scope::Unavailable);
             let endpoint = EndpointIdentity::new(
                 record.protocol,
                 record.local_addr,
@@ -472,6 +472,22 @@ fn native_pass_from_records(
             pid,
             message,
         ));
+    }
+    if sockets
+        .iter()
+        .any(|socket| socket.endpoint.ipv6_scope == Some(Ipv6Scope::Unavailable))
+    {
+        if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+            evidence_gaps.push(EvidenceGap::new(
+                EvidenceImpact::Scope,
+                EvidenceGapCode::NativeFieldUnavailable,
+                None,
+                None,
+                "IPv6 scope identifiers are unavailable from macOS socket descriptor rows",
+            ));
+        } else {
+            omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
+        }
     }
     let local_completeness = vec![OwnerCompleteness::Complete; sockets.len()];
     Ok(crate::observation::NativeObservationPass {
@@ -553,6 +569,13 @@ struct ProcessMetadata {
     parent_process_name: Option<String>,
     partial: bool,
     budget_omitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParentNameRead {
+    Value(String),
+    Unavailable,
+    BudgetExceeded,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1107,27 +1130,43 @@ fn child_process_ids(parent_pid: u32) -> Result<Vec<u32>, CollectorError> {
     let capacity = MAX_TREE_PROCESSES + 1;
     let buffer_bytes = checked_buffer_len::<libc::pid_t>(capacity, "proc_listchildpids")?;
     let mut raw_pids = vec![0 as libc::pid_t; capacity];
-    let count = unsafe {
-        // SAFETY: raw_pids owns buffer_bytes bytes and proc_listchildpids writes
-        // at most that many pid_t values into it. The count is capped at one
-        // past the tree limit; that is enough for the shared cap refusal.
-        libc::proc_listchildpids(
-            parent_pid,
-            raw_pids.as_mut_ptr().cast::<c_void>(),
-            buffer_bytes,
-        )
+    child_process_ids_with_reader(&mut raw_pids, buffer_bytes, |buffer, buffer_bytes| {
+        call_count_api(|| unsafe {
+            // SAFETY: buffer owns buffer_bytes bytes and proc_listchildpids writes
+            // at most that many pid_t values into it. The count is capped at one
+            // past the tree limit; that is enough for the shared cap refusal.
+            libc::proc_listchildpids(
+                parent_pid,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer_bytes,
+            )
+        })
+    })
+}
+
+fn child_process_ids_with_reader<Read>(
+    raw_pids: &mut Vec<libc::pid_t>,
+    buffer_bytes: libc::c_int,
+    mut read: Read,
+) -> Result<Vec<u32>, CollectorError>
+where
+    Read: FnMut(&mut [libc::pid_t], libc::c_int) -> std::io::Result<libc::c_int>,
+{
+    let count = match read(raw_pids, buffer_bytes) {
+        Ok(count) => count,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(Vec::new()),
+        Err(error) => return Err(platform_error("proc_listchildpids", error.to_string())),
     };
     if count < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(Vec::new());
-        }
-        return Err(platform_error("proc_listchildpids", error.to_string()));
+        return Err(platform_error(
+            "proc_listchildpids",
+            "negative child process count".to_owned(),
+        ));
     }
 
     let count = usize::try_from(count).expect("non-negative child PID count must fit usize");
-    raw_pids.truncate(count.min(capacity));
-    let mut pids = raw_pids
+    raw_pids.truncate(count.min(raw_pids.len()));
+    let mut pids = std::mem::take(raw_pids)
         .into_iter()
         .filter_map(valid_pid)
         .collect::<Vec<_>>();
@@ -1252,7 +1291,7 @@ fn read_process_metadata_bounded(
     pid: u32,
     profile: MetadataProfile,
     aggregate_remaining: usize,
-    parent_names: &mut HashMap<ProcessIdentity, Option<String>>,
+    parent_names: &mut HashMap<ProcessIdentity, ParentNameRead>,
 ) -> ProcessMetadata {
     if profile == MetadataProfile::IdentityOnly {
         return ProcessMetadata::default();
@@ -1295,7 +1334,6 @@ fn read_process_metadata_bounded(
     if let Some(info) = &bsd_info {
         metadata.parent_pid = nonzero_pid(info.pbi_ppid);
         if let Some(parent_pid) = metadata.parent_pid {
-            let parent_name_budget = remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES);
             let parent = read_process_bsdinfo(parent_pid)
                 .ok()
                 .and_then(|parent_info| {
@@ -1306,40 +1344,23 @@ fn read_process_metadata_bounded(
                         start_marker,
                     };
                     if let Some(name) = parent_names.get(&identity) {
-                        return Some(
-                            name.as_ref()
-                                .filter(|name| name.len() <= parent_name_budget)
-                                .cloned(),
-                        );
+                        return Some(parent_name_for_budget(name, remaining));
                     }
-                    let name = (parent_name_budget != 0)
-                        .then(|| {
-                            read_process_name_bounded(parent_pid, parent_name_budget)
-                                .ok()
-                                .flatten()
-                        })
-                        .flatten();
-                    let verified = read_process_bsdinfo(parent_pid)
+                    let name = read_process_name_budgeted(
+                        parent_pid,
+                        remaining.min(crate::observation::PROCESS_NAME_MAX_BYTES),
+                    )
+                    .unwrap_or(ParentNameRead::Unavailable);
+                    read_process_bsdinfo(parent_pid)
                         .ok()
                         .and_then(|after| process_start_time_marker_from_bsd_info(&after).ok())
-                        .filter(|after| *after == start_marker)
-                        .and(name);
-                    parent_names.insert(identity, verified.clone());
-                    Some(verified)
-                })
-                .flatten();
-            match parent {
-                Some(parent_name) => {
-                    metadata.parent_process_name = Some(parent_name);
-                    metadata.partial |= metadata.parent_process_name.is_none();
-                    metadata.budget_omitted |= metadata.parent_process_name.is_none()
-                        && parent_name_budget < crate::observation::PROCESS_NAME_MAX_BYTES;
-                    remaining = remaining.saturating_sub(
-                        metadata.parent_process_name.as_ref().map_or(0, String::len),
-                    );
-                }
-                None => metadata.partial = true,
-            }
+                        .filter(|after| *after == start_marker)?;
+                    parent_names.insert(identity, name.clone());
+                    Some(name)
+                });
+            retain_parent_process_name(&mut metadata, parent);
+            remaining = remaining
+                .saturating_sub(metadata.parent_process_name.as_ref().map_or(0, String::len));
         }
     } else {
         metadata.partial = true;
@@ -1354,6 +1375,24 @@ fn read_process_metadata_bounded(
     }
 
     metadata
+}
+
+fn retain_parent_process_name(metadata: &mut ProcessMetadata, parent_name: Option<ParentNameRead>) {
+    match parent_name {
+        Some(ParentNameRead::Value(name)) => metadata.parent_process_name = Some(name),
+        Some(ParentNameRead::BudgetExceeded) => {
+            metadata.partial = true;
+            metadata.budget_omitted = true;
+        }
+        Some(ParentNameRead::Unavailable) | None => metadata.partial = true,
+    }
+}
+
+fn parent_name_for_budget(parent_name: &ParentNameRead, max_bytes: usize) -> ParentNameRead {
+    match parent_name {
+        ParentNameRead::Value(name) if name.len() > max_bytes => ParentNameRead::BudgetExceeded,
+        _ => parent_name.clone(),
+    }
 }
 
 fn apply_command_line_read(
@@ -1437,22 +1476,50 @@ fn process_ids() -> Result<Vec<u32>, CollectorError> {
         let (buffer, buffer_bytes) = buffer.map_or((std::ptr::null_mut(), 0), |buffer| {
             (buffer.as_mut_ptr().cast::<c_void>(), buffer_bytes)
         });
-        let count = unsafe {
+        match call_count_api(|| unsafe {
             // SAFETY: a null buffer and zero size is the documented sizing call.
             // Otherwise buffer owns buffer_bytes bytes and libproc does not retain it.
             libc::proc_listallpids(buffer, buffer_bytes)
-        };
-        if count < 0 {
-            let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
-                Err(crate::observation::ObservationError::SocketTablePermissionDenied.into())
-            } else {
-                Err(platform_error("proc_listallpids", error.to_string()))
+        }) {
+            Err(error) => {
+                if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+                    Err(crate::observation::ObservationError::SocketTablePermissionDenied.into())
+                } else {
+                    Err(platform_error("proc_listallpids", error.to_string()))
+                }
             }
-        } else {
-            Ok(count)
+            Ok(count) => Ok(count),
         }
     })
+}
+
+fn call_count_api<Call>(call: Call) -> std::io::Result<libc::c_int>
+where
+    Call: FnOnce() -> libc::c_int,
+{
+    unsafe {
+        // SAFETY: __error returns this thread's valid errno slot. libproc uses
+        // zero for both an empty result and failure, so stale errno must be gone.
+        *libc::__error() = 0;
+    }
+    let count = call();
+    let errno = if count <= 0 {
+        unsafe {
+            // SAFETY: __error returns this thread's valid errno slot.
+            *libc::__error()
+        }
+    } else {
+        0
+    };
+    count_result(count, errno)
+}
+
+fn count_result(count: libc::c_int, errno: libc::c_int) -> std::io::Result<libc::c_int> {
+    if count < 0 || (count == 0 && errno != 0) {
+        Err(std::io::Error::from_raw_os_error(errno))
+    } else {
+        Ok(count)
+    }
 }
 
 fn process_ids_with_reader<Read>(mut read: Read) -> Result<Vec<u32>, CollectorError>
@@ -1792,11 +1859,6 @@ fn socket_record_from_in_sockinfo(
         protocol,
         local_addr,
         local_port,
-        ipv6_ifindex: if family == libc::AF_INET6 {
-            info.insi_v6.in6_ifindex
-        } else {
-            0
-        },
         state,
         pid,
         socket_id,
@@ -1873,6 +1935,16 @@ fn read_process_name(pid: u32) -> std::io::Result<Option<String>> {
 }
 
 fn read_process_name_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Option<String>> {
+    Ok(match read_process_name_budgeted(pid, max_bytes)? {
+        ParentNameRead::Value(name) => Some(name),
+        ParentNameRead::Unavailable | ParentNameRead::BudgetExceeded => None,
+    })
+}
+
+fn read_process_name_budgeted(pid: u32, max_bytes: usize) -> std::io::Result<ParentNameRead> {
+    if max_bytes == 0 {
+        return Ok(ParentNameRead::BudgetExceeded);
+    }
     let pid = pid_to_c_int(pid)?;
     let mut buffer = [0 as libc::c_char; 64];
     let written_bytes = unsafe {
@@ -1886,7 +1958,7 @@ fn read_process_name_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Opti
     if written_bytes < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(c_char_slice_to_string_bounded(&buffer, max_bytes))
+    Ok(c_char_slice_to_parent_name(&buffer, max_bytes))
 }
 
 fn read_executable_path_bounded(pid: u32, max_bytes: usize) -> std::io::Result<Option<PathBuf>> {
@@ -2148,14 +2220,23 @@ fn c_char_slice_to_string(bytes: &[libc::c_char]) -> Option<String> {
 }
 
 fn c_char_slice_to_string_bounded(bytes: &[libc::c_char], max_bytes: usize) -> Option<String> {
+    match c_char_slice_to_parent_name(bytes, max_bytes) {
+        ParentNameRead::Value(value) => Some(value),
+        ParentNameRead::Unavailable | ParentNameRead::BudgetExceeded => None,
+    }
+}
+
+fn c_char_slice_to_parent_name(bytes: &[libc::c_char], max_bytes: usize) -> ParentNameRead {
     let ptr = bytes.as_ptr();
     if ptr.is_null() || bytes.first().copied() == Some(0) {
-        return None;
+        return ParentNameRead::Unavailable;
     }
 
-    let nul_index = bytes.iter().position(|byte| *byte == 0)?;
-    if nul_index == 0 || nul_index > max_bytes {
-        return None;
+    let Some(nul_index) = bytes.iter().position(|byte| *byte == 0) else {
+        return ParentNameRead::Unavailable;
+    };
+    if nul_index == 0 {
+        return ParentNameRead::Unavailable;
     }
     let text = unsafe {
         // SAFETY: nul_index proves there is a NUL terminator inside bytes, and ptr
@@ -2163,14 +2244,18 @@ fn c_char_slice_to_string_bounded(bytes: &[libc::c_char], max_bytes: usize) -> O
         CStr::from_ptr(ptr)
     };
     let bytes = text.to_bytes();
-    let decoded_len = crate::observation::lossy_utf8_len(bytes)?;
-    if decoded_len == 0 || decoded_len > max_bytes {
-        None
-    } else {
-        let mut text = String::with_capacity(decoded_len);
-        crate::observation::push_utf8_lossy(&mut text, bytes);
-        Some(text)
+    let Some(decoded_len) = crate::observation::lossy_utf8_len(bytes) else {
+        return ParentNameRead::Unavailable;
+    };
+    if decoded_len == 0 {
+        return ParentNameRead::Unavailable;
     }
+    if decoded_len > max_bytes {
+        return ParentNameRead::BudgetExceeded;
+    }
+    let mut text = String::with_capacity(decoded_len);
+    crate::observation::push_utf8_lossy(&mut text, bytes);
+    ParentNameRead::Value(text)
 }
 
 fn nonzero_pid(pid: u32) -> Option<u32> {
@@ -2239,7 +2324,8 @@ mod tests {
         decode_procargs2, decode_procargs2_bounded, fd_list_is_complete, fd_record_count,
         fresh_process_evidence_from_reads, list_process_fds_with_reader, native_pass_from_records,
         process_ids_with_reader, process_observation_from_metadata, read_changing_native_buffer,
-        retain_socket_record, socket_record_from_info, sorted_owner_is_new,
+        retain_parent_process_name, retain_socket_record, socket_record_from_info,
+        sorted_owner_is_new,
     };
     use crate::model::Protocol;
     use crate::observation::{
@@ -2539,7 +2625,6 @@ mod tests {
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 5353);
         assert_eq!(record.pid, 902);
-        assert_eq!(record.ipv6_ifindex, 0);
 
         let pass = native_pass_from_records(
             &[record],
@@ -2547,38 +2632,36 @@ mod tests {
             std::collections::BTreeSet::new(),
             0,
         )
-        .expect("zero native scope is representable");
+        .expect("unavailable native scope is representable");
         assert_eq!(
             pass.sockets[0].endpoint.ipv6_scope,
-            Some(Ipv6Scope::Unscoped)
+            Some(Ipv6Scope::Unavailable)
         );
     }
 
     #[test]
-    fn ipv6_socket_retains_native_interface_index() {
-        let mut info = zeroed_socket_fdinfo();
-        info.psi.soi_protocol = libc::IPPROTO_UDP;
-        info.psi.soi_family = libc::AF_INET6;
-        info.psi.soi_kind = super::SOCKINFO_IN;
-        let mut native = in_sockinfo_v6(5353, Ipv6Addr::LOCALHOST);
-        native.insi_v6.in6_ifindex = 7;
-        info.psi.soi_proto = SocketProtocolInfo { pri_in: native };
-
-        let record = socket_record_from_info(902, &info)
-            .expect("valid scoped IPv6 fdinfo")
-            .expect("UDP socket is kept");
-        let pass = native_pass_from_records(
-            &[record],
-            vec![vec![902]],
-            std::collections::BTreeSet::new(),
-            0,
+    fn production_orchestration_emits_endpoint_null_ipv6_scope_evidence() {
+        let pass = super::MacosCollector::collect_native_pass_with(
+            || Ok(vec![902]),
+            |pid, _| {
+                Ok((
+                    vec![super::SocketRecord {
+                        protocol: Protocol::Udp,
+                        local_addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        local_port: 5353,
+                        state: SocketState::Bound,
+                        pid,
+                        socket_id: 77,
+                    }],
+                    BTreeSet::new(),
+                ))
+            },
         )
-        .expect("scoped native pass is valid");
+        .expect("IPv6 socket remains observable without native scope");
 
-        assert_eq!(
-            pass.sockets[0].endpoint.ipv6_scope,
-            Some(Ipv6Scope::interface_index(7).unwrap())
-        );
+        assert_eq!(pass.owners.evidence_gaps[0].impact, EvidenceImpact::Scope);
+        assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
+        assert_eq!(pass.owners.evidence_gaps[0].pid, None);
     }
 
     #[test]
@@ -2587,7 +2670,6 @@ mod tests {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
-            ipv6_ifindex: 0,
             state: SocketState::Listen,
             pid: 100,
             socket_id: 0xCAFE,
@@ -2624,7 +2706,6 @@ mod tests {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
-            ipv6_ifindex: 0,
             state: SocketState::Listen,
             pid: 100,
             socket_id: 0,
@@ -2647,7 +2728,6 @@ mod tests {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
-            ipv6_ifindex: 0,
             state: SocketState::Listen,
             pid: 100,
             socket_id: 0,
@@ -2696,7 +2776,6 @@ mod tests {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
-            ipv6_ifindex: 0,
             state: SocketState::Listen,
             pid: 100,
             socket_id: 0xCAFE,
@@ -2757,7 +2836,6 @@ mod tests {
             protocol: Protocol::Udp,
             local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             local_port: 5353,
-            ipv6_ifindex: 0,
             state: SocketState::Bound,
             pid: 902,
             socket_id: 77,
@@ -2835,7 +2913,6 @@ mod tests {
                         protocol: Protocol::Udp,
                         local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                         local_port: 5353,
-                        ipv6_ifindex: 0,
                         state: SocketState::Bound,
                         pid,
                         socket_id: 77,
@@ -3047,6 +3124,86 @@ mod tests {
     }
 
     #[test]
+    fn parent_name_exact_fit_is_retained_without_budget_omission() {
+        let mut metadata = ProcessMetadata::default();
+        let native = [
+            b'p'.cast_signed(),
+            b'a'.cast_signed(),
+            b'r'.cast_signed(),
+            b'e'.cast_signed(),
+            b'n'.cast_signed(),
+            b't'.cast_signed(),
+            0,
+        ];
+
+        retain_parent_process_name(
+            &mut metadata,
+            Some(super::c_char_slice_to_parent_name(&native, 6)),
+        );
+
+        assert_eq!(metadata.parent_process_name.as_deref(), Some("parent"));
+        assert!(!metadata.partial);
+        assert!(!metadata.budget_omitted);
+    }
+
+    #[test]
+    fn parent_name_first_excess_and_zero_remaining_are_budget_omissions() {
+        for max_bytes in [5, 0] {
+            let mut metadata = ProcessMetadata::default();
+            let native = [
+                b'p'.cast_signed(),
+                b'a'.cast_signed(),
+                b'r'.cast_signed(),
+                b'e'.cast_signed(),
+                b'n'.cast_signed(),
+                b't'.cast_signed(),
+                0,
+            ];
+
+            retain_parent_process_name(
+                &mut metadata,
+                Some(super::c_char_slice_to_parent_name(&native, max_bytes)),
+            );
+
+            assert_eq!(metadata.parent_process_name, None);
+            assert!(metadata.partial);
+            assert!(metadata.budget_omitted);
+            assert_eq!(
+                process_observation_from_metadata(metadata).metadata_omission,
+                Some(crate::observation::MetadataOmission::BudgetExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_parent_name_is_not_a_budget_omission() {
+        let mut metadata = ProcessMetadata::default();
+
+        retain_parent_process_name(&mut metadata, Some(super::ParentNameRead::Unavailable));
+
+        assert!(metadata.partial);
+        assert!(!metadata.budget_omitted);
+    }
+
+    #[test]
+    fn cached_parent_name_respects_each_childs_remaining_budget() {
+        let cached = super::ParentNameRead::Value("parent".to_owned());
+
+        assert_eq!(
+            super::parent_name_for_budget(&cached, 6),
+            super::ParentNameRead::Value("parent".to_owned())
+        );
+        assert_eq!(
+            super::parent_name_for_budget(&cached, 5),
+            super::ParentNameRead::BudgetExceeded
+        );
+        assert_eq!(
+            super::parent_name_for_budget(&cached, 0),
+            super::ParentNameRead::BudgetExceeded
+        );
+    }
+
+    #[test]
     fn procargs2_seam_enforces_one_mib_final_utf8_boundary() {
         let max = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
         let exact_argument = vec![b'x'; max];
@@ -3228,6 +3385,78 @@ mod tests {
         assert_eq!(pids.len(), max);
         assert_eq!(pids.first(), Some(&1));
         assert_eq!(pids.last(), Some(&u32::try_from(max).unwrap()));
+    }
+
+    #[test]
+    fn zero_count_with_errno_is_an_error_and_zero_without_errno_is_success() {
+        let error = super::count_result(0, libc::EIO).expect_err("zero with errno is failure");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(super::count_result(0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_call_clears_stale_errno_before_native_invocation() {
+        unsafe {
+            // SAFETY: __error returns this test thread's valid errno slot.
+            *libc::__error() = libc::EIO;
+        }
+
+        assert_eq!(super::call_count_api(|| 0).unwrap(), 0);
+        let error = super::call_count_api(|| {
+            unsafe {
+                // SAFETY: __error returns this test thread's valid errno slot.
+                *libc::__error() = libc::EACCES;
+            }
+            0
+        })
+        .expect_err("errno set by the invocation makes zero an error");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn all_pid_zero_error_cannot_become_an_empty_complete_list() {
+        let error = process_ids_with_reader(|_, _| {
+            super::count_result(0, libc::EACCES)
+                .map_err(|error| super::platform_error("proc_listallpids", error.to_string()))
+        })
+        .expect_err("zero-on-error must remain an enumeration failure");
+
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Platform {
+                operation: "proc_listallpids",
+                ..
+            }
+        ));
+        assert!(
+            process_ids_with_reader(|_, _| Ok(0))
+                .expect("genuine zero is not a native failure")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn child_pid_reader_preserves_genuine_zero_children_and_zero_error() {
+        let mut buffer = vec![0; 4];
+        let buffer_bytes = libc::c_int::try_from(std::mem::size_of_val(buffer.as_slice())).unwrap();
+        let children = super::child_process_ids_with_reader(&mut buffer, buffer_bytes, |_, _| {
+            super::count_result(0, 0)
+        })
+        .expect("zero children is a valid result");
+        assert!(children.is_empty());
+
+        let mut buffer = vec![0; 4];
+        let error = super::child_process_ids_with_reader(&mut buffer, buffer_bytes, |_, _| {
+            super::count_result(0, libc::EACCES)
+        })
+        .expect_err("zero with errno is a child enumeration failure");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Platform {
+                operation: "proc_listchildpids",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -377,6 +377,7 @@ struct SocketRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OwnerScanLoss {
     EnumerationIncomplete,
+    AncestorPidOwnersInvisible,
     PermissionDenied(u32),
     Disappeared(u32),
     Unattributable(u32),
@@ -440,6 +441,9 @@ fn native_pass_from_records(
         );
     }
 
+    let ancestor_pid_owners_invisible = owner_scan
+        .losses
+        .contains(&OwnerScanLoss::AncestorPidOwnersInvisible);
     let mut reasons = BTreeSet::new();
     let mut evidence_gaps = Vec::with_capacity(owner_scan.losses.len());
     let mut omitted_evidence_gap_count = owner_scan.omitted_loss_count;
@@ -449,6 +453,11 @@ fn native_pass_from_records(
                 None,
                 EvidenceGapCode::OwnerAttributionIncomplete,
                 "process visibility or enumeration was incomplete before socket ownership could be attributed",
+            ),
+            OwnerScanLoss::AncestorPidOwnersInvisible => (
+                None,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "ancestor PID namespace processes may own sockets but are invisible to this process enumeration",
             ),
             OwnerScanLoss::PermissionDenied(pid) => (
                 Some(pid),
@@ -475,12 +484,18 @@ fn native_pass_from_records(
         }
     }
     let global_completeness = OwnerCompleteness::partial(reasons)?;
-    // PID/fd traversal losses have no endpoint provenance. They reduce only
-    // global authority; copying them into every socket would falsely turn an
-    // unknown global owner into socket-local evidence. Consequently, local
-    // Complete means all attributable edges were retained; it cannot exclude an
-    // unreadable process that shares the same socket inode.
-    let local_completeness = vec![OwnerCompleteness::Complete; records.len()];
+    // Ordinary PID/fd traversal losses have no endpoint provenance and reduce
+    // only global authority. Nested PID namespaces are different: an invisible
+    // ancestor-namespace process may share any socket visible in the current
+    // network namespace, so no socket's owner set is provably complete.
+    let local_completeness = if ancestor_pid_owners_invisible {
+        vec![
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?;
+            records.len()
+        ]
+    } else {
+        vec![OwnerCompleteness::Complete; records.len()]
+    };
     Ok(crate::observation::NativeObservationPass {
         sockets,
         owners: OwnerAssociations {
@@ -495,6 +510,8 @@ fn native_pass_from_records(
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 enum SocketParseError {
+    #[error("invalid /proc/net socket table header")]
+    InvalidHeader,
     #[error("missing field {field}")]
     MissingField { field: &'static str },
     #[error("local address must be ADDRESS:PORT, got {value}")]
@@ -679,8 +696,24 @@ fn parse_socket_table(
     clock_ticks_per_second: Option<u64>,
     max_records: usize,
 ) -> Result<Vec<SocketRecord>, SocketParseError> {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or(SocketParseError::InvalidHeader)?;
+    let mut header_fields = header.split_whitespace();
+    let expected_remote_address = match address_family {
+        AddressFamily::Ipv4 => "rem_address",
+        AddressFamily::Ipv6 => "remote_address",
+    };
+    if header_fields.next() != Some("sl")
+        || header_fields.next() != Some("local_address")
+        || header_fields.next() != Some(expected_remote_address)
+        || header_fields.next() != Some("st")
+        || header_fields.nth(7) != Some("inode")
+    {
+        return Err(SocketParseError::InvalidHeader);
+    }
+
     let mut records = Vec::new();
-    for (line_index, line) in text.lines().enumerate().skip(1) {
+    for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
@@ -691,7 +724,7 @@ fn parse_socket_table(
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(line = line_index + 1, %error, "malformed /proc/net row");
+                tracing::warn!(line = line_index + 2, %error, "malformed /proc/net row");
                 return Err(error);
             }
         }
@@ -928,6 +961,9 @@ fn collect_socket_owners_detailed(
     if enumeration_incomplete || proc_visibility_restricted(proc_root) {
         result.record_loss(OwnerScanLoss::EnumerationIncomplete);
     }
+    if ancestor_pid_visibility_not_proven(proc_root) {
+        result.record_loss(OwnerScanLoss::AncestorPidOwnersInvisible);
+    }
     let mut fd_entries_visited = 0;
     for pid in pids {
         scan_pid_socket_owners(
@@ -1018,6 +1054,33 @@ fn proc_visibility_restricted(proc_root: &Path) -> bool {
                 })
             })
     })
+}
+
+fn ancestor_pid_visibility_not_proven(proc_root: &Path) -> bool {
+    let Ok(status) = read_bounded_text(&proc_root.join("self/status"), MAX_STATUS_BYTES) else {
+        return true;
+    };
+    let mut nspid_lines = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
+    let Some(nspid) = nspid_lines.next() else {
+        return true;
+    };
+    if nspid_lines.next().is_some() {
+        return true;
+    }
+
+    let mut id_count = 0usize;
+    for field in nspid.split_whitespace() {
+        let Ok(pid) = field.parse::<u32>() else {
+            return true;
+        };
+        if pid == 0 {
+            return true;
+        }
+        id_count += 1;
+    }
+    id_count != 1
 }
 
 #[cfg(test)]
@@ -1856,15 +1919,16 @@ mod tests {
 
     use super::{
         AddressFamily, CollectionLimits, LinuxCollector, MAX_CHILD_PROCESSES, MAX_STATUS_BYTES,
-        OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord, append_sorted_owner,
-        bounded_scope_identifier, collect_child_processes_from, collect_pid_socket_owners,
-        collect_process_context_from, collect_related_process_hints_from, collect_socket_owners,
-        collect_socket_owners_detailed, collect_socket_records, collect_tree_process_infos,
-        decode_cmdline, native_pass_from_records, parse_process_group_id,
-        parse_process_start_time_ticks, parse_process_status, parse_socket_inode,
-        parse_socket_line, parse_socket_table, proc_visibility_restricted, read_bounded_text,
-        read_cmdline, read_cmdline_bounded, read_fresh_process_evidence, read_link_bounded,
-        read_process_metadata_bounded, read_process_status,
+        OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord,
+        ancestor_pid_visibility_not_proven, append_sorted_owner, bounded_scope_identifier,
+        collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
+        collect_related_process_hints_from, collect_socket_owners, collect_socket_owners_detailed,
+        collect_socket_records, collect_tree_process_infos, decode_cmdline,
+        native_pass_from_records, parse_process_group_id, parse_process_start_time_ticks,
+        parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
+        proc_visibility_restricted, read_bounded_text, read_cmdline, read_cmdline_bounded,
+        read_fresh_process_evidence, read_link_bounded, read_process_metadata_bounded,
+        read_process_status,
     };
     use crate::model::{PermissionStatus, Platform, Protocol};
     use crate::observation::{
@@ -1930,6 +1994,7 @@ mod tests {
     }
     const HEADER: &str =
         "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
+    const HEADER6: &str = "sl local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
 
     fn row(local: &str, state: &str, inode: u64) -> String {
         row_with_timer(local, state, "00:00000000", inode)
@@ -1964,11 +2029,19 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(path.join("net")).expect("test proc net directory must be created");
+        fs::create_dir_all(path.join("self")).expect("test proc self directory must be created");
+        fs::write(path.join("self/status"), "Name:\tkickoutchi\nNSpid:\t1\n")
+            .expect("initial PID namespace evidence must be written");
         path
     }
 
     fn write_socket_table(proc_root: &Path, relative_path: &str, rows: &[String]) {
-        let text = format!("{HEADER}\n{}\n", rows.join("\n"));
+        let header = if relative_path.ends_with('6') {
+            HEADER6
+        } else {
+            HEADER
+        };
+        let text = format!("{header}\n{}\n", rows.join("\n"));
         fs::write(proc_root.join(relative_path), text).expect("test socket table must be written");
     }
 
@@ -2307,6 +2380,43 @@ mod tests {
     }
 
     #[test]
+    fn table_parser_rejects_empty_garbage_and_headerless_inputs() {
+        let first = row("0100007F:0BB8", "0A", 1);
+        let second = row("0100007F:1770", "01", 2);
+        for text in [
+            String::new(),
+            "not a proc socket table\n".to_owned(),
+            format!("{first}\n"),
+            format!("{first}\n{second}\n"),
+        ] {
+            assert_eq!(
+                parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 8,),
+                Err(SocketParseError::InvalidHeader),
+                "input must not be accepted without the procfs header: {text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn table_parser_accepts_header_only_and_normal_proc_tables() {
+        assert_eq!(
+            parse_socket_table(HEADER, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 8,),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            parse_socket_table(HEADER6, Protocol::Tcp, AddressFamily::Ipv6, Some(100), 8,),
+            Ok(Vec::new()),
+        );
+
+        let text = format!("  {HEADER}  \n{}\n", row("0100007F:0BB8", "0A", 7));
+        let records = parse_socket_table(&text, Protocol::Tcp, AddressFamily::Ipv4, Some(100), 8)
+            .expect("normal proc socket table parses");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].inode, 7);
+        assert_eq!(records[0].local_port, 3000);
+    }
+
+    #[test]
     fn table_parser_refuses_the_first_row_past_its_retention_limit() {
         let text = format!(
             "{HEADER}\n{}\n{}\n",
@@ -2621,6 +2731,96 @@ mod tests {
             OwnerCompleteness::Partial { .. }
         ));
         assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn initial_pid_namespace_keeps_visible_socket_ownership_complete() {
+        let proc_root = temp_proc_root("initial-pid-namespace");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 1234, "worker", 1);
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234/fd/0"))
+            .expect("visible socket owner fixture");
+        fs::create_dir_all(proc_root.join("self")).expect("self proc fixture");
+        fs::write(
+            proc_root.join("self/status"),
+            "Name:\tkickoutchi\nUmask:\t0022\nState:\tR (running)\nTgid:\t4321\nNgid:\t0\nPid:\t4321\nPPid:\t4000\nTracerPid:\t0\nNSpid:\t4321\nUid:\t1000\t1000\t1000\t1000\n",
+        )
+        .expect("production-shaped initial namespace status");
+
+        assert!(!ancestor_pid_visibility_not_proven(&proc_root));
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("initial PID namespace collection succeeds");
+        assert_eq!(snapshot.owner_completeness, OwnerCompleteness::Complete);
+        assert_eq!(
+            snapshot.sockets[0].owner_completeness,
+            OwnerCompleteness::Complete
+        );
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn nested_pid_namespace_marks_visible_owner_and_hidden_co_owner_incomplete() {
+        let proc_root = temp_proc_root("nested-pid-namespace");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 12, "visible-worker", 1);
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("12/fd/0"))
+            .expect("visible socket owner fixture");
+        fs::create_dir_all(proc_root.join("self")).expect("self proc fixture");
+        fs::write(
+            proc_root.join("self/status"),
+            "Name:\tkickoutchi\nUmask:\t0022\nState:\tR (running)\nTgid:\t12\nNgid:\t0\nPid:\t12\nPPid:\t1\nTracerPid:\t0\nNSpid:\t4321\t12\nUid:\t1000\t1000\t1000\t1000\n",
+        )
+        .expect("production-shaped nested namespace status");
+
+        assert!(ancestor_pid_visibility_not_proven(&proc_root));
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("nested PID namespace collection remains usable");
+        let visible_owner_pids = snapshot.sockets[0]
+            .owners
+            .iter()
+            .map(|owner| match owner {
+                crate::observation::OwnerObservation::Verified(identity) => identity.pid,
+                crate::observation::OwnerObservation::UnverifiedPid { pid, .. } => *pid,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_owner_pids, [12]);
+        assert!(!snapshot.owner_completeness.is_complete());
+        assert!(!snapshot.sockets[0].owner_completeness.is_complete());
+        assert!(snapshot.evidence_gaps.iter().any(|gap| {
+            gap.code == EvidenceGapCode::OwnerAttributionIncomplete && gap.pid.is_none()
+        }));
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn missing_or_malformed_nspid_cannot_prove_complete_pid_visibility() {
+        let proc_root = temp_proc_root("unknown-pid-namespace");
+        fs::remove_file(proc_root.join("self/status")).expect("remove default status fixture");
+        assert!(ancestor_pid_visibility_not_proven(&proc_root));
+
+        for status in [
+            "Name:\tkickoutchi\nPid:\t123\n",
+            "Name:\tkickoutchi\nNSpid:\t123\tnot-a-pid\n",
+            "Name:\tkickoutchi\nNSpid:\t123\t12\nNSpid:\t123\t12\n",
+        ] {
+            fs::write(proc_root.join("self/status"), status).expect("status fixture");
+            assert!(
+                ancestor_pid_visibility_not_proven(&proc_root),
+                "status: {status:?}"
+            );
+        }
 
         fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
     }

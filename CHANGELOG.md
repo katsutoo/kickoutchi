@@ -61,6 +61,19 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 
 ### Fixed
 
+- Linux socket collection now rejects empty, malformed, and headerless procfs
+  tables while accepting the kernel's family-specific IPv4 and IPv6 headers.
+  Ownership remains explicitly partial when a nested or unverifiable PID
+  namespace could hide an ancestor-namespace socket owner.
+- macOS process enumeration now distinguishes genuine empty results from
+  zero-plus-errno failures, reports IPv6 scope as unavailable instead of
+  retaining an unsupported interface index, and classifies bounded parent-name
+  omissions without exceeding the metadata allowance.
+- Windows socket collection now converts IPv6 scope IDs from network byte order,
+  normalizes IPv4-mapped IPv6 endpoints, and retains ownerless UDP endpoints as
+  partial rather than treating PID zero as a process. Authoritative socket rows
+  also survive Toolhelp metadata-enumeration failures through bounded direct
+  owner-identity reads, while destructive tree collection remains fail closed.
 - Linux process identity now parses the bounded ASCII tail of `/proc/<pid>/stat`
   from bytes, so a valid non-UTF-8 `comm` cannot abort collection. Restricted or
   incomplete procfs PID enumeration now marks global ownership partial instead

@@ -793,9 +793,9 @@ Use this fact-source and limitation matrix as the platform contract:
 | IPv4/IPv6 UDP bound rows | `/proc/net/udp`, `/proc/net/udp6` | `proc_listallpids` + `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` | `GetExtendedUdpTable` owner tables |
 | Socket owner PID | `/proc/<pid>/fd` inode links | Per-process libproc file descriptors | Extended owner-table PID |
 | Process start identity | `/proc/<pid>/stat` field 22 | `proc_bsdinfo` start time | `GetProcessTimes` creation time |
-| Process metadata | `/proc/<pid>` files and links | `proc_bsdinfo`, `proc_name`, `proc_pidpath`, and bounded `KERN_PROCARGS2` | `CreateToolhelp32Snapshot`/`Process32FirstW`/`Process32NextW` for bounded name and parent rows, `QueryFullProcessImageNameW` for path, and bounded `NtQueryInformationProcess(ProcessCommandLineInformation)` for the legacy command line |
+| Process metadata | `/proc/<pid>` files and links | `proc_bsdinfo`, `proc_name`, `proc_pidpath`, and bounded `KERN_PROCARGS2` | `CreateToolhelp32Snapshot`/`Process32FirstW`/`Process32NextW` for bounded name and parent rows, `QueryFullProcessImageNameW` for path, and bounded `NtQueryInformationProcess(ProcessCommandLineInformation)` for the legacy command line; socket-owner enrichment falls back to bounded direct PID identity reads when Toolhelp relation enumeration fails |
 | Socket token | `/proc/net` inode | `socket_info.soi_so` returned by `PROC_PIDFDSOCKETINFO` | Unavailable in this release |
-| IPv6 scope ID | Unavailable from the selected `/proc/net` row format; every IPv6 row uses `Unavailable` | `in6_ifindex` | `dwLocalScopeId` |
+| IPv6 scope ID | Unavailable from the selected `/proc/net` row format; every IPv6 row uses `Unavailable` | Unavailable from the selected libproc socket descriptor interpretation; every IPv6 row uses `Unavailable` | Network-byte-order `dwLocalScopeId` converted to host order |
 | Timer estimate | TCP-only `/proc/net/tcp*` `tr` and `tm->when`, retained as kind and raw ticks; duration uses checked `_SC_CLK_TCK` conversion | Unavailable | Unavailable |
 | Scope | `/proc/self/ns/net` current namespace | Declared process-visible host coverage; no global identifier | Declared current native Windows host stack; no global identifier |
 
@@ -803,6 +803,13 @@ Permanent limitations are part of the contract:
 
 - Linux observes only the current network namespace and never enters another
   namespace implicitly.
+- Linux `/proc/<pid>` enumeration sees only PIDs visible in the collector's PID
+  namespace. A bounded, unique, positive `/proc/self/status` `NSpid` chain with
+  exactly one value is required before ownership visibility is treated as
+  initial-namespace complete. A nested, missing, unreadable, duplicate, zero, or
+  malformed chain adds endpoint-null ownership uncertainty and makes every
+  retained socket's owner set partial because an ancestor-namespace process may
+  share a socket in the current network namespace.
 - The selected Linux `/proc/net/*6` source exposes no scope identifier, so every
   Linux IPv6 observation uses `Ipv6Scope::Unavailable`. A snapshot containing
   such rows adds one endpoint-null `native_field_unavailable` gap with `Scope`
@@ -822,9 +829,18 @@ Permanent limitations are part of the contract:
   this scope. Denial, truncation, disappearance, or malformed enumeration for a
   returned process is a `SocketSet` gap and prevents socket-set completeness; it
   is not reclassified as an ordinary scope exclusion.
+- The selected macOS libproc socket descriptor interpretation does not provide a
+  supported IPv6 scope identifier. Every macOS IPv6 observation therefore uses
+  `Ipv6Scope::Unavailable` and the snapshot adds one endpoint-null
+  `native_field_unavailable` gap with `Scope` impact.
 - Windows collection excludes the separate WSL network stack. Excluded-port or
   reservation evidence is reported only when a supported native source supplies
   it.
+- Windows converts `dwLocalScopeId` from network byte order. IPv4-mapped IPv6
+  owner-table rows normalize to IPv4 and discard IPv6 scope. An IP Helper UDP row
+  with owning PID zero remains an authoritative endpoint with an empty partial
+  owner set and endpoint-local `owner_attribution_incomplete` evidence; PID zero
+  is never read as a process owner.
 - Owner PID, verified process identity, and optional process metadata have
   separate completeness. Failure to read a start marker preserves a native PID
   as `UnverifiedPid` and affects ownership verification. Failure to read a name,
@@ -863,6 +879,9 @@ Permanent limitations are part of the contract:
   attribution partial at socket or snapshot scope as the source permits.
 - Mark timer expiry as estimated.
 - Fail closed on oversized or malformed identity-critical files.
+- Validate the native socket-table header before accepting either rows or an
+  empty table; recognize the kernel's family-specific `rem_address` and
+  `remote_address` labels, and reject empty, garbage, or headerless input.
 - Replace the current 16 KiB truncate-and-mark-partial command-line behavior
   with the shared 1 MiB contract. Preserve the complete raw value through 1 MiB;
   above the cap serialize `null`, mark metadata partial, and add the bounded
@@ -889,6 +908,9 @@ Permanent limitations are part of the contract:
   size checks alone are insufficient ABI evidence.
 - Retain `socket_info.soi_so` only as an opaque token for within-pass association
   and ordering. It does not prove cross-capture identity or replacement.
+- Clear and inspect thread-local errno around libproc count APIs so a genuine
+  zero result remains valid while zero-plus-errno cannot become a complete empty
+  process or child list.
 
 ### 2.3 Windows
 
@@ -908,6 +930,11 @@ Permanent limitations are part of the contract:
 - IP Helper owner-table rows remain socket-set evidence even when process
   identity or metadata reads fail. Such failure affects ownership or metadata,
   not the existence of the socket row.
+- Toolhelp relation-enumeration failure during socket-owner enrichment falls
+  back to bounded direct reads of only the owner PIDs and returns partial
+  metadata. Tree snapshots still propagate Toolhelp failure. Read-only process
+  context and command-line helpers fail closed to empty relationship or metadata
+  evidence rather than returning partial native relations.
 - The former `sysinfo` metadata snapshot was not considered bounded merely
   because results were truncated afterward and has been replaced by bounded
   native sources. Enumerate at most 131,072 fixed-size Toolhelp rows; allocate name,
@@ -929,7 +956,8 @@ retains all states for watch and why.
 - [x] Native fixture tests cover every documented state and malformed tables.
 - [x] Every platform enforces process-metadata limits before allocation; Windows
       uses its bounded native replacement.
-- [x] Linux, macOS, and Windows CI compile and run their collector tests.
+- [ ] Linux, macOS, and Windows CI compile and run their collector tests after
+      the completeness and native endpoint remediation.
 - [x] Release-mode feasibility measurements confirm the 100 ms watch minimum or
       Stage 0 is reopened before named endpoints and public commands begin.
 
