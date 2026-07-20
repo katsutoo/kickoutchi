@@ -2399,3 +2399,34 @@ The internal implementation order is:
 14. Pass the final all-or-nothing release gate.
 
 Development may proceed stage by stage. Release remains atomic.
+
+## Post-1.3.0 Follow-up: Update Notification
+
+This is explicitly outside the atomic named endpoints, `watch`, and `why`
+release. Do not begin it until this complete plan ships as `1.3.0`. Consider it
+for `1.3.1` or a later release after separately freezing its behavior and privacy
+contract.
+
+Add a non-intrusive notification when a newer Kickoutchi release is available:
+
+- Never block startup on a network request.
+- Check in the background at most once per configured cache interval, initially
+  proposed as 24 hours.
+- Show a status notice rather than a modal or forced prompt.
+- Never install an update automatically.
+- Never contaminate normal stdout, legacy JSON, snapshot JSON, or watch NDJSON.
+  An interactive CLI notice may use stderr only when attached to a terminal.
+- Fail silently when offline, rate-limited, or unable to reach the release
+  source.
+- Allow automatic checks to be disabled.
+- State in the privacy documentation that checking contacts the release source
+  and can reveal the installed version, IP address, and approximate usage time.
+- Give installation-aware guidance. Installer users may run
+  `kickoutchi-update`; Homebrew, Scoop, Cargo, Nix, and future AUR users should
+  update through their package manager.
+- Do not execute `kickoutchi-update` merely to check for a release.
+
+Before implementation, define the trusted release metadata source, cache file
+location and bounds, timeout and response-size limits, version comparison rules,
+pre-release handling, package-manager detection policy, tests, and failure
+behavior.
