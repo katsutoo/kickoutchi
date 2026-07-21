@@ -2384,6 +2384,44 @@ Perform one final review of the complete diff, not only the last stage.
 - Confirm native CI results belong to the exact release commit.
 - Confirm QA and benchmark results belong to the exact release artifacts.
 
+### 13.3 Repository and launch cleanup
+
+After the complete implementation passes its technical gates, perform one
+deliberate cleanup and launch-surface pass before tagging `1.3.0`:
+
+- Remove obsolete scratch files, stale generated artifacts, superseded temporary
+  fixtures, dead scripts, and duplicate notes that are no longer needed. Do not
+  delete raw benchmark samples, review reports, security evidence, or fixtures
+  referenced by an approved gate; reproducibility and audit evidence are release
+  assets, not clutter.
+- Review the repository tree and ignored files for accidental local state such as
+  `tmp/`, editor output, logs, stale binaries, and abandoned benchmark runs. Keep
+  only intentional source, documentation, reproducible tooling, and cited
+  evidence in the release commit.
+- Rewrite and reorganize the README where needed so a new user can quickly
+  understand the `1.3.0` product: named endpoints, `watch`, `why`, installation,
+  first commands, configuration, filters, structured output, privacy, platform
+  limitations, safety, and links to deeper reference material. Remove stale,
+  duplicated, provisional, and implementation-stage wording.
+- Check every README command against the final release binaries. Ensure help,
+  README, changelog, schema documentation, examples, and platform notes describe
+  the same behavior and versioned contracts.
+- Update the GitHub repository About metadata for the final product: concise
+  description, website URL, and relevant topics. Remove stale wording and ensure
+  the metadata matches the README and `1.3.0` release positioning.
+- In the separate `kickoutchi-front` repository, update the landing page for the
+  complete `1.3.0` release. Cover named endpoints, watch, why, supported
+  platforms, installation methods, representative commands/output, safety and
+  privacy limitations, and links to the repository and release artifacts.
+- Build and inspect the final `kickoutchi-front` production site on desktop and
+  mobile. Verify links, commands, version references, screenshots or recordings,
+  metadata, social previews, and download/install calls to action against the
+  exact `1.3.0` release candidate. Do not publish claims that exceed the final QA
+  and benchmark evidence.
+- Record the `kickoutchi-front` commit and deployed URL in the final release
+  review so the application repository, GitHub About panel, landing page, release
+  notes, and artifacts can be audited as one coordinated launch.
+
 ## Final All-or-Nothing Release Gate
 
 Do not release unless every item is checked:
@@ -2401,6 +2439,11 @@ Do not release unless every item is checked:
 - [ ] QA verdict is PASS and recommendation is `ship`.
 - [ ] Release benchmark is trustworthy and within declared budgets.
 - [ ] Changelog, README, help, and platform limitations are complete.
+- [ ] Repository cleanup removed disposable files without deleting cited review,
+      security, or benchmark evidence.
+- [ ] GitHub About metadata and the production `kickoutchi-front` landing page
+      match the final `1.3.0` release; the frontend commit and deployed URL are
+      recorded in the release review.
 - [ ] Release artifacts and checksums were verified.
 
 If any item fails, the release is held. Do not hide an incomplete path behind a
