@@ -67,6 +67,31 @@ A no-duration watch may run until cancellation; each poll, allocation, table,
 buffer, label, event batch, native read, and retained state set remains
 independently bounded.
 
+## Test Layers
+
+Use the following terms consistently throughout implementation and review:
+
+- Unit tests exercise one behavior through a focused in-process boundary.
+- Integration tests exercise real native APIs or collaborating modules without
+  requiring a complete user journey. The exact bind-probe matrix remains native
+  integration coverage until a public command consumes it.
+- Automated end-to-end tests invoke the real `kick` or `kickoutchi` binary and
+  cross the relevant OS boundaries using only test-owned processes, sockets,
+  files, and configuration. They assert exit code, stdout, stderr, structured
+  output, observable side effects, negative behavior, and guaranteed cleanup.
+- Native end-to-end means the journey ran on the target OS. Cross-compilation is
+  useful evidence but is not native end-to-end coverage.
+- Exploratory end-to-end QA exercises exact release artifacts as a real user and
+  remains separate from the deterministic automated E2E suite.
+
+Every public feature adds the smallest representative real-binary journeys when
+its CLI surface becomes available. E2E tests use readiness IPC or observable
+conditions instead of sleeps, impose bounded timeouts, preserve the first
+failure, and never retry into green. No E2E test may signal or otherwise modify
+an unrelated process. Full TUI automation is required only if a deterministic
+pseudo-terminal harness adds coverage beyond the existing state and rendering
+tests; interactive TUI behavior is always exercised during Stage 11 QA.
+
 ## Definition of Complete
 
 The release is complete only when all of the following are true:
@@ -781,6 +806,8 @@ unrelated; any nonzero omitted-gap count therefore blocks both destructive modes
       contract, integration, and mutation-confirmed tests.
 - [x] Unit tests cover stable, partial, denied, raced, duplicate, zero, maximum,
       and maximum-plus-one observations.
+- [x] Existing real-binary list, inspect, and test-owned kill journeys remain
+      green on their supported native test hosts.
 
 ## Stage 2: Complete Native Collection
 
@@ -960,6 +987,8 @@ retains all states for watch and why.
       uses its bounded native replacement.
 - [x] Linux, macOS, and Windows CI compile and run their collector tests after
       the completeness and native endpoint remediation.
+- [x] Real-binary native smoke coverage proves authoritative socket rows reach
+      the public CLI while fixture tests retain exhaustive collector coverage.
 - [x] Release-mode feasibility measurements confirm the 100 ms watch minimum or
       Stage 0 is reopened before named endpoints and public commands begin.
 
@@ -1056,6 +1085,9 @@ scope deliberately and therefore apply to scoped and scope-unavailable rows.
 - [x] Matching and precedence are deterministic.
 - [x] JSON changes are pinned and documented.
 - [x] CLI and TUI rendering remain aligned for Unicode labels.
+- [x] A real-binary journey proves configured labels reach table output,
+      filtering, and `kickoutchi.list/1` JSON without changing unconfigured
+      output.
 
 ## Stage 4: Implement the Watch Engine
 
@@ -1256,6 +1288,9 @@ prevents a 100 ms interval from becoming an external-process spawn loop.
 - [x] Memory remains bounded by two snapshots and one bounded event batch.
 - [x] Cancellation, duration, broken pipes, and repeated failures are tested.
 - [x] NDJSON schema and stdout/stderr separation are pinned.
+- [x] Real-binary journeys cover argument rejection, baseline NDJSON, duration,
+      Ctrl-C, schema shape, and stdout/stderr separation against controlled local
+      observations.
 
 ## Stage 5: Implement Exact Bind Probes
 
@@ -1318,6 +1353,9 @@ platform-sensitive setup with new local unsafe code.
 - [x] No probe leaves a socket or helper process behind.
 - [x] Probe language says "now" and does not promise future availability.
 - [x] The approved `socket2` dependency matches the reviewed lockfile version.
+- [x] Probe behavior has native integration coverage; public end-to-end coverage
+      is intentionally deferred until `why` exposes the probe through a shipped
+      binary.
 
 ## Stage 6: Implement the Why Verdict Engine
 
@@ -1494,6 +1532,9 @@ as a guarantee that a future bind will succeed at expiration.
 - [ ] Exact queries never imply a host-wide conclusion.
 - [ ] Human and JSON results carry equivalent facts.
 - [ ] Every verdict maps to a documented exit code.
+- [ ] Real-binary E2E journeys cover bindable and occupied TCP/UDP endpoints,
+      IPv4/IPv6 behavior, representative incomplete evidence, aggregate exit-code
+      precedence, JSON, stdout/stderr separation, and helper cleanup.
 
 ## Stage 7: Stabilize Public Output and Documentation
 
@@ -1946,6 +1987,8 @@ requires this planning document to understand the change.
 - [ ] Help and README examples match executable behavior.
 - [ ] Permanent limitations are visible, not buried.
 - [ ] Changelog identifies additive serialized-contract changes.
+- [ ] Real-binary E2E assertions pin documented commands, schema/version pairs,
+      exit codes, and privacy-sensitive field absence against executable output.
 
 ## Stage 8: Security Review and Remediation
 
@@ -2162,7 +2205,30 @@ Extend the test helper to support:
 Use dynamically assigned ports. Do not use sleeps for synchronization. Give
 every helper a deadline, explicit owner, and guaranteed cleanup path.
 
-### 9.4 Mutation confirmation
+### 9.4 Automated end-to-end coverage
+
+Run a deliberately small real-binary suite covering the critical journeys:
+
+- Existing bare invocation, list, inspect, short-binary parity, protected
+  refusal, and test-owned single/tree/group kill behavior.
+- Exact and wildcard labels reaching table output, search, filters, legacy JSON,
+  watch, and why.
+- Watch baseline, bind, release, replacement where deterministically
+  reproducible, duration, Ctrl-C, transient failure/recovery, valid NDJSON, and
+  clean stdout/stderr separation.
+- Why bindable, occupied, unavailable, unsupported, partial/permission-limited,
+  multi-endpoint precedence, human/JSON parity, and broken-output behavior.
+- TCP/UDP and IPv4/IPv6 representatives, including wildcard and dual-stack modes
+  only where the native host supports them.
+- Cleanup after success, refusal, assertion failure, timeout, and cancellation;
+  no helper process or socket may survive the test.
+
+During development these journeys may use Cargo-built test binaries. Stage 10
+repeats the applicable native journeys against exact release artifacts on every
+supported platform. Keep TUI state and rendering coverage deterministic
+in-process unless a stable pseudo-terminal harness demonstrates additional value.
+
+### 9.5 Mutation confirmation
 
 For critical safety and contract tests, deliberately restore the relevant faulty
 behavior once and confirm that the targeted test fails for the intended reason.
@@ -2181,6 +2247,8 @@ treated as unprotected, and signal delivery before final revalidation.
 - [ ] No timing test relies on arbitrary sleeps.
 - [ ] Critical tests were mutation-confirmed.
 - [ ] The full suite passes repeatedly and in parallel where supported.
+- [ ] The focused real-binary E2E suite covers every critical public journey,
+      asserts negative space, and proves helper cleanup without retries.
 
 ## Stage 10: Native Continuous Integration
 
@@ -2211,8 +2279,9 @@ If repository policy changes, update this section to match `mise.toml` and CI;
 the current repository policy always wins over a stale command copied here.
 
 Also run platform-native integration tests for collectors, process identity,
-socket states, probes, watch, and why. Verify the release artifacts, not only
-test-harness binaries.
+socket states, and probes, plus the applicable automated real-binary E2E journeys
+for labels, watch, why, inspect, and safe test-owned termination. Verify the exact
+release artifacts, not only test-harness binaries.
 
 ### Stage 10 gate
 
@@ -2221,11 +2290,16 @@ test-harness binaries.
 - [ ] Windows native matrix passes.
 - [ ] Both release binaries build on every target.
 - [ ] No platform test is skipped merely to make the matrix green.
+- [ ] Automated E2E journeys pass natively against exact release artifacts on
+      Linux, macOS, and Windows, with unsupported host capabilities reported
+      explicitly rather than silently skipped.
 
 ## Stage 11: End-to-End QA
 
 Load and follow the QA skill against exact candidate release artifacts. Passing
-unit tests and CI is necessary but not sufficient.
+unit tests, integration tests, automated E2E tests, and CI is necessary but not
+sufficient. This stage adds exploratory user-level coverage and must not merely
+repeat the automated suite.
 
 ### 11.1 QA preparation
 
@@ -2435,6 +2509,8 @@ Do not release unless every item is checked:
 - [ ] Existing command behavior remains regression-clean.
 - [ ] Config, filters, output schemas, and exit codes are frozen and documented.
 - [ ] Linux, macOS, and Windows native CI passes on the exact release commit.
+- [ ] Automated real-binary E2E journeys pass natively on Linux, macOS, and
+      Windows against the exact release artifacts.
 - [ ] Security review has no unresolved release blocker.
 - [ ] Automated tests are deterministic and repeatedly green.
 - [ ] QA verdict is PASS and recommendation is `ship`.
