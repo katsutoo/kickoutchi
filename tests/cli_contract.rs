@@ -1945,6 +1945,7 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1964,6 +1965,7 @@ mod windows {
     const HELPER_READY_WAIT: Duration = Duration::from_secs(5);
     /// How long a parked helper may outlive its test before self-destructing.
     const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
+    static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct ChildGuard {
         child: Child,
@@ -2125,11 +2127,13 @@ mod windows {
         std::process::exit(0)
     }
 
-    fn unique_suffix() -> u128 {
-        SystemTime::now()
+    fn unique_suffix() -> String {
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock must be after Unix epoch")
-            .as_nanos()
+            .as_nanos();
+        let counter = UNIQUE_SUFFIX_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{timestamp}-{counter}")
     }
 
     fn wait_for_file(path: &Path) {

@@ -238,13 +238,7 @@ impl LinuxCollector {
                 )
             });
         if projected_rows.is_none_or(|count| count > self.limits.port_entries) {
-            return Err(resource_cap_error(
-                &self.proc_root,
-                format!(
-                    "collected port rows exceed {} entry cap",
-                    self.limits.port_entries
-                ),
-            ));
+            return Err(crate::observation::ObservationError::LegacyProjectionLimitExceeded.into());
         }
 
         native_pass_from_records(&records, owner_scan)
@@ -624,17 +618,15 @@ fn collect_socket_records_bounded(
             SocketParseError::SocketObservationLimitExceeded => CollectorError::Observation(
                 crate::observation::ObservationError::SocketObservationLimitExceeded,
             ),
-            error => CollectorError::Read {
-                path: path.clone(),
-                source: std::io::Error::new(ErrorKind::InvalidData, error),
-            },
+            _ => CollectorError::Observation(
+                crate::observation::ObservationError::NativeDataMalformed,
+            ),
         })?;
         for record in parsed {
             if records.len() >= max_records {
-                return Err(resource_cap_error(
-                    proc_root,
-                    format!("collected sockets exceed {max_records} entry cap"),
-                ));
+                return Err(
+                    crate::observation::ObservationError::SocketObservationLimitExceeded.into(),
+                );
             }
             records.push(record);
         }
@@ -643,13 +635,26 @@ fn collect_socket_records_bounded(
 }
 
 fn read_socket_table(path: &Path, optional: bool) -> Result<Option<String>, CollectorError> {
-    match read_bounded_text(path, NATIVE_SOCKET_TABLE_MAX_BYTES) {
-        Ok(text) => Ok(Some(text)),
+    read_socket_table_bounded(path, optional, NATIVE_SOCKET_TABLE_MAX_BYTES)
+}
+
+fn read_socket_table_bounded(
+    path: &Path,
+    optional: bool,
+    max_bytes: usize,
+) -> Result<Option<String>, CollectorError> {
+    match read_bounded_bytes(path, max_bytes) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| crate::observation::ObservationError::NativeDataMalformed.into()),
         Err(source) if optional && source.kind() == ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(CollectorError::Read {
-            path: path.to_path_buf(),
-            source,
-        }),
+        Err(source) if source.kind() == ErrorKind::PermissionDenied => {
+            Err(crate::observation::ObservationError::SocketTablePermissionDenied.into())
+        }
+        Err(source) if source.kind() == ErrorKind::InvalidData => {
+            Err(crate::observation::ObservationError::NativeDataOversized.into())
+        }
+        Err(_) => Err(crate::observation::ObservationError::SocketTableUnavailable.into()),
     }
 }
 
@@ -939,9 +944,17 @@ fn collect_socket_owners_detailed(
     }
 
     let (pids, enumeration_incomplete) = owner_process_ids_with_limit(proc_root, max_process_ids)
-        .map_err(|source| CollectorError::Read {
-        path: proc_root.to_path_buf(),
-        source,
+        .map_err(|source| {
+        if source.kind() == ErrorKind::InvalidData {
+            CollectorError::Observation(
+                crate::observation::ObservationError::ProcessIdentityLimitExceeded,
+            )
+        } else {
+            CollectorError::Read {
+                path: proc_root.to_path_buf(),
+                source,
+            }
+        }
     })?;
 
     // Walk every PID's file descriptors, no early exit. A single listening socket
@@ -1140,10 +1153,7 @@ fn scan_pid_socket_owners(
 
     for entry in fd_entries {
         if *fd_entries_visited >= max_fd_entries {
-            return Err(resource_cap_error(
-                &fd_dir,
-                format!("file-descriptor traversal exceeds {max_fd_entries} entry cap"),
-            ));
+            return Err(crate::observation::ObservationError::OwnerAttributionLimitExceeded.into());
         }
         *fd_entries_visited += 1;
         let entry = match entry {
@@ -1169,10 +1179,9 @@ fn scan_pid_socket_owners(
         let pids = result.owners.entry(inode).or_default();
         if pids.last().copied() != Some(pid) {
             if result.owner_edges >= OWNER_EDGES_MAX {
-                return Err(resource_cap_error(
-                    &fd_dir,
-                    format!("socket ownership exceeds {OWNER_EDGES_MAX} edge cap"),
-                ));
+                return Err(
+                    crate::observation::ObservationError::OwnerAttributionLimitExceeded.into(),
+                );
             }
             pids.push(pid);
             result.owner_edges += 1;
@@ -1212,13 +1221,6 @@ fn read_native_process_marker(path: &Path) -> std::io::Result<ProcessStartMarker
     let ticks = read_process_start_time_ticks(path)?;
     ProcessStartMarker::linux(ticks)
         .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
-}
-
-fn resource_cap_error(path: &Path, message: String) -> CollectorError {
-    CollectorError::Read {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(ErrorKind::InvalidData, message),
-    }
 }
 
 fn parse_socket_inode(target: &Path) -> Option<u64> {
@@ -1928,12 +1930,12 @@ mod tests {
         parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
         proc_visibility_restricted, read_bounded_text, read_cmdline, read_cmdline_bounded,
         read_fresh_process_evidence, read_link_bounded, read_process_metadata_bounded,
-        read_process_status,
+        read_process_status, read_socket_table_bounded,
     };
     use crate::model::{PermissionStatus, Platform, Protocol};
     use crate::observation::{
         CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EvidenceGapCode, EvidenceImpact,
-        FILE_DESCRIPTOR_ENTRIES_MAX, OwnerCompleteness, PROCESS_NAME_MAX_BYTES,
+        FILE_DESCRIPTOR_ENTRIES_MAX, ObservationError, OwnerCompleteness, PROCESS_NAME_MAX_BYTES,
         PlatformSocketToken, SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness, SocketState,
         TcpTimerKind, UnverifiedOwnerReason,
     };
@@ -2450,8 +2452,32 @@ mod tests {
         )
         .expect_err("malformed authoritative rows must fail the pass");
 
-        assert!(error.to_string().contains("net/tcp"), "{error}");
-        assert!(error.to_string().contains("missing field"), "{error}");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(ObservationError::NativeDataMalformed)
+        ));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn socket_table_reader_preserves_malformed_and_oversized_categories() {
+        let proc_root = temp_proc_root("socket-table-errors");
+        let path = proc_root.join("net/tcp");
+        fs::write(&path, [0xff]).expect("invalid UTF-8 fixture");
+        assert!(matches!(
+            read_socket_table_bounded(&path, false, 1),
+            Err(crate::collector::CollectorError::Observation(
+                ObservationError::NativeDataMalformed
+            ))
+        ));
+
+        fs::write(&path, b"abcd").expect("oversized fixture");
+        assert!(matches!(
+            read_socket_table_bounded(&path, false, 3),
+            Err(crate::collector::CollectorError::Observation(
+                ObservationError::NativeDataOversized
+            ))
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3636,10 +3662,12 @@ mod tests {
         .expect_err("fd traversal past the cap must fail closed");
 
         assert_eq!(visited, 2);
-        assert!(
-            error.to_string().contains("file-descriptor traversal"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(
+                ObservationError::OwnerAttributionLimitExceeded
+            )
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3670,10 +3698,12 @@ mod tests {
         )
         .expect_err("collector must enforce fd cap");
 
-        assert!(
-            error.to_string().contains("file-descriptor traversal"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(
+                ObservationError::OwnerAttributionLimitExceeded
+            )
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3701,7 +3731,12 @@ mod tests {
         )
         .expect_err("collector must enforce row cap");
 
-        assert!(error.to_string().contains("port rows exceed"), "{error}");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(
+                ObservationError::LegacyProjectionLimitExceeded
+            )
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3727,10 +3762,12 @@ mod tests {
         )
         .expect_err("collector must enforce PID cap");
 
-        assert!(
-            error.to_string().contains("process list exceeds"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(
+                ObservationError::ProcessIdentityLimitExceeded
+            )
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 

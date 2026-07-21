@@ -33,6 +33,14 @@ const DOCKER_ROWS_MAX: usize = 128;
 const DOCKER_MATCHES_MAX: usize = 8;
 const DOCKER_FIELD_MAX_BYTES: usize = 4 * 1024;
 const DOCKER_PORT_SEGMENTS_MAX: usize = 64;
+const DOCKER_HOST_MAX_BYTES: usize = 4 * 1024;
+
+#[cfg(unix)]
+const DEFAULT_LOCAL_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
+#[cfg(windows)]
+const DEFAULT_LOCAL_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
+#[cfg(not(any(unix, windows)))]
+const DEFAULT_LOCAL_DOCKER_HOST: &str = "";
 
 const DOCKER_PROCESS_NAMES: &[&str] = &[
     "docker",
@@ -121,17 +129,40 @@ fn docker_container_ls_with_runner(
     protocol: Protocol,
     run: impl FnOnce(&mut Command) -> Option<std::process::Output>,
 ) -> Option<String> {
+    let configured_host = std::env::var("DOCKER_HOST").ok();
+    docker_container_ls_with_host_and_runner(port, protocol, configured_host.as_deref(), run)
+}
+
+fn docker_container_ls_with_host_and_runner(
+    port: u16,
+    protocol: Protocol,
+    configured_host: Option<&str>,
+    run: impl FnOnce(&mut Command) -> Option<std::process::Output>,
+) -> Option<String> {
     if docker_command_is_elevated() {
         debug!("skipping PATH-resolved docker CLI while process is elevated");
         return None;
     }
 
+    let docker_host = local_docker_host(configured_host);
+    if configured_host.is_some_and(|host| !docker_host_is_local(host)) {
+        debug!("ignoring non-local Docker endpoint during port enrichment");
+    }
     let publish_filter = format!("publish={port}/{}", protocol_filter(protocol));
     // `docker` resolves through PATH on purpose: install locations vary too
     // much (distro packages, Docker Desktop, Homebrew) for a fixed allowlist.
-    // Elevation is rejected above before PATH resolution.
+    // Elevation is rejected above before PATH resolution. An explicit local
+    // host prevents the user's current Docker context from selecting a remote
+    // daemon; a local DOCKER_HOST remains useful for rootless engines.
     let mut command = Command::new("docker");
     command
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("DOCKER_TLS")
+        .env_remove("DOCKER_TLS_VERIFY")
+        .env_remove("DOCKER_CERT_PATH")
+        .arg("--host")
+        .arg(docker_host)
         .arg("container")
         .arg("ls")
         .arg("--filter")
@@ -151,6 +182,38 @@ fn docker_container_ls_with_runner(
             None
         }
     }
+}
+
+fn local_docker_host(configured_host: Option<&str>) -> &str {
+    configured_host
+        .filter(|host| docker_host_is_local(host))
+        .unwrap_or(DEFAULT_LOCAL_DOCKER_HOST)
+}
+
+fn docker_host_is_local(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > DOCKER_HOST_MAX_BYTES
+        || host.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        host.strip_prefix("unix://")
+            .is_some_and(|path| path.starts_with('/') && path.len() > 1)
+    }
+
+    #[cfg(windows)]
+    {
+        const LOCAL_NPIPE_PREFIX: &str = "npipe:////./pipe/";
+        host.get(..LOCAL_NPIPE_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LOCAL_NPIPE_PREFIX))
+            && host.len() > LOCAL_NPIPE_PREFIX.len()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    false
 }
 
 #[cfg(test)]
@@ -870,9 +933,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DOCKER_MATCHES_MAX, DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity,
-        TEST_ELEVATION_OVERRIDE, docker_container_ls_with_runner, docker_context_from_ps_output,
-        finish_output_drain, host_addr_matches, looks_like_docker_owner, parse_published_ports,
+        DEFAULT_LOCAL_DOCKER_HOST, DOCKER_HOST_MAX_BYTES, DOCKER_MATCHES_MAX,
+        DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity, TEST_ELEVATION_OVERRIDE,
+        docker_container_ls_with_host_and_runner, docker_container_ls_with_runner,
+        docker_context_from_ps_output, docker_host_is_local, finish_output_drain,
+        host_addr_matches, local_docker_host, looks_like_docker_owner, parse_published_ports,
         read_output_bounded, run_command_bounded_with, run_command_bounded_with_capacity,
         should_try_docker_enrichment, spawn_output_drain,
     };
@@ -1015,6 +1080,95 @@ mod tests {
         TEST_ELEVATION_OVERRIDE.with(|override_value| override_value.set(None));
 
         assert!(output.is_none());
+    }
+
+    #[test]
+    fn remote_docker_endpoints_fall_back_to_the_platform_local_daemon() {
+        for remote in [
+            "tcp://docker.example:2376",
+            "ssh://builder.example",
+            "http://docker.example",
+            "https://docker.example",
+            "npipe:////remote-host/pipe/docker_engine",
+            "unix://relative.sock",
+            "unix:///tmp/socket\nignored",
+        ] {
+            assert!(
+                !docker_host_is_local(remote),
+                "unexpectedly local: {remote}"
+            );
+            assert_eq!(local_docker_host(Some(remote)), DEFAULT_LOCAL_DOCKER_HOST);
+        }
+        let oversized = format!("unix:///{}", "x".repeat(DOCKER_HOST_MAX_BYTES));
+        assert!(!docker_host_is_local(&oversized));
+        assert_eq!(
+            local_docker_host(Some(&oversized)),
+            DEFAULT_LOCAL_DOCKER_HOST
+        );
+    }
+
+    #[test]
+    fn docker_command_removes_ambient_remote_selectors_and_pins_local_host() {
+        TEST_ELEVATION_OVERRIDE.with(|override_value| override_value.set(Some(false)));
+        let output = docker_container_ls_with_host_and_runner(
+            8080,
+            Protocol::Tcp,
+            Some("ssh://builder.example"),
+            |command| {
+                let arguments = command
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arguments,
+                    [
+                        "--host",
+                        DEFAULT_LOCAL_DOCKER_HOST,
+                        "container",
+                        "ls",
+                        "--filter",
+                        "publish=8080/tcp",
+                        "--format",
+                        "json",
+                    ]
+                );
+                for variable in [
+                    "DOCKER_HOST",
+                    "DOCKER_CONTEXT",
+                    "DOCKER_TLS",
+                    "DOCKER_TLS_VERIFY",
+                    "DOCKER_CERT_PATH",
+                ] {
+                    assert_eq!(
+                        command
+                            .get_envs()
+                            .find(|(name, _)| *name == variable)
+                            .map(|(_, value)| value),
+                        Some(None),
+                        "{variable} must be removed"
+                    );
+                }
+                None
+            },
+        );
+        TEST_ELEVATION_OVERRIDE.with(|override_value| override_value.set(None));
+        assert!(output.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_local_unix_docker_host_is_preserved() {
+        let host = "unix:///run/user/1000/docker.sock";
+        assert!(docker_host_is_local(host));
+        assert_eq!(local_docker_host(Some(host)), host);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_windows_docker_named_pipe_is_preserved() {
+        let host = "npipe:////./pipe/docker_engine_rootless";
+        assert!(docker_host_is_local(host));
+        assert_eq!(local_docker_host(Some(host)), host);
     }
 
     #[cfg(target_os = "linux")]

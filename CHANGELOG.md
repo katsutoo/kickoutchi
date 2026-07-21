@@ -81,6 +81,10 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 
 ### Fixed
 
+- Optional Docker enrichment now pins the CLI to a bounded local Unix socket or
+  Windows named pipe and removes ambient host, context, and TLS selectors. A
+  remote Docker context can no longer receive local port-diagnostic queries or
+  be presented as local container ownership.
 - Linux socket collection now rejects empty, malformed, and headerless procfs
   tables while accepting the kernel's family-specific IPv4 and IPv6 headers.
   Ownership remains explicitly partial when a nested or unverifiable PID
