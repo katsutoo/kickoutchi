@@ -17,6 +17,7 @@ mod display;
 mod docker;
 mod error;
 mod input;
+mod labels;
 // The read-only family inspection view. It renders data from the process-tree
 // snapshot; Windows omits POSIX process-group sections.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

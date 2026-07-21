@@ -338,6 +338,7 @@ mod tests {
     use crate::app::App;
     use crate::config::Config;
     use crate::input::Action;
+    use crate::labels::{LabelInput, LabelRegistry};
 
     fn render_text(app: &App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -374,6 +375,56 @@ mod tests {
         assert!(text.contains("Details"), "{text}");
         assert!(text.contains("PID: 18422 | Process: node"), "{text}");
         assert!(text.contains("Status: 5/5 open ports"), "{text}");
+    }
+
+    #[test]
+    fn configured_labels_render_only_when_table_width_can_preserve_legacy_layout() {
+        let config = Config {
+            labels: LabelRegistry::from_inputs(vec![LabelInput {
+                protocol: "tcp".to_owned(),
+                address: "127.0.0.1".to_owned(),
+                port: 3000,
+                scope_id: None,
+                label: "web dev".to_owned(),
+            }])
+            .unwrap(),
+            ..Config::default()
+        };
+        let app = App::new_fake(&config);
+
+        let wide = render_text(&app, 120, 30);
+        assert!(wide.contains("LABEL"), "{wide}");
+        assert!(wide.contains("web dev"), "{wide}");
+
+        let minimum = render_text(&app, 80, 20);
+        assert!(!minimum.contains("LABEL"), "{minimum}");
+        assert!(minimum.contains("SCOPE"), "{minimum}");
+
+        let below_boundary = render_text(&app, 105, 30);
+        assert!(!below_boundary.contains("LABEL"), "{below_boundary}");
+        let at_boundary = render_text(&app, 106, 30);
+        assert!(at_boundary.contains("LABEL"), "{at_boundary}");
+        assert!(at_boundary.contains("web dev"), "{at_boundary}");
+    }
+
+    #[test]
+    fn configured_unmatched_selector_still_enables_wide_label_column() {
+        let config = Config {
+            labels: LabelRegistry::from_inputs(vec![LabelInput {
+                protocol: "tcp".to_owned(),
+                address: "*".to_owned(),
+                port: 65_000,
+                scope_id: None,
+                label: "unused".to_owned(),
+            }])
+            .unwrap(),
+            ..Config::default()
+        };
+        let app = App::new_fake(&config);
+
+        let wide = render_text(&app, 120, 30);
+        assert!(wide.contains("LABEL"), "{wide}");
+        assert!(!wide.contains("unused"), "{wide}");
     }
 
     #[test]

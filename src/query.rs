@@ -6,10 +6,14 @@
 
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
+use std::net::IpAddr;
+use std::num::NonZeroU32;
 
 use thiserror::Error;
 
+use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
 use crate::model::{BindScope, PortEntryView, Protocol, SortMode};
+use crate::observation::Ipv6Scope;
 
 /// Longest search text we'll take from the TUI or CLI.
 ///
@@ -24,6 +28,18 @@ pub(crate) struct QueryOptions<'a> {
     pub(crate) filter_text: &'a str,
     pub(crate) sort_mode: SortMode,
     pub(crate) hide_system_processes: bool,
+    pub(crate) capabilities: QueryCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryCapabilities {
+    state: bool,
+}
+
+impl QueryCapabilities {
+    pub(crate) const LIST: Self = Self { state: false };
+    #[allow(dead_code, reason = "consumed by the full-state watch query path")]
+    pub(crate) const WATCH: Self = Self { state: true };
 }
 
 #[derive(Debug)]
@@ -58,6 +74,12 @@ pub(crate) enum QueryError {
         value: String,
         expected: &'static str,
     },
+    #[error("filter field {field:?} is not supported by this command")]
+    UnsupportedField { field: &'static str },
+    #[error("scope_id filter cannot be combined with an IPv4 address or family")]
+    ScopeRequiresIpv6,
+    #[error("these filter capabilities require full socket-state entries")]
+    FullStateEntriesRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,12 +91,45 @@ enum FilterTerm {
     Scope(BindScope),
     Protected(bool),
     Parent(String),
+    Label(String),
+    Address(IpAddr),
+    ScopeId(NonZeroU32),
+    Family(AddressFamily),
+    State(StateFilter),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateFilter {
+    Listen,
+    Bound,
+    Closed,
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
+    DeleteTcb,
+    NewSynReceived,
+    Unknown,
 }
 
 pub(crate) fn query_view_indices(
     entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
 ) -> Result<QueryIndexResult, QueryError> {
+    if options.capabilities != QueryCapabilities::LIST {
+        return Err(QueryError::FullStateEntriesRequired);
+    }
     let MatchingIndices {
         indices,
         hidden_system_process_count,
@@ -102,7 +157,7 @@ fn matching_indices(
     entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
 ) -> Result<MatchingIndices, QueryError> {
-    let terms = parse_filter_text(options.filter_text)?;
+    let terms = parse_filter_text(options.filter_text, options.capabilities)?;
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
         options.port.is_some() || options.process.is_some() || !terms.is_empty();
@@ -217,7 +272,17 @@ fn compare_views(
     })
 }
 
-fn parse_filter_text(text: &str) -> Result<Vec<FilterTerm>, QueryError> {
+pub(crate) fn validate_filter_text(
+    text: &str,
+    capabilities: QueryCapabilities,
+) -> Result<(), QueryError> {
+    parse_filter_text(text, capabilities).map(|_| ())
+}
+
+fn parse_filter_text(
+    text: &str,
+    capabilities: QueryCapabilities,
+) -> Result<Vec<FilterTerm>, QueryError> {
     if text.len() > FILTER_TEXT_MAX_BYTES {
         return Err(QueryError::TooLong {
             actual: text.len(),
@@ -225,10 +290,15 @@ fn parse_filter_text(text: &str) -> Result<Vec<FilterTerm>, QueryError> {
         });
     }
 
-    text.split_whitespace().map(parse_token).collect()
+    let terms = text
+        .split_whitespace()
+        .map(|token| parse_token(token, capabilities))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_term_combinations(&terms)?;
+    Ok(terms)
 }
 
-fn parse_token(token: &str) -> Result<FilterTerm, QueryError> {
+fn parse_token(token: &str, capabilities: QueryCapabilities) -> Result<FilterTerm, QueryError> {
     let Some((field, value)) = token.split_once(':') else {
         return Ok(FilterTerm::Plain(normalized(token)));
     };
@@ -240,6 +310,12 @@ fn parse_token(token: &str) -> Result<FilterTerm, QueryError> {
         "scope" => parse_scope(value),
         "protected" => parse_protected(value),
         "parent" => parse_parent(value),
+        "label" => parse_nonempty_text("label", value).map(FilterTerm::Label),
+        "address" => parse_address(value),
+        "scope_id" => parse_scope_id(value),
+        "family" => parse_family(value),
+        "state" if capabilities.state => parse_state(value),
+        "state" => Err(QueryError::UnsupportedField { field: "state" }),
         _ => Ok(FilterTerm::Plain(normalized(token))),
     }
 }
@@ -297,6 +373,91 @@ fn parse_parent(value: &str) -> Result<FilterTerm, QueryError> {
     Ok(FilterTerm::Parent(normalized(value)))
 }
 
+fn parse_nonempty_text(field: &'static str, value: &str) -> Result<String, QueryError> {
+    if value.is_empty() {
+        return Err(invalid_value(field, value, "a nonempty value"));
+    }
+    Ok(normalized(value))
+}
+
+fn parse_address(value: &str) -> Result<FilterTerm, QueryError> {
+    if value.is_empty() || value.len() > SELECTOR_ADDRESS_MAX_BYTES {
+        return Err(invalid_value(
+            "address",
+            value,
+            "a literal IP address of at most 64 bytes",
+        ));
+    }
+    value
+        .parse::<IpAddr>()
+        .map(normalize_ip_address)
+        .map(FilterTerm::Address)
+        .map_err(|_| invalid_value("address", value, "a literal IPv4 or IPv6 address"))
+}
+
+fn parse_scope_id(value: &str) -> Result<FilterTerm, QueryError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .and_then(NonZeroU32::new)
+        .map(FilterTerm::ScopeId)
+        .ok_or_else(|| invalid_value("scope_id", value, "an integer from 1 to 4294967295"))
+}
+
+fn parse_family(value: &str) -> Result<FilterTerm, QueryError> {
+    match value.to_ascii_lowercase().as_str() {
+        "ipv4" => Ok(FilterTerm::Family(AddressFamily::Ipv4)),
+        "ipv6" => Ok(FilterTerm::Family(AddressFamily::Ipv6)),
+        _ => Err(invalid_value("family", value, "ipv4 or ipv6")),
+    }
+}
+
+fn parse_state(value: &str) -> Result<FilterTerm, QueryError> {
+    let state = match value {
+        "listen" => StateFilter::Listen,
+        "bound" => StateFilter::Bound,
+        "closed" => StateFilter::Closed,
+        "syn_sent" => StateFilter::SynSent,
+        "syn_received" => StateFilter::SynReceived,
+        "established" => StateFilter::Established,
+        "fin_wait1" => StateFilter::FinWait1,
+        "fin_wait2" => StateFilter::FinWait2,
+        "close_wait" => StateFilter::CloseWait,
+        "closing" => StateFilter::Closing,
+        "last_ack" => StateFilter::LastAck,
+        "time_wait" => StateFilter::TimeWait,
+        "delete_tcb" => StateFilter::DeleteTcb,
+        "new_syn_received" => StateFilter::NewSynReceived,
+        "unknown" => StateFilter::Unknown,
+        _ => {
+            return Err(invalid_value(
+                "state",
+                value,
+                "a lowercase socket state name",
+            ));
+        }
+    };
+    Ok(FilterTerm::State(state))
+}
+
+fn validate_term_combinations(terms: &[FilterTerm]) -> Result<(), QueryError> {
+    let has_scope = terms
+        .iter()
+        .any(|term| matches!(term, FilterTerm::ScopeId(_)));
+    if !has_scope {
+        return Ok(());
+    }
+    if terms.iter().any(|term| {
+        matches!(
+            term,
+            FilterTerm::Family(AddressFamily::Ipv4) | FilterTerm::Address(IpAddr::V4(_))
+        )
+    }) {
+        return Err(QueryError::ScopeRequiresIpv6);
+    }
+    Ok(())
+}
+
 fn normalized(value: &str) -> String {
     value.to_lowercase()
 }
@@ -322,6 +483,18 @@ fn term_matches<'a>(
         FilterTerm::Scope(scope) => entry.scope() == *scope,
         FilterTerm::Protected(protected) => entry.protected == *protected,
         FilterTerm::Parent(needle) => parent_matches(entry, needle, metadata),
+        FilterTerm::Label(needle) => entry
+            .label
+            .is_some_and(|label| metadata.contains(label, needle)),
+        FilterTerm::Address(address) => normalize_ip_address(entry.local_addr) == *address,
+        FilterTerm::ScopeId(scope_id) => {
+            entry.ipv6_scope == Some(Ipv6Scope::InterfaceIndex(*scope_id))
+        }
+        FilterTerm::Family(AddressFamily::Ipv4) => normalize_ip_address(entry.local_addr).is_ipv4(),
+        FilterTerm::Family(AddressFamily::Ipv6) => normalize_ip_address(entry.local_addr).is_ipv6(),
+        FilterTerm::State(_) => {
+            unreachable!("full-state filters cannot be evaluated against legacy list rows")
+        }
     }
 }
 
@@ -339,6 +512,9 @@ fn plain_matches<'a>(
         || contains_ascii(entry.protocol.label(), needle_lower)
         || contains_ascii(entry.state.label(), needle_lower)
         || contains_ascii(entry.scope_label(), needle_lower)
+        || entry
+            .label
+            .is_some_and(|value| metadata.contains(value, needle_lower))
         || entry
             .process_name
             .is_some_and(|value| metadata.contains(value, needle_lower))
@@ -486,11 +662,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FILTER_TEXT_MAX_BYTES, QueryError, QueryOptions, normalized_sort_keys, query_view_indices,
+        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions, normalized_sort_keys,
+        query_view_indices,
     };
+    use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
         PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState, SortMode,
     };
+    use crate::observation::Ipv6Scope;
 
     fn entry(port: u16, name: &str) -> PortEntry {
         PortEntry {
@@ -520,6 +699,7 @@ mod tests {
             filter_text,
             sort_mode: SortMode::Port,
             hide_system_processes: false,
+            capabilities: QueryCapabilities::LIST,
         }
     }
 
@@ -598,6 +778,87 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_and_label_filters_match_normalized_fields() {
+        let mut ipv4 = entry(3000, "node");
+        ipv4.local_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut ipv6 = entry(5353, "mdns");
+        ipv6.protocol = Protocol::Udp;
+        ipv6.state = SocketState::Bound;
+        ipv6.local_addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        ipv6.ipv6_scope = Some(crate::observation::Ipv6Scope::interface_index(7).unwrap());
+        let rows = [ipv4, ipv6];
+        let mut views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        views[0].label = Some("Web Development");
+        views[1].label = Some("mDNS");
+
+        let matching = |filter| {
+            query_view_indices(&views, query(filter))
+                .unwrap()
+                .indices
+                .iter()
+                .map(|&index| rows[index].local_port)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching("label:development"), [3000]);
+        assert_eq!(matching("web"), [3000]);
+        assert_eq!(matching("address:::1"), [5353]);
+        assert_eq!(matching("family:ipv4"), [3000]);
+        assert_eq!(matching("family:ipv6 scope_id:7"), [5353]);
+        assert!(matching("scope_id:8").is_empty());
+    }
+
+    #[test]
+    fn mapped_address_filters_normalize_and_scope_conflicts_fail() {
+        let row = entry(3000, "node");
+        assert_eq!(matching_ports(&[row], "address:::ffff:127.0.0.1"), [3000]);
+
+        let mut mapped = entry(3000, "node");
+        mapped.local_addr = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        mapped.ipv6_scope = Some(Ipv6Scope::Unavailable);
+        assert_eq!(
+            matching_ports(&[mapped.clone()], "address:127.0.0.1"),
+            [3000]
+        );
+        assert_eq!(matching_ports(&[mapped.clone()], "family:ipv4"), [3000]);
+        assert!(matching_ports(&[mapped], "family:ipv6").is_empty());
+
+        let rows = [entry(3000, "node")];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        for filter in ["family:ipv4 scope_id:1", "address:127.0.0.1 scope_id:1"] {
+            assert!(matches!(
+                query_view_indices(&views, query(filter)),
+                Err(QueryError::ScopeRequiresIpv6)
+            ));
+        }
+    }
+
+    #[test]
+    fn watch_only_state_filter_is_reserved_from_list_queries() {
+        assert_eq!(
+            super::validate_filter_text("state:listen", QueryCapabilities::LIST),
+            Err(QueryError::UnsupportedField { field: "state" })
+        );
+        assert!(super::validate_filter_text("state:listen", QueryCapabilities::WATCH).is_ok());
+        assert!(super::validate_filter_text("state:established", QueryCapabilities::WATCH).is_ok());
+        assert!(matches!(
+            super::validate_filter_text("state:not-a-state", QueryCapabilities::WATCH),
+            Err(QueryError::InvalidValue { field: "state", .. })
+        ));
+        assert!(super::validate_filter_text("future:value", QueryCapabilities::LIST).is_ok());
+
+        let rows = [entry(3000, "node")];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let options = QueryOptions {
+            capabilities: QueryCapabilities::WATCH,
+            ..query("state:listen")
+        };
+        assert!(matches!(
+            query_view_indices(&views, options),
+            Err(QueryError::FullStateEntriesRequired)
+        ));
+    }
+
+    #[test]
     fn structured_filters_reject_bad_values() {
         let rows = [entry(3000, "node")];
 
@@ -624,9 +885,11 @@ mod tests {
         // actually hit this bound is via CLI `--filter`. The cap lives here, so
         // the test pins it here too; the CLI turns the error into exit 2.
         let rows = [entry(3000, "node")];
+        let maximum = "a".repeat(FILTER_TEXT_MAX_BYTES);
         let too_long = "a".repeat(FILTER_TEXT_MAX_BYTES + 1);
 
         let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        assert!(query_view_indices(&views, query(&maximum)).is_ok());
         let error =
             query_view_indices(&views, query(&too_long)).expect_err("over-cap filter is rejected");
 
@@ -637,6 +900,25 @@ mod tests {
                 max: FILTER_TEXT_MAX_BYTES,
             }
         );
+
+        let address_at_cap = format!("address:{}", "1".repeat(SELECTOR_ADDRESS_MAX_BYTES));
+        assert!(matches!(
+            super::validate_filter_text(&address_at_cap, QueryCapabilities::LIST),
+            Err(QueryError::InvalidValue {
+                field: "address",
+                expected: "a literal IPv4 or IPv6 address",
+                ..
+            })
+        ));
+        let address_above_cap = format!("address:{}", "1".repeat(SELECTOR_ADDRESS_MAX_BYTES + 1));
+        assert!(matches!(
+            super::validate_filter_text(&address_above_cap, QueryCapabilities::LIST),
+            Err(QueryError::InvalidValue {
+                field: "address",
+                expected: "a literal IP address of at most 64 bytes",
+                ..
+            })
+        ));
     }
 
     #[test]

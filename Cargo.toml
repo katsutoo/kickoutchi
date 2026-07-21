@@ -53,9 +53,9 @@ tracing-subscriber = "0.3.23"
 # in the shared model/config/CLI foundation.
 dirs = "6.0.0"
 
-# Terminal column widths for CLI table padding: process names keep visible
-# Unicode, and byte length misaligns columns for accented/CJK names. Already
-# in the dependency tree via ratatui, so this adds no new supply-chain weight.
+# Terminal column widths for table padding and bounded endpoint-label display:
+# byte length misaligns columns for accented/CJK text. Already in the dependency
+# tree via ratatui, so this adds no new supply-chain weight.
 unicode-width = "0.2.2"
 
 # Exact bind diagnostics require setting reuse-address and IPv6-only behavior

@@ -10,9 +10,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
+use crate::labels::{LABEL_SELECTORS_MAX, LabelInput, LabelRegistry};
 use crate::model::SortMode;
 use crate::protection;
 
@@ -66,6 +68,8 @@ pub(crate) struct Config {
     pub(crate) confirm_force_kill: bool,
     /// Process names that require stronger confirmation before termination.
     pub(crate) protected_processes: Vec<String>,
+    /// Validated endpoint annotations shared by CLI, TUI, and future diagnostics.
+    pub(crate) labels: LabelRegistry,
 }
 
 impl Default for Config {
@@ -79,6 +83,7 @@ impl Default for Config {
             // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
+            labels: LabelRegistry::default(),
         }
     }
 }
@@ -97,6 +102,65 @@ struct ConfigFile {
     hide_system_processes: Option<bool>,
     confirm_force_kill: Option<bool>,
     protected_processes: Option<Vec<String>>,
+    ports: Option<PortLabels>,
+}
+
+#[derive(Debug)]
+struct PortLabels(Vec<PortLabelFile>);
+
+impl<'de> Deserialize<'de> for PortLabels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(PortLabelsVisitor)
+    }
+}
+
+struct PortLabelsVisitor;
+
+impl<'de> Visitor<'de> for PortLabelsVisitor {
+    type Value = PortLabels;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array of endpoint label selectors")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut ports = Vec::new();
+        loop {
+            let index = ports.len();
+            if index == LABEL_SELECTORS_MAX {
+                return match sequence.next_element::<IgnoredAny>() {
+                    Ok(Some(_)) => Err(A::Error::custom(format!(
+                        "ports has more than {LABEL_SELECTORS_MAX} selectors"
+                    ))),
+                    Ok(None) => Ok(PortLabels(ports)),
+                    Err(error) => Err(A::Error::custom(format!("ports[{index}]: {error}"))),
+                };
+            }
+            match sequence.next_element::<PortLabelFile>() {
+                Ok(Some(port)) => ports.push(port),
+                Ok(None) => return Ok(PortLabels(ports)),
+                Err(error) => {
+                    return Err(A::Error::custom(format!("ports[{index}]: {error}")));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortLabelFile {
+    protocol: String,
+    address: String,
+    port: u64,
+    scope_id: Option<u64>,
+    label: String,
 }
 
 impl Config {
@@ -171,6 +235,23 @@ impl Config {
                         detail,
                     },
                 )?;
+        }
+        if let Some(PortLabels(ports)) = file.ports {
+            let inputs = ports
+                .into_iter()
+                .map(|port| LabelInput {
+                    protocol: port.protocol,
+                    address: port.address,
+                    port: port.port,
+                    scope_id: port.scope_id,
+                    label: port.label,
+                })
+                .collect();
+            config.labels =
+                LabelRegistry::from_inputs(inputs).map_err(|error| ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                })?;
         }
 
         Ok(config)
@@ -283,13 +364,17 @@ fn default_config_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
     use std::time::Duration;
 
     use super::{
-        CONFIG_FILE_MAX_BYTES, Config, ConfigError, PROTECTED_PROCESSES_MAX, read_config_from,
+        CONFIG_FILE_MAX_BYTES, Config, ConfigError, LABEL_SELECTORS_MAX, PROTECTED_PROCESSES_MAX,
+        read_config_from,
     };
+    use crate::model::Protocol;
     use crate::model::SortMode;
 
     /// Tests go through `Config::parse` with a fixed fake path: the I/O above it
@@ -325,6 +410,111 @@ mod tests {
             config.hide_system_processes,
             Config::default().hide_system_processes
         );
+    }
+
+    #[test]
+    fn endpoint_labels_parse_and_resolve_exact_before_wildcard() {
+        let config = parse(
+            r#"
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 3000
+label = "development"
+
+[[ports]]
+protocol = "tcp"
+address = "127.0.0.1"
+port = 3000
+label = "web dev"
+"#,
+        )
+        .expect("valid endpoint labels parse");
+
+        assert_eq!(
+            config
+                .labels
+                .resolve_parts(Protocol::Tcp, IpAddr::V4(Ipv4Addr::LOCALHOST), 3000, None,),
+            Some("web dev")
+        );
+        assert_eq!(
+            config.labels.resolve_parts(
+                Protocol::Tcp,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                3000,
+                None,
+            ),
+            Some("development")
+        );
+    }
+
+    #[test]
+    fn endpoint_label_errors_name_the_index_without_reflecting_hostile_text() {
+        let detail = invalid_detail(parse(
+            r#"
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 3000
+label = "evil\u001b[2J"
+"#,
+        ));
+
+        assert!(detail.starts_with("ports[0].label"), "{detail}");
+        assert!(!detail.contains("evil"), "{detail}");
+        assert!(!detail.contains('\u{1b}'), "{detail}");
+    }
+
+    #[test]
+    fn endpoint_label_selector_rejects_unknown_fields() {
+        let detail = invalid_detail(parse(
+            r#"
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 3000
+label = "web"
+hostname = "localhost"
+"#,
+        ));
+
+        assert!(detail.contains("ports[0]"), "{detail}");
+        assert!(detail.contains("unknown field `hostname`"), "{detail}");
+    }
+
+    #[test]
+    fn endpoint_label_missing_field_names_the_selector_index() {
+        let detail = invalid_detail(parse(
+            r#"
+[[ports]]
+protocol = "tcp"
+port = 3000
+label = "web"
+"#,
+        ));
+
+        assert!(detail.contains("ports[0]"), "{detail}");
+        assert!(detail.contains("missing field `address`"), "{detail}");
+    }
+
+    #[test]
+    fn endpoint_label_config_accepts_256_selectors_and_rejects_257th() {
+        let mut text = String::new();
+        for port in 1..=LABEL_SELECTORS_MAX {
+            write!(
+                text,
+                "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"service\"\n"
+            )
+            .unwrap();
+        }
+        let config = parse(&text).expect("256 selectors must be accepted");
+        assert_eq!(config.labels.len(), LABEL_SELECTORS_MAX);
+
+        let excess = format!(
+            "{text}[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = 257\nlabel = \"excess\"\n"
+        );
+        let detail = invalid_detail(parse(&excess));
+        assert!(detail.contains("more than 256 selectors"), "{detail}");
     }
 
     #[test]

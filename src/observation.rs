@@ -837,6 +837,7 @@ impl NetworkSnapshot {
             },
             process_identity,
             ipv6_scope: socket.local_endpoint.ipv6_scope,
+            label: None,
         }
     }
 }
@@ -1985,7 +1986,7 @@ mod tests {
     fn tui_row_representation_is_compact_and_borrowed() {
         assert_eq!(std::mem::size_of::<PortEntryDescriptor>(), 12);
         assert!(std::mem::size_of::<crate::model::PortEntry>() <= 176);
-        assert!(std::mem::size_of::<crate::model::PortEntryView<'_>>() <= 144);
+        assert!(std::mem::size_of::<crate::model::PortEntryView<'_>>() <= 160);
     }
 
     #[test]

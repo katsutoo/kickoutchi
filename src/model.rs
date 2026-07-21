@@ -3,8 +3,8 @@
 //!
 //! Platform collectors produce one authoritative `NetworkSnapshot`; existing
 //! CLI and TUI surfaces borrow or materialize this legacy [`PortEntry`] view.
-//! The serde shape is the stable `list --json` contract, so internal identity
-//! evidence is skipped and renaming a serialized field still breaks scripts.
+//! [`PortEntryView`] owns the stable `list --json` serialization contract while
+//! internal identity evidence remains outside that wire shape.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -111,21 +111,17 @@ impl BindScope {
 /// `Option` fields are `None` when the OS wouldn't tell us; `permission` records
 /// that it happened, so consumers can tell "there's no value" apart from "we
 /// weren't allowed to look".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortEntry {
     pub(crate) protocol: Protocol,
     pub(crate) local_addr: IpAddr,
     pub(crate) local_port: u16,
     pub(crate) state: SocketState,
     pub(crate) pid: Option<u32>,
-    #[serde(serialize_with = "serialize_optional_shared_str")]
     pub(crate) process_name: Option<Arc<str>>,
-    #[serde(serialize_with = "serialize_optional_shared_path")]
     pub(crate) executable_path: Option<Arc<Path>>,
-    #[serde(serialize_with = "serialize_optional_shared_str")]
     pub(crate) command_line: Option<Arc<str>>,
     pub(crate) parent_pid: Option<u32>,
-    #[serde(serialize_with = "serialize_optional_shared_str")]
     pub(crate) parent_process_name: Option<Arc<str>>,
     /// Reserved, and effectively always empty on real rows: the Linux collector
     /// never populates this. Per-row child enumeration would mean walking the whole
@@ -137,9 +133,7 @@ pub(crate) struct PortEntry {
     pub(crate) protected: bool,
     pub(crate) platform: Platform,
     pub(crate) permission: PermissionStatus,
-    #[serde(skip)]
     pub(crate) process_identity: Option<ProcessIdentity>,
-    #[serde(skip)]
     pub(crate) ipv6_scope: Option<Ipv6Scope>,
 }
 
@@ -161,6 +155,7 @@ pub(crate) struct PortEntryView<'a> {
     pub(crate) permission: PermissionStatus,
     pub(crate) process_identity: Option<ProcessIdentity>,
     pub(crate) ipv6_scope: Option<Ipv6Scope>,
+    pub(crate) label: Option<&'a str>,
 }
 
 impl Serialize for PortEntryView<'_> {
@@ -168,7 +163,7 @@ impl Serialize for PortEntryView<'_> {
     where
         S: Serializer,
     {
-        let mut row = serializer.serialize_struct("PortEntry", 14)?;
+        let mut row = serializer.serialize_struct("PortEntry", 15)?;
         row.serialize_field("protocol", &self.protocol)?;
         row.serialize_field("local_addr", &self.local_addr)?;
         row.serialize_field("local_port", &self.local_port)?;
@@ -183,6 +178,7 @@ impl Serialize for PortEntryView<'_> {
         row.serialize_field("protected", &self.protected)?;
         row.serialize_field("platform", &self.platform)?;
         row.serialize_field("permission", &self.permission)?;
+        row.serialize_field("label", &self.label)?;
         row.end()
     }
 }
@@ -205,6 +201,7 @@ impl<'a> From<&'a PortEntry> for PortEntryView<'a> {
             permission: entry.permission,
             process_identity: entry.process_identity,
             ipv6_scope: entry.ipv6_scope,
+            label: None,
         }
     }
 }
@@ -230,32 +227,11 @@ impl PortEntryView<'_> {
     }
 }
 
-#[allow(
-    clippy::ref_option,
-    reason = "serde serialize_with passes the field by reference"
-)]
-fn serialize_optional_shared_str<S>(
-    value: &Option<Arc<str>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    value.as_deref().serialize(serializer)
-}
-
-#[allow(
-    clippy::ref_option,
-    reason = "serde serialize_with passes the field by reference"
-)]
-fn serialize_optional_shared_path<S>(
-    value: &Option<Arc<Path>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    value.as_deref().serialize(serializer)
+impl<'a> PortEntryView<'a> {
+    pub(crate) fn with_label(mut self, label: Option<&'a str>) -> Self {
+        self.label = label;
+        self
+    }
 }
 
 /// Extra context we gather lazily for the selected process.
@@ -511,7 +487,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use super::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, SortMode};
+    use super::{
+        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState, SortMode,
+    };
 
     /// A tiny entry builder so each test only spells out the fields it cares
     /// about.
@@ -599,7 +577,8 @@ mod tests {
         row.parent_process_name = Some(Arc::from("cursor-agent"));
         row.child_pids = vec![18430];
 
-        let value = serde_json::to_value(&row).expect("PortEntry must serialize");
+        let view = PortEntryView::from(&row).with_label(Some("web dev"));
+        let value = serde_json::to_value(view).expect("production list view must serialize");
         assert_eq!(
             value,
             serde_json::json!({
@@ -613,19 +592,22 @@ mod tests {
                 "command_line": "node server.js",
                 "parent_pid": 18001,
                 "parent_process_name": "cursor-agent",
-                "child_pids": [18430],
+                "child_pids": [],
                 "protected": false,
                 "platform": "linux",
                 "permission": "full",
+                "label": "web dev",
             })
         );
     }
 
     #[test]
     fn json_renders_missing_metadata_as_null() {
-        let value = serde_json::to_value(entry(53, None, None)).expect("must serialize");
+        let row = entry(53, None, None);
+        let value = serde_json::to_value(PortEntryView::from(&row)).expect("must serialize");
         assert_eq!(value["pid"], serde_json::Value::Null);
         assert_eq!(value["process_name"], serde_json::Value::Null);
         assert_eq!(value["executable_path"], serde_json::Value::Null);
+        assert_eq!(value["label"], serde_json::Value::Null);
     }
 }

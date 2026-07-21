@@ -7,26 +7,39 @@ use ratatui::widgets::{Block, Row, Table, TableState};
 
 use crate::app::App;
 use crate::display::sanitize;
+use crate::labels::label_display_text;
 use crate::model::{PermissionStatus, PortEntryView};
 
 use super::theme::Theme;
 
 const MISSING: &str = "-";
+// Borders, selected-row marker, and seven inter-column spaces sit outside the
+// declared constraints, so 106 is the first width that preserves every legacy
+// column while adding the 32-column label.
+const LABEL_COLUMN_MIN_TABLE_WIDTH: u16 = 106;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let header = Row::new([
-        "PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE", "SCOPE",
-    ])
-    .style(theme.table_header())
-    .bottom_margin(1);
+    let show_labels = app.labels_configured() && area.width >= LABEL_COLUMN_MIN_TABLE_WIDTH;
+    let headers = if show_labels {
+        vec![
+            "PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE", "SCOPE", "LABEL",
+        ]
+    } else {
+        vec![
+            "PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE", "SCOPE",
+        ]
+    };
+    let header = Row::new(headers)
+        .style(theme.table_header())
+        .bottom_margin(1);
     // Borders, the header, and its bottom margin consume four rows.
     let viewport_len = usize::from(area.height.saturating_sub(4));
     let (viewport_start, viewport_end) =
         visible_range(app.rows().len(), app.selected_index(), viewport_len);
     let rows = app
         .rows_range(viewport_start..viewport_end)
-        .map(|entry| row(entry, theme));
-    let widths = [
+        .map(|entry| row(entry, theme, show_labels));
+    let mut widths = vec![
         Constraint::Length(6),
         Constraint::Min(13),
         Constraint::Length(6),
@@ -35,6 +48,9 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         Constraint::Length(8),
         Constraint::Length(9),
     ];
+    if show_labels {
+        widths.push(Constraint::Length(32));
+    }
     let table = Table::new(rows, widths)
         .header(header)
         .block(
@@ -66,8 +82,8 @@ fn visible_range(total: usize, selected: Option<usize>, capacity: usize) -> (usi
     (start, start.saturating_add(capacity).min(total))
 }
 
-fn row(entry: PortEntryView<'_>, theme: Theme) -> Row<'static> {
-    let cells = [
+fn row(entry: PortEntryView<'_>, theme: Theme, show_labels: bool) -> Row<'static> {
+    let mut cells = vec![
         entry.protocol.label().to_owned(),
         entry.local_addr.to_string(),
         entry.local_port.to_string(),
@@ -76,6 +92,13 @@ fn row(entry: PortEntryView<'_>, theme: Theme) -> Row<'static> {
         entry.state.label().to_owned(),
         entry.scope_label().to_owned(),
     ];
+    if show_labels {
+        cells.push(
+            entry
+                .label
+                .map_or_else(|| MISSING.to_owned(), label_display_text),
+        );
+    }
     let mut row = Row::new(cells);
 
     if entry.protected {

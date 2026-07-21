@@ -8,7 +8,7 @@ use crate::diagnostic;
 use crate::model::PortEntryView;
 use crate::observation::NetworkSnapshot;
 use crate::output;
-use crate::query::{self, QueryOptions};
+use crate::query::{self, QueryCapabilities, QueryOptions};
 
 use super::{ExitReason, ListArgs};
 
@@ -35,7 +35,16 @@ fn run_list_snapshot_with_writer(
     };
     let views = descriptors
         .iter()
-        .map(|descriptor| snapshot.port_entry_view(descriptor))
+        .map(|descriptor| {
+            let view = snapshot.port_entry_view(descriptor);
+            let label = config.labels.resolve_parts(
+                view.protocol,
+                view.local_addr,
+                view.local_port,
+                view.ipv6_scope,
+            );
+            view.with_label(label)
+        })
         .collect::<Vec<_>>();
     run_list_views_with_writer(args, config, &views, writer)
 }
@@ -59,6 +68,7 @@ fn run_list_views_with_writer(
             filter_text: args.filter.as_deref().unwrap_or_default(),
             sort_mode,
             hide_system_processes: config.hide_system_processes,
+            capabilities: QueryCapabilities::LIST,
         },
     ) {
         Ok(result) => result,
@@ -92,7 +102,9 @@ fn run_list_views_with_writer(
             return output_error_reason(&error);
         }
         maybe_print_no_match_diagnostic_views(diagnostic_port, entries);
-    } else if let Err(error) = output::write_view_table(writer, entries, &visible_indices) {
+    } else if let Err(error) =
+        output::write_view_table(writer, entries, &visible_indices, !config.labels.is_empty())
+    {
         return output_error_reason(&error);
     }
 
@@ -139,6 +151,7 @@ mod tests {
     use super::run_list_snapshot_with_writer;
     use crate::cli::{ExitReason, ListArgs};
     use crate::config::Config;
+    use crate::labels::{LabelInput, LabelRegistry};
     use crate::model::SortMode;
 
     fn args(json: bool) -> ListArgs {
@@ -181,6 +194,82 @@ mod tests {
         assert_eq!(reason, ExitReason::Success);
         assert_eq!(ports, [3000, 5000]);
         assert!(output.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn configured_labels_annotate_table_json_and_filters() {
+        let rows = [
+            crate::cli::test_support::entry(3000),
+            crate::cli::test_support::entry(5000),
+        ];
+        let config = Config {
+            labels: LabelRegistry::from_inputs(vec![LabelInput {
+                protocol: "tcp".to_owned(),
+                address: "127.0.0.1".to_owned(),
+                port: 3000,
+                scope_id: None,
+                label: "web dev".to_owned(),
+            }])
+            .unwrap(),
+            ..Config::default()
+        };
+
+        let mut table = Vec::new();
+        assert_eq!(
+            run_list_with_writer(&args(false), &config, &rows, &mut table),
+            ExitReason::Success
+        );
+        let table = String::from_utf8(table).unwrap();
+        assert!(table.lines().next().unwrap().ends_with("LABEL"), "{table}");
+        assert!(table.contains("web dev"), "{table}");
+
+        let mut json = Vec::new();
+        assert_eq!(
+            run_list_with_writer(&args(true), &config, &rows, &mut json),
+            ExitReason::Success
+        );
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value[0]["label"], "web dev");
+        assert!(value[1]["label"].is_null());
+
+        let mut filtered_args = args(false);
+        filtered_args.filter = Some("label:web".to_owned());
+        let mut filtered = Vec::new();
+        assert_eq!(
+            run_list_with_writer(&filtered_args, &config, &rows, &mut filtered),
+            ExitReason::Success
+        );
+        let filtered = String::from_utf8(filtered).unwrap();
+        assert!(filtered.contains("3000"), "{filtered}");
+        assert!(!filtered.contains("5000"), "{filtered}");
+    }
+
+    #[test]
+    fn unmatched_configured_selector_still_enables_label_column() {
+        let rows = [crate::cli::test_support::entry(3000)];
+        let config = Config {
+            labels: LabelRegistry::from_inputs(vec![LabelInput {
+                protocol: "tcp".to_owned(),
+                address: "*".to_owned(),
+                port: 5000,
+                scope_id: None,
+                label: "unused".to_owned(),
+            }])
+            .unwrap(),
+            ..Config::default()
+        };
+        let mut output = Vec::new();
+
+        assert_eq!(
+            run_list_with_writer(&args(false), &config, &rows, &mut output),
+            ExitReason::Success
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.lines().next().unwrap().ends_with("LABEL"),
+            "{output}"
+        );
+        assert!(!output.contains("unused"), "{output}");
     }
 
     struct FailingWriter {

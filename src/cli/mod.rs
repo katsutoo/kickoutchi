@@ -199,6 +199,15 @@ pub(crate) struct KillArgs {
 /// mapping is this module's whole job, so letting errors escape to `main`
 /// would split that contract across two files.
 pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
+    if let Command::List(args) = command
+        && let Err(error) = crate::query::validate_filter_text(
+            args.filter.as_deref().unwrap_or_default(),
+            crate::query::QueryCapabilities::LIST,
+        )
+    {
+        eprintln!("error: invalid filter: {error}");
+        return ExitReason::InvalidArguments;
+    }
     let profile = match command {
         Command::List(_) => crate::observation::MetadataProfile::LegacyList,
         Command::Kill(_) => crate::observation::MetadataProfile::Display,

@@ -18,6 +18,7 @@ use crate::input::Action;
 use crate::model::{
     DockerPortContext, PortEntry, PortEntryView, ProcessContext, Protocol, SortMode,
 };
+use crate::observation::Ipv6Scope;
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
@@ -78,6 +79,7 @@ struct RowKey {
     protocol: Protocol,
     local_addr: std::net::IpAddr,
     local_port: u16,
+    ipv6_scope: Option<Ipv6Scope>,
 }
 
 impl From<&PortEntry> for RowKey {
@@ -87,6 +89,7 @@ impl From<&PortEntry> for RowKey {
             protocol: entry.protocol,
             local_addr: entry.local_addr,
             local_port: entry.local_port,
+            ipv6_scope: entry.ipv6_scope,
         }
     }
 }
@@ -98,6 +101,7 @@ impl From<PortEntryView<'_>> for RowKey {
             protocol: entry.protocol,
             local_addr: entry.local_addr,
             local_port: entry.local_port,
+            ipv6_scope: entry.ipv6_scope,
         }
     }
 }
@@ -214,6 +218,7 @@ pub(crate) struct App {
     hide_system_processes: bool,
     force_kill_confirmation: ForceKillConfirmation,
     protected_processes: Vec<String>,
+    labels: crate::labels::LabelRegistry,
     network_snapshot: Option<crate::observation::NetworkSnapshot>,
     selected_context_key: Option<RowKey>,
     selected_process_context: Option<ProcessContext>,
@@ -279,6 +284,7 @@ impl App {
             hide_system_processes: config.hide_system_processes,
             force_kill_confirmation: ForceKillConfirmation::from_config(config.confirm_force_kill),
             protected_processes: config.protected_processes.clone(),
+            labels: config.labels.clone(),
             network_snapshot: None,
             selected_context_key: None,
             selected_process_context: None,
@@ -507,6 +513,10 @@ impl App {
         self.row_count()
     }
 
+    pub(crate) fn labels_configured(&self) -> bool {
+        !self.labels.is_empty()
+    }
+
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.selected_index
     }
@@ -523,9 +533,16 @@ impl App {
 
     fn row_view(&self, index: usize) -> Option<PortEntryView<'_>> {
         let snapshot = self.network_snapshot.as_ref()?;
-        self.row_descriptors
-            .get(index)
-            .map(|descriptor| snapshot.port_entry_view(descriptor))
+        self.row_descriptors.get(index).map(|descriptor| {
+            let view = snapshot.port_entry_view(descriptor);
+            let label = self.labels.resolve_parts(
+                view.protocol,
+                view.local_addr,
+                view.local_port,
+                view.ipv6_scope,
+            );
+            view.with_label(label)
+        })
     }
 
     fn all_views(&self) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
@@ -1397,6 +1414,7 @@ impl App {
                 filter_text: &self.filter_text,
                 sort_mode: self.sort_mode,
                 hide_system_processes: self.hide_system_processes,
+                capabilities: crate::query::QueryCapabilities::LIST,
             },
         );
         let (visible_row_indices, filter_error) = match query_result {
@@ -1852,20 +1870,21 @@ fn preserved_selection(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use super::{
-        App, ContextRequestState, ContextWorker, Modal, RefreshWorker, RowKey,
+        App, ContextRequestState, ContextWorker, Modal, RefreshWorker, RowKey, preserved_selection,
         termination_status_line,
     };
     use crate::config::Config;
     use crate::input::Action;
     use crate::model::{
         DockerContainerPort, DockerPortContext, PermissionStatus, Platform, PortEntry,
-        ProcessContext, Protocol, SocketState, SortMode,
+        PortEntryView, ProcessContext, Protocol, SocketState, SortMode,
     };
+    use crate::observation::Ipv6Scope;
     use crate::process::{ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome};
 
     fn entry(port: u16, name: Option<&str>) -> PortEntry {
@@ -1975,6 +1994,24 @@ mod tests {
 
     fn set_confirmation_start_time(app: &mut App, start_time_ticks: u64) {
         finish_selected_context(app, context(start_time_ticks));
+    }
+
+    #[test]
+    fn preserved_selection_distinguishes_ipv6_interface_scopes() {
+        let mut first = entry_with_pid(8080, Some(42), Protocol::Tcp, "service");
+        first.local_addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        first.ipv6_scope = Some(Ipv6Scope::interface_index(1).unwrap());
+        let mut second = first.clone();
+        second.ipv6_scope = Some(Ipv6Scope::interface_index(2).unwrap());
+        let rows = [first, second];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let selected_key = RowKey::from(views[1]);
+
+        assert_ne!(RowKey::from(views[0]), selected_key);
+        assert_eq!(
+            preserved_selection(&views, &[0, 1], Some(selected_key), 0),
+            Some(1)
+        );
     }
 
     #[test]

@@ -35,6 +35,7 @@ they are added to the native test and artifact matrix.
 - Lists listening TCP sockets and bound UDP sockets.
 - Shows address, port, PID, process name, parent, path, command, bind scope, and
   permission status when available.
+- Names configured endpoints in CLI and TUI tables, search, filters, and JSON.
 - Explains Docker-owned or partial-metadata ports in details when Docker CLI
   metadata is available; Docker is optional and never required for normal port
   listing. PATH-based Docker enrichment is disabled while Kickoutchi is elevated
@@ -197,6 +198,7 @@ cargo run                                 # open the TUI
 cargo run --bin kick -- list              # list ports
 cargo run --bin kick -- list --port 3000  # show one port
 cargo run --bin kick -- list --json       # JSON for scripts
+cargo run --bin kick -- list --filter label:web
 cargo run --bin kick -- kill --port 3000  # ask, then kick it out
 cargo run --bin kick -- inspect --port 3000  # read-only family view
 cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor
@@ -227,11 +229,43 @@ default_sort = "port"
 hide_system_processes = false
 confirm_force_kill = true
 protected_processes = ["redis-server"]
+
+[[ports]]
+protocol = "tcp"
+address = "127.0.0.1"
+port = 3000
+label = "web dev"
+
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 8080
+label = "local web services"
 ```
 
 `refresh_interval_seconds` is `1..=3600`. `default_sort` is one of `port`,
 `pid`, `protocol`, `process`, `parent`, or `scope`. Configured protected names
 extend rather than replace the built-in safety list.
+
+Each `[[ports]]` selector requires lowercase `tcp` or `udp`, a literal IP
+address or explicit `"*"` wildcard, a port in `1..=65535`, and a label. An
+optional nonzero `scope_id` is accepted only for an exact IPv6 address. Exact
+selectors take precedence over wildcard selectors for the same protocol and
+port. Labels are limited to 128 UTF-8 bytes and safe visible Unicode; a maximum
+of 256 selectors is accepted. Configuring any selector enables the `LABEL`
+column in CLI tables and sufficiently wide TUI tables, even if no visible row
+currently matches.
+
+IPv6 interface scope is currently available from the Windows collector only.
+Linux and macOS report IPv6 scope as unavailable, so exact IPv6 selectors and
+`scope_id:` filters do not match on those platforms. Use an explicit `"*"`
+selector when a protocol-and-port label is appropriate regardless of address or
+interface scope.
+
+`list --filter` supports plain case-insensitive search plus structured
+`label:`, `address:`, `scope_id:`, and `family:ipv4|ipv6` terms. These compose
+with the existing `pid:`, `port:`, `proto:`, `scope:`, `protected:`, and
+`parent:` terms.
 
 ## Exit Codes
 
@@ -247,11 +281,12 @@ extend rather than replace the built-in safety list.
 
 ## Structured Output And Privacy
 
-`list --json` is the stable legacy top-level array used by scripts. It may
-contain process names, executable paths, and complete command lines; command
-lines can contain tokens or other secrets. Treat JSON output as sensitive and
-redact it before sharing. Human terminal output is sanitized independently and
-does not imply that structured values are safe to publish.
+`list --json` is the stable `kickoutchi.list/1` top-level array used by scripts.
+Each row includes an additive `label` field containing the configured label or
+`null`. It may contain process names, executable paths, and complete command
+lines; command lines can contain tokens or other secrets. Treat JSON output as
+sensitive and redact it before sharing. Human terminal output is sanitized
+independently and does not imply that structured values are safe to publish.
 
 Report suspected vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md).

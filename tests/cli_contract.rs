@@ -883,6 +883,63 @@ mod linux {
     }
 
     #[test]
+    fn configured_endpoint_label_reaches_real_table_filter_and_json() {
+        let _host_observation = lock_host_observation();
+        let (_helper, port, ready_file) = spawn_listener_process();
+        let port_text = port.to_string();
+        let config = format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"web dev\"\n"
+        );
+
+        let table = kickoutchi_with_config(
+            &[
+                "list",
+                "--port",
+                port_text.as_str(),
+                "--filter",
+                "label:web",
+            ],
+            &config,
+        );
+        assert_eq!(table.status.code(), Some(0), "{}", stderr(&table));
+        assert!(stdout(&table).lines().next().unwrap().ends_with("LABEL"));
+        assert!(stdout(&table).contains("web dev"), "{}", stdout(&table));
+        assert!(!stdout(&table).contains("wildcard"), "{}", stdout(&table));
+
+        let json =
+            kickoutchi_with_config(&["list", "--port", port_text.as_str(), "--json"], &config);
+        assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+        let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+        assert_eq!(value.as_array().map(Vec::len), Some(1));
+        assert_eq!(value[0]["label"], "web dev");
+
+        let unconfigured = kickoutchi(&["list", "--port", port_text.as_str()]);
+        assert_eq!(
+            unconfigured.status.code(),
+            Some(0),
+            "{}",
+            stderr(&unconfigured)
+        );
+        assert!(
+            !stdout(&unconfigured)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("LABEL")
+        );
+        let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn list_rejects_watch_only_state_filter_as_invalid_arguments() {
+        let output = kickoutchi(&["list", "--filter", "state:listen"]);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(stdout(&output), "");
+        assert!(stderr(&output).contains("not supported by this command"));
+    }
+
+    #[test]
     fn udp_ipv6_socket_is_listed_through_the_real_binary() {
         let _host_observation = lock_host_observation();
         let socket = match UdpSocket::bind("[::1]:0") {

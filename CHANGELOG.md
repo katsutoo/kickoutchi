@@ -19,6 +19,12 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 - Native dependency contract tests for the approved socket lifecycle across TCP,
   UDP, IPv4, IPv6, wildcard, reuse-address, IPv6-only, and dual-stack modes,
   including immediate close and exact endpoint rebinding.
+- Validated endpoint labels configured through exact or wildcard `[[ports]]`
+  selectors. Labels appear in CLI and sufficiently wide TUI tables, plain
+  search, `label:` filters, and the additive nullable `label` field in
+  `kickoutchi.list/1` JSON.
+- Shared normalized `address:`, numeric `scope_id:`, and `family:ipv4|ipv6`
+  filters for endpoint-aware list and TUI queries.
 
 ### Changed
 
@@ -58,6 +64,9 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   release-artifact sampling protocol and documented the exact shipped target
   matrix, configuration, exit codes, checksum limits, and structured-output
   privacy.
+- Endpoint selector matching now canonicalizes IPv4-mapped IPv6 addresses,
+  preserves numeric IPv6 scope identity, applies exact matches before wildcard
+  matches, and rejects unsafe Unicode before any terminal rendering.
 
 ### Fixed
 

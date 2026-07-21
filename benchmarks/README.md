@@ -34,3 +34,13 @@ feasibility decision, not a cross-machine performance promise.
 The final release benchmark must additionally interleave baseline and candidate
 artifacts under the same live or synthetic workload and preserve its ordering
 seed and all raw samples.
+
+Named-endpoint gate evidence is retained in the five
+`named-endpoints-*-2026-07-21.tsv` files. The maximum legal selector workload is
+`named-endpoints-max-selectors.toml`; regenerate it to a new path with:
+
+```sh
+python benchmarks/generate-max-label-config.py /tmp/max-labels.toml
+```
+
+The generator uses exclusive creation so it cannot overwrite existing evidence.

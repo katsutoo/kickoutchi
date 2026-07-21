@@ -51,7 +51,7 @@ fn sanitize_with_layout(text: &str, preserve_newlines: bool) -> String {
             continue;
         }
 
-        if is_control(ch) || is_display_spoofing_format(ch) {
+        if is_control(ch) || is_default_ignorable(ch) {
             out.push(REPLACEMENT);
             continue;
         }
@@ -113,19 +113,28 @@ fn is_control(ch: char) -> bool {
     matches!(ch, '\x00'..='\x1f' | '\x7f' | '\u{0080}'..='\u{009f}')
 }
 
-/// Crate-visible so other display surfaces (the diagnostic command-line
-/// quoter) can apply the exact same spoofing-character policy without
-/// duplicating this list and letting the two drift apart.
-pub(crate) fn is_display_spoofing_format(ch: char) -> bool {
+/// Unicode 17.0 `Default_Ignorable_Code_Point`, which includes bidi controls.
+/// Keeping one pinned table prevents validation and terminal sinks from drifting.
+pub(crate) const fn is_default_ignorable(ch: char) -> bool {
     matches!(
         ch,
-        // Arabic Letter Mark, zero-width marks/joiners, bidi isolates/overrides,
-        // and byte-order/word joiners. They render invisibly or reorder text.
-        '\u{061c}'
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2069}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fff8}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
     )
 }
 

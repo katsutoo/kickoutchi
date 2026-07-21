@@ -12,12 +12,17 @@ use serde::ser::{SerializeSeq, Serializer};
 use unicode_width::UnicodeWidthStr;
 
 use crate::display::sanitize;
+use crate::labels::label_display_text;
 #[cfg(test)]
 use crate::model::PortEntry;
 use crate::model::PortEntryView;
 
 const COLUMN_COUNT: usize = 6;
 const HEADERS: [&str; COLUMN_COUNT] = ["PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE"];
+const LABELED_COLUMN_COUNT: usize = 7;
+const LABELED_HEADERS: [&str; LABELED_COLUMN_COUNT] = [
+    "PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE", "LABEL",
+];
 
 /// Stand-in for metadata the OS wouldn't give us. A visible dash keeps the
 /// columns lined up and says "unknown" out loud instead of leaving a gap.
@@ -37,14 +42,18 @@ pub(crate) fn write_table(
     indices: &[usize],
 ) -> std::io::Result<()> {
     let views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
-    write_view_table(writer, &views, indices)
+    write_view_table(writer, &views, indices, false)
 }
 
 pub(crate) fn write_view_table(
     writer: &mut impl Write,
     entries: &[PortEntryView<'_>],
     indices: &[usize],
+    show_labels: bool,
 ) -> std::io::Result<()> {
+    if show_labels {
+        return write_labeled_view_table(writer, entries, indices);
+    }
     // Each column grows to its widest cell. The model's own types keep content
     // in check (addresses, ports, PIDs, short comm-style names), so there's no
     // need for a width cap — and command lines deliberately aren't columns here.
@@ -60,6 +69,31 @@ pub(crate) fn write_view_table(
     writer.write_all(b"\n")?;
     for &index in indices {
         write_entry(writer, &entries[index], &widths)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_labeled_view_table(
+    writer: &mut impl Write,
+    entries: &[PortEntryView<'_>],
+    indices: &[usize],
+) -> std::io::Result<()> {
+    let mut widths: [usize; LABELED_COLUMN_COUNT] = LABELED_HEADERS.map(UnicodeWidthStr::width);
+    for &index in indices {
+        let entry = &entries[index];
+        update_widths(entry, &mut widths);
+        widths[6] = widths[6].max(
+            entry
+                .label
+                .map_or(1, |label| label_display_text(label).width()),
+        );
+    }
+
+    write_cells(writer, LABELED_HEADERS, &widths)?;
+    writer.write_all(b"\n")?;
+    for &index in indices {
+        write_labeled_entry(writer, &entries[index], &widths)?;
         writer.write_all(b"\n")?;
     }
     Ok(())
@@ -93,7 +127,7 @@ pub(crate) fn write_view_json(
     writer.write_all(b"\n").map_err(serde_json::Error::io)
 }
 
-fn update_widths(entry: &PortEntryView<'_>, widths: &mut [usize; COLUMN_COUNT]) {
+fn update_widths(entry: &PortEntryView<'_>, widths: &mut [usize]) {
     widths[0] = widths[0].max(entry.protocol.label().width());
     widths[1] = widths[1].max(entry.local_addr.to_string().width());
     widths[2] = widths[2].max(entry.local_port.to_string().width());
@@ -125,10 +159,35 @@ fn write_entry(
     )
 }
 
-fn write_cells(
+fn write_labeled_entry(
     writer: &mut impl Write,
-    cells: [&str; COLUMN_COUNT],
-    widths: &[usize; COLUMN_COUNT],
+    entry: &PortEntryView<'_>,
+    widths: &[usize; LABELED_COLUMN_COUNT],
+) -> std::io::Result<()> {
+    let address = entry.local_addr.to_string();
+    let port = entry.local_port.to_string();
+    let pid = entry.pid.map(|pid| pid.to_string());
+    let process = entry.process_name.map(sanitize);
+    let label = entry.label.map(label_display_text);
+    write_cells(
+        writer,
+        [
+            entry.protocol.label(),
+            &address,
+            &port,
+            pid.as_deref().unwrap_or(MISSING),
+            process.as_deref().unwrap_or(MISSING),
+            entry.state.label(),
+            label.as_deref().unwrap_or(MISSING),
+        ],
+        widths,
+    )
+}
+
+fn write_cells<const N: usize>(
+    writer: &mut impl Write,
+    cells: [&str; N],
+    widths: &[usize; N],
 ) -> std::io::Result<()> {
     for (index, (cell, width)) in cells.into_iter().zip(widths.iter()).enumerate() {
         if index > 0 {
@@ -137,7 +196,7 @@ fn write_cells(
         writer.write_all(cell.as_bytes())?;
         // Pad every column but the last — trailing spaces are just invisible
         // noise for diffs and shells.
-        if index < COLUMN_COUNT - 1 {
+        if index < N - 1 {
             let remaining = width.saturating_sub(cell.width());
             debug_assert!(remaining <= PADDING.len());
             writer.write_all(&PADDING[..remaining])?;
@@ -154,8 +213,10 @@ mod tests {
 
     use unicode_width::UnicodeWidthStr;
 
-    use super::{write_json, write_table};
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+    use super::{write_json, write_table, write_view_json, write_view_table};
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
+    };
 
     fn entry(port: u16, pid: Option<u32>, name: Option<&str>) -> PortEntry {
         PortEntry {
@@ -190,6 +251,17 @@ mod tests {
         let mut bytes = Vec::new();
         write_json(&mut bytes, entries, &indices).expect("JSON writes");
         String::from_utf8(bytes).expect("JSON is UTF-8")
+    }
+
+    fn labeled_table(entries: &[PortEntry], labels: &[Option<&str>]) -> String {
+        let mut views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        for (view, label) in views.iter_mut().zip(labels.iter().copied()) {
+            view.label = label;
+        }
+        let indices = (0..views.len()).collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        write_view_table(&mut bytes, &views, &indices, true).expect("labeled table writes");
+        String::from_utf8(bytes).expect("table is UTF-8")
     }
 
     #[test]
@@ -272,16 +344,54 @@ mod tests {
     }
 
     #[test]
+    fn label_column_is_conditional_aligned_and_unicode_bounded() {
+        let entries = [
+            entry(3000, Some(1), Some("node")),
+            entry(5353, Some(2), Some("mdns")),
+        ];
+        let legacy = table(&entries);
+        assert!(!legacy.lines().next().unwrap().contains("LABEL"));
+
+        let labeled = labeled_table(&entries, &[Some(&"界".repeat(17)), None]);
+        let lines = labeled.lines().collect::<Vec<_>>();
+        assert!(lines[0].ends_with("LABEL"), "{labeled}");
+        assert!(lines[1].ends_with('…'), "{labeled}");
+        assert!(lines[2].ends_with('-'), "{labeled}");
+        let label_offset = lines[0].find("LABEL").unwrap();
+        assert_eq!(
+            lines[1][..lines[1].find('界').unwrap()].width(),
+            label_offset
+        );
+
+        let hostile = labeled_table(&entries[..1], &[Some("safe\u{1b}[2J\u{202e}text")]);
+        assert!(!hostile.contains('\u{1b}'), "{hostile}");
+        assert!(!hostile.contains('\u{202e}'), "{hostile}");
+    }
+
+    #[test]
+    fn legacy_json_serializes_present_and_missing_labels() {
+        let entries = [
+            entry(3000, Some(1), Some("node")),
+            entry(5353, Some(2), Some("mdns")),
+        ];
+        let mut views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        views[0].label = Some("web dev");
+        let mut bytes = Vec::new();
+        write_view_json(&mut bytes, &views, &[0, 1]).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(value[0]["label"], "web dev");
+        assert_eq!(value[1]["label"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn json_is_an_array_even_when_empty() {
         assert_eq!(json(&[]), "[]\n");
         let rows = [entry(3000, Some(1), Some("node"))];
         let json = json(&rows);
-        assert_eq!(
-            json,
-            format!("{}\n", serde_json::to_string_pretty(&rows).unwrap())
-        );
         let value: serde_json::Value = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(value.as_array().map(Vec::len), Some(1));
+        assert_eq!(value[0]["label"], serde_json::Value::Null);
     }
 
     #[derive(Default)]

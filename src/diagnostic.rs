@@ -5,7 +5,7 @@
 //! or claim ownership of a socket the OS didn't actually confirm. Hints, not
 //! accusations.
 
-use crate::display::{REPLACEMENT, is_display_spoofing_format, sanitize};
+use crate::display::{REPLACEMENT, is_default_ignorable, sanitize};
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
@@ -110,7 +110,7 @@ fn push_quoted_command(out: &mut String, command_line: &str) {
             // and zero-width characters are category Cf and would pass raw,
             // letting a command line visually reorder this message. Same
             // policy as `sanitize`.
-            ch if is_display_spoofing_format(ch) => out.push(REPLACEMENT),
+            ch if is_default_ignorable(ch) => out.push(REPLACEMENT),
             ch => out.push(ch),
         }
     }

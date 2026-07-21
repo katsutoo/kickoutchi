@@ -1049,11 +1049,11 @@ scope deliberately and therefore apply to scoped and scope-unavailable rows.
 
 ### Stage 3 gate
 
-- [ ] Unconfigured users see no human-table layout change.
-- [ ] Config errors name the invalid selector without leaking unsafe text.
-- [ ] Matching and precedence are deterministic.
-- [ ] JSON changes are pinned and documented.
-- [ ] CLI and TUI rendering remain aligned for Unicode labels.
+- [x] Unconfigured users see no human-table layout change.
+- [x] Config errors name the invalid selector without leaking unsafe text.
+- [x] Matching and precedence are deterministic.
+- [x] JSON changes are pinned and documented.
+- [x] CLI and TUI rendering remain aligned for Unicode labels.
 
 ## Stage 4: Implement the Watch Engine
 
