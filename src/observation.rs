@@ -117,12 +117,21 @@ impl EndpointIdentity {
         port: u32,
         ipv6_scope: Option<Ipv6Scope>,
     ) -> Result<Self, EndpointIdentityError> {
+        let was_ipv4_mapped =
+            matches!(address, IpAddr::V6(value) if value.to_ipv4_mapped().is_some());
+        let address = match address {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map_or(IpAddr::V6(address), IpAddr::V4),
+            address @ IpAddr::V4(_) => address,
+        };
         let port = u16::try_from(port)
             .ok()
             .and_then(NonZeroU16::new)
             .ok_or(EndpointIdentityError::InvalidPort)?;
         let ipv6_scope = match (address, ipv6_scope) {
             (IpAddr::V4(_), None) => None,
+            (IpAddr::V4(_), Some(_)) if was_ipv4_mapped => None,
             (IpAddr::V4(_), Some(_)) => return Err(EndpointIdentityError::Ipv4WithScope),
             (IpAddr::V6(_), None) => return Err(EndpointIdentityError::Ipv6WithoutScope),
             (IpAddr::V6(_), Some(scope)) => Some(scope),
@@ -134,6 +143,22 @@ impl EndpointIdentity {
             ipv6_scope,
         })
     }
+}
+
+pub(crate) fn compare_endpoint_identity(
+    left: &EndpointIdentity,
+    right: &EndpointIdentity,
+) -> Ordering {
+    left.protocol
+        .cmp(&right.protocol)
+        .then_with(|| match (left.address, right.address) {
+            (IpAddr::V4(left), IpAddr::V4(right)) => left.octets().cmp(&right.octets()),
+            (IpAddr::V4(_), IpAddr::V6(_)) => Ordering::Less,
+            (IpAddr::V6(_), IpAddr::V4(_)) => Ordering::Greater,
+            (IpAddr::V6(left), IpAddr::V6(right)) => left.octets().cmp(&right.octets()),
+        })
+        .then_with(|| left.ipv6_scope.cmp(&right.ipv6_scope))
+        .then_with(|| left.port.cmp(&right.port))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -155,6 +180,14 @@ impl MacOsProcessStartTime {
             seconds,
             microseconds,
         })
+    }
+
+    pub(crate) const fn seconds(self) -> u64 {
+        self.seconds
+    }
+
+    pub(crate) const fn microseconds(self) -> u32 {
+        self.microseconds
     }
 }
 
@@ -239,7 +272,7 @@ pub(crate) enum SocketState {
 }
 
 impl SocketState {
-    const fn order_key(self) -> (u8, u32) {
+    pub(crate) const fn order_key(self) -> (u8, u32) {
         match self {
             Self::Closed => (0, 0),
             Self::Listen => (1, 0),
@@ -344,6 +377,36 @@ pub(crate) enum EvidenceGapCode {
     ObservationRaced,
 }
 
+impl EvidenceGapCode {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::OwnerPermissionDenied => "owner_permission_denied",
+            Self::OwnerAttributionIncomplete => "owner_attribution_incomplete",
+            Self::OwnerDisappeared => "owner_disappeared",
+            Self::ProcessIdentityUnavailable => "process_identity_unavailable",
+            Self::ProcessMetadataUnavailable => "process_metadata_unavailable",
+            Self::NativeFieldUnavailable => "native_field_unavailable",
+            Self::ScopeExcluded => "scope_excluded",
+            Self::NoncriticalEvidenceTruncated => "noncritical_evidence_truncated",
+            Self::ObservationRaced => "observation_raced",
+        }
+    }
+
+    pub(crate) const fn name_order(self) -> u8 {
+        match self {
+            Self::NativeFieldUnavailable => 0,
+            Self::NoncriticalEvidenceTruncated => 1,
+            Self::ObservationRaced => 2,
+            Self::OwnerAttributionIncomplete => 3,
+            Self::OwnerDisappeared => 4,
+            Self::OwnerPermissionDenied => 5,
+            Self::ProcessIdentityUnavailable => 6,
+            Self::ProcessMetadataUnavailable => 7,
+            Self::ScopeExcluded => 8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum EvidenceImpact {
     SocketSet,
@@ -356,13 +419,35 @@ pub(crate) enum EvidenceImpact {
     Scope,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EvidenceGap {
     pub(crate) impact: EvidenceImpact,
     pub(crate) code: EvidenceGapCode,
     pub(crate) endpoint: Option<EndpointIdentity>,
     pub(crate) pid: Option<u32>,
     message: String,
+}
+
+impl Ord for EvidenceGap {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.impact
+            .cmp(&other.impact)
+            .then_with(|| self.code.name().cmp(other.code.name()))
+            .then_with(|| match (&self.endpoint, &other.endpoint) {
+                (Some(left), Some(right)) => compare_endpoint_identity(left, right),
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            .then_with(|| self.pid.cmp(&other.pid))
+            .then_with(|| self.message.cmp(&other.message))
+    }
+}
+
+impl PartialOrd for EvidenceGap {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl EvidenceGap {
@@ -380,6 +465,10 @@ impl EvidenceGap {
             pid,
             message: truncate_utf8(message, EVIDENCE_MESSAGE_MAX_BYTES).to_owned(),
         }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -401,14 +490,20 @@ impl OwnerCompleteness {
         if reasons.is_empty() {
             return Ok(Self::Complete);
         }
-        Ok(Self::Partial {
-            reasons: reasons.into_iter().collect(),
-        })
+        let mut reasons = reasons.into_iter().collect::<Vec<_>>();
+        reasons.sort_unstable_by_key(|reason| reason.name_order());
+        Ok(Self::Partial { reasons })
     }
 
     pub(crate) fn is_complete(&self) -> bool {
         matches!(self, Self::Complete)
     }
+}
+
+pub(crate) fn owner_reason_names(
+    reasons: &[EvidenceGapCode],
+) -> impl ExactSizeIterator<Item = &'static str> + '_ {
+    reasons.iter().map(|reason| reason.name())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -666,8 +761,23 @@ pub(crate) struct PortEntryDescriptor {
 }
 
 impl NetworkSnapshot {
+    pub(crate) fn socket_set_diff_safe(&self) -> bool {
+        self.completeness != SnapshotCompleteness::Raced
+            && self.omitted_evidence_gap_count == 0
+            && !self
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap.impact == EvidenceImpact::SocketSet)
+    }
+
+    pub(crate) fn platform(&self) -> Platform {
+        snapshot_platform(self)
+    }
+
     #[allow(dead_code, reason = "derived from snapshots for watch consumers")]
     pub(crate) fn diff_readiness(&self, endpoint: &EndpointIdentity) -> DiffReadiness {
+        #[cfg(test)]
+        DIFF_READINESS_CALLS.with(|calls| calls.set(calls.get() + 1));
         if self.completeness == SnapshotCompleteness::Raced
             || self.omitted_evidence_gap_count != 0
             || self
@@ -840,6 +950,21 @@ impl NetworkSnapshot {
             label: None,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIFF_READINESS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_diff_readiness_call_count() {
+    DIFF_READINESS_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn diff_readiness_call_count() -> usize {
+    DIFF_READINESS_CALLS.with(std::cell::Cell::get)
 }
 
 fn snapshot_platform(snapshot: &NetworkSnapshot) -> Platform {
@@ -1215,7 +1340,7 @@ fn compare_owner_completeness(left: &OwnerCompleteness, right: &OwnerCompletenes
         (
             OwnerCompleteness::Partial { reasons: left },
             OwnerCompleteness::Partial { reasons: right },
-        ) => left.cmp(right),
+        ) => owner_reason_names(left).cmp(owner_reason_names(right)),
     }
 }
 
@@ -2565,6 +2690,24 @@ mod tests {
             Ipv6Scope::interface_index(u64::from(u32::MAX) + 1),
             Err(EndpointIdentityError::InvalidInterfaceIndex)
         );
+        assert_eq!(
+            EndpointIdentity::new(
+                Protocol::Tcp,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                1,
+                Some(maximum_scope),
+            ),
+            Err(EndpointIdentityError::Ipv4WithScope)
+        );
+        let mapped = EndpointIdentity::new(
+            Protocol::Tcp,
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            1,
+            Some(Ipv6Scope::Unavailable),
+        )
+        .expect("mapped IPv6 canonicalizes to IPv4");
+        assert_eq!(mapped.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(mapped.ipv6_scope, None);
     }
 
     #[test]
@@ -3254,6 +3397,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(80, Some(1)), (81, Some(2))]
         );
+    }
+
+    #[test]
+    fn evidence_gap_order_uses_public_code_names() {
+        let mut gaps = [
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::ProcessMetadataUnavailable,
+                None,
+                None,
+                "process",
+            ),
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::NativeFieldUnavailable,
+                None,
+                None,
+                "native",
+            ),
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::NoncriticalEvidenceTruncated,
+                None,
+                None,
+                "truncated",
+            ),
+        ];
+
+        gaps.sort();
+
+        assert_eq!(
+            gaps.iter().map(|gap| gap.code.name()).collect::<Vec<_>>(),
+            [
+                "native_field_unavailable",
+                "noncritical_evidence_truncated",
+                "process_metadata_unavailable",
+            ]
+        );
+    }
+
+    #[test]
+    fn evidence_gap_endpoint_order_uses_scope_before_port() {
+        let address = IpAddr::V6("fe80::1".parse().unwrap());
+        let scope_two = Ipv6Scope::interface_index(2).unwrap();
+        let scope_three = Ipv6Scope::interface_index(3).unwrap();
+        let mut gaps = [
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::ProcessMetadataUnavailable,
+                Some(
+                    EndpointIdentity::new(Protocol::Tcp, address, 8_000, Some(scope_three))
+                        .unwrap(),
+                ),
+                None,
+                "scope three",
+            ),
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::ProcessMetadataUnavailable,
+                Some(
+                    EndpointIdentity::new(Protocol::Tcp, address, 9_000, Some(scope_two)).unwrap(),
+                ),
+                None,
+                "scope two",
+            ),
+        ];
+
+        gaps.sort();
+
+        assert_eq!(
+            gaps[0].endpoint.as_ref().unwrap().ipv6_scope,
+            Some(scope_two)
+        );
+        assert_eq!(gaps[0].endpoint.as_ref().unwrap().port.get(), 9_000);
+        assert_eq!(
+            gaps[1].endpoint.as_ref().unwrap().ipv6_scope,
+            Some(scope_three)
+        );
+        assert_eq!(gaps[1].endpoint.as_ref().unwrap().port.get(), 8_000);
     }
 
     #[test]

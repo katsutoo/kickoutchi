@@ -64,6 +64,9 @@ they are added to the native test and artifact matrix.
   process-group analog.
 - Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
   path.
+- Watches native socket snapshots for deterministic baseline, bind, release,
+  replacement, and collection-gap events without invoking Docker or external
+  network tools in the polling loop.
 
 ## Performance
 
@@ -199,6 +202,8 @@ cargo run --bin kick -- list              # list ports
 cargo run --bin kick -- list --port 3000  # show one port
 cargo run --bin kick -- list --json       # JSON for scripts
 cargo run --bin kick -- list --filter label:web
+cargo run --bin kick -- watch --port 3000 --duration 30s
+cargo run --bin kick -- watch --filter state:listen --json
 cargo run --bin kick -- kill --port 3000  # ask, then kick it out
 cargo run --bin kick -- inspect --port 3000  # read-only family view
 cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor
@@ -209,6 +214,29 @@ cargo run --bin kick -- kill --port 3000 --group  # kick out the whole process g
 Kickoutchi asks before it terminates anything unless you pass `--yes`. Use
 `--yes` only when you already trust the exact target; protected processes still
 require stronger confirmation.
+
+## Watch Socket Changes
+
+`kick watch` collects full-state native socket snapshots and streams changes until
+Ctrl-C. Use `--duration` for a bounded run and `--json` for one independently
+valid `kickoutchi.watch_event/1` JSON record per line:
+
+```sh
+kick watch
+kick watch --tcp --address 127.0.0.1 --port 3000
+kick watch --filter label:web --interval 500ms
+kick watch --filter state:established --duration 30s --json
+```
+
+Intervals must be `100ms..=60s`; the default is `1s`. Explicit durations must be
+`100ms..=7d`. Time values use one unsigned integer followed by `ms`, `s`, `m`,
+`h`, or `d`.
+
+Watch accepts the list filter vocabulary plus `state:` across all native TCP
+states and UDP `bound`. Failed polls emit `collection_gap` and retain the last
+valid snapshot, so recovery cannot fabricate release events. Three consecutive
+collection failures end the command with exit code 1 after the third gap is
+flushed. Ctrl-C, duration expiry, and a closed stdout consumer exit successfully.
 
 ## Install Locally
 
@@ -287,6 +315,11 @@ Each row includes an additive `label` field containing the configured label or
 lines; command lines can contain tokens or other secrets. Treat JSON output as
 sensitive and redact it before sharing. Human terminal output is sanitized
 independently and does not imply that structured values are safe to publish.
+
+`watch --json` emits versioned `kickoutchi.watch_event/1` NDJSON. Watch omits
+complete process command lines, but owner identity, process metadata, endpoint
+labels, and evidence can still be sensitive. Diagnostics use stderr and never
+contaminate NDJSON stdout.
 
 Report suspected vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md).

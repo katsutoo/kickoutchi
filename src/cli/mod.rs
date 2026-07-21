@@ -7,6 +7,7 @@
 
 mod kill;
 mod list;
+mod watch;
 // Scoped (`--tree`/`--group`) kills sit behind the same platform gate as the
 // `tree` module whose planning and execution they drive.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -37,6 +38,8 @@ use self::kill::run_kill;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use self::kill::{KillTargetError, print_target_error, resolve_single_port_owner};
 use self::list::run_list_snapshot;
+pub(crate) use self::watch::WatchSignalGuard;
+use self::watch::{WatchArgs, run_watch};
 
 /// Stable exit codes — the script-facing contract.
 ///
@@ -106,6 +109,8 @@ pub(crate) enum Command {
     /// group, and ports — read-only, to pick the right root for a tree kill.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Inspect(InspectArgs),
+    /// Stream bounded socket changes until interrupted or the duration expires.
+    Watch(WatchArgs),
 }
 
 /// `inspect` takes exactly one starting point, like `kill`: a PID (which may
@@ -198,7 +203,19 @@ pub(crate) struct KillArgs {
 /// Errors are printed here (stderr) rather than propagated: the exit-code
 /// mapping is this module's whole job, so letting errors escape to `main`
 /// would split that contract across two files.
-pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
+pub(crate) fn run(
+    command: &Command,
+    config: &Config,
+    watch_signal_guard: Option<WatchSignalGuard>,
+) -> ExitReason {
+    if let Command::Watch(args) = command {
+        return run_watch(
+            args,
+            config,
+            watch_signal_guard.expect("watch installs its signal guard before config loading"),
+        );
+    }
+    debug_assert!(watch_signal_guard.is_none());
     if let Command::List(args) = command
         && let Err(error) = crate::query::validate_filter_text(
             args.filter.as_deref().unwrap_or_default(),
@@ -213,6 +230,7 @@ pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
         Command::Kill(_) => crate::observation::MetadataProfile::Display,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Inspect(_) => crate::observation::MetadataProfile::Display,
+        Command::Watch(_) => unreachable!("watch owns its repeated collection loop"),
     };
     let snapshot = match collector::collect_snapshot(profile) {
         Ok(snapshot) => snapshot,
@@ -237,6 +255,7 @@ pub(crate) fn run(command: &Command, config: &Config) -> ExitReason {
         }
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Inspect(args) => run_inspect(args, config, &snapshot),
+        Command::Watch(_) => unreachable!("watch is dispatched before one-shot collection"),
     }
 }
 

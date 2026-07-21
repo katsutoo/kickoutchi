@@ -25,6 +25,12 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   `kickoutchi.list/1` JSON.
 - Shared normalized `address:`, numeric `scope_id:`, and `family:ipv4|ipv6`
   filters for endpoint-aware list and TUI queries.
+- A bounded `watch` command that emits deterministic baseline, bind, release,
+  replacement, and collection-gap events from full-state native socket snapshots.
+  It supports human output or versioned `kickoutchi.watch_event/1` NDJSON,
+  endpoint and full-state filters, configurable polling intervals and duration,
+  clean Ctrl-C and broken-pipe termination, and explicit recovery from transient
+  collection failures without fabricating releases.
 
 ### Changed
 

@@ -83,7 +83,7 @@ pub(crate) enum QueryError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FilterTerm {
+pub(crate) enum FilterTerm {
     Plain(String),
     Pid(u32),
     Port(u16),
@@ -99,13 +99,13 @@ enum FilterTerm {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressFamily {
+pub(crate) enum AddressFamily {
     Ipv4,
     Ipv6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StateFilter {
+pub(crate) enum StateFilter {
     Listen,
     Bound,
     Closed,
@@ -279,7 +279,7 @@ pub(crate) fn validate_filter_text(
     parse_filter_text(text, capabilities).map(|_| ())
 }
 
-fn parse_filter_text(
+pub(crate) fn parse_filter_text(
     text: &str,
     capabilities: QueryCapabilities,
 ) -> Result<Vec<FilterTerm>, QueryError> {

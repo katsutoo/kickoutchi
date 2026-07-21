@@ -35,6 +35,7 @@ mod query;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod tree;
 mod ui;
+mod watch;
 #[cfg(windows)]
 mod windows_tree;
 
@@ -44,7 +45,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::error::ErrorKind as ClapErrorKind;
 
-use crate::cli::{Cli, ExitReason};
+use crate::cli::{Cli, Command, ExitReason, WatchSignalGuard};
 use crate::config::Config;
 use crate::display::sanitize_multiline;
 
@@ -71,6 +72,21 @@ pub fn run() -> ExitCode {
         }
     };
 
+    let watch_signal_guard = if matches!(args.command.as_ref(), Some(Command::Watch(_))) {
+        match WatchSignalGuard::install() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                eprintln!(
+                    "error: installing Ctrl-C handler failed: {}",
+                    sanitize_multiline(&error.to_string())
+                );
+                return ExitReason::Failure.into();
+            }
+        }
+    } else {
+        None
+    };
+
     let mut config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
@@ -81,7 +97,7 @@ pub fn run() -> ExitCode {
     config.apply_cli_overrides(args.refresh_interval);
 
     match args.command {
-        Some(command) => cli::run(&command, &config).into(),
+        Some(command) => cli::run(&command, &config, watch_signal_guard).into(),
         None => run_tui(&config),
     }
 }

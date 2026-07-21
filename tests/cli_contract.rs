@@ -21,8 +21,9 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, UdpSocket};
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::sync::{Arc, Mutex};
@@ -71,6 +72,20 @@ mod linux {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("contract value must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
     struct ChildGuard {
         child: Child,
     }
@@ -86,6 +101,14 @@ mod linux {
             continue_pid(self.child.id());
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+
+    struct DirectoryGuard(PathBuf);
+
+    impl Drop for DirectoryGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -124,6 +147,59 @@ mod linux {
             .expect("kickoutchi binary must run with explicit config");
         let _ = fs::remove_dir_all(config_dir);
         output
+    }
+
+    fn kickoutchi_with_config_deadline(args: &[&str], config_text: &str) -> Output {
+        let config_dir = isolated_config_home();
+        let config_guard = DirectoryGuard(config_dir.clone());
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, config_text).expect("test config file must be written");
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("kickoutchi binary must run with explicit config");
+        let mut child = ChildGuard { child };
+        let deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch exit status must be readable")
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch exceeded its exit deadline"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut stdout = Vec::new();
+        child
+            .child
+            .stdout
+            .take()
+            .expect("watch stdout must be piped")
+            .read_to_end(&mut stdout)
+            .expect("watch stdout must be readable");
+        let mut stderr = Vec::new();
+        child
+            .child
+            .stderr
+            .take()
+            .expect("watch stderr must be piped")
+            .read_to_end(&mut stderr)
+            .expect("watch stderr must be readable");
+        drop(config_guard);
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
     }
 
     fn kick(args: &[&str]) -> Output {
@@ -937,6 +1013,349 @@ mod linux {
         assert_eq!(output.status.code(), Some(2));
         assert_eq!(stdout(&output), "");
         assert!(stderr(&output).contains("not supported by this command"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the real-binary schema contract asserts every field and nested shape"
+    )]
+    fn watch_emits_versioned_baseline_ndjson_and_exits_after_duration() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let port_text = port.to_string();
+
+        let config = format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"watch fixture\"\n"
+        );
+        let output = kickoutchi_with_config_deadline(
+            &[
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &port_text,
+                "--filter",
+                "state:listen label:fixture",
+                "--interval",
+                "100ms",
+                "--duration",
+                "1s",
+                "--json",
+            ],
+            &config,
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let records = stdout(&output)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{}", stdout(&output));
+        assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
+        assert_eq!(records[0]["version"], 1);
+        assert_eq!(records[0]["sequence"], 0);
+        assert_eq!(records[0]["event"], "baseline");
+        assert_eq!(
+            records[0]["observation"]["previous_completed_unix_ms"],
+            serde_json::Value::Null
+        );
+        assert_eq!(records[0]["data"]["endpoint"]["port"], port);
+        assert_eq!(records[0]["data"]["state"]["kind"], "listen");
+        assert_eq!(records[0]["data"]["label"], "watch fixture");
+        assert_eq!(
+            records[0]["data"]["previous_owners"],
+            serde_json::Value::Null
+        );
+        assert_eq!(records[0]["data"]["filter_result"], "matched");
+        assert_json_keys(
+            &records[0],
+            &[
+                "schema",
+                "version",
+                "sequence",
+                "event",
+                "observation",
+                "data",
+            ],
+        );
+        assert_json_keys(
+            &records[0]["observation"],
+            &[
+                "previous_completed_unix_ms",
+                "attempt_started_unix_ms",
+                "attempt_completed_unix_ms",
+            ],
+        );
+        assert!(records[0]["observation"]["attempt_started_unix_ms"].is_u64());
+        assert!(records[0]["observation"]["attempt_completed_unix_ms"].is_u64());
+        assert_json_keys(
+            &records[0]["data"],
+            &[
+                "endpoint",
+                "state",
+                "previous_owners",
+                "current_owners",
+                "previous_socket_token",
+                "current_socket_token",
+                "multiplicity",
+                "label",
+                "filter_result",
+                "certainty",
+                "evidence",
+                "omitted_evidence_count",
+                "evidence_gaps",
+                "omitted_evidence_gap_count",
+            ],
+        );
+        assert_json_keys(
+            &records[0]["data"]["endpoint"],
+            &["protocol", "address", "port", "ipv6_scope"],
+        );
+        assert!(matches!(
+            records[0]["data"]["endpoint"]["protocol"].as_str(),
+            Some("tcp" | "udp")
+        ));
+        assert!(records[0]["data"]["endpoint"]["address"].is_string());
+        assert!(records[0]["data"]["endpoint"]["port"].is_u64());
+        if !records[0]["data"]["endpoint"]["ipv6_scope"].is_null() {
+            assert_json_keys(
+                &records[0]["data"]["endpoint"]["ipv6_scope"],
+                &["kind", "interface_index"],
+            );
+        }
+        assert_json_keys(&records[0]["data"]["state"], &["kind", "native_code"]);
+        assert!(records[0]["data"]["state"]["kind"].is_string());
+        assert_json_keys(
+            &records[0]["data"]["current_owners"],
+            &["owners", "omitted_owner_count", "completeness", "reasons"],
+        );
+        let owners = records[0]["data"]["current_owners"]["owners"]
+            .as_array()
+            .expect("current owner set is an array");
+        assert!(!owners.is_empty());
+        for owner in owners {
+            match owner["kind"].as_str() {
+                Some("verified") => {
+                    assert_json_keys(owner, &["kind", "identity"]);
+                    assert_json_keys(&owner["identity"], &["pid", "start_marker"]);
+                    assert!(owner["identity"]["pid"].is_u64());
+                    let marker = &owner["identity"]["start_marker"];
+                    match marker["kind"].as_str() {
+                        Some("linux_start_ticks") => assert_json_keys(marker, &["kind", "ticks"]),
+                        Some("macos_start_time") => {
+                            assert_json_keys(marker, &["kind", "seconds", "microseconds"]);
+                        }
+                        Some("windows_creation_time") => {
+                            assert_json_keys(marker, &["kind", "filetime_ticks"]);
+                        }
+                        other => panic!("unexpected process marker kind: {other:?}"),
+                    }
+                }
+                Some("unverified_pid") => {
+                    assert_json_keys(owner, &["kind", "pid", "reason"]);
+                    assert!(owner["pid"].is_u64());
+                    assert!(owner["reason"].is_string());
+                }
+                other => panic!("unexpected owner kind: {other:?}"),
+            }
+        }
+        assert!(records[0]["data"]["current_owners"]["omitted_owner_count"].is_u64());
+        assert!(matches!(
+            records[0]["data"]["current_owners"]["completeness"].as_str(),
+            Some("complete" | "partial" | "raced")
+        ));
+        assert!(records[0]["data"]["current_owners"]["reasons"].is_array());
+        assert!(records[0]["data"]["previous_socket_token"].is_null());
+        if !records[0]["data"]["current_socket_token"].is_null() {
+            assert_json_keys(
+                &records[0]["data"]["current_socket_token"],
+                &["kind", "value"],
+            );
+            assert!(matches!(
+                records[0]["data"]["current_socket_token"]["kind"].as_str(),
+                Some("linux_inode" | "macos_socket_id")
+            ));
+            assert!(records[0]["data"]["current_socket_token"]["value"].is_u64());
+        }
+        assert!(records[0]["data"]["multiplicity"].is_u64());
+        assert!(records[0]["data"]["label"].is_null() || records[0]["data"]["label"].is_string());
+        assert!(matches!(
+            records[0]["data"]["filter_result"].as_str(),
+            Some("not_applied" | "matched" | "indeterminate")
+        ));
+        assert!(matches!(
+            records[0]["data"]["certainty"].as_str(),
+            Some("proven" | "estimated" | "heuristic" | "unknown")
+        ));
+        assert!(records[0]["data"]["evidence"].is_array());
+        assert!(records[0]["data"]["omitted_evidence_count"].is_u64());
+        assert!(records[0]["data"]["evidence_gaps"].is_array());
+        assert!(records[0]["data"]["omitted_evidence_gap_count"].is_u64());
+        assert!(!stdout(&output).contains("command_line"));
+        drop(listener);
+    }
+
+    #[test]
+    fn watch_rejects_invalid_arguments_before_collection() {
+        for args in [
+            vec!["watch", "--interval", "99ms"],
+            vec!["watch", "--duration", "7d1s"],
+            vec!["watch", "--scope-id", "1"],
+            vec!["watch", "--port", "0"],
+            vec!["watch", "--filter", "state:not-a-state"],
+        ] {
+            let output = kickoutchi(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert_eq!(stdout(&output), "", "{args:?}");
+            assert!(stderr(&output).contains("error:"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn watch_ctrl_c_after_baseline_exits_successfully() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let config_home = isolated_config_home();
+        let config_guard = DirectoryGuard(config_home.clone());
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .args([
+                "watch",
+                "--port",
+                &port.to_string(),
+                "--interval",
+                "100ms",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("watch process must start");
+        let mut child = ChildGuard { child };
+        let pid = child.id();
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .expect("watch stdout must be piped");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = ready_tx.send(result);
+        });
+        let baseline = ready_rx
+            .recv_timeout(KICK_EXIT_WAIT)
+            .expect("watch must emit a bounded baseline")
+            .expect("watch baseline must be readable");
+        let value: serde_json::Value = serde_json::from_str(&baseline).expect("baseline is JSON");
+        assert_eq!(value["event"], "baseline");
+
+        let platform_pid = libc::pid_t::try_from(pid).expect("child PID must fit pid_t");
+        // SAFETY: the PID belongs to this test's child and SIGINT is the behavior under test.
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch exit status must be readable")
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "watch did not exit after SIGINT");
+            thread::sleep(Duration::from_millis(10));
+        };
+        reader.join().expect("watch stdout reader must finish");
+        assert_eq!(status.code(), Some(0));
+        drop(config_guard);
+        drop(listener);
+    }
+
+    #[test]
+    fn watch_ctrl_c_while_config_is_blocked_exits_successfully() {
+        let config_home = isolated_config_home();
+        let config_guard = DirectoryGuard(config_home.clone());
+        let config_path = config_home.join("blocked-config.fifo");
+        let native_path = std::ffi::CString::new(config_path.as_os_str().as_bytes())
+            .expect("temporary path has no NUL byte");
+        // SAFETY: `native_path` is a valid NUL-terminated path and the mode is a
+        // normal owner-only permission mask.
+        assert_eq!(unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) }, 0);
+        let fifo_guard = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&config_path)
+            .expect("test must hold the FIFO open without completing its read");
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .arg("--config")
+            .arg(&config_path)
+            .args(["watch", "--duration", "1s"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("watch process must start");
+        let mut child = ChildGuard { child };
+        let pid = child.id();
+        let blocked_deadline = Instant::now() + KICK_EXIT_WAIT;
+        loop {
+            let wait_channel = fs::read_to_string(format!("/proc/{pid}/wchan"))
+                .expect("watch wait channel must remain readable");
+            if wait_channel.contains("pipe_read") {
+                break;
+            }
+            assert!(
+                Instant::now() < blocked_deadline,
+                "watch did not block while reading its config FIFO: {wait_channel}"
+            );
+            thread::yield_now();
+        }
+
+        let platform_pid = libc::pid_t::try_from(pid).expect("child PID must fit pid_t");
+        // SAFETY: the PID belongs to this test's child and SIGINT is the behavior under test.
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGINT) }, 0);
+        let exit_deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch exit status must be readable")
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < exit_deadline,
+                "watch did not exit after startup SIGINT"
+            );
+            thread::yield_now();
+        };
+        let mut stdout = String::new();
+        child
+            .child
+            .stdout
+            .take()
+            .expect("watch stdout must be piped")
+            .read_to_string(&mut stdout)
+            .expect("watch stdout must be readable");
+        let mut stderr = String::new();
+        child
+            .child
+            .stderr
+            .take()
+            .expect("watch stderr must be piped")
+            .read_to_string(&mut stderr)
+            .expect("watch stderr must be readable");
+
+        assert_eq!(status.code(), Some(0));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        drop(fifo_guard);
+        drop(config_guard);
     }
 
     #[test]

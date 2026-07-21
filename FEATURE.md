@@ -240,8 +240,9 @@ cross-cutting rules apply to every public surface:
   compatible unless this plan names an additive change explicitly.
 - Config reads remain byte-bounded, but a user-supplied special file or a stalled
   filesystem may block in the host OS. The CLI does not claim a portable config
-  read deadline in this release. An absent default config retains its current
-  success behavior.
+  read deadline in this release. Watch installs its Ctrl-C handler before config
+  loading, so cancellation during that no-output startup window still exits `0`.
+  An absent default config retains its current success behavior.
 
 ### 0.3 Exit codes
 
@@ -1165,7 +1166,8 @@ batch. Stream events and discard them after writing.
 - Allow a budget of three consecutive collection failures after a valid
   baseline. Emit one gap per failure and wait the requested interval before
   retrying. The third consecutive failure exhausts the budget and exits `1`
-  after its gap is flushed.
+  after its gap is flushed. Budget exhaustion takes precedence over cancellation
+  or duration expiry observed during that third failed poll.
 - Exit cleanly on Ctrl-C or duration expiry.
 - Exit `0` for Ctrl-C, duration expiry, and broken stdout pipes.
 - Exit `1` for initial collection failure or exhausted failure budget.
@@ -1182,6 +1184,8 @@ batch. Stream events and discard them after writing.
 An initial collection failure writes one sanitized diagnostic to stderr, emits
 no baseline or NDJSON record, and exits `1`. After a baseline, every failed poll
 emits and flushes its typed `collection_gap` before retry or termination.
+Once initial collection begins, its failure or unusable result takes precedence
+over cancellation or duration expiry observed during that attempt.
 
 A wall-clock read failure is the exception because a conforming watch record
 cannot fabricate its required observation timestamps. Whether it occurs before
@@ -1245,12 +1249,12 @@ prevents a 100 ms interval from becoming an external-process spawn loop.
 
 ### Stage 4 gate
 
-- [ ] Bind, release, replacement, duplicates, and gaps are correct.
-- [ ] No failed snapshot fabricates events.
-- [ ] Output ordering is deterministic.
-- [ ] Memory remains bounded by two snapshots and one bounded event batch.
-- [ ] Cancellation, duration, broken pipes, and repeated failures are tested.
-- [ ] NDJSON schema and stdout/stderr separation are pinned.
+- [x] Bind, release, replacement, duplicates, and gaps are correct.
+- [x] No failed snapshot fabricates events.
+- [x] Output ordering is deterministic.
+- [x] Memory remains bounded by two snapshots and one bounded event batch.
+- [x] Cancellation, duration, broken pipes, and repeated failures are tested.
+- [x] NDJSON schema and stdout/stderr separation are pinned.
 
 ## Stage 5: Implement Exact Bind Probes
 
@@ -1749,10 +1753,11 @@ other causes remain separate evidence gaps. The legacy `permission` field keeps
 its existing name and meaning. Snapshot sockets sort by protocol, address
 family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.1 state order, token
 kind/value with null last, then canonical owner-set key. Processes sort by PID,
-marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
-`ownership`, `metadata`, `scope`), code, endpoint, PID, and message. Evidence
-items sort by source in the order listed by `Evidence`, then code, certainty, and
-message. No public array uses hash-map iteration order.
+  marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
+  `ownership`, `metadata`, `scope`), code, the same canonical endpoint key used
+  by sockets and events, PID, and message. Evidence items sort by source in the
+  order listed by `Evidence`, then code, certainty, and message. No public array
+  uses hash-map iteration order.
 
 #### Watch NDJSON
 

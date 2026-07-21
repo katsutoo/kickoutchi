@@ -30,6 +30,19 @@ pub(crate) fn sanitize_multiline(text: &str) -> String {
     sanitize_with_layout(text, true)
 }
 
+pub(crate) fn sanitize_bounded(text: &str, max_bytes: usize) -> String {
+    let mut sanitized = sanitize(text);
+    if sanitized.len() <= max_bytes {
+        return sanitized;
+    }
+    let mut end = max_bytes;
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized.truncate(end);
+    sanitized
+}
+
 fn sanitize_with_layout(text: &str, preserve_newlines: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
