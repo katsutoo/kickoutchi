@@ -2324,7 +2324,10 @@ mod tests {
 
         let error = collect_socket_records(&proc_root).expect_err("missing tcp table must fail");
 
-        assert!(error.to_string().contains("net/tcp"), "{error}");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(ObservationError::SocketTableUnavailable)
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3549,7 +3552,10 @@ mod tests {
             crate::observation::MetadataProfile::LegacyList,
         )
         .expect_err("missing proc root must fail");
-        assert!(error.to_string().contains("cannot read"), "{error}");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(ObservationError::SocketTableUnavailable)
+        ));
     }
 
     #[test]
