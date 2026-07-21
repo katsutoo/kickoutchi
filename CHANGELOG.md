@@ -31,6 +31,11 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   endpoint and full-state filters, configurable polling intervals and duration,
   clean Ctrl-C and broken-pipe termination, and explicit recovery from transient
   collection failures without fabricating releases.
+- Exact TCP and UDP bind diagnostics across IPv4 and IPv6, with validated scope,
+  reuse-address, IPv6-only, and dual-stack controls. Results distinguish current
+  bindability, address conflicts, permission denial, unavailable addresses,
+  unsupported native behavior, and other retained OS errors; every probe closes
+  its socket immediately and makes no promise about a later bind race.
 
 ### Changed
 
@@ -48,7 +53,7 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   proves freeze/thaw support before target assignment. Freeze or final-validation
   failure withholds whole-job delivery, attempts thaw when required, and
   preserves primary, secondary, cleanup, and verified fallback outcomes.
-- Pinned `socket2` 0.6.5 with its empty default feature set for future exact bind
+- Pinned `socket2` 0.6.5 with its empty default feature set for exact bind
   probes. Its dependency graph, license, MSRV, unsafe call surface, binary-size
   impact, and Linux, macOS, and Windows behavior were reviewed and accepted
   before probe implementation.

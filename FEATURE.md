@@ -1312,11 +1312,11 @@ platform-sensitive setup with new local unsafe code.
 
 ### Stage 5 gate
 
-- [ ] Every supported matrix entry has a native test.
-- [ ] Probe results preserve exact OS error categories.
-- [ ] No probe leaves a socket or helper process behind.
-- [ ] Probe language says "now" and does not promise future availability.
-- [ ] The approved `socket2` dependency matches the reviewed lockfile version.
+- [x] Every supported matrix entry has a native test.
+- [x] Probe results preserve exact OS error categories.
+- [x] No probe leaves a socket or helper process behind.
+- [x] Probe language says "now" and does not promise future availability.
+- [x] The approved `socket2` dependency matches the reviewed lockfile version.
 
 ## Stage 6: Implement the Why Verdict Engine
 

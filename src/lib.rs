@@ -26,6 +26,11 @@ mod model;
 mod observation;
 mod output;
 mod platform;
+#[allow(
+    dead_code,
+    reason = "exact probes are consumed by the upcoming why command"
+)]
+mod probe;
 mod process;
 mod process_evidence;
 mod protection;
