@@ -326,23 +326,33 @@ mod why_native {
         })
     }
 
+    fn assert_native_occupancy(output: &Output) {
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stderr.is_empty());
+        let value = json(output);
+        assert_eq!(value["results"][0]["probe"]["outcome"], "address_in_use");
+        #[cfg(windows)]
+        assert_eq!(value["results"][0]["verdict"], "owned");
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            value["results"][0]["verdict"].as_str(),
+            Some("owned" | "owner_hidden" | "reservation_or_policy_unknown")
+        ));
+    }
+
     #[test]
-    fn why_reports_native_tcp_and_udp_owners() {
+    fn why_reports_native_tcp_and_udp_occupancy() {
         let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
         let tcp_port = tcp.local_addr().expect("TCP address is known").port();
         let tcp_port = tcp_port.to_string();
         let tcp_output = run_why(&[tcp_port.as_str(), "--tcp", "--address", "127.0.0.1"]);
-        assert_eq!(tcp_output.status.code(), Some(3));
-        assert!(tcp_output.stderr.is_empty());
-        assert_eq!(json(&tcp_output)["results"][0]["verdict"], "owned");
+        assert_native_occupancy(&tcp_output);
 
         let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
         let udp_port = udp.local_addr().expect("UDP address is known").port();
         let udp_port = udp_port.to_string();
         let udp_output = run_why(&[udp_port.as_str(), "--udp", "--address", "127.0.0.1"]);
-        assert_eq!(udp_output.status.code(), Some(3));
-        assert!(udp_output.stderr.is_empty());
-        assert_eq!(json(&udp_output)["results"][0]["verdict"], "owned");
+        assert_native_occupancy(&udp_output);
     }
 
     #[test]

@@ -166,19 +166,19 @@ cargo build --locked --profile dist --all-features --bin kickoutchi --bin kick
 - Candidate size: 3,686,584 bytes.
 - Complete eight-endpoint Why JSON, three warmups and 30 retained samples, zero
   errors:
-  - p50: 15.787 ms
-  - p95: 31.968 ms
-  - p99/max: 32.203 ms
-- Peak RSS: 21,976 KiB across ten successful retained samples.
+  - p50: 32.042 ms
+  - p95: 32.455 ms
+  - p99/max: 32.627 ms
+- Peak RSS: 22,184 KiB across ten successful retained samples.
 - Raw latency evidence:
   `benchmarks/why-complete-2026-07-22.tsv`
-  (`706f3626fa8406a131790404bec4725138510e98a8f938c5741659042d7d27e1`).
+  (`a2822a45bf74a80d79ae07abb4f5eaece3ab2ab826bfae447a8cb504b0819673`).
 - Exact source patch:
   `benchmarks/why-complete-2026-07-22.tsv.source.patch`
-  (`b389404cd0897c72dbeaad953c4226823bbf49ee7336b15d7c25eae16d451264`).
+  (`4948fa4e8ebed89f9d7f20aed3e98b88b4a6e95cbd38387b343c3f56b3cecabd`).
 - Raw RSS evidence:
   `benchmarks/why-complete-rss-2026-07-22.tsv`
-  (`e30ad91da676de3745485bf044de7c63e10eaaf24134ffa79164d688e5ac8750`).
+  (`edc8df1a0d07a8c62a6ea26040de9b86d9d7151655cc5d8bcc2d06234f8e71fa`).
 
 The latency samples are visibly bimodal on a shared workstation and are exact-
 artifact acceptance evidence, not a production capacity estimate or a claim of
