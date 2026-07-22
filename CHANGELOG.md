@@ -36,6 +36,11 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   bindability, address conflicts, permission denial, unavailable addresses,
   unsupported native behavior, and other retained OS errors; every probe closes
   its socket immediately and makes no promise about a later bind race.
+- A bounded `why` command that evaluates exact endpoint matrices from one native
+  snapshot and sequential bind probes. Human and versioned `kickoutchi.why/1`
+  JSON output report deterministic verdicts, certainty, labels, evidence,
+  evidence gaps, omitted counts, and aggregate exit status without collecting
+  full process command lines.
 
 ### Changed
 
@@ -81,6 +86,21 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 
 ### Fixed
 
+- macOS tree and group rollback now resumes the post-stop process identity when
+  PID reuse is detected, while still withholding termination from identities the
+  user did not authorize.
+- Linux ownership collection now treats unreadable or unprovable procfs mount
+  visibility as partial, and exact-fit procfs executable links no longer lose
+  metadata because magic symlinks report a zero size.
+- Why output now streams every legal bounded result shape instead of rejecting a
+  valid document above 256 KiB, and its evidence order consistently keeps owner
+  and kernel facts before the exact probe and supporting timer evidence.
+- Docker enrichment no longer associates explicit IPv4 and IPv6 publications
+  across address families, and oversized Linux privilege status is detected with
+  a limit-plus-one read before any Docker command can run.
+- Real-binary contract runners now enforce process and pipe-drain deadlines, and
+  benchmark producers reject ambiguous workloads and existing evidence paths
+  instead of replacing retained measurements.
 - Windows tree kills now reapply `--yes` warning authorization during every
   committed containment sweep and withhold all termination when a late child
   requires fresh review. Windows custom protected names and protected-name

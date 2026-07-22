@@ -928,8 +928,20 @@ fn collect_socket_owners_detailed(
     max_process_ids: usize,
     max_fd_entries: usize,
 ) -> Result<OwnerScanResult, CollectorError> {
+    let mut result = OwnerScanResult {
+        owners: HashMap::with_capacity(target_inodes.len()),
+        losses: BTreeSet::new(),
+        omitted_loss_count: 0,
+        owner_edges: 0,
+    };
+    if proc_visibility_restricted(proc_root) {
+        result.record_loss(OwnerScanLoss::EnumerationIncomplete);
+    }
+    if ancestor_pid_visibility_not_proven(proc_root) {
+        result.record_loss(OwnerScanLoss::AncestorPidOwnersInvisible);
+    }
     if target_inodes.is_empty() {
-        return Ok(OwnerScanResult::default());
+        return Ok(result);
     }
 
     let (pids, enumeration_incomplete) = owner_process_ids_with_limit(proc_root, max_process_ids)
@@ -945,6 +957,9 @@ fn collect_socket_owners_detailed(
             }
         }
     })?;
+    if enumeration_incomplete {
+        result.record_loss(OwnerScanLoss::EnumerationIncomplete);
+    }
 
     // Walk every PID's file descriptors, no early exit. A single listening socket
     // can be shared by several processes (a parent that bound it then forked,
@@ -954,18 +969,6 @@ fn collect_socket_owners_detailed(
     // others happily keep the port open. Correctness wins over the fd walks we'd
     // save. If this scan ever becomes the refresh bottleneck on a huge host, the
     // fix is netlink `sock_diag`, not a correctness-breaking early stop.
-    let mut result = OwnerScanResult {
-        owners: HashMap::with_capacity(target_inodes.len()),
-        losses: BTreeSet::new(),
-        omitted_loss_count: 0,
-        owner_edges: 0,
-    };
-    if enumeration_incomplete || proc_visibility_restricted(proc_root) {
-        result.record_loss(OwnerScanLoss::EnumerationIncomplete);
-    }
-    if ancestor_pid_visibility_not_proven(proc_root) {
-        result.record_loss(OwnerScanLoss::AncestorPidOwnersInvisible);
-    }
     let mut fd_entries_visited = 0;
     for pid in pids {
         scan_pid_socket_owners(
@@ -1037,25 +1040,47 @@ fn owner_process_ids_with_limit(
 
 fn proc_visibility_restricted(proc_root: &Path) -> bool {
     let Ok(mounts) = read_bounded_text(&proc_root.join("mounts"), MAX_STATUS_BYTES) else {
-        return false;
+        return true;
     };
     let proc_root = proc_root.as_os_str().as_bytes();
-    mounts.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        let _source = fields.next();
-        let mount_point = fields.next();
-        let filesystem = fields.next();
-        let options = fields.next();
-        mount_point.is_some_and(|value| value.as_bytes() == proc_root)
-            && filesystem == Some("proc")
-            && options.is_some_and(|value| {
-                value.split(',').any(|option| {
-                    option
-                        .strip_prefix("hidepid=")
-                        .is_some_and(|mode| mode != "0" && mode != "off")
-                })
-            })
-    })
+    let mut matching_options = None;
+    for line in mounts.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 6
+            || fields[4].parse::<u32>().is_err()
+            || fields[5].parse::<u32>().is_err()
+        {
+            return true;
+        }
+        if fields[1].as_bytes() != proc_root {
+            continue;
+        }
+        if matching_options.replace((fields[2], fields[3])).is_some() {
+            return true;
+        }
+    }
+
+    let Some((filesystem, options)) = matching_options else {
+        return true;
+    };
+    if filesystem != "proc" {
+        return true;
+    }
+
+    let mut hidepid = None;
+    for option in options.split(',') {
+        if option.is_empty() {
+            return true;
+        }
+        if let Some(mode) = option.strip_prefix("hidepid=") {
+            if mode.is_empty() || hidepid.replace(mode).is_some() {
+                return true;
+            }
+        } else if option == "hidepid" {
+            return true;
+        }
+    }
+    !matches!(hidepid, None | Some("0" | "off"))
 }
 
 fn ancestor_pid_visibility_not_proven(proc_root: &Path) -> bool {
@@ -1365,12 +1390,15 @@ fn read_link_bounded(path: &Path, max_bytes: usize) -> std::io::Result<PathBuf> 
             "symlink target has no remaining byte budget",
         ));
     }
-    let reported_length = fs::symlink_metadata(path)
-        .ok()
-        .map(|metadata| metadata.len());
+    let read_capacity = max_bytes.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "symlink target byte limit overflow",
+        )
+    })?;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "path contains NUL"))?;
-    let mut bytes = vec![0_u8; max_bytes];
+    let mut bytes = vec![0_u8; read_capacity];
     let written = unsafe {
         // SAFETY: `path` is NUL terminated, `bytes` is writable for its length
         // bytes, and readlink does not retain either pointer.
@@ -1380,7 +1408,7 @@ fn read_link_bounded(path: &Path, max_bytes: usize) -> std::io::Result<PathBuf> 
         return Err(std::io::Error::last_os_error());
     }
     let written = usize::try_from(written).expect("non-negative readlink size fits usize");
-    if written == max_bytes && reported_length != u64::try_from(max_bytes).ok() {
+    if written > max_bytes {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             format!("symlink target exceeds {max_bytes} byte limit"),
@@ -2027,6 +2055,11 @@ mod tests {
         fs::create_dir_all(path.join("self")).expect("test proc self directory must be created");
         fs::write(path.join("self/status"), "Name:\tkickoutchi\nNSpid:\t1\n")
             .expect("initial PID namespace evidence must be written");
+        fs::write(
+            path.join("mounts"),
+            format!("proc {} proc rw,nosuid,nodev 0 0\n", path.display()),
+        )
+        .expect("unrestricted proc mount evidence must be written");
         path
     }
 
@@ -2512,6 +2545,25 @@ mod tests {
     }
 
     #[test]
+    fn executable_symlink_reader_accepts_exact_proc_magic_symlink_target() {
+        let link = Path::new("/proc/self/exe");
+        let target = fs::read_link(link).expect("current executable proc symlink is readable");
+        let target_len = target.as_os_str().as_encoded_bytes().len();
+        assert!(target_len > 0);
+
+        assert_eq!(
+            read_link_bounded(link, target_len).expect("exact proc magic symlink target fits"),
+            target,
+        );
+        assert_eq!(
+            read_link_bounded(link, target_len - 1)
+                .expect_err("proc magic symlink maximum plus one is rejected")
+                .kind(),
+            ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
     fn socket_inode_is_extracted_from_fd_symlink_targets() {
         assert_eq!(
             parse_socket_inode(Path::new("socket:[12345]")),
@@ -2753,6 +2805,129 @@ mod tests {
             OwnerCompleteness::Partial { .. }
         ));
         assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn unrestricted_proc_mount_modes_prove_complete_visibility() {
+        let proc_root = temp_proc_root("unrestricted-proc-owner-scan");
+        for options in ["rw,nosuid,nodev", "rw,hidepid=0", "rw,hidepid=off"] {
+            fs::write(
+                proc_root.join("mounts"),
+                format!("proc {} proc {options} 0 0\n", proc_root.display()),
+            )
+            .expect("mount fixture");
+            assert!(!proc_visibility_restricted(&proc_root), "{options}");
+
+            let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([7]), 4, 4)
+                .expect("unrestricted empty scan succeeds");
+            assert!(!scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
+        }
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn unproven_proc_mount_visibility_fails_closed() {
+        let proc_root = temp_proc_root("unproven-proc-owner-scan");
+        let mounts = proc_root.join("mounts");
+
+        fs::remove_file(&mounts).expect("remove default mount fixture");
+        assert!(proc_visibility_restricted(&proc_root), "missing mounts");
+
+        fs::create_dir(&mounts).expect("unreadable mount fixture");
+        assert!(proc_visibility_restricted(&proc_root), "unreadable mounts");
+        fs::remove_dir(&mounts).expect("remove unreadable mount fixture");
+
+        for (name, evidence) in [
+            ("malformed", b"proc /proc proc rw 0\n".as_slice()),
+            ("invalid UTF-8", b"proc /proc proc rw 0 \xff\n".as_slice()),
+            ("no matching mount", b"proc /other proc rw 0 0\n".as_slice()),
+        ] {
+            fs::write(&mounts, evidence).expect("mount evidence fixture");
+            assert!(proc_visibility_restricted(&proc_root), "{name}");
+        }
+
+        let matching = format!("proc {} proc rw 0 0\n", proc_root.display());
+        fs::write(&mounts, format!("{matching}{matching}"))
+            .expect("ambiguous mount evidence fixture");
+        assert!(proc_visibility_restricted(&proc_root), "ambiguous mounts");
+
+        fs::write(&mounts, vec![b'x'; MAX_STATUS_BYTES + 1]).expect("oversized mount fixture");
+        assert!(proc_visibility_restricted(&proc_root), "oversized mounts");
+
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([7]), 4, 4)
+            .expect("unproven empty scan remains evidence");
+        assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn restricted_proc_visibility_is_global_loss_without_target_inodes() {
+        let proc_root = temp_proc_root("restricted-empty-inodes");
+        write_process(&proc_root, 42, "worker", 1);
+        fs::write(
+            proc_root.join("mounts"),
+            format!("proc {} proc rw,hidepid=2 0 0\n", proc_root.display()),
+        )
+        .expect("restricted mount fixture");
+
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::new(), 0, 0)
+            .expect("empty inode scan skips PID enumeration");
+        assert_eq!(scan.losses.len(), 1);
+        assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
+        let pass = native_pass_from_records(&[], scan).expect("global loss is representable");
+        assert!(matches!(
+            pass.owners.global_completeness,
+            OwnerCompleteness::Partial { .. }
+        ));
+        assert_eq!(pass.owners.evidence_gaps.len(), 1);
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn unproven_mount_and_ancestor_visibility_are_losses_without_target_inodes() {
+        let proc_root = temp_proc_root("unproven-empty-inodes");
+        write_process(&proc_root, 42, "worker", 1);
+        fs::remove_file(proc_root.join("mounts")).expect("remove mount evidence");
+        fs::write(
+            proc_root.join("self/status"),
+            "Name:\tkickoutchi\nNSpid:\t100\t1\n",
+        )
+        .expect("nested PID namespace evidence");
+
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::new(), 0, 0)
+            .expect("empty inode scan skips PID enumeration");
+        assert_eq!(scan.losses.len(), 2);
+        assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
+        assert!(
+            scan.losses
+                .contains(&OwnerScanLoss::AncestorPidOwnersInvisible)
+        );
+        let pass = native_pass_from_records(&[], scan).expect("global losses are representable");
+        assert!(matches!(
+            pass.owners.global_completeness,
+            OwnerCompleteness::Partial { .. }
+        ));
+        assert_eq!(pass.owners.evidence_gaps.len(), 2);
+
+        fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
+    }
+
+    #[test]
+    fn unrestricted_visibility_remains_complete_without_target_inodes() {
+        let proc_root = temp_proc_root("unrestricted-empty-inodes");
+        write_process(&proc_root, 42, "worker", 1);
+
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::new(), 0, 0)
+            .expect("empty inode scan skips PID enumeration");
+        assert!(scan.losses.is_empty());
+        let pass = native_pass_from_records(&[], scan).expect("complete scan is representable");
+        assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
+        assert!(pass.owners.evidence_gaps.is_empty());
 
         fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
     }

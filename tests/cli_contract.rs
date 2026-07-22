@@ -1,29 +1,409 @@
+use std::io::{self, Read, Write};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const REAL_BINARY_EXIT_WAIT: Duration = Duration::from_secs(10);
+const COMMAND_RUNNER_HELPER_ENV: &str = "KICKOUTCHI_TEST_COMMAND_RUNNER_HELPER";
+
+struct CommandChild(Option<Child>);
+
+impl CommandChild {
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("command child must be owned")
+    }
+
+    fn kill_and_reap(&mut self, deadline: Instant) -> io::Result<()> {
+        if let Some(mut child) = self.0.take() {
+            let kill_error = child.kill().err();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return Ok(()),
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        return Err(kill_error.unwrap_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "killed command exceeded its reap deadline",
+                            )
+                        }));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for CommandChild {
+    fn drop(&mut self) {
+        let _ = self.kill_and_reap(Instant::now() + Duration::from_secs(1));
+    }
+}
+
+fn pipe_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn finish_pipe(
+    reader: Option<mpsc::Receiver<io::Result<Vec<u8>>>>,
+    name: &str,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{name} pipe exceeded its drain deadline"),
+                ),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    io::Error::other(format!("{name} reader stopped without output"))
+                }
+            })?,
+        None => Ok(Vec::new()),
+    }
+}
+
+fn collect_child_output(child: Child, stdin: Option<&[u8]>, wait: Duration) -> io::Result<Output> {
+    let pid = child.id();
+    let mut child = CommandChild(Some(child));
+    let deadline = Instant::now() + wait;
+    let stdout_reader = child.child_mut().stdout.take().map(pipe_reader);
+    let stderr_reader = child.child_mut().stderr.take().map(pipe_reader);
+
+    if let Some(input) = stdin {
+        let write_result = child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("command stdin was not piped"))
+            .and_then(|pipe| pipe.write_all(input));
+        drop(child.child_mut().stdin.take());
+        if let Err(error) = write_result {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+            let cleanup_error = child.kill_and_reap(cleanup_deadline).err();
+            let _ = finish_pipe(stdout_reader, "stdout", cleanup_deadline);
+            let _ = finish_pipe(stderr_reader, "stderr", cleanup_deadline);
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; command cleanup failed: {cleanup_error}"),
+                ));
+            }
+            return Err(error);
+        }
+    }
+
+    let status: ExitStatus = loop {
+        match child.child_mut().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+                let cleanup_error = child.kill_and_reap(cleanup_deadline).err();
+                let _ = finish_pipe(stdout_reader, "stdout", cleanup_deadline);
+                let _ = finish_pipe(stderr_reader, "stderr", cleanup_deadline);
+                let cleanup = cleanup_error
+                    .map_or_else(String::new, |error| format!("; cleanup failed: {error}"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("command PID {pid} exceeded its exit deadline{cleanup}"),
+                ));
+            }
+            Err(error) => {
+                let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+                let cleanup_error = child.kill_and_reap(cleanup_deadline).err();
+                let _ = finish_pipe(stdout_reader, "stdout", cleanup_deadline);
+                let _ = finish_pipe(stderr_reader, "stderr", cleanup_deadline);
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}; command cleanup failed: {cleanup_error}"),
+                    ));
+                }
+                return Err(error);
+            }
+        }
+    };
+    child.disarm();
+    let stdout = finish_pipe(stdout_reader, "stdout", deadline);
+    let stderr = finish_pipe(stderr_reader, "stderr", deadline);
+
+    Ok(Output {
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+fn run_command_with_deadline(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    wait: Duration,
+) -> io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    collect_child_output(command.spawn()?, stdin, wait)
+}
+
+#[test]
+fn command_runner_helper_process() {
+    match std::env::var(COMMAND_RUNNER_HELPER_ENV).as_deref() {
+        Ok("dual-output") => {
+            let bytes = vec![0xa5; 256 * 1024];
+            io::stdout()
+                .write_all(&bytes)
+                .expect("helper stdout must be writable");
+            io::stderr()
+                .write_all(&bytes)
+                .expect("helper stderr must be writable");
+        }
+        Ok("park") => loop {
+            thread::park();
+        },
+        _ => {}
+    }
+}
+
+#[test]
+#[allow(
+    clippy::naive_bytecount,
+    reason = "the helper output includes test-harness text around the exact binary payload"
+)]
+fn command_runner_drains_large_stdout_and_stderr_without_deadlock() {
+    let output = run_command_with_deadline(
+        Command::new(std::env::current_exe().expect("test binary path resolves"))
+            .env(COMMAND_RUNNER_HELPER_ENV, "dual-output")
+            .args(["--exact", "command_runner_helper_process", "--nocapture"]),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("dual-output helper must finish before its deadline");
+
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == 0xa5).count(),
+        256 * 1024,
+    );
+    assert_eq!(
+        output.stderr.iter().filter(|byte| **byte == 0xa5).count(),
+        256 * 1024,
+    );
+}
+
+#[test]
+fn command_runner_timeout_kills_and_reaps_child() {
+    let child = Command::new(std::env::current_exe().expect("test binary path resolves"))
+        .env(COMMAND_RUNNER_HELPER_ENV, "park")
+        .args(["--exact", "command_runner_helper_process", "--nocapture"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("parked helper must start");
+    #[cfg(unix)]
+    let pid = child.id();
+
+    let error = collect_child_output(child, None, Duration::from_millis(100))
+        .expect_err("parked helper must exceed its deadline");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+    #[cfg(unix)]
+    {
+        let pid = libc::pid_t::try_from(pid).expect("helper PID must fit pid_t");
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "timed-out helper must have been reaped");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "timed-out helper PID must no longer exist",
+        );
+    }
+}
+
 #[test]
 fn cli_and_config_errors_sanitize_terminal_controls() {
-    let argument = std::process::Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
-        .args(["list", "--sort", "evil\u{202e}value"])
-        .output()
-        .expect("invalid argument command runs");
+    let argument = run_command_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_kickoutchi")).args([
+            "list",
+            "--sort",
+            "evil\u{202e}value",
+        ]),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("invalid argument command runs");
     assert_eq!(argument.status.code(), Some(2));
     let stderr = String::from_utf8(argument.stderr).expect("stderr is UTF-8");
     assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
 
-    let config = std::process::Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
-        .args(["--config", "missing\x1b]0;spoof\x07.toml", "list"])
-        .output()
-        .expect("missing config command runs");
+    let config = run_command_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_kickoutchi")).args([
+            "--config",
+            "missing\x1b]0;spoof\x07.toml",
+            "list",
+        ]),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("missing config command runs");
     assert_eq!(config.status.code(), Some(1));
     let stderr = String::from_utf8(config.stderr).expect("stderr is UTF-8");
     assert!(!stderr.contains('\x1b'), "{stderr:?}");
     assert!(!stderr.contains('\x07'), "{stderr:?}");
 }
 
+#[cfg(any(target_os = "macos", windows))]
+mod why_native {
+    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
+    use std::fs;
+    use std::net::{Ipv6Addr, TcpListener, UdpSocket};
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct ConfigGuard(PathBuf);
+
+    impl ConfigGuard {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kickoutchi-why-native-{}-{unique}.toml",
+                std::process::id()
+            ));
+            fs::write(&path, "").expect("isolated config must be written");
+            Self(path)
+        }
+    }
+
+    impl Drop for ConfigGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn run_why(args: &[&str]) -> Output {
+        let config = ConfigGuard::new();
+        run_command_with_deadline(
+            Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+                .arg("--config")
+                .arg(&config.0)
+                .arg("why")
+                .args(args)
+                .arg("--json"),
+            None,
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("why command must run before its deadline")
+    }
+
+    fn json(output: &Output) -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "why stdout must be JSON: {error}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    #[test]
+    fn why_reports_native_tcp_and_udp_owners() {
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
+        let tcp_port = tcp.local_addr().expect("TCP address is known").port();
+        let tcp_port = tcp_port.to_string();
+        let tcp_output = run_why(&[tcp_port.as_str(), "--tcp", "--address", "127.0.0.1"]);
+        assert_eq!(tcp_output.status.code(), Some(3));
+        assert!(tcp_output.stderr.is_empty());
+        assert_eq!(json(&tcp_output)["results"][0]["verdict"], "owned");
+
+        let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
+        let udp_port = udp.local_addr().expect("UDP address is known").port();
+        let udp_port = udp_port.to_string();
+        let udp_output = run_why(&[udp_port.as_str(), "--udp", "--address", "127.0.0.1"]);
+        assert_eq!(udp_output.status.code(), Some(3));
+        assert!(udp_output.stderr.is_empty());
+        assert_eq!(json(&udp_output)["results"][0]["verdict"], "owned");
+    }
+
+    #[test]
+    fn why_keeps_ipv6_as_an_explicit_native_result() {
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            let output = run_why(&["3000", "--tcp", "--address", "::1"]);
+            let value = json(&output);
+            assert_eq!(output.status.code(), Some(3));
+            assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
+            assert_eq!(value["results"][0]["endpoint"]["address"], "::1");
+            assert!(matches!(
+                value["results"][0]["verdict"].as_str(),
+                Some("unsupported" | "address_unavailable")
+            ));
+            return;
+        };
+        let port = listener.local_addr().expect("IPv6 address is known").port();
+        let port = port.to_string();
+
+        let output = run_why(&[port.as_str(), "--tcp", "--address", "::1"]);
+        let value = json(&output);
+
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stderr.is_empty());
+        assert_eq!(value["results"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["results"][0]["endpoint"]["address"], "::1");
+        assert_eq!(value["results"][0]["probe"]["outcome"], "address_in_use");
+        #[cfg(windows)]
+        assert_eq!(value["results"][0]["verdict"], "owned");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            value["results"][0]["verdict"],
+            "reservation_or_policy_unknown"
+        );
+    }
+
+    #[test]
+    fn why_closes_a_successful_native_probe() {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("temporary UDP fixture must bind");
+        let port = socket.local_addr().expect("UDP address is known").port();
+        drop(socket);
+        let port_text = port.to_string();
+
+        let output = run_why(&[port_text.as_str(), "--udp", "--address", "127.0.0.1"]);
+
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(json(&output)["results"][0]["verdict"], "bindable_now");
+        let rebound = UdpSocket::bind(("127.0.0.1", port))
+            .expect("the completed probe must not retain its socket");
+        drop(rebound);
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::{REAL_BINARY_EXIT_WAIT, collect_child_output, run_command_with_deadline};
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, UdpSocket};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::sync::{Arc, Mutex};
@@ -59,6 +439,7 @@ mod linux {
     const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
     const HELPER_BIND_ANY_ENV: &str = "KICKOUTCHI_TEST_HELPER_BIND_ANY";
+    const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
     static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
     // Port 0 never hosts a real listening socket (the kernel reads it as "assign an
     // ephemeral port"), so `list --port 0` deterministically finds no confirmed
@@ -112,6 +493,14 @@ mod linux {
         }
     }
 
+    struct FileGuard(PathBuf);
+
+    impl Drop for FileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     struct PidGuard {
         pid: u32,
     }
@@ -132,74 +521,103 @@ mod linux {
     }
 
     fn kickoutchi_with_config(args: &[&str], config_text: &str) -> Output {
+        kickoutchi_with_config_deadline(args, config_text)
+    }
+
+    fn kickoutchi_with_config_deadline(args: &[&str], config_text: &str) -> Output {
+        binary_with_config_deadline_with_env(
+            env!("CARGO_BIN_EXE_kickoutchi"),
+            args,
+            config_text,
+            &[],
+        )
+    }
+
+    fn binary_with_config_deadline_with_env(
+        path: &str,
+        args: &[&str],
+        config_text: &str,
+        environment: &[(&str, &std::ffi::OsStr)],
+    ) -> Output {
         let config_dir = isolated_config_home();
+        let config_guard = DirectoryGuard(config_dir.clone());
         let config_path = config_dir.join("config.toml");
         fs::write(&config_path, config_text).expect("test config file must be written");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
+        let mut command = Command::new(path);
         command
             .arg("--config")
             .arg(&config_path)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let output = command
-            .output()
-            .expect("kickoutchi binary must run with explicit config");
-        let _ = fs::remove_dir_all(config_dir);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let output = run_command_with_deadline(&mut command, None, KICK_EXIT_WAIT)
+            .expect("CLI binary must run with explicit config before its deadline");
+        drop(config_guard);
         output
     }
 
-    fn kickoutchi_with_config_deadline(args: &[&str], config_text: &str) -> Output {
-        let config_dir = isolated_config_home();
-        let config_guard = DirectoryGuard(config_dir.clone());
-        let config_path = config_dir.join("config.toml");
-        fs::write(&config_path, config_text).expect("test config file must be written");
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
-            .arg("--config")
-            .arg(&config_path)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("kickoutchi binary must run with explicit config");
-        let mut child = ChildGuard { child };
-        let deadline = Instant::now() + KICK_EXIT_WAIT;
-        let status = loop {
-            if let Some(status) = child
-                .child
-                .try_wait()
-                .expect("watch exit status must be readable")
-            {
-                break status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "watch exceeded its exit deadline"
-            );
-            thread::sleep(Duration::from_millis(10));
-        };
-        let mut stdout = Vec::new();
-        child
-            .child
-            .stdout
-            .take()
-            .expect("watch stdout must be piped")
-            .read_to_end(&mut stdout)
-            .expect("watch stdout must be readable");
-        let mut stderr = Vec::new();
-        child
-            .child
-            .stderr
-            .take()
-            .expect("watch stderr must be piped")
-            .read_to_end(&mut stderr)
-            .expect("watch stderr must be readable");
-        drop(config_guard);
-        Output {
-            status,
-            stdout,
-            stderr,
-        }
+    fn why(args: &[&str]) -> Output {
+        why_with_config(args, "")
+    }
+
+    fn why_with_config(args: &[&str], config_text: &str) -> Output {
+        let mut command_args = Vec::with_capacity(args.len() + 1);
+        command_args.push("why");
+        command_args.extend_from_slice(args);
+        kickoutchi_with_config_deadline(&command_args, config_text)
+    }
+
+    fn kick_why(args: &[&str]) -> Output {
+        let mut command_args = Vec::with_capacity(args.len() + 1);
+        command_args.push("why");
+        command_args.extend_from_slice(args);
+        binary_with_config_deadline_with_env(env!("CARGO_BIN_EXE_kick"), &command_args, "", &[])
+    }
+
+    fn why_with_bind_faults(args: &[&str], library: &Path, mode: &str) -> Output {
+        let mut command_args = Vec::with_capacity(args.len() + 1);
+        command_args.push("why");
+        command_args.extend_from_slice(args);
+        binary_with_config_deadline_with_env(
+            env!("CARGO_BIN_EXE_kickoutchi"),
+            &command_args,
+            "",
+            &[
+                ("LD_PRELOAD", library.as_os_str()),
+                (
+                    "KICKOUTCHI_TEST_BIND_FAULT_MODE",
+                    std::ffi::OsStr::new(mode),
+                ),
+            ],
+        )
+    }
+
+    fn build_bind_fault_library() -> (DirectoryGuard, PathBuf) {
+        let directory = temp_file_path("bind-faults");
+        fs::create_dir(&directory).expect("bind-fault directory must be created");
+        let guard = DirectoryGuard(directory.clone());
+        let library = directory.join("libkickoutchi_bind_faults.so");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bind_faults.c");
+        let output = run_command_with_deadline(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+                .arg(&source)
+                .arg("-ldl")
+                .arg("-o")
+                .arg(&library),
+            None,
+            CHILD_EXIT_WAIT,
+        )
+        .expect("C compiler must build the bind-fault fixture before its deadline");
+        assert!(
+            output.status.success(),
+            "bind-fault fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (guard, library)
     }
 
     fn kick(args: &[&str]) -> Output {
@@ -208,28 +626,35 @@ mod linux {
 
     fn run_binary(path: &str, args: &[&str], stdin: Option<&str>) -> Output {
         let config_home = isolated_config_home();
+        let config_guard = DirectoryGuard(config_home.clone());
         let mut command = Command::new(path);
-        command
+        command.env("XDG_CONFIG_HOME", &config_home).args(args);
+        let output = run_command_with_deadline(
+            &mut command,
+            stdin.map(str::as_bytes),
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("kickoutchi output must be collected before its deadline");
+        drop(config_guard);
+        output
+    }
+
+    fn run_why_with_closed_stdout(args: &[&str]) -> Output {
+        let config_home = isolated_config_home();
+        let config_guard = DirectoryGuard(config_home.clone());
+        let (reader, writer) = UnixStream::pair().expect("test pipe must be created");
+        drop(reader);
+        let child = Command::new(env!("CARGO_BIN_EXE_kick"))
             .env("XDG_CONFIG_HOME", &config_home)
+            .arg("why")
             .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if stdin.is_some() {
-            command.stdin(Stdio::piped());
-        }
-        let mut child = command.spawn().expect("kickoutchi binary must run");
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin must be piped")
-                .write_all(input.as_bytes())
-                .expect("confirmation input must be written");
-        }
-        let output = child
-            .wait_with_output()
-            .expect("kickoutchi output must be collected");
-        let _ = fs::remove_dir_all(config_home);
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("why binary must run with a closed stdout reader");
+        let output = collect_child_output(child, None, KICK_EXIT_WAIT)
+            .expect("why output must be collected before its deadline");
+        drop(config_guard);
         output
     }
 
@@ -265,8 +690,15 @@ mod linux {
     }
 
     fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
+        spawn_listener_process_with_metadata_access(true)
+    }
+
+    fn spawn_listener_process_with_metadata_access(
+        metadata_accessible: bool,
+    ) -> (ChildGuard, u16, PathBuf) {
         let ready_file = temp_file_path("listener-ready");
-        let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+        let mut command = Command::new(std::env::current_exe().expect("test binary path resolves"));
+        command
             .env(HELPER_LISTENER_ENV, "1")
             .env(HELPER_PORT_ENV, "0")
             .env(HELPER_READY_ENV, &ready_file)
@@ -276,9 +708,11 @@ mod linux {
                 "--nocapture",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("listener helper process must start");
+            .stderr(Stdio::null());
+        if !metadata_accessible {
+            command.env(HELPER_NONDUMPABLE_ENV, "1");
+        }
+        let child = command.spawn().expect("listener helper process must start");
         let guard = ChildGuard { child };
         wait_for_file(&ready_file);
         let port = fs::read_to_string(&ready_file)
@@ -482,6 +916,13 @@ mod linux {
             return;
         }
 
+        if std::env::var_os(HELPER_NONDUMPABLE_ENV).is_some() {
+            // SAFETY: prctl is called with the documented PR_SET_DUMPABLE
+            // operation and one integer value; no pointer crosses the boundary.
+            let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+            assert_eq!(result, 0, "test helper must disable dumpability");
+        }
+
         let port = std::env::var(HELPER_PORT_ENV)
             .expect("helper port must be set")
             .parse::<u16>()
@@ -581,10 +1022,12 @@ mod linux {
                 // group member that is no longer a descendant. The sleeper's
                 // stdio must not inherit the pipe, or `output()` would wait
                 // for the sleeper's EOF instead of sh's exit.
-                let output = Command::new("sh")
-                    .args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"])
-                    .output()
-                    .expect("group orphan spawner must run");
+                let output = run_command_with_deadline(
+                    Command::new("sh").args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"]),
+                    None,
+                    CHILD_EXIT_WAIT,
+                )
+                .expect("group orphan spawner must run");
                 let orphan_pid = String::from_utf8_lossy(&output.stdout)
                     .trim()
                     .parse::<u32>()
@@ -1013,6 +1456,352 @@ mod linux {
         assert_eq!(output.status.code(), Some(2));
         assert_eq!(stdout(&output), "");
         assert!(stderr(&output).contains("not supported by this command"));
+    }
+
+    #[test]
+    fn why_reports_a_test_owned_tcp_listener_with_versioned_json() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address is known")
+            .port();
+        let port_text = port.to_string();
+
+        let output = why(&[
+            port_text.as_str(),
+            "--tcp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&output)).expect("why output must be JSON");
+        assert_json_keys(
+            &value,
+            &[
+                "schema",
+                "version",
+                "query",
+                "capture",
+                "scope",
+                "completeness",
+                "owner_completeness",
+                "results",
+                "aggregate_exit_code",
+            ],
+        );
+        assert_eq!(value["schema"], "kickoutchi.why");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["aggregate_exit_code"], 3);
+        assert_eq!(value["results"][0]["verdict"], "owned");
+        assert_eq!(value["results"][0]["probe"]["outcome"], "address_in_use");
+        assert!(
+            value["results"][0]["evidence"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["code"] == "visible_verified_owner" && item["certainty"] == "proven"
+                }))
+        );
+        assert!(!stdout(&output).contains("command_line"));
+    }
+
+    #[test]
+    fn why_reports_real_permission_limited_owner_evidence() {
+        let _host_observation = lock_host_observation();
+        let (_helper, port, ready_file) = spawn_listener_process_with_metadata_access(false);
+        let _ready_file = FileGuard(ready_file);
+        let port_text = port.to_string();
+
+        let output = why(&[
+            port_text.as_str(),
+            "--tcp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&output)).expect("why output must be JSON");
+        assert_eq!(value["results"][0]["probe"]["outcome"], "address_in_use");
+        assert_eq!(value["completeness"], "partial");
+        assert_eq!(value["owner_completeness"], "partial");
+        assert!(
+            value["results"][0]["evidence_gaps"]
+                .as_array()
+                .is_some_and(|gaps| gaps.iter().any(|gap| {
+                    gap["impact"] == "ownership"
+                        && matches!(
+                            gap["code"].as_str(),
+                            Some("owner_permission_denied" | "owner_attribution_incomplete")
+                        )
+                }))
+        );
+    }
+
+    #[test]
+    fn why_reports_bindable_udp_and_releases_its_probe_socket() {
+        let _host_observation = lock_host_observation();
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("temporary UDP socket must bind");
+        let port = socket.local_addr().expect("socket address is known").port();
+        drop(socket);
+        let port_text = port.to_string();
+
+        let output = kick_why(&[
+            port_text.as_str(),
+            "--udp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&output)).expect("why output must be JSON");
+        assert_eq!(value["aggregate_exit_code"], 0);
+        assert_eq!(value["results"][0]["verdict"], "bindable_now");
+        let rebound = UdpSocket::bind(("127.0.0.1", port))
+            .expect("why must close the exact probe socket before returning");
+        drop(rebound);
+    }
+
+    #[test]
+    fn why_reports_occupied_udp_in_human_output_and_bindable_tcp_in_json() {
+        let _host_observation = lock_host_observation();
+        let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
+        let udp_port = udp.local_addr().expect("UDP address is known").port();
+        let udp_port_text = udp_port.to_string();
+        let occupied = why(&[udp_port_text.as_str(), "--udp", "--address", "127.0.0.1"]);
+        assert_eq!(occupied.status.code(), Some(3), "{}", stderr(&occupied));
+        assert_eq!(stderr(&occupied), "");
+        assert!(stdout(&occupied).contains("verdict=owned"));
+        assert!(stdout(&occupied).contains("probe=address_in_use"));
+        assert!(stdout(&occupied).contains("certainty=proven"));
+
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP fixture must bind");
+        let tcp_port = tcp.local_addr().expect("TCP address is known").port();
+        drop(tcp);
+        let tcp_port_text = tcp_port.to_string();
+        let bindable = why(&[
+            tcp_port_text.as_str(),
+            "--tcp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+        assert_eq!(bindable.status.code(), Some(0), "{}", stderr(&bindable));
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&bindable)).expect("why output must be JSON");
+        assert_eq!(value["results"][0]["verdict"], "bindable_now");
+        drop(
+            TcpListener::bind(("127.0.0.1", tcp_port))
+                .expect("why must release the successful TCP probe"),
+        );
+    }
+
+    #[test]
+    fn why_real_binary_preserves_aggregate_exit_when_stdout_has_no_reader() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
+        let occupied_port = listener.local_addr().expect("TCP address is known").port();
+        let occupied_port = occupied_port.to_string();
+        let occupied = run_why_with_closed_stdout(&[
+            occupied_port.as_str(),
+            "--tcp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+        assert_eq!(occupied.status.code(), Some(3));
+        assert!(occupied.stderr.is_empty());
+
+        let temporary = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
+        let bindable_port = temporary.local_addr().expect("UDP address is known").port();
+        drop(temporary);
+        let bindable_port = bindable_port.to_string();
+        let bindable = run_why_with_closed_stdout(&[
+            bindable_port.as_str(),
+            "--udp",
+            "--address",
+            "127.0.0.1",
+            "--json",
+        ]);
+        assert_eq!(bindable.status.code(), Some(0));
+        assert!(bindable.stderr.is_empty());
+    }
+
+    #[test]
+    fn why_real_binary_applies_full_aggregate_exit_precedence() {
+        let _host_observation = lock_host_observation();
+        let (_library_guard, library) = build_bind_fault_library();
+        let temporary =
+            TcpListener::bind(("127.0.0.1", 0)).expect("temporary aggregate fixture must bind");
+        let port = temporary
+            .local_addr()
+            .expect("temporary aggregate address is known")
+            .port();
+        drop(temporary);
+        let port = port.to_string();
+        let args = [
+            port.as_str(),
+            "--all-protocols",
+            "--all-addresses",
+            "--json",
+        ];
+
+        let failure = why_with_bind_faults(&args, &library, "mixed");
+        assert_eq!(failure.status.code(), Some(1), "{}", stderr(&failure));
+        assert_eq!(stderr(&failure), "");
+        let failure_json: serde_json::Value =
+            serde_json::from_str(&stdout(&failure)).expect("why output must be JSON");
+        let failure_verdicts = failure_json["results"]
+            .as_array()
+            .expect("results are an array")
+            .iter()
+            .filter_map(|result| result["verdict"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(failure_json["aggregate_exit_code"], 1);
+        assert!(failure_verdicts.contains("indeterminate"));
+        assert!(failure_verdicts.contains("permission_denied"));
+        assert!(failure_verdicts.contains("reservation_or_policy_unknown"));
+        assert!(failure_verdicts.contains("bindable_now"));
+
+        let permission = why_with_bind_faults(&args, &library, "permission");
+        assert_eq!(permission.status.code(), Some(4), "{}", stderr(&permission));
+        assert_eq!(stderr(&permission), "");
+        let permission_json: serde_json::Value =
+            serde_json::from_str(&stdout(&permission)).expect("why output must be JSON");
+        let permission_verdicts = permission_json["results"]
+            .as_array()
+            .expect("results are an array")
+            .iter()
+            .filter_map(|result| result["verdict"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(permission_json["aggregate_exit_code"], 4);
+        assert!(permission_verdicts.contains("permission_denied"));
+        assert!(permission_verdicts.contains("reservation_or_policy_unknown"));
+        assert!(!permission_verdicts.contains("indeterminate"));
+    }
+
+    #[test]
+    fn why_applies_labels_and_rejects_invalid_scope_before_output() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
+        let port = listener
+            .local_addr()
+            .expect("listener address is known")
+            .port();
+        let port_text = port.to_string();
+        let config = format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"web fixture\"\n"
+        );
+
+        let labeled = why_with_config(
+            &[port_text.as_str(), "--address", "127.0.0.1", "--json"],
+            &config,
+        );
+        assert_eq!(labeled.status.code(), Some(3), "{}", stderr(&labeled));
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&labeled)).expect("why output must be JSON");
+        assert_eq!(value["results"][0]["label"], "web fixture");
+
+        let invalid = why(&[
+            port_text.as_str(),
+            "--address",
+            "127.0.0.1",
+            "--scope-id",
+            "3",
+        ]);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert_eq!(stdout(&invalid), "");
+        assert!(stderr(&invalid).contains("scope ID is valid only"));
+
+        for invalid_args in [
+            vec!["0", "--address", "127.0.0.1"],
+            vec!["65536", "--address", "127.0.0.1"],
+            vec!["3000", "--address", "fe80::1%3"],
+            vec!["3000", "--address", "::1", "--scope-id", "0"],
+        ] {
+            let output = why(&invalid_args);
+            assert_eq!(output.status.code(), Some(2), "{invalid_args:?}");
+            assert_eq!(stdout(&output), "");
+            assert!(!stderr(&output).is_empty());
+        }
+    }
+
+    #[test]
+    fn why_keeps_linux_ipv6_and_the_complete_expansion_explicit() {
+        let _host_observation = lock_host_observation();
+        let ipv6 = match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) if !required_linux_capabilities() => {
+                eprintln!("skipping IPv6 why contract because loopback is unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("required IPv6 loopback is unavailable: {error}"),
+        };
+        let ipv6_port = ipv6.local_addr().expect("IPv6 address is known").port();
+        let ipv6_port_text = ipv6_port.to_string();
+        let ipv6_output = why(&[
+            ipv6_port_text.as_str(),
+            "--tcp",
+            "--address",
+            "::1",
+            "--json",
+        ]);
+        assert_eq!(ipv6_output.status.code(), Some(3));
+        let ipv6_value: serde_json::Value =
+            serde_json::from_str(&stdout(&ipv6_output)).expect("IPv6 why output must be JSON");
+        assert_eq!(ipv6_value["results"][0]["endpoint"]["address"], "::1");
+        assert_eq!(
+            ipv6_value["results"][0]["probe"]["outcome"],
+            "address_in_use"
+        );
+        assert_eq!(
+            ipv6_value["results"][0]["verdict"],
+            "reservation_or_policy_unknown"
+        );
+        assert!(
+            ipv6_value["results"][0]["evidence"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["code"] == "potential_scope_overlap" && item["certainty"] == "unknown"
+                }))
+        );
+
+        let matrix_output = why(&[
+            ipv6_port_text.as_str(),
+            "--all-protocols",
+            "--all-addresses",
+            "--json",
+        ]);
+        assert_eq!(matrix_output.status.code(), Some(3));
+        assert_eq!(stderr(&matrix_output), "");
+        let matrix: serde_json::Value =
+            serde_json::from_str(&stdout(&matrix_output)).expect("matrix output must be JSON");
+        assert_eq!(matrix["results"].as_array().map(Vec::len), Some(8));
+        assert_eq!(matrix["aggregate_exit_code"], 3);
+        let verdicts = matrix["results"]
+            .as_array()
+            .expect("matrix results are an array")
+            .iter()
+            .filter_map(|result| result["verdict"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(verdicts.contains("bindable_now"));
+        assert!(verdicts.iter().any(|verdict| *verdict != "bindable_now"));
+        assert!(
+            matrix["scope"]["limitations"]
+                .as_array()
+                .is_some_and(|limitations| limitations
+                    .iter()
+                    .any(|limitation| { limitation == "scoped_ipv6_exact_matching_unavailable" }))
+        );
     }
 
     #[test]
@@ -1502,23 +2291,26 @@ mod linux {
         let test_binary = std::env::current_exe().expect("test binary path resolves");
         let ready_file = temp_file_path("namespace-listener-ready");
         let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --nocapture & helper=$!; i=0; while test ! -s "$3"; do i=$((i+1)); test "$i" -lt 10000 || exit 90; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
-        let output = Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--net",
-                "--pid",
-                "--fork",
-                "--mount-proc",
-                "sh",
-                "-c",
-                script,
-                "sh",
-            ])
-            .arg(test_binary)
-            .arg(env!("CARGO_BIN_EXE_kickoutchi"))
-            .arg(&ready_file)
-            .output();
+        let output = run_command_with_deadline(
+            Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--net",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                    "sh",
+                    "-c",
+                    script,
+                    "sh",
+                ])
+                .arg(test_binary)
+                .arg(env!("CARGO_BIN_EXE_kickoutchi"))
+                .arg(&ready_file),
+            None,
+            CHILD_EXIT_WAIT,
+        );
         let output = match output {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1939,8 +2731,8 @@ mod linux {
 
 #[cfg(windows)]
 mod windows {
+    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
     use std::fs;
-    use std::io::Write;
     use std::net::TcpListener;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Path, PathBuf};
@@ -2001,26 +2793,13 @@ mod windows {
     fn kickoutchi_with_stdin(args: &[&str], stdin: Option<&str>) -> Output {
         let config_home = isolated_config_home();
         let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
-        command
-            .env("APPDATA", &config_home)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if stdin.is_some() {
-            command.stdin(Stdio::piped());
-        }
-        let mut child = command.spawn().expect("kickoutchi binary must run");
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin must be piped")
-                .write_all(input.as_bytes())
-                .expect("confirmation input must be written");
-        }
-        let output = child
-            .wait_with_output()
-            .expect("kickoutchi output must be collected");
+        command.env("APPDATA", &config_home).args(args);
+        let output = run_command_with_deadline(
+            &mut command,
+            stdin.map(str::as_bytes),
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("kickoutchi output must be collected before its deadline");
         let _ = fs::remove_dir_all(config_home);
         output
     }
@@ -2572,8 +3351,8 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
     use std::fs;
-    use std::io::Write;
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
@@ -2681,27 +3460,13 @@ mod macos {
         let config_path = config_dir.join("config.toml");
         fs::write(&config_path, "").expect("isolated config file must be written");
         let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
-        command
-            .args(args)
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if stdin.is_some() {
-            command.stdin(Stdio::piped());
-        }
-        let mut child = command.spawn().expect("kickoutchi binary must run");
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .as_mut()
-                .expect("stdin must be piped")
-                .write_all(input.as_bytes())
-                .expect("confirmation input must be written");
-        }
-        let output = child
-            .wait_with_output()
-            .expect("kickoutchi output must be collected");
+        command.args(args).arg("--config").arg(&config_path);
+        let output = run_command_with_deadline(
+            &mut command,
+            stdin.map(str::as_bytes),
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("kickoutchi output must be collected before its deadline");
         let _ = fs::remove_dir_all(config_dir);
         output
     }
@@ -2941,10 +3706,12 @@ mod macos {
                 // group member that is no longer a descendant. The sleeper's
                 // stdio must not inherit the pipe, or `output()` would wait
                 // for the sleeper's EOF instead of sh's exit.
-                let output = Command::new("sh")
-                    .args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"])
-                    .output()
-                    .expect("group orphan spawner must run");
+                let output = run_command_with_deadline(
+                    Command::new("sh").args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"]),
+                    None,
+                    CHILD_EXIT_WAIT,
+                )
+                .expect("group orphan spawner must run");
                 let orphan_pid = String::from_utf8_lossy(&output.stdout)
                     .trim()
                     .parse::<u32>()

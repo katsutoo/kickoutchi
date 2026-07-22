@@ -671,7 +671,11 @@ struct FrozenNode {
     parent_process_name: Option<String>,
     process_name: Option<String>,
     owner_uid: Option<u32>,
+    /// Identity authorized for termination. This never changes after discovery.
     start_time_marker: Option<ProcessStartMarker>,
+    /// Latest identity observed after this PID accepted `SIGSTOP`, used only to
+    /// guard rollback when termination authorization fails.
+    rollback_start_time_marker: Option<ProcessStartMarker>,
     depth: usize,
 }
 
@@ -685,6 +689,7 @@ impl FrozenNode {
             process_name: info.process_name.clone(),
             owner_uid: info.owner_uid,
             start_time_marker: info.start_time_marker,
+            rollback_start_time_marker: info.start_time_marker,
             depth,
         }
     }
@@ -917,17 +922,21 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
 
     let mut frozen = match verify_root_after_stop(root, scope, ops) {
         Ok(node) => vec![node],
-        Err(outcome) => {
+        Err((outcome, observed_root)) => {
             // Only the root is stopped at this point.
-            let root_node = FrozenNode {
-                pid: root.pid,
-                parent_pid: None,
-                parent_process_name: None,
-                process_name: root.process_name.clone(),
-                owner_uid: root.owner_uid,
-                start_time_marker: root.process_start_time_marker,
-                depth: 0,
-            };
+            let root_node = observed_root.map_or_else(
+                || FrozenNode {
+                    pid: root.pid,
+                    parent_pid: None,
+                    parent_process_name: None,
+                    process_name: root.process_name.clone(),
+                    owner_uid: root.owner_uid,
+                    start_time_marker: root.process_start_time_marker,
+                    rollback_start_time_marker: root.process_start_time_marker,
+                    depth: 0,
+                },
+                |node| *node,
+            );
             return refuse_after_thaw(outcome, &[root_node], ops);
         }
     };
@@ -958,13 +967,22 @@ fn verify_root_after_stop<Ops: TreeProcessOps>(
     root: &KillTarget,
     scope: SweepScope,
     ops: &mut Ops,
-) -> Result<FrozenNode, TreeKillOutcome> {
-    let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
+) -> Result<FrozenNode, (TreeKillOutcome, Option<Box<FrozenNode>>)> {
+    let snapshot = ops
+        .snapshot()
+        .map_err(|error| (TreeKillOutcome::SnapshotFailed(error), None))?;
     let Some(info) = snapshot.iter().find(|info| info.pid == root.pid) else {
-        return Err(TreeKillOutcome::RootAlreadyExited);
+        return Err((TreeKillOutcome::RootAlreadyExited, None));
     };
+    let mut observed = FrozenNode::from_info(info, 0);
+    // The post-stop marker is rollback evidence only. Keep the marker that the
+    // user authorized as the termination identity even on this refusal path.
+    observed.start_time_marker = root.process_start_time_marker;
     if !root_identity_matches(root, info) {
-        return Err(TreeKillOutcome::TargetChanged { pid: root.pid });
+        return Err((
+            TreeKillOutcome::TargetChanged { pid: root.pid },
+            Some(Box::new(observed)),
+        ));
     }
     // For group scope the confirmed group is part of the root's identity: the
     // sweep derives every other member from it, so a root that moved groups
@@ -972,9 +990,12 @@ fn verify_root_after_stop<Ops: TreeProcessOps>(
     if let SweepScope::Group { pgid } = scope
         && info.process_group != Some(pgid)
     {
-        return Err(TreeKillOutcome::TargetChanged { pid: root.pid });
+        return Err((
+            TreeKillOutcome::TargetChanged { pid: root.pid },
+            Some(Box::new(observed)),
+        ));
     }
-    Ok(FrozenNode::from_info(info, 0))
+    Ok(observed)
 }
 
 /// Strict root identity: both start markers present and equal, and the confirmed
@@ -1142,6 +1163,14 @@ fn verify_frozen_identities<Ops: TreeProcessOps>(
     let index = ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(|error| {
         TreeKillOutcome::SnapshotFailed(format!("process index construction failed: {error:?}"))
     })?;
+    // Capture rollback identities for the complete present set before any one
+    // member can fail validation. Termination authorization remains in
+    // start_time_marker and is checked separately below.
+    for node in frozen.iter_mut() {
+        if let Some(info) = index.process(node.pid) {
+            node.rollback_start_time_marker = info.start_time_marker;
+        }
+    }
     for node in frozen.iter_mut() {
         let Some(info) = index.process(node.pid) else {
             return Err(TreeKillOutcome::TargetChanged { pid: node.pid });
@@ -1398,8 +1427,8 @@ fn signal_group<Ops: TreeProcessOps>(
 fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) -> Vec<u32> {
     let mut failed = Vec::new();
     for node in frozen.iter().rev() {
-        ops.prepare_thaw(node.pid, node.start_time_marker);
-        if ops.cont(node.pid) == TreeSignalResult::Denied {
+        ops.prepare_thaw(node.pid, node.rollback_start_time_marker);
+        if ops.cont(node.pid) != TreeSignalResult::Delivered {
             failed.push(node.pid);
         }
     }
@@ -1462,6 +1491,7 @@ mod tests {
         missing_deliver: Vec<u32>,
         deny_deliver: Vec<u32>,
         deny_cont: Vec<u32>,
+        missing_cont: Vec<u32>,
         prepared_thaws: HashMap<u32, Option<crate::observation::ProcessStartMarker>>,
         fresh_evidence: HashMap<u32, Result<FreshProcessEvidence, ProcessEvidenceError>>,
     }
@@ -1477,6 +1507,7 @@ mod tests {
                 missing_deliver: Vec::new(),
                 deny_deliver: Vec::new(),
                 deny_cont: Vec::new(),
+                missing_cont: Vec::new(),
                 prepared_thaws: HashMap::new(),
                 fresh_evidence: HashMap::new(),
             }
@@ -1515,6 +1546,8 @@ mod tests {
             self.events.push(Event::Cont(pid));
             if self.deny_cont.contains(&pid) {
                 TreeSignalResult::Denied
+            } else if self.missing_cont.contains(&pid) {
+                TreeSignalResult::NotFound
             } else {
                 TreeSignalResult::Delivered
             }
@@ -1584,11 +1617,33 @@ mod tests {
             process_name: Some("node".to_owned()),
             owner_uid: None,
             start_time_marker: marker,
+            rollback_start_time_marker: marker,
             depth: 0,
         }];
         let mut ops = FakeOps::new(Vec::new());
 
         assert!(super::thaw_all(&frozen, &mut ops).is_empty());
+        assert_eq!(ops.prepared_thaws.get(&42), Some(&marker));
+        assert_eq!(ops.events, [Event::Cont(42)]);
+    }
+
+    #[test]
+    fn refusal_reports_not_found_continuation_as_thaw_failure() {
+        let marker = crate::observation::ProcessStartMarker::linux(55).ok();
+        let frozen = [FrozenNode {
+            pid: 42,
+            parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node".to_owned()),
+            owner_uid: None,
+            start_time_marker: marker,
+            rollback_start_time_marker: marker,
+            depth: 0,
+        }];
+        let mut ops = FakeOps::new(Vec::new());
+        ops.missing_cont.push(42);
+
+        assert_eq!(super::thaw_all(&frozen, &mut ops), [42]);
         assert_eq!(ops.prepared_thaws.get(&42), Some(&marker));
         assert_eq!(ops.events, [Event::Cont(42)]);
     }
@@ -1935,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn root_identity_drift_thaws_and_refuses() {
+    fn stopped_root_replacement_is_refused_but_prepared_for_rollback() {
         let root = root_target(100, "node", 10);
         // Same PID, different start marker: a reused PID. Refuse, and thaw.
         let mut ops = FakeOps::new(vec![vec![info(100, Some(1), "node", 999)]]);
@@ -1951,20 +2006,27 @@ mod tests {
 
         assert_eq!(outcome, TreeKillOutcome::TargetChanged { pid: 100 });
         assert_eq!(ops.events, vec![Event::Stop(100), Event::Cont(100)]);
+        assert_eq!(
+            ops.prepared_thaws.get(&100),
+            Some(&crate::observation::ProcessStartMarker::linux(999).ok())
+        );
         assert!(ops.delivered_pids().is_empty());
     }
 
     #[test]
-    fn frozen_descendant_identity_drift_thaws_everything() {
+    fn all_stopped_descendant_replacements_are_prepared_before_first_refusal() {
         let root = root_target(100, "root", 10);
         let stable = vec![
             info(100, Some(1), "root", 10),
-            info(101, Some(100), "child", 11),
+            info(101, Some(100), "first-child", 11),
+            info(102, Some(100), "second-child", 12),
         ];
-        // The final verify snapshot shows the child's marker changed.
+        // Both descendants were replaced after discovery. Validation fails on
+        // 101 first, but rollback must already retain 102's stopped identity.
         let drifted = vec![
             info(100, Some(1), "root", 10),
-            info(101, Some(100), "child", 777),
+            info(101, Some(100), "first-child", 777),
+            info(102, Some(100), "second-child", 888),
         ];
         let mut ops = FakeOps::new(vec![
             stable.clone(), // verify root
@@ -1985,10 +2047,20 @@ mod tests {
         assert_eq!(outcome, TreeKillOutcome::TargetChanged { pid: 101 });
         assert!(ops.delivered_pids().is_empty());
         assert_eq!(
+            ops.prepared_thaws,
+            HashMap::from([
+                (100, crate::observation::ProcessStartMarker::linux(10).ok()),
+                (101, crate::observation::ProcessStartMarker::linux(777).ok()),
+                (102, crate::observation::ProcessStartMarker::linux(888).ok()),
+            ])
+        );
+        assert_eq!(
             ops.events,
             vec![
                 Event::Stop(100),
                 Event::Stop(101),
+                Event::Stop(102),
+                Event::Cont(102),
                 Event::Cont(101),
                 Event::Cont(100)
             ],

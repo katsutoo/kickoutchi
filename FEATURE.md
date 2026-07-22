@@ -1527,12 +1527,12 @@ as a guarantee that a future bind will succeed at expiration.
 
 ### Stage 6 gate
 
-- [ ] Every verdict has an explicit certainty and evidence list.
-- [ ] Conflicting evidence produces raced or indeterminate output.
-- [ ] Exact queries never imply a host-wide conclusion.
-- [ ] Human and JSON results carry equivalent facts.
-- [ ] Every verdict maps to a documented exit code.
-- [ ] Real-binary E2E journeys cover bindable and occupied TCP/UDP endpoints,
+- [x] Every verdict has an explicit certainty and evidence list.
+- [x] Conflicting evidence produces raced or indeterminate output.
+- [x] Exact queries never imply a host-wide conclusion.
+- [x] Human and JSON results carry equivalent facts.
+- [x] Every verdict maps to a documented exit code.
+- [x] Real-binary E2E journeys cover bindable and occupied TCP/UDP endpoints,
       IPv4/IPv6 behavior, representative incomplete evidence, aggregate exit-code
       precedence, JSON, stdout/stderr separation, and helper cleanup.
 
@@ -1797,9 +1797,10 @@ family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.
 kind/value with null last, then canonical owner-set key. Processes sort by PID,
   marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
   `ownership`, `metadata`, `scope`), code, the same canonical endpoint key used
-  by sockets and events, PID, and message. Evidence items sort by source in the
-  order listed by `Evidence`, then code, certainty, and message. No public array
-  uses hash-map iteration order.
+  by sockets and events, PID, and message. Snapshot and event evidence items sort
+  by source in the order listed by `Evidence`, then code, certainty, and message.
+  Why verdict evidence instead preserves the presentation order frozen in Stage
+  6.3. No public array uses hash-map iteration order.
 
 #### Watch NDJSON
 

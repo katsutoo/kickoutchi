@@ -19,6 +19,25 @@ def fail(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
+def require_absent(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        fail(f"could not inspect evidence path {path}: {error}")
+    fail(f"evidence path already exists: {path}")
+
+
+def publish_new(temporary_path: Path, path: Path) -> None:
+    try:
+        os.link(temporary_path, path)
+    except FileExistsError:
+        fail(f"evidence path already exists: {path}")
+    except OSError as error:
+        fail(f"could not publish evidence path {path}: {error}")
+
+
 def snapshot_executable(path: Path, directory: Path) -> tuple[Path, str]:
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -77,7 +96,7 @@ def run_with_rss(command: list[str], environment: dict[str, str]) -> tuple[int, 
 
 
 if len(sys.argv) > 5:
-    fail("usage: measure-linux-peak-rss.py [BINARY] [SAMPLES] [list|watch] [OUTPUT]")
+    fail("usage: measure-linux-peak-rss.py [BINARY] [SAMPLES] [list|watch|why] [OUTPUT]")
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/dist/kick").resolve()
 try:
@@ -88,11 +107,17 @@ except ValueError:
 if samples < 1 or samples > SAMPLES_MAX:
     fail(f"samples must be in 1..={SAMPLES_MAX}")
 workload = sys.argv[3] if len(sys.argv) > 3 else "list"
-if workload not in {"list", "watch"}:
-    fail("workload must be list or watch")
+if workload not in {"list", "watch", "why"}:
+    fail("workload must be list, watch, or why")
 output = Path(
     sys.argv[4] if len(sys.argv) > 4 else "/tmp/kickoutchi-peak-rss.tsv"
 ).resolve()
+output.parent.mkdir(parents=True, exist_ok=True)
+require_absent(output)
+evidence_directory = tempfile.TemporaryDirectory(
+    prefix=f".{output.name}.", dir=output.parent
+)
+temporary_output = Path(evidence_directory.name) / "samples.tsv"
 
 artifact_directory = tempfile.TemporaryDirectory(prefix="kickoutchi-benchmark-")
 artifact_snapshot, artifact_sha256 = snapshot_executable(
@@ -105,7 +130,7 @@ environment["XDG_CONFIG_HOME"] = str(config_home)
 command: list[str]
 if workload == "list":
     command = [str(artifact_snapshot), "list", "--json"]
-else:
+elif workload == "watch":
     command = [
         str(artifact_snapshot),
         "watch",
@@ -117,6 +142,15 @@ else:
         "500ms",
         "--json",
     ]
+else:
+    command = [
+        str(artifact_snapshot),
+        "why",
+        "49152",
+        "--all-protocols",
+        "--all-addresses",
+        "--json",
+    ]
 failures = 0
 rows: list[tuple[int, int, int]] = []
 for sample in range(1, samples + 1):
@@ -124,39 +158,28 @@ for sample in range(1, samples + 1):
         status, peak_kib = run_with_rss(command, environment)
     except OSError as error:
         fail(f"could not execute benchmark binary: {error}")
-    failures += int(status != 0)
+    failures += int(status not in ({0, 3} if workload == "why" else {0}))
     rows.append((sample, status, peak_kib))
 
 peak_kib = max(peak for _, _, peak in rows)
-output.parent.mkdir(parents=True, exist_ok=True)
-temporary_path: Path | None = None
-try:
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=output.parent,
-        prefix=f".{output.name}.",
-        delete=False,
-    ) as file:
-        temporary_path = Path(file.name)
-        file.write(f"# artifact_sha256={artifact_sha256}\n")
-        file.write(f"# artifact_bytes={artifact_snapshot.stat().st_size}\n")
-        file.write(f"# workload={workload}\n")
-        file.write(f"# command={' '.join(command[1:])}\n")
-        file.write(f"# samples={samples}\n")
-        file.write(f"# child_timeout_seconds={CHILD_TIMEOUT_SECONDS}\n")
-        file.write("sample\tstatus\tpeak_rss_kib\n")
-        for sample, status, sample_peak_kib in rows:
-            file.write(f"{sample}\t{status}\t{sample_peak_kib}\n")
-        file.write(f"# failures={failures}\n")
-        file.write(f"# peak_rss_kib={peak_kib}\n")
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temporary_path, output)
-    temporary_path = None
-finally:
-    if temporary_path is not None:
-        temporary_path.unlink(missing_ok=True)
+with temporary_output.open(
+    mode="w",
+    encoding="utf-8",
+) as file:
+    file.write(f"# artifact_sha256={artifact_sha256}\n")
+    file.write(f"# artifact_bytes={artifact_snapshot.stat().st_size}\n")
+    file.write(f"# workload={workload}\n")
+    file.write(f"# command={' '.join(command[1:])}\n")
+    file.write(f"# samples={samples}\n")
+    file.write(f"# child_timeout_seconds={CHILD_TIMEOUT_SECONDS}\n")
+    file.write("sample\tstatus\tpeak_rss_kib\n")
+    for sample, status, sample_peak_kib in rows:
+        file.write(f"{sample}\t{status}\t{sample_peak_kib}\n")
+    file.write(f"# failures={failures}\n")
+    file.write(f"# peak_rss_kib={peak_kib}\n")
+    file.flush()
+    os.fsync(file.fileno())
+publish_new(temporary_output, output)
 print(
     f"artifact_sha256={artifact_sha256} samples={samples} "
     f"workload={workload} failures={failures} peak_rss_kib={peak_kib} output={output}"

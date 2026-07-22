@@ -19,6 +19,8 @@ not implemented early here.
 - Candidate source: dirty worktree based on the baseline commit.
 - Candidate source patch SHA-256 recorded by the benchmark harness:
   `36320c8ddee725195f3901edc32e457e9db4756aba5a68e75033bae93d6650da`.
+- The dirty candidate patch files were not retained. Candidate measurements are
+  historical pre-policy, non-reproducible, and not current release evidence.
 - Baseline `dist` artifact SHA-256:
   `7184727cea04e447b52c2ffb4dc73ba7d7dfeb4e973942c7bf1f290d33e47509`.
 - Candidate `dist` artifact SHA-256:
@@ -146,6 +148,11 @@ target-neutral and passed every installed cross-target compile/lint boundary.
 Verdict: PASS for latency and size; peak-RSS delta is directional because the
 short independent runs are noisy.
 
+Provenance qualification: the baseline files identify clean committed source,
+but the dirty candidate and max-selector source patches were not retained. The
+comparison is a historical pre-policy gate result, is not independently
+reproducible, and must not be treated as current release evidence.
+
 Environment:
 
 - Linux `7.1.4-arch1-1`, x86_64.
@@ -185,6 +192,9 @@ feasibility floor; the run is inconclusive about the selector configuration's
 typical latency cost.
 
 Raw files and SHA-256 checksums:
+
+These TSVs are retained as historical records only. No missing companion patch
+is implied to exist.
 
 - `benchmarks/named-endpoints-baseline-1-2026-07-21.tsv`:
   `9cc0a219aca8c02f8eccb4e7e3f446664216562b206913243c4408ebde459549`

@@ -9,10 +9,12 @@ macOS, Windows, and supply-chain jobs. The subsequent independent review found
 no remaining actionable correctness, security, test-quality, or contract issue.
 
 The implementation baseline is commit
-`93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The optimized benchmark artifact
-was rebuilt from current `HEAD` `8fe4fca234169219d42132486f2658dc248a4a0c`
-plus the product-source patch identified in the raw sample file as
+`93c9f0a60b1c9006ee41f6c2b2e1573afcd210d0`. The historical optimized benchmark
+artifact was built from `HEAD` `8fe4fca234169219d42132486f2658dc248a4a0c`
+plus a dirty product-source patch identified in the raw sample file as
 `2531ec1a4fcaed58ad94964c1dbb309d2cda924ddde475d999f224cd533d2093`.
+That patch was not retained. This measurement predates the companion-patch
+policy, is non-reproducible, and is not current release evidence.
 
 ## Implemented Contract
 
@@ -133,6 +135,10 @@ restored before final verification.
 
 Verdict: PASS for the Stage 2 decision. This is not the final release benchmark
 and makes no cross-machine performance claim.
+
+Provenance qualification: the dirty-source patch was not retained. The numbers
+below are historical pre-policy results, cannot be independently reproduced,
+and must not be used as current release evidence.
 
 - Workload: optimized `target/dist/kick list --json`, which runs full native
   collection and then the legacy projection.

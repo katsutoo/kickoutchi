@@ -49,9 +49,9 @@ input_path = Path(
     sys.argv[1] if len(sys.argv) > 1 else "/tmp/kickoutchi-list-latency.tsv"
 ).resolve()
 declared_samples: int | None = None
+workload: str | None = None
 header_seen = False
-latencies = []
-failures = 0
+measurements = []
 count = 0
 
 for line in read_bounded_regular_file(input_path).splitlines():
@@ -62,6 +62,13 @@ for line in read_bounded_regular_file(input_path).splitlines():
         if not value.isascii() or not value.isdecimal():
             fail("declared sample count is invalid")
         declared_samples = int(value)
+        continue
+    if line.startswith("# workload="):
+        if workload is not None:
+            fail("sample file declares its workload more than once")
+        workload = line.removeprefix("# workload=")
+        if workload not in {"list", "watch", "why"}:
+            fail("declared workload is invalid")
         continue
     if line == "sample\tlatency_ns\tstatus":
         if header_seen:
@@ -86,15 +93,15 @@ for line in read_bounded_regular_file(input_path).splitlines():
         fail(f"latency exceeds the bounded child duration for sample {sample}")
     if status > 255:
         fail(f"status is outside 0..=255 for sample {sample}")
-    if status == 0:
-        latencies.append(latency)
-    else:
-        failures += 1
+    measurements.append((latency, status))
 
 if not header_seen:
     fail("sample file is missing its exact header")
 if declared_samples is None or declared_samples != count:
     fail("declared sample count does not match measured rows")
+successful_statuses = {0, 3} if workload == "why" else {0}
+latencies = [latency for latency, status in measurements if status in successful_statuses]
+failures = count - len(latencies)
 if not latencies:
     fail("sample file contains no successful measurements")
 

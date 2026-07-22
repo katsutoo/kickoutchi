@@ -18,7 +18,7 @@ Collect the stable-watch gate workload separately from the build so Linux child
 resource high-water marks cannot inherit compiler RSS:
 
 ```sh
-python benchmarks/collect-watch-samples.py target/dist/kick 100 4 \
+python benchmarks/collect-watch-samples.py target/dist/kick 100 4 watch \
   benchmarks/watch-stable-2026-07-21.tsv
 python benchmarks/summarize-list-samples.py \
   benchmarks/watch-stable-2026-07-21.tsv
@@ -33,6 +33,22 @@ sampling cannot change its scope. This does not replace the final interleaved
 release benchmark for high churn, maximum snapshots, failures, or native runs on
 all supported platforms.
 
+Collect the complete Why matrix with retained source and artifact identity:
+
+```sh
+python benchmarks/collect-watch-samples.py target/dist/kick 30 3 why \
+  benchmarks/why-complete-2026-07-22.tsv
+python benchmarks/summarize-list-samples.py \
+  benchmarks/why-complete-2026-07-22.tsv
+python benchmarks/measure-linux-peak-rss.py target/dist/kick 10 why \
+  benchmarks/why-complete-rss-2026-07-22.tsv
+```
+
+The Why workload evaluates TCP and UDP over the four canonical loopback and
+wildcard addresses. Exit `0` and aggregate unavailable exit `3` are both valid;
+the harness parses one result before sampling and requires exactly eight
+endpoints with an aggregate field matching the process status.
+
 The latency script records one bounded child-process invocation per row with its
 nanosecond duration and exit status. It writes environment, source, patch, and
 artifact identifiers as comment lines. It also writes an applyable
@@ -43,6 +59,13 @@ results when either file is unavailable or its checksum does not match.
 The retained patch deliberately has zero context so it does not embed whitespace
 on blank context lines; verify or apply it with `git apply --unidiff-zero` from
 the recorded source commit.
+
+The collect-watch grammar is `BINARY [SAMPLES [WARMUPS [WORKLOAD [OUTPUT]]]]`,
+where `WORKLOAD` is exactly `watch` or `why`. Supplying an output therefore also
+requires an explicit workload. Collect-list follows the same tracked and
+untracked companion-patch provenance policy. All latency and RSS producers
+publish completed files with exclusive creation and refuse existing TSV or
+companion-patch paths; choose a new evidence name rather than replacing one.
 
 On Linux, the peak-RSS helper runs independent invocations and obtains their
 high-water mark from `wait4` through Python's `resource.getrusage`. Report the

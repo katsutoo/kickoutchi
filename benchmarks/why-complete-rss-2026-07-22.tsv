@@ -1,0 +1,19 @@
+# artifact_sha256=b0409ea25f5712dc673089aea47c493929fbdf158527d5027c513030bf10b244
+# artifact_bytes=3686584
+# workload=why
+# command=why 49152 --all-protocols --all-addresses --json
+# samples=10
+# child_timeout_seconds=30
+sample	status	peak_rss_kib
+1	0	21976
+2	0	21976
+3	0	21976
+4	0	21976
+5	0	21976
+6	0	21976
+7	0	21976
+8	0	21976
+9	0	21976
+10	0	21976
+# failures=0
+# peak_rss_kib=21976

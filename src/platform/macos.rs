@@ -904,13 +904,21 @@ impl MacosTreeOps {
     /// `Ok(())` only when a recorded marker still matches; `Err` when identity
     /// is unavailable, the process is gone, or the PID was recycled.
     fn recheck_marker(&self, pid: u32) -> Result<(), TreeSignalResult> {
+        self.recheck_marker_with(pid, |pid| {
+            read_process_bsdinfo(pid)
+                .map(|info| process_start_time_marker_from_bsd_info(&info).ok())
+        })
+    }
+
+    fn recheck_marker_with<Read>(&self, pid: u32, read_marker: Read) -> Result<(), TreeSignalResult>
+    where
+        Read: FnOnce(u32) -> std::io::Result<Option<ProcessStartMarker>>,
+    {
         let Some(expected) = self.verified_markers.get(&pid) else {
             return Err(TreeSignalResult::Denied);
         };
-        match read_process_bsdinfo(pid) {
-            Ok(info) if process_start_time_marker_from_bsd_info(&info).ok() == Some(*expected) => {
-                Ok(())
-            }
+        match read_marker(pid) {
+            Ok(Some(actual)) if actual == *expected => Ok(()),
             // A different marker means the verified process is gone and the
             // PID now belongs to someone else: report the member as exited
             // rather than signalling the stranger.
@@ -947,8 +955,16 @@ impl TreeProcessOps for MacosTreeOps {
     }
 
     fn prepare_thaw(&mut self, pid: u32, marker: Option<ProcessStartMarker>) {
-        if let Some(marker) = marker {
-            self.verified_markers.insert(pid, marker);
+        // This is the identity observed after SIGSTOP, which can differ from
+        // the identity authorized for termination after PID reuse. Missing
+        // rollback evidence must also clear any earlier delivery marker.
+        match marker {
+            Some(marker) => {
+                self.verified_markers.insert(pid, marker);
+            }
+            None => {
+                self.verified_markers.remove(&pid);
+            }
         }
     }
 
@@ -2363,6 +2379,57 @@ mod tests {
         assert_eq!(
             ops.recheck_marker(42),
             Err(crate::tree::TreeSignalResult::Denied)
+        );
+    }
+
+    #[test]
+    fn rollback_without_observed_marker_clears_prior_authorization() {
+        let marker =
+            crate::observation::ProcessStartMarker::macos(1, 0).expect("test marker is valid");
+        let mut ops = super::MacosTreeOps::new();
+        ops.prepare_thaw(42, Some(marker));
+
+        ops.prepare_thaw(42, None);
+
+        assert!(!ops.verified_markers.contains_key(&42));
+        assert_eq!(
+            ops.recheck_marker_with(42, |_| Ok(Some(marker))),
+            Err(crate::tree::TreeSignalResult::Denied)
+        );
+    }
+
+    #[test]
+    fn rollback_continuation_accepts_stopped_root_and_descendant_replacements() {
+        let root_replacement =
+            crate::observation::ProcessStartMarker::macos(2, 0).expect("test marker is valid");
+        let descendant_replacement =
+            crate::observation::ProcessStartMarker::macos(3, 0).expect("test marker is valid");
+        let mut ops = super::MacosTreeOps::new();
+        ops.prepare_thaw(42, Some(root_replacement));
+        ops.prepare_thaw(43, Some(descendant_replacement));
+
+        assert_eq!(
+            ops.recheck_marker_with(42, |_| Ok(Some(root_replacement))),
+            Ok(())
+        );
+        assert_eq!(
+            ops.recheck_marker_with(43, |_| Ok(Some(descendant_replacement))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rollback_continuation_refuses_when_identity_changes_again() {
+        let stopped_replacement =
+            crate::observation::ProcessStartMarker::macos(2, 0).expect("test marker is valid");
+        let later_replacement =
+            crate::observation::ProcessStartMarker::macos(3, 0).expect("test marker is valid");
+        let mut ops = super::MacosTreeOps::new();
+        ops.prepare_thaw(42, Some(stopped_replacement));
+
+        assert_eq!(
+            ops.recheck_marker_with(42, |_| Ok(Some(later_replacement))),
+            Err(crate::tree::TreeSignalResult::NotFound)
         );
     }
 

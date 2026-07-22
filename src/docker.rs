@@ -35,6 +35,9 @@ const DOCKER_FIELD_MAX_BYTES: usize = 4 * 1024;
 const DOCKER_PORT_SEGMENTS_MAX: usize = 64;
 const DOCKER_HOST_MAX_BYTES: usize = 4 * 1024;
 
+#[cfg(target_os = "linux")]
+const LINUX_STATUS_READ_MAX_BYTES: usize = 64 * 1024;
+
 #[cfg(unix)]
 const DEFAULT_LOCAL_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 #[cfg(windows)]
@@ -276,20 +279,33 @@ fn linux_aux_is_secure() -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_process_has_capabilities() -> bool {
-    const STATUS_READ_MAX_BYTES: u64 = 64 * 1024;
     #[cfg(test)]
     if let Some((_, _, capabilities)) = TEST_LINUX_ELEVATION_SOURCES.with(std::cell::Cell::get) {
         return capabilities;
     }
-    let mut status = String::new();
-    let result = std::fs::File::open("/proc/self/status").and_then(|file| {
-        file.take(STATUS_READ_MAX_BYTES)
-            .read_to_string(&mut status)
-            .map(|_| ())
-    });
     // Docker enrichment is optional. If the privilege state cannot be proven
     // ordinary, fail closed and do not cross PATH with the process's authority.
-    result.is_err() || linux_status_has_capabilities(&status).unwrap_or(true)
+    std::fs::File::open("/proc/self/status")
+        .and_then(read_linux_status_bounded)
+        .map_or(true, |status| {
+            linux_status_has_capabilities(&status).unwrap_or(true)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_status_bounded(mut reader: impl Read) -> io::Result<String> {
+    let mut status = String::new();
+    reader
+        .by_ref()
+        .take((LINUX_STATUS_READ_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut status)?;
+    if status.len() > LINUX_STATUS_READ_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Linux process status exceeds the read limit",
+        ));
+    }
+    Ok(status)
 }
 
 #[cfg(target_os = "linux")]
@@ -904,7 +920,12 @@ fn host_addr_matches(row_addr: IpAddr, docker_addr: Option<IpAddr>) -> bool {
     };
     let row_addr = normalize_addr(row_addr);
     let docker_addr = normalize_addr(docker_addr);
-    row_addr == docker_addr || row_addr.is_unspecified() || docker_addr.is_unspecified()
+    let same_family = matches!(
+        (row_addr, docker_addr),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    );
+    same_family
+        && (row_addr == docker_addr || row_addr.is_unspecified() || docker_addr.is_unspecified())
 }
 
 fn normalize_addr(addr: IpAddr) -> IpAddr {
@@ -944,13 +965,26 @@ mod tests {
     use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
 
     #[cfg(target_os = "linux")]
-    use super::{TEST_LINUX_ELEVATION_SOURCES, linux_status_has_capabilities};
+    use super::{
+        LINUX_STATUS_READ_MAX_BYTES, TEST_LINUX_ELEVATION_SOURCES, linux_status_has_capabilities,
+        read_linux_status_bounded,
+    };
 
     const LARGE_OUTPUT_HELPER_ENV: &str = "KICKOUTCHI_TEST_DOCKER_LARGE_OUTPUT";
     const INHERITED_PIPE_PARENT_ENV: &str = "KICKOUTCHI_TEST_DOCKER_PIPE_PARENT";
     const INHERITED_PIPE_GRANDCHILD_ENV: &str = "KICKOUTCHI_TEST_DOCKER_PIPE_GRANDCHILD";
 
     struct ChannelReader(std::sync::mpsc::Receiver<()>);
+
+    #[cfg(target_os = "linux")]
+    struct ErrorReader;
+
+    #[cfg(target_os = "linux")]
+    impl Read for ErrorReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected status read failure"))
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -968,6 +1002,37 @@ mod tests {
             linux_status_has_capabilities("CapPrm:\txyz\nCapEff:\t0\nCapAmb:\t0\n"),
             None,
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_status_reader_accepts_the_exact_limit() {
+        let input = "x".repeat(LINUX_STATUS_READ_MAX_BYTES);
+
+        let status = read_linux_status_bounded(Cursor::new(input.as_bytes()))
+            .expect("an exact-limit status must be accepted");
+
+        assert_eq!(status, input);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_status_reader_rejects_limit_plus_one() {
+        let input = vec![b'x'; LINUX_STATUS_READ_MAX_BYTES + 1];
+
+        let error = read_linux_status_bounded(Cursor::new(input))
+            .expect_err("an oversized status must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_status_reader_propagates_read_errors() {
+        let error = read_linux_status_bounded(ErrorReader)
+            .expect_err("a status read failure must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     impl Read for ChannelReader {
@@ -1460,6 +1525,32 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_wildcard_publish_does_not_match_an_ipv4_socket_row() {
+        let row = entry(
+            8080,
+            Protocol::Tcp,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "docker-proxy",
+        );
+        let output = r#"{"ID":"abc123","Names":"web","Ports":"[::]:8080->80/tcp","Labels":""}"#;
+
+        assert!(docker_context_from_ps_output(&row, output).is_none());
+    }
+
+    #[test]
+    fn ipv4_wildcard_publish_does_not_match_an_ipv6_socket_row() {
+        let row = entry(
+            8080,
+            Protocol::Tcp,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "docker-proxy",
+        );
+        let output = r#"{"ID":"abc123","Names":"web","Ports":"0.0.0.0:8080->80/tcp","Labels":""}"#;
+
+        assert!(docker_context_from_ps_output(&row, output).is_none());
+    }
+
+    #[test]
     fn malformed_json_rows_are_ignored_without_losing_valid_matches() {
         let row = entry(
             8080,
@@ -1480,6 +1571,7 @@ mod tests {
 
     #[test]
     fn wildcard_addresses_match_specific_socket_views() {
+        assert!(host_addr_matches(IpAddr::V6(Ipv6Addr::LOCALHOST), None,));
         assert!(host_addr_matches(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
@@ -1493,6 +1585,10 @@ mod tests {
             Some(IpAddr::V6(Ipv6Addr::new(
                 0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001,
             ))),
+        ));
+        assert!(!host_addr_matches(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
         ));
     }
 }

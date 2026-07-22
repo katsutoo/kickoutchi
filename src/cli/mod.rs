@@ -8,6 +8,7 @@
 mod kill;
 mod list;
 mod watch;
+mod why;
 // Scoped (`--tree`/`--group`) kills sit behind the same platform gate as the
 // `tree` module whose planning and execution they drive.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -40,6 +41,7 @@ use self::kill::{KillTargetError, print_target_error, resolve_single_port_owner}
 use self::list::run_list_snapshot;
 pub(crate) use self::watch::WatchSignalGuard;
 use self::watch::{WatchArgs, run_watch};
+use self::why::{WhyArgs, run_why};
 
 /// Stable exit codes — the script-facing contract.
 ///
@@ -111,6 +113,8 @@ pub(crate) enum Command {
     Inspect(InspectArgs),
     /// Stream bounded socket changes until interrupted or the duration expires.
     Watch(WatchArgs),
+    /// Explain whether exact local endpoints are bindable now.
+    Why(WhyArgs),
 }
 
 /// `inspect` takes exactly one starting point, like `kill`: a PID (which may
@@ -215,6 +219,9 @@ pub(crate) fn run(
             watch_signal_guard.expect("watch installs its signal guard before config loading"),
         );
     }
+    if let Command::Why(args) = command {
+        return run_why(args, config);
+    }
     debug_assert!(watch_signal_guard.is_none());
     if let Command::List(args) = command
         && let Err(error) = crate::query::validate_filter_text(
@@ -231,6 +238,7 @@ pub(crate) fn run(
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Inspect(_) => crate::observation::MetadataProfile::Display,
         Command::Watch(_) => unreachable!("watch owns its repeated collection loop"),
+        Command::Why(_) => unreachable!("why owns collection and exact probing"),
     };
     let snapshot = match collector::collect_snapshot(profile) {
         Ok(snapshot) => snapshot,
@@ -256,6 +264,7 @@ pub(crate) fn run(
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Inspect(args) => run_inspect(args, config, &snapshot),
         Command::Watch(_) => unreachable!("watch is dispatched before one-shot collection"),
+        Command::Why(_) => unreachable!("why is dispatched before one-shot collection"),
     }
 }
 
@@ -548,6 +557,44 @@ mod tests {
     #[test]
     fn list_sort_rejects_unknown_modes_at_parse_time() {
         assert!(Cli::try_parse_from(["kickoutchi", "list", "--sort", "alphabetical"]).is_err());
+    }
+
+    #[test]
+    fn why_flags_parse_and_conflicting_selectors_are_rejected() {
+        let cli = Cli::try_parse_from([
+            "kick",
+            "why",
+            "3000",
+            "--all-protocols",
+            "--all-addresses",
+            "--reuse-address",
+            "--json",
+        ])
+        .expect("valid why invocation");
+        let Some(Command::Why(args)) = cli.command else {
+            panic!("expected a why command");
+        };
+        assert_eq!(args.port, 3000);
+        assert!(args.all_protocols);
+        assert!(args.all_addresses);
+        assert!(args.reuse_address);
+        assert!(args.json);
+
+        assert!(Cli::try_parse_from(["kick", "why", "3000", "--tcp", "--udp"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "kick",
+                "why",
+                "3000",
+                "--address",
+                "127.0.0.1",
+                "--all-addresses",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["kick", "why", "3000", "--ipv6-only", "--dual-stack"]).is_err()
+        );
     }
 
     #[test]

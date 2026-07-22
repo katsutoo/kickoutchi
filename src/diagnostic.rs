@@ -5,6 +5,8 @@
 //! or claim ownership of a socket the OS didn't actually confirm. Hints, not
 //! accusations.
 
+pub(crate) mod verdict;
+
 use crate::display::{REPLACEMENT, is_default_ignorable, sanitize};
 use crate::model::RelatedProcessHint;
 
