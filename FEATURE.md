@@ -1538,6 +1538,41 @@ as a guarantee that a future bind will succeed at expiration.
 
 ## Stage 7: Stabilize Public Output and Documentation
 
+The following implementation decisions are frozen before coding:
+
+- `why.results` preserves the validated query matrix order: protocol-major then
+  address-minor. Protocol order is TCP then UDP; `--all-addresses` order is
+  `127.0.0.1`, `0.0.0.0`, `::1`, then `::`. It is not re-sorted into snapshot
+  order.
+- Evidence gaps with a null endpoint sort before endpoint-specific gaps when all
+  earlier gap-key fields are equal. Null means the gap may affect the whole
+  observation scope, so global uncertainty is presented first.
+- A raced socket-local `OwnerSet` serializes `reasons` as exactly
+  `["observation_raced"]`. Snapshot-global race gaps remain separate and are not
+  copied into arbitrary owner sets.
+- Native scope identifiers above the retained byte limit are noncritical
+  metadata loss: collectors serialize a null identifier, one endpoint-null
+  `native_field_unavailable` Scope gap, and partial completeness. Direct internal
+  construction with an oversized identifier remains an operational error so an
+  invalid domain value cannot enter a snapshot.
+- One shared `src/public_output.rs` module owns reusable public DTOs, stable name
+  mappings, checked conversions, and canonical comparison helpers. Command
+  modules own only their envelopes and rendering policy.
+- Snapshot serialization uses borrowed records and sorted indexes streamed to the
+  writer. It does not clone a maximum snapshot into a second owned DTO graph or
+  rendered document buffer.
+- Public schema documentation lives in `docs/structured-output.md`, platform and
+  scope limitations in `docs/platform-support.md`, and configuration/filter
+  reference in `docs/configuration.md`. The README and CLI help remain concise
+  entry points that link to those documents.
+- Why does not request optional Docker enrichment in this release. Documentation
+  must describe that actual behavior rather than imply Docker evidence is always
+  available.
+- The package version remains unchanged during this stage. The minor-version bump
+  occurs before the exact release-candidate CI gate; native CI, exploratory QA,
+  benchmarks, and final review then run against that same versioned commit and
+  its artifacts.
+
 ### 7.1 Serialized contracts
 
 Do not serialize internal domain or error types directly. Dedicated public DTOs
@@ -1636,7 +1671,9 @@ completeness and endpoint-null reasons remain separate snapshot fields. Analysis
 checks both when global attribution matters, but serializers never merge a
 global reason into an arbitrary OwnerSet. Each local `reasons` array is
 deduplicated and lexicographically sorted, capped at eight. Exceeding that cap is
-an identity-reliability error, not silent truncation.
+an identity-reliability error, not silent truncation. A raced OwnerSet has the
+single required reason `observation_raced`; complete and partial sets serialize
+only their actual local reason codes.
 
 Canonical ordering keys are fixed:
 
@@ -1695,6 +1732,11 @@ counts beyond the source-format limit. Socket-row overflow uses
 Scope `identifier` is the bounded sanitized `/proc/self/ns/net` link text in
 `net:[decimal]` form on Linux and `null` on macOS and Windows. Scope limitation
 arrays are deduplicated and sorted in the order listed by the `Scope` contract.
+When a native scope identifier exceeds 256 UTF-8 bytes, its collector retains no
+prefix: it emits a null identifier, one endpoint-null
+`native_field_unavailable` Scope gap, and partial completeness. An oversized
+identifier supplied directly to the internal scope constructor is an operational
+error rather than a silently repaired domain value.
 Every Evidence and EvidenceGap message is at most 512 UTF-8 bytes after
 sanitization.
 
@@ -1797,10 +1839,12 @@ family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.
 kind/value with null last, then canonical owner-set key. Processes sort by PID,
   marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
   `ownership`, `metadata`, `scope`), code, the same canonical endpoint key used
-  by sockets and events, PID, and message. Snapshot and event evidence items sort
-  by source in the order listed by `Evidence`, then code, certainty, and message.
-  Why verdict evidence instead preserves the presentation order frozen in Stage
-  6.3. No public array uses hash-map iteration order.
+  by sockets and events, PID, and message. A null endpoint sorts before every
+  concrete endpoint when the preceding impact and code fields are equal.
+  Snapshot and event evidence items sort by source in the order listed by
+  `Evidence`, then code, certainty, and message. Why verdict evidence instead
+  preserves the presentation order frozen in Stage 6.3. No public array uses
+  hash-map iteration order.
 
 #### Watch NDJSON
 
@@ -1915,7 +1959,10 @@ according to the watch policy, and then discard it. Exceeding the record bound i
 
 Verdict names are the lowercase `snake_case` forms from Stage 6.2. Why JSON does
 not include full command lines. Human and JSON output must be generated from the
-same verdict DTO and carry equivalent facts.
+same verdict DTO and carry equivalent facts. Results preserve the validated query
+matrix order rather than snapshot order: TCP before UDP, with addresses in query
+order; `--all-addresses` uses `127.0.0.1`, `0.0.0.0`, `::1`, then `::`. Why does
+not request optional Docker enrichment in this release.
 
 ### 7.2 Filters
 
@@ -1977,6 +2024,12 @@ Update:
 - Proven, estimated, heuristic, and unknown terminology.
 - Security and privacy implications of process metadata.
 - Changelog entries for commands, config, filters, and schema additions.
+
+The complete structured-output contract is maintained in
+`docs/structured-output.md`, platform and observation-scope limitations in
+`docs/platform-support.md`, and configuration plus filter behavior in
+`docs/configuration.md`. README and help examples link to these references rather
+than duplicating their full schema tables.
 
 Changelog entries and commit messages must describe their changes
 self-contained. Do not write public history such as "implements Stage 4" that
