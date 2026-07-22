@@ -42,6 +42,11 @@ they are added to the native test and artifact matrix.
   so a user-writable executable search path cannot cross a privilege boundary.
 - Opens as a terminal UI when run without a command.
 - Works as a script-friendly CLI with table or JSON output.
+- Exports a complete within-scope native observation with
+  `list --snapshot-json`, using the versioned `kickoutchi.snapshot/1` contract.
+- Explains whether exact TCP/UDP endpoints are bindable now with `why`, combining
+  one native snapshot with sequential bind probes and reporting evidence,
+  evidence gaps, certainty, and an aggregate exit status.
 - Asks before termination, because Donkey may yell but Donkey does not kill
   random swamp residents without confirmation.
 - Kicks out whole process trees (`kill --tree` in the CLI; `t`/`T` in the TUI
@@ -201,9 +206,12 @@ cargo run                                 # open the TUI
 cargo run --bin kick -- list              # list ports
 cargo run --bin kick -- list --port 3000  # show one port
 cargo run --bin kick -- list --json       # JSON for scripts
+cargo run --bin kick -- list --snapshot-json  # complete within-scope snapshot
 cargo run --bin kick -- list --filter label:web
 cargo run --bin kick -- watch --port 3000 --duration 30s
 cargo run --bin kick -- watch --filter state:listen --json
+cargo run --bin kick -- why 3000          # explain TCP loopback bindability
+cargo run --bin kick -- why 3000 --all-protocols --all-addresses --json
 cargo run --bin kick -- kill --port 3000  # ask, then kick it out
 cargo run --bin kick -- inspect --port 3000  # read-only family view
 cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor
@@ -238,6 +246,33 @@ valid snapshot, so recovery cannot fabricate release events. Three consecutive
 collection failures end the command with exit code 1 after the third gap is
 flushed. Ctrl-C, duration expiry, and a closed stdout consumer exit successfully.
 
+Watch is polling, not a kernel event feed. A socket that opens and closes between
+polls can be missed, multiple changes can collapse into one net difference, and
+event times describe capture intervals rather than exact kernel event times.
+
+## Explain Port Availability
+
+`kick why PORT` checks exact endpoints without terminating anything. By default
+it evaluates TCP on IPv4 and IPv6 loopback; selectors can choose TCP, UDP, one
+literal address, all loopback/wildcard addresses, IPv6 mode, scope ID, and
+reuse-address behavior:
+
+```sh
+kick why 3000
+kick why 5353 --udp --address 127.0.0.1
+kick why 3000 --tcp --address :: --ipv6-only --json
+```
+
+Why collects one bounded native snapshot, then binds and immediately closes each
+requested endpoint in sequence. A successful probe temporarily occupies the
+endpoint, and another process can bind after it closes; `bindable_now` proves
+only that exact probe at its completion time. Why does not invoke Docker.
+
+Why exits `0` only when every requested endpoint is proven bindable now, `3` for
+an unavailable endpoint, `4` when permission prevents a reliable answer, `1`
+for an indeterminate or operational result, and `2` for invalid arguments. With
+multiple endpoints, `1` takes precedence over `4`, then `3`, then `0`.
+
 ## Install Locally
 
 ```sh
@@ -249,7 +284,9 @@ cargo install --path . --locked
 The default config is `~/.config/kickoutchi/config.toml` on Linux and the
 platform config directory returned by the OS on macOS and Windows. Use
 `--config FILE` to select another file. Unknown keys and files above 64 KiB are
-rejected.
+rejected. See the complete
+[configuration and filter reference](docs/configuration.md) for platform paths,
+precedence, validation, label matching, and current command capabilities.
 
 ```toml
 refresh_interval_seconds = 3
@@ -271,29 +308,16 @@ port = 8080
 label = "local web services"
 ```
 
-`refresh_interval_seconds` is `1..=3600`. `default_sort` is one of `port`,
-`pid`, `protocol`, `process`, `parent`, or `scope`. Configured protected names
-extend rather than replace the built-in safety list.
+Configured protected names extend rather than replace the built-in safety list.
+Endpoint labels support exact literal-address selectors and explicit `"*"`
+fallbacks; exact selectors take precedence. Labels appear in list, snapshot,
+watch, and Why output.
 
-Each `[[ports]]` selector requires lowercase `tcp` or `udp`, a literal IP
-address or explicit `"*"` wildcard, a port in `1..=65535`, and a label. An
-optional nonzero `scope_id` is accepted only for an exact IPv6 address. Exact
-selectors take precedence over wildcard selectors for the same protocol and
-port. Labels are limited to 128 UTF-8 bytes and safe visible Unicode; a maximum
-of 256 selectors is accepted. Configuring any selector enables the `LABEL`
-column in CLI tables and sufficiently wide TUI tables, even if no visible row
-currently matches.
-
-IPv6 interface scope is currently available from the Windows collector only.
-Linux and macOS report IPv6 scope as unavailable, so exact IPv6 selectors and
-`scope_id:` filters do not match on those platforms. Use an explicit `"*"`
-selector when a protocol-and-port label is appropriate regardless of address or
-interface scope.
-
-`list --filter` supports plain case-insensitive search plus structured
-`label:`, `address:`, `scope_id:`, and `family:ipv4|ipv6` terms. These compose
-with the existing `pid:`, `port:`, `proto:`, `scope:`, `protected:`, and
-`parent:` terms.
+`list`, TUI search, and `watch` share plain search and structured `pid:`,
+`port:`, `proto:`, `scope:`, `protected:`, `parent:`, `label:`, `address:`,
+`scope_id:`, and `family:` terms. Watch additionally accepts `state:` because it
+observes the full native socket-state snapshot. Terms compose with AND semantics;
+Why instead uses exact endpoint arguments and has no general filter expression.
 
 ## Exit Codes
 
@@ -309,17 +333,38 @@ with the existing `pid:`, `port:`, `proto:`, `scope:`, `protected:`, and
 
 ## Structured Output And Privacy
 
-`list --json` is the stable `kickoutchi.list/1` top-level array used by scripts.
-Each row includes an additive `label` field containing the configured label or
-`null`. It may contain process names, executable paths, and complete command
-lines; command lines can contain tokens or other secrets. Treat JSON output as
-sensitive and redact it before sharing. Human terminal output is sanitized
-independently and does not imply that structured values are safe to publish.
+Kickoutchi has four distinct structured interfaces:
 
-`watch --json` emits versioned `kickoutchi.watch_event/1` NDJSON. Watch omits
-complete process command lines, but owner identity, process metadata, endpoint
-labels, and evidence can still be sensitive. Diagnostics use stderr and never
-contaminate NDJSON stdout.
+- `list --json` is the stable `kickoutchi.list/1` top-level array for legacy
+  scripts. It is a filtered listening-TCP/bound-UDP projection and can include
+  process and parent names, executable paths, and complete command lines.
+- `list --snapshot-json` emits one versioned `kickoutchi.snapshot/1` object. It
+  bypasses list filters, sorting, and system-row hiding and includes the complete
+  full-state native observation within the declared scope. It omits complete
+  command lines and parent process names.
+- `watch --json` emits one independently valid `kickoutchi.watch_event/1` JSON
+  object per line. It reports baseline and changes, not a complete retained
+  history, and omits complete command lines.
+- `why --json` emits one versioned `kickoutchi.why/1` object after evaluating the
+  whole endpoint matrix. It omits complete command lines and Docker enrichment.
+
+All four remain sensitive, as does `inspect`, which can show process-family
+command lines and relationships. Depending on the contract, output can expose
+endpoints, PIDs, stable process-start markers, process and parent names,
+executable paths, ownership, configured labels, scope identifiers, evidence,
+and errors. `list --json` can additionally expose complete command lines
+containing tokens, credentials, URLs, paths, or user data. Optional TUI details
+can expose local Docker and Compose metadata. Human terminal sanitization and
+JSON escaping are not redaction; remove sensitive values before sharing output.
+
+Certainty applies only to the claim carrying it: `proven` is established by an
+authoritative native fact or exact probe, `estimated` is derived from an interval
+or timer, `heuristic` is plausible but not authoritative, and `unknown` records
+permission, scope, race, platform, or evidence limits.
+
+See the [structured output reference](docs/structured-output.md) for schemas,
+stable values, limits, ordering, streams, and exact exit behavior. Diagnostics
+use stderr and do not contaminate structured stdout.
 
 Report suspected vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md).
@@ -327,7 +372,10 @@ Report suspected vulnerabilities privately as described in
 ## Platform Notes
 
 - **Linux:** native `/proc` collection. Termination uses `pidfd`, so the final
-  signal is tied to the prepared process handle instead of a recycled PID.
+  signal is tied to the prepared process handle instead of a recycled PID. Socket
+  observation covers only the current network namespace, while procfs/PID
+  namespace visibility can separately limit owner attribution. Elevation may
+  reduce permission gaps but does not widen namespace scope.
 - **Windows:** native IP Helper collection, process-handle single-PID
   termination, read-only `inspect`, and CLI `kill --tree` through Job Object
   containment. Windows termination is hard termination (`TerminateProcess` /
@@ -338,11 +386,20 @@ Report suspected vulnerabilities privately as described in
   assigning the target and refuses without containment when the host does not
   support it.
   `--group` and the TUI `t`/`T` tree keys are not available on Windows. Native
-  Windows cannot see individual Linux processes inside WSL2; use the Linux build
-  inside WSL2 for those trees.
+  Windows cannot observe the separate WSL network stack or individual Linux
+  processes inside WSL; use the Linux build inside WSL for those sockets and
+  trees. Elevation does not merge the two network stacks.
 - **macOS:** native `libproc` / `sysctl` collection and Unix `SIGTERM` / `SIGKILL`
   termination. macOS has no pidfd, so Kickoutchi re-checks process identity right
-  before signalling and refuses if the PID changed faces.
+  before signalling and refuses if the PID changed faces. Collection is
+  process-first, so sockets without a visible user-process descriptor are outside
+  its declared scope.
+
+A `complete` result is complete only within the platform's declared native
+observation scope. See
+[platform support and observation limits](docs/platform-support.md) for
+permanent scope exclusions, permission behavior, polling limits, bind-probe
+races, WSL, IPv6 scope availability, and safe certainty interpretation.
 
 ## Safety Rules
 

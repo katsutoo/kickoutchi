@@ -3,7 +3,7 @@ use std::io::{self, ErrorKind, Write};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use clap::Args;
 use serde::Serialize;
@@ -14,13 +14,15 @@ use crate::display::{sanitize, sanitize_bounded};
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, label_display_text, normalize_ip_address};
 use crate::model::{BindScope, Protocol};
 use crate::observation::{
-    EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact, Ipv6Scope,
-    MacOsProcessStartTime, MetadataCompleteness, MetadataProfile, NetworkSnapshot,
-    ObservationError, OwnerCompleteness, OwnerObservation, PlatformSocketToken, ProcessIdentity,
-    ProcessObservation, ProcessStartMarker, SnapshotCompleteness, SocketObservation, SocketState,
-    UnverifiedOwnerReason,
+    EndpointIdentity, EvidenceGap, Ipv6Scope, MetadataCompleteness, MetadataProfile,
+    NetworkSnapshot, ObservationError, OwnerCompleteness, OwnerObservation, ProcessIdentity,
+    ProcessObservation, SnapshotCompleteness, SocketObservation, SocketState,
 };
 use crate::protection::is_protected_process_name;
+use crate::public_output::{
+    EndpointDto, EvidenceDto, EvidenceGapDto, OwnerSetDto, PublicOutputError, SocketStateDto,
+    SocketTokenDto, socket_state_name, unix_milliseconds,
+};
 use crate::query::{AddressFamily, FilterTerm, QueryCapabilities, StateFilter};
 use crate::watch::{
     Certainty, DiffError, EventKind, WATCH_EVENT_BATCH_MAX, WATCH_EVENT_EVIDENCE_MAX,
@@ -39,10 +41,10 @@ const CANCELLATION_POLL_MAX: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Args)]
 pub(crate) struct WatchArgs {
-    /// Include TCP observations. May be combined with --udp.
+    /// Include TCP; combine with --udp. Neither flag means both protocols.
     #[arg(long)]
     tcp: bool,
-    /// Include UDP observations. May be combined with --tcp.
+    /// Include UDP; combine with --tcp. Neither flag means both protocols.
     #[arg(long)]
     udp: bool,
     /// Match this literal normalized IP address across IPv6 scopes.
@@ -54,16 +56,22 @@ pub(crate) struct WatchArgs {
     /// Match this exact nonzero port.
     #[arg(long)]
     port: Option<u64>,
-    /// Apply search text or structured full-state filters.
+    /// Apply plain or structured full-state filters using AND semantics.
+    ///
+    /// Fields: `pid:`, `port:`, `proto:`, `scope:`, `protected:`, `parent:`,
+    /// `label:`, `address:`, `scope_id:`, `family:`, and `state:`. State values:
+    /// `listen`, `bound`, `closed`, `syn_sent`, `syn_received`, `established`,
+    /// `fin_wait1`, `fin_wait2`, `close_wait`, `closing`, `last_ack`,
+    /// `time_wait`, `delete_tcb`, `new_syn_received`, `unknown`.
     #[arg(long, value_name = "TEXT")]
     filter: Option<String>,
-    /// Poll interval, such as 500ms or 2s.
+    /// Poll every 100ms..=60s (default 1s), for example 500ms or 2s.
     #[arg(long, value_name = "DURATION", default_value = "1s")]
     interval: String,
-    /// Stop after this duration instead of waiting for Ctrl-C.
+    /// Stop after 100ms..=7d instead of waiting for Ctrl-C.
     #[arg(long, value_name = "DURATION")]
     duration: Option<String>,
-    /// Emit versioned newline-delimited JSON.
+    /// Emit `kickoutchi.watch_event/1` NDJSON to stdout; diagnostics use stderr.
     #[arg(long)]
     json: bool,
 }
@@ -292,11 +300,11 @@ fn run_watch_loop(
         previous_completed_unix_ms: None,
         attempt_started_unix_ms: match unix_milliseconds(previous.capture_started_at) {
             Ok(value) => value,
-            Err(error) => return clock_failure(diagnostics, &error),
+            Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
         },
         attempt_completed_unix_ms: match unix_milliseconds(previous.capture_completed_at) {
             Ok(value) => value,
-            Err(error) => return clock_failure(diagnostics, &error),
+            Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
         },
     };
     let baseline = match baseline_events(&previous) {
@@ -361,15 +369,15 @@ fn run_watch_loop(
         let gap_times = ObservationTimes {
             previous_completed_unix_ms: match unix_milliseconds(previous.capture_completed_at) {
                 Ok(value) => Some(value),
-                Err(error) => return clock_failure(diagnostics, &error),
+                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
             },
             attempt_started_unix_ms: match unix_milliseconds(attempt_started) {
                 Ok(value) => value,
-                Err(error) => return clock_failure(diagnostics, &error),
+                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
             },
             attempt_completed_unix_ms: match unix_milliseconds(attempt_completed) {
                 Ok(value) => value,
-                Err(error) => return clock_failure(diagnostics, &error),
+                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
             },
         };
 
@@ -383,7 +391,7 @@ fn run_watch_loop(
                         return ExitReason::Failure;
                     }
                 };
-                let gap = gap_from_result(result, consecutive_failures);
+                let gap = gap_from_result(&result, consecutive_failures);
                 match write_gap(output, options.json, sequence, gap_times, &gap) {
                     Ok(()) => {}
                     Err(OutputError::BrokenPipe) => return ExitReason::Success,
@@ -435,11 +443,11 @@ fn run_watch_loop(
             previous_completed_unix_ms: gap_times.previous_completed_unix_ms,
             attempt_started_unix_ms: match unix_milliseconds(current.capture_started_at) {
                 Ok(value) => value,
-                Err(error) => return clock_failure(diagnostics, &error),
+                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
             },
             attempt_completed_unix_ms: match unix_milliseconds(current.capture_completed_at) {
                 Ok(value) => value,
-                Err(error) => return clock_failure(diagnostics, &error),
+                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
             },
         };
         let diff = match diff_snapshots(&previous, &current) {
@@ -1157,7 +1165,7 @@ fn common_plain_match(socket: &SocketObservation, label: Option<&str>, needle: &
             .label()
             .to_ascii_lowercase()
             .contains(needle)
-        || state_name(socket.state).contains(needle)
+        || socket_state_name(socket.state).contains(needle)
         || bind_scope(endpoint.address).label().contains(needle)
         || label.is_some_and(|label| lowered_contains(label, needle))
 }
@@ -1262,101 +1270,29 @@ struct WatchRecord<T> {
 
 #[derive(Serialize)]
 struct EndpointEventData<'a> {
-    endpoint: EndpointDto,
+    endpoint: EndpointDto<'a>,
     state: SocketStateDto,
-    previous_owners: Option<OwnerSetDto>,
-    current_owners: Option<OwnerSetDto>,
+    previous_owners: Option<OwnerSetDto<'a>>,
+    current_owners: Option<OwnerSetDto<'a>>,
     previous_socket_token: Option<SocketTokenDto>,
     current_socket_token: Option<SocketTokenDto>,
     multiplicity: u32,
     label: Option<&'a str>,
     filter_result: &'static str,
     certainty: &'static str,
-    evidence: Vec<EvidenceDto>,
+    evidence: Vec<EvidenceDto<'static>>,
     omitted_evidence_count: u64,
-    evidence_gaps: Vec<EvidenceGapDto>,
+    evidence_gaps: Vec<EvidenceGapDto<'a>>,
     omitted_evidence_gap_count: u64,
 }
 
 #[derive(Serialize)]
-struct EndpointDto {
-    protocol: Protocol,
-    address: String,
-    port: u16,
-    ipv6_scope: Option<Ipv6ScopeDto>,
-}
-
-#[derive(Serialize)]
-struct Ipv6ScopeDto {
-    kind: &'static str,
-    interface_index: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct SocketStateDto {
-    kind: &'static str,
-    native_code: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct SocketTokenDto {
-    kind: &'static str,
-    value: u64,
-}
-
-#[derive(Serialize)]
-struct OwnerSetDto {
-    owners: Vec<OwnerDto>,
-    omitted_owner_count: u64,
-    completeness: &'static str,
-    reasons: Vec<&'static str>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OwnerDto {
-    Verified { identity: ProcessIdentityDto },
-    UnverifiedPid { pid: u32, reason: &'static str },
-}
-
-#[derive(Serialize)]
-struct ProcessIdentityDto {
-    pid: u32,
-    start_marker: ProcessMarkerDto,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ProcessMarkerDto {
-    LinuxStartTicks { ticks: u64 },
-    MacosStartTime { seconds: u64, microseconds: u32 },
-    WindowsCreationTime { filetime_ticks: u64 },
-}
-
-#[derive(Serialize)]
-struct EvidenceDto {
-    code: &'static str,
-    source: &'static str,
-    certainty: &'static str,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct EvidenceGapDto {
-    code: &'static str,
-    impact: &'static str,
-    endpoint: Option<EndpointDto>,
-    pid: Option<u32>,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct GapData {
+struct GapData<'a> {
     error: PublicError,
     certainty: &'static str,
     consecutive_failures: u8,
     completeness: Option<&'static str>,
-    evidence_gaps: Vec<EvidenceGapDto>,
+    evidence_gaps: Vec<EvidenceGapDto<'a>>,
     omitted_evidence_gap_count: u64,
 }
 
@@ -1391,26 +1327,32 @@ fn write_endpoint_event(
         (Vec::new(), 0)
     };
     let evidence = if event.kind == EventKind::Replacement {
-        vec![EvidenceDto {
-            code: "process_identity_changed",
-            source: "analysis",
-            certainty: Certainty::Proven.name(),
-            message: "verified process identity changed between observations".to_owned(),
-        }]
+        vec![EvidenceDto::literal(
+            "process_identity_changed",
+            "analysis",
+            Certainty::Proven.name(),
+            "verified process identity changed between observations",
+        )]
     } else {
         Vec::new()
     };
     let data = EndpointEventData {
-        endpoint: endpoint_dto(&socket.local_endpoint),
-        state: socket_state_dto(socket.state),
-        previous_owners: event.previous_socket.map(owner_set_dto),
-        current_owners: event.current_socket.map(owner_set_dto),
+        endpoint: EndpointDto::from(&socket.local_endpoint),
+        state: SocketStateDto::from(socket.state),
+        previous_owners: event
+            .previous_socket
+            .map(|socket| OwnerSetDto::new(&socket.owners, &socket.owner_completeness))
+            .transpose()?,
+        current_owners: event
+            .current_socket
+            .map(|socket| OwnerSetDto::new(&socket.owners, &socket.owner_completeness))
+            .transpose()?,
         previous_socket_token: event
             .previous_socket
-            .and_then(|socket| socket.socket_token.map(token_dto)),
+            .and_then(|socket| socket.socket_token.map(SocketTokenDto::from)),
         current_socket_token: event
             .current_socket
-            .and_then(|socket| socket.socket_token.map(token_dto)),
+            .and_then(|socket| socket.socket_token.map(SocketTokenDto::from)),
         multiplicity: event.multiplicity,
         label: config.labels.resolve(&socket.local_endpoint),
         filter_result: filter_result.name(),
@@ -1516,11 +1458,11 @@ fn retain_bounded_gap<'a>(gaps: &mut Vec<&'a EvidenceGap>, gap: &'a EvidenceGap)
     }
 }
 
-fn event_gap_dtos(
-    event: WatchEvent<'_>,
+fn event_gap_dtos<'a>(
+    event: WatchEvent<'a>,
     previous_index: Option<&GapIndex>,
     current_index: Option<&GapIndex>,
-) -> (Vec<EvidenceGapDto>, u64) {
+) -> (Vec<EvidenceGapDto<'a>>, u64) {
     let mut gaps = Vec::with_capacity(WATCH_EVENT_GAPS_MAX);
     let mut total = 0u64;
     if let (Some(snapshot), Some(socket), Some(index)) = (
@@ -1540,7 +1482,7 @@ fn event_gap_dtos(
     (
         gaps.into_iter()
             .take(WATCH_EVENT_GAPS_MAX)
-            .map(evidence_gap_dto)
+            .map(EvidenceGapDto::from)
             .collect(),
         omitted,
     )
@@ -1581,7 +1523,7 @@ fn write_human_event(
         event.kind.name().to_ascii_uppercase(),
         endpoint.protocol.label(),
         endpoint_text,
-        state_name(socket.state),
+        socket_state_name(socket.state),
         if owners.is_empty() { "-" } else { &owners },
         label
             .as_deref()
@@ -1602,7 +1544,7 @@ fn write_gap(
     json: bool,
     sequence: u64,
     observation: ObservationTimes,
-    gap: &GapData,
+    gap: &GapData<'_>,
 ) -> Result<(), OutputError> {
     if !json {
         return writeln!(
@@ -1632,13 +1574,13 @@ fn write_gap(
 }
 
 fn gap_from_result(
-    result: Result<NetworkSnapshot, CollectorError>,
+    result: &Result<NetworkSnapshot, CollectorError>,
     consecutive_failures: u8,
-) -> GapData {
+) -> GapData<'_> {
     match result {
         Err(error) => GapData {
             error: PublicError {
-                code: collector_error_code(&error),
+                code: collector_error_code(error),
                 message: sanitize_bounded(&error.to_string(), 512),
             },
             certainty: "unknown",
@@ -1683,7 +1625,7 @@ fn gap_from_result(
                     .evidence_gaps
                     .iter()
                     .take(WATCH_EVENT_GAPS_MAX)
-                    .map(evidence_gap_dto)
+                    .map(EvidenceGapDto::from)
                     .collect(),
                 omitted_evidence_gap_count: omitted,
             }
@@ -1697,7 +1639,7 @@ fn write_json_record(writer: &mut impl Write, value: &impl Serialize) -> Result<
         if record.limit_exceeded {
             OutputError::EventLimit
         } else {
-            OutputError::Serialization(error)
+            OutputError::from(PublicOutputError::from(error))
         }
     })?;
     record
@@ -1747,7 +1689,7 @@ impl Write for BoundedRecord {
 enum OutputError {
     BrokenPipe,
     Io(io::Error),
-    Serialization(serde_json::Error),
+    Public(PublicOutputError),
     EventLimit,
 }
 
@@ -1761,11 +1703,27 @@ impl From<io::Error> for OutputError {
     }
 }
 
+impl From<PublicOutputError> for OutputError {
+    fn from(error: PublicOutputError) -> Self {
+        if error.io_error_kind() == Some(ErrorKind::BrokenPipe) {
+            Self::BrokenPipe
+        } else {
+            Self::Public(error)
+        }
+    }
+}
+
 fn output_failure(diagnostics: &mut impl Write, error: &OutputError) -> ExitReason {
     let message = match error {
         OutputError::BrokenPipe => return ExitReason::Success,
         OutputError::Io(error) => format!("writing watch output failed: {error}"),
-        OutputError::Serialization(error) => format!("serializing watch event failed: {error}"),
+        OutputError::Public(PublicOutputError::Io(error)) => {
+            format!("writing watch output failed: {error}")
+        }
+        OutputError::Public(error @ PublicOutputError::Serialization(_)) => {
+            format!("serializing watch event failed: {error}")
+        }
+        OutputError::Public(error) => format!("preparing watch event failed: {error}"),
         OutputError::EventLimit => "watch event exceeded its 64 KiB record limit".to_owned(),
     };
     write_diagnostic(diagnostics, &message);
@@ -1806,14 +1764,6 @@ fn write_diagnostic(writer: &mut impl Write, message: &str) {
     let _ = writer.flush();
 }
 
-fn unix_milliseconds(time: SystemTime) -> Result<u64, ObservationError> {
-    let milliseconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ObservationError::ClockUnavailable)?
-        .as_millis();
-    u64::try_from(milliseconds).map_err(|_| ObservationError::ClockUnavailable)
-}
-
 fn validate_wall_interval(
     started: SystemTime,
     completed: SystemTime,
@@ -1824,171 +1774,10 @@ fn validate_wall_interval(
         .map_err(|_| ObservationError::InvalidWallClockInterval)
 }
 
-fn endpoint_dto(endpoint: &EndpointIdentity) -> EndpointDto {
-    EndpointDto {
-        protocol: endpoint.protocol,
-        address: normalize_ip_address(endpoint.address).to_string(),
-        port: endpoint.port.get(),
-        ipv6_scope: endpoint.ipv6_scope.map(|scope| match scope {
-            Ipv6Scope::Unscoped => Ipv6ScopeDto {
-                kind: "unscoped",
-                interface_index: None,
-            },
-            Ipv6Scope::InterfaceIndex(index) => Ipv6ScopeDto {
-                kind: "interface_index",
-                interface_index: Some(index.get()),
-            },
-            Ipv6Scope::Unavailable => Ipv6ScopeDto {
-                kind: "unavailable",
-                interface_index: None,
-            },
-        }),
-    }
-}
-
-fn socket_state_dto(state: SocketState) -> SocketStateDto {
-    SocketStateDto {
-        kind: state_name(state),
-        native_code: match state {
-            SocketState::Unknown(code) => Some(code),
-            _ => None,
-        },
-    }
-}
-
-const fn state_name(state: SocketState) -> &'static str {
-    match state {
-        SocketState::Closed => "closed",
-        SocketState::Listen => "listen",
-        SocketState::SynSent => "syn_sent",
-        SocketState::SynReceived => "syn_received",
-        SocketState::Established => "established",
-        SocketState::FinWait1 => "fin_wait1",
-        SocketState::FinWait2 => "fin_wait2",
-        SocketState::CloseWait => "close_wait",
-        SocketState::Closing => "closing",
-        SocketState::LastAck => "last_ack",
-        SocketState::TimeWait => "time_wait",
-        SocketState::DeleteTcb => "delete_tcb",
-        SocketState::NewSynReceived => "new_syn_received",
-        SocketState::Bound => "bound",
-        SocketState::Unknown(_) => "unknown",
-    }
-}
-
-fn token_dto(token: PlatformSocketToken) -> SocketTokenDto {
-    match token {
-        PlatformSocketToken::LinuxInode(value) => SocketTokenDto {
-            kind: "linux_inode",
-            value: value.get(),
-        },
-        PlatformSocketToken::MacOsSocketId(value) => SocketTokenDto {
-            kind: "macos_socket_id",
-            value: value.get(),
-        },
-    }
-}
-
-fn owner_set_dto(socket: &SocketObservation) -> OwnerSetDto {
-    let omitted = socket
-        .owners
-        .len()
-        .saturating_sub(crate::observation::SERIALIZED_OWNERS_MAX);
-    let (completeness, reasons) = match &socket.owner_completeness {
-        OwnerCompleteness::Complete => ("complete", Vec::new()),
-        OwnerCompleteness::Partial { reasons } => (
-            "partial",
-            crate::observation::owner_reason_names(reasons).collect(),
-        ),
-        OwnerCompleteness::Raced => ("raced", vec!["observation_raced"]),
-    };
-    OwnerSetDto {
-        owners: socket
-            .owners
-            .iter()
-            .take(crate::observation::SERIALIZED_OWNERS_MAX)
-            .map(owner_dto)
-            .collect(),
-        omitted_owner_count: u64::try_from(omitted).unwrap_or(u64::MAX),
-        completeness,
-        reasons,
-    }
-}
-
-fn owner_dto(owner: &OwnerObservation) -> OwnerDto {
-    match owner {
-        OwnerObservation::Verified(identity) => OwnerDto::Verified {
-            identity: identity_dto(*identity),
-        },
-        OwnerObservation::UnverifiedPid { pid, reason } => OwnerDto::UnverifiedPid {
-            pid: *pid,
-            reason: unverified_reason(*reason),
-        },
-    }
-}
-
 const fn owner_pid(owner: &OwnerObservation) -> u32 {
     match owner {
         OwnerObservation::Verified(identity) => identity.pid,
         OwnerObservation::UnverifiedPid { pid, .. } => *pid,
-    }
-}
-
-fn identity_dto(identity: ProcessIdentity) -> ProcessIdentityDto {
-    ProcessIdentityDto {
-        pid: identity.pid,
-        start_marker: marker_dto(identity.start_marker),
-    }
-}
-
-fn marker_dto(marker: ProcessStartMarker) -> ProcessMarkerDto {
-    match marker {
-        ProcessStartMarker::LinuxStartTicks(value) => {
-            ProcessMarkerDto::LinuxStartTicks { ticks: value.get() }
-        }
-        ProcessStartMarker::MacOsStartTime(value) => marker_macos_dto(value),
-        ProcessStartMarker::WindowsCreationTime(value) => ProcessMarkerDto::WindowsCreationTime {
-            filetime_ticks: value.get(),
-        },
-    }
-}
-
-fn marker_macos_dto(value: MacOsProcessStartTime) -> ProcessMarkerDto {
-    ProcessMarkerDto::MacosStartTime {
-        seconds: value.seconds(),
-        microseconds: value.microseconds(),
-    }
-}
-
-fn evidence_gap_dto(gap: &EvidenceGap) -> EvidenceGapDto {
-    EvidenceGapDto {
-        code: gap_code(gap.code),
-        impact: impact_name(gap.impact),
-        endpoint: gap.endpoint.as_ref().map(endpoint_dto),
-        pid: gap.pid,
-        message: sanitize_bounded(gap.message(), 512),
-    }
-}
-
-const fn gap_code(code: EvidenceGapCode) -> &'static str {
-    code.name()
-}
-
-const fn impact_name(impact: EvidenceImpact) -> &'static str {
-    match impact {
-        EvidenceImpact::SocketSet => "socket_set",
-        EvidenceImpact::Ownership => "ownership",
-        EvidenceImpact::Metadata => "metadata",
-        EvidenceImpact::Scope => "scope",
-    }
-}
-
-const fn unverified_reason(reason: UnverifiedOwnerReason) -> &'static str {
-    match reason {
-        UnverifiedOwnerReason::PermissionDenied => "owner_permission_denied",
-        UnverifiedOwnerReason::Disappeared => "owner_disappeared",
-        UnverifiedOwnerReason::IdentityUnavailable => "process_identity_unavailable",
-        UnverifiedOwnerReason::Raced => "observation_raced",
     }
 }
 
@@ -3531,7 +3320,8 @@ mod tests {
 
     #[test]
     fn collection_gap_shape_is_fully_pinned() {
-        let gap = super::gap_from_result(Err(ObservationError::SocketTableUnavailable.into()), 2);
+        let result = Err(ObservationError::SocketTableUnavailable.into());
+        let gap = super::gap_from_result(&result, 2);
         let observation = ObservationTimes {
             previous_completed_unix_ms: Some(10),
             attempt_started_unix_ms: 11,
@@ -3577,62 +3367,64 @@ mod tests {
     fn fully_populated_replacement_record_stays_within_its_calculated_bound() {
         let snapshot = snapshot();
         let endpoint = &snapshot.sockets[0].local_endpoint;
-        let owner_set = || super::OwnerSetDto {
-            owners: (0..crate::observation::SERIALIZED_OWNERS_MAX)
-                .map(|offset| super::OwnerDto::Verified {
-                    identity: super::ProcessIdentityDto {
-                        pid: u32::MAX - u32::try_from(offset).unwrap(),
-                        start_marker: super::ProcessMarkerDto::WindowsCreationTime {
-                            filetime_ticks: u64::MAX - u64::try_from(offset).unwrap(),
-                        },
-                    },
+        let owners = (0..crate::observation::SERIALIZED_OWNERS_MAX)
+            .map(|offset| {
+                OwnerObservation::Verified(crate::observation::ProcessIdentity {
+                    pid: u32::MAX - u32::try_from(offset).unwrap(),
+                    start_marker: crate::observation::ProcessStartMarker::windows(
+                        u64::MAX - u64::try_from(offset).unwrap(),
+                    )
+                    .unwrap(),
                 })
-                .collect(),
-            omitted_owner_count: u64::MAX,
-            completeness: "partial",
-            reasons: vec![
-                "native_field_unavailable",
-                "noncritical_evidence_truncated",
-                "observation_raced",
-                "owner_attribution_incomplete",
-                "owner_disappeared",
-                "owner_permission_denied",
-                "process_identity_unavailable",
-                "process_metadata_unavailable",
-            ],
-        };
+            })
+            .collect::<Vec<_>>();
+        let owner_completeness = OwnerCompleteness::partial([
+            EvidenceGapCode::NativeFieldUnavailable,
+            EvidenceGapCode::NoncriticalEvidenceTruncated,
+            EvidenceGapCode::ObservationRaced,
+            EvidenceGapCode::OwnerAttributionIncomplete,
+            EvidenceGapCode::OwnerDisappeared,
+            EvidenceGapCode::OwnerPermissionDenied,
+            EvidenceGapCode::ProcessIdentityUnavailable,
+            EvidenceGapCode::ProcessMetadataUnavailable,
+        ])
+        .unwrap();
+        let owner_set = || super::OwnerSetDto::new(&owners, &owner_completeness).unwrap();
         let escaped_message = "\\".repeat(512);
         let evidence = (0..crate::watch::WATCH_EVENT_EVIDENCE_MAX)
-            .map(|_| super::EvidenceDto {
-                code: "process_identity_changed",
-                source: "analysis",
-                certainty: "heuristic",
-                message: escaped_message.clone(),
+            .map(|_| {
+                super::EvidenceDto::literal(
+                    "process_identity_changed",
+                    "analysis",
+                    "heuristic",
+                    &escaped_message,
+                )
             })
             .collect();
-        let evidence_gaps = (0..crate::watch::WATCH_EVENT_GAPS_MAX)
-            .map(|offset| super::EvidenceGapDto {
-                code: "process_metadata_unavailable",
-                impact: "metadata",
-                endpoint: Some(super::endpoint_dto(endpoint)),
-                pid: Some(u32::MAX - u32::try_from(offset).unwrap()),
-                message: escaped_message.clone(),
+        let gaps = (0..crate::watch::WATCH_EVENT_GAPS_MAX)
+            .map(|offset| {
+                EvidenceGap::new(
+                    EvidenceImpact::Metadata,
+                    EvidenceGapCode::ProcessMetadataUnavailable,
+                    Some(endpoint.clone()),
+                    Some(u32::MAX - u32::try_from(offset).unwrap()),
+                    &escaped_message,
+                )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let evidence_gaps = gaps.iter().map(super::EvidenceGapDto::from).collect();
         let label = "x".repeat(128);
         let data = super::EndpointEventData {
-            endpoint: super::endpoint_dto(endpoint),
-            state: super::socket_state_dto(snapshot.sockets[0].state),
+            endpoint: super::EndpointDto::from(endpoint),
+            state: super::SocketStateDto::from(snapshot.sockets[0].state),
             previous_owners: Some(owner_set()),
             current_owners: Some(owner_set()),
-            previous_socket_token: Some(super::SocketTokenDto {
-                kind: "macos_socket_id",
-                value: u64::MAX,
-            }),
-            current_socket_token: Some(super::SocketTokenDto {
-                kind: "macos_socket_id",
-                value: u64::MAX,
-            }),
+            previous_socket_token: Some(super::SocketTokenDto::from(
+                crate::observation::PlatformSocketToken::macos_socket_id(u64::MAX).unwrap(),
+            )),
+            current_socket_token: Some(super::SocketTokenDto::from(
+                crate::observation::PlatformSocketToken::macos_socket_id(u64::MAX).unwrap(),
+            )),
             multiplicity: u32::MAX,
             label: Some(&label),
             filter_result: "indeterminate",
@@ -3758,9 +3550,15 @@ mod tests {
             EvidenceGapCode::OwnerAttributionIncomplete,
         ])
         .unwrap();
+        let owner_set = super::OwnerSetDto::new(
+            &snapshot.sockets[0].owners,
+            &snapshot.sockets[0].owner_completeness,
+        )
+        .unwrap();
+        let owner_set = serde_json::to_value(owner_set).unwrap();
         assert_eq!(
-            super::owner_set_dto(&snapshot.sockets[0]).reasons,
-            ["owner_attribution_incomplete", "owner_permission_denied"]
+            owner_set["reasons"],
+            serde_json::json!(["owner_attribution_incomplete", "owner_permission_denied"])
         );
 
         let mut record = BoundedRecord::new();

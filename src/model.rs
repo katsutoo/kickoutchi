@@ -10,8 +10,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 
@@ -156,31 +155,6 @@ pub(crate) struct PortEntryView<'a> {
     pub(crate) process_identity: Option<ProcessIdentity>,
     pub(crate) ipv6_scope: Option<Ipv6Scope>,
     pub(crate) label: Option<&'a str>,
-}
-
-impl Serialize for PortEntryView<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut row = serializer.serialize_struct("PortEntry", 15)?;
-        row.serialize_field("protocol", &self.protocol)?;
-        row.serialize_field("local_addr", &self.local_addr)?;
-        row.serialize_field("local_port", &self.local_port)?;
-        row.serialize_field("state", &self.state)?;
-        row.serialize_field("pid", &self.pid)?;
-        row.serialize_field("process_name", &self.process_name)?;
-        row.serialize_field("executable_path", &self.executable_path)?;
-        row.serialize_field("command_line", &self.command_line)?;
-        row.serialize_field("parent_pid", &self.parent_pid)?;
-        row.serialize_field("parent_process_name", &self.parent_process_name)?;
-        row.serialize_field("child_pids", &[] as &[u32])?;
-        row.serialize_field("protected", &self.protected)?;
-        row.serialize_field("platform", &self.platform)?;
-        row.serialize_field("permission", &self.permission)?;
-        row.serialize_field("label", &self.label)?;
-        row.end()
-    }
 }
 
 impl<'a> From<&'a PortEntry> for PortEntryView<'a> {
@@ -578,7 +552,8 @@ mod tests {
         row.child_pids = vec![18430];
 
         let view = PortEntryView::from(&row).with_label(Some("web dev"));
-        let value = serde_json::to_value(view).expect("production list view must serialize");
+        let value = serde_json::to_value(crate::public_output::LegacyListRecord::from(&view))
+            .expect("production list view must serialize");
         assert_eq!(
             value,
             serde_json::json!({
@@ -604,7 +579,9 @@ mod tests {
     #[test]
     fn json_renders_missing_metadata_as_null() {
         let row = entry(53, None, None);
-        let value = serde_json::to_value(PortEntryView::from(&row)).expect("must serialize");
+        let view = PortEntryView::from(&row);
+        let value = serde_json::to_value(crate::public_output::LegacyListRecord::from(&view))
+            .expect("must serialize");
         assert_eq!(value["pid"], serde_json::Value::Null);
         assert_eq!(value["process_name"], serde_json::Value::Null);
         assert_eq!(value["executable_path"], serde_json::Value::Null);

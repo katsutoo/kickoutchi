@@ -85,10 +85,7 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "FILE", global = true)]
     pub(crate) config: Option<PathBuf>,
 
-    /// Override the configured refresh interval, in seconds.
-    ///
-    /// clap enforces the same bounds as the config file, so an out-of-range
-    /// flag is a usage error (exit 2) instead of a config error (exit 1).
+    /// Override the configured refresh interval (1..=3600 seconds).
     #[arg(
         long,
         value_name = "SECONDS",
@@ -104,6 +101,20 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Print open ports and exit.
+    ///
+    /// Filters use AND semantics. Structured fields are `pid:`, `port:`,
+    /// `proto:`, `scope:`, `protected:`, `parent:`, `label:`, `address:`,
+    /// `scope_id:`, and `family:`. For example:
+    /// `--filter 'proto:tcp family:ipv6 parent:node'`. `state:` is reserved for
+    /// `watch` and is rejected here. See the filter syntax documentation for
+    /// matching and normalization rules.
+    ///
+    /// `--json` preserves the legacy visible-row `kickoutchi.list/1` array for
+    /// existing scripts and may include full command lines. `--snapshot-json`
+    /// emits the complete, unfiltered within-scope `kickoutchi.snapshot/1`
+    /// observation, including completeness and evidence gaps but not full command
+    /// lines. See the structured output documentation for schemas and privacy
+    /// guidance.
     List(ListArgs),
     /// Terminate the process owning a port or PID (after confirmation).
     Kill(KillArgs),
@@ -112,8 +123,51 @@ pub(crate) enum Command {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Inspect(InspectArgs),
     /// Stream bounded socket changes until interrupted or the duration expires.
+    ///
+    /// Watch compares full-state native snapshots. Polling can miss sockets that
+    /// appear and disappear between snapshots; observation times bracket a
+    /// collection attempt, not the exact event time. Neither protocol flag means
+    /// both TCP and UDP, and `--tcp --udp` also selects both. Docker and other
+    /// external network tools are never run by the polling loop.
+    ///
+    /// Filters use AND semantics and support plain text plus `pid:`, `port:`,
+    /// `proto:`, `scope:`, `protected:`, `parent:`, `label:`, `address:`,
+    /// `scope_id:`, `family:`, and watch-only `state:`. Missing owner or process
+    /// metadata can produce an emitted `indeterminate` match when those facts are
+    /// needed to decide an otherwise possible event; definite nonmatches remain
+    /// suppressed. See the filter documentation for accepted values.
+    ///
+    /// An initial collection failure emits no records and exits 1. After a valid
+    /// baseline, an unusable poll emits and flushes `collection_gap`, retains the
+    /// last valid snapshot, and retries; the third consecutive failure flushes
+    /// its gap and exits 1. Collection gaps bypass endpoint filters.
+    ///
+    /// JSON mode writes one `kickoutchi.watch_event/1` object per stdout line;
+    /// diagnostics go only to stderr. Records omit full command lines but can
+    /// contain sensitive owner, process, endpoint, label, and evidence data. See
+    /// the structured output documentation for the schema and failure contract.
     Watch(WatchArgs),
     /// Explain whether exact local endpoints are bindable now.
+    ///
+    /// The default query probes TCP on `127.0.0.1`, then `::1`. Protocol order is
+    /// TCP then UDP; `--all-addresses` order is `127.0.0.1`, `0.0.0.0`, `::1`,
+    /// then `::`. Results preserve that protocol-major matrix order, capped at
+    /// eight endpoints.
+    ///
+    /// `--scope-id` requires one explicit IPv6 address. `--ipv6-only` and
+    /// `--dual-stack` are mutually exclusive and require only IPv6 addresses;
+    /// without either flag, the operating system's IPv6 behavior is used.
+    ///
+    /// Each exact endpoint is temporarily bound and immediately closed in
+    /// sequence. A successful bind proves availability only at probe completion:
+    /// it does not reserve the endpoint, and another process may bind afterward.
+    /// Why does not run Docker and never includes full process command lines.
+    ///
+    /// `--json` emits one `kickoutchi.why/1` document. Exit codes are 0 for all
+    /// bindable, 1 for operational or indeterminate results, 2 for invalid
+    /// arguments, 3 for occupied, unavailable, unsupported, or otherwise
+    /// non-bindable endpoints, and 4 for permission denial. See the structured
+    /// output documentation for verdicts and the schema.
     Why(WhyArgs),
 }
 
@@ -143,10 +197,11 @@ pub(crate) struct ListArgs {
     #[arg(long)]
     pub(crate) process: Option<String>,
 
-    /// Apply TUI-style search text or structured filters.
+    /// Apply plain search or structured filters (all terms must match).
     ///
-    /// Examples: `3000`, `port:3000`, `proto:udp`, `scope:public`,
-    /// `protected:true`, `parent:node`.
+    /// Examples: `3000`, `pid:4242`, `proto:udp`, `protected:false`,
+    /// `parent:node`, `label:web`, `address:127.0.0.1`, `scope_id:3`,
+    /// `family:ipv6`. `state:` is watch-only and rejected by list.
     #[arg(long, value_name = "TEXT")]
     pub(crate) filter: Option<String>,
 
@@ -154,9 +209,16 @@ pub(crate) struct ListArgs {
     #[arg(long, value_name = "MODE", value_parser = parse_sort_mode)]
     pub(crate) sort: Option<SortMode>,
 
-    /// Print stable JSON instead of a table.
-    #[arg(long)]
+    /// Print the legacy visible-row `kickoutchi.list/1` JSON array.
+    #[arg(long, conflicts_with = "snapshot_json")]
     pub(crate) json: bool,
+
+    /// Print the complete, unfiltered `kickoutchi.snapshot/1` JSON observation.
+    #[arg(
+        long,
+        conflicts_with_all = ["json", "port", "process", "filter", "sort"]
+    )]
+    pub(crate) snapshot_json: bool,
 }
 
 /// `kill` requires exactly one target: a PID or a port. Requiring one stops
@@ -233,6 +295,7 @@ pub(crate) fn run(
         return ExitReason::InvalidArguments;
     }
     let profile = match command {
+        Command::List(args) if args.snapshot_json => crate::observation::MetadataProfile::Display,
         Command::List(_) => crate::observation::MetadataProfile::LegacyList,
         Command::Kill(_) => crate::observation::MetadataProfile::Display,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -497,7 +560,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use super::kill::KillTargetError;
@@ -508,6 +571,14 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::model::Protocol;
     use crate::model::SortMode;
+
+    fn long_help(subcommand: &str) -> String {
+        let mut command = Cli::command();
+        let subcommand = command
+            .find_subcommand_mut(subcommand)
+            .expect("subcommand exists");
+        subcommand.render_long_help().to_string().replace('`', "")
+    }
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
@@ -552,6 +623,87 @@ mod tests {
         assert_eq!(args.filter.as_deref(), Some("scope:public"));
         assert_eq!(args.sort, Some(SortMode::Scope));
         assert!(args.json);
+        assert!(!args.snapshot_json);
+    }
+
+    #[test]
+    fn list_help_distinguishes_legacy_rows_from_complete_snapshots() {
+        let help = long_help("list");
+
+        assert!(help.contains("legacy visible-row kickoutchi.list/1"));
+        assert!(help.contains("complete, unfiltered within-scope kickoutchi.snapshot/1"));
+        assert!(help.contains("scope_id:"));
+        assert!(help.contains("family:"));
+        assert!(help.contains("state: is reserved for watch and is rejected here"));
+    }
+
+    #[test]
+    fn watch_help_documents_polling_filter_and_stream_contracts() {
+        let help = long_help("watch");
+
+        for required in [
+            "Polling can miss sockets",
+            "Neither protocol flag means both TCP and UDP",
+            "watch-only state:",
+            "new_syn_received",
+            "can produce an emitted indeterminate match",
+            "definite nonmatches remain suppressed",
+            "initial collection failure emits no records and exits 1",
+            "third consecutive failure",
+            "Collection gaps bypass endpoint filters",
+            "100ms..=60s",
+            "100ms..=7d",
+            "kickoutchi.watch_event/1",
+            "stdout line",
+            "stderr",
+            "never run by the polling loop",
+        ] {
+            assert!(help.contains(required), "missing help text: {required}");
+        }
+    }
+
+    #[test]
+    fn why_help_documents_matrix_probe_output_and_exit_contracts() {
+        let help = long_help("why");
+
+        for required in [
+            "TCP on 127.0.0.1, then ::1",
+            "127.0.0.1, 0.0.0.0, ::1, then ::",
+            "eight endpoints",
+            "--scope-id requires one explicit IPv6 address",
+            "operating system's IPv6 behavior is used",
+            "temporarily bound and immediately closed",
+            "does not reserve the endpoint",
+            "kickoutchi.why/1",
+            "Exit codes are 0",
+            "does not run Docker",
+            "never includes full process command lines",
+        ] {
+            assert!(help.contains(required), "missing help text: {required}");
+        }
+    }
+
+    #[test]
+    fn snapshot_json_parses_alone_and_rejects_legacy_selectors() {
+        let cli = Cli::try_parse_from(["kickoutchi", "list", "--snapshot-json"])
+            .expect("valid snapshot invocation");
+        let Some(Command::List(args)) = cli.command else {
+            panic!("expected a list command");
+        };
+        assert!(args.snapshot_json);
+        assert!(!args.json);
+
+        for conflict in [
+            vec!["--json"],
+            vec!["--port", "3000"],
+            vec!["--process", "node"],
+            vec!["--filter", "proto:tcp"],
+            vec!["--sort", "port"],
+        ] {
+            let mut invocation = vec!["kickoutchi", "list", "--snapshot-json"];
+            invocation.extend(conflict);
+            assert!(Cli::try_parse_from(invocation).is_err());
+        }
     }
 
     #[test]

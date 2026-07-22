@@ -96,7 +96,10 @@ def run_with_rss(command: list[str], environment: dict[str, str]) -> tuple[int, 
 
 
 if len(sys.argv) > 5:
-    fail("usage: measure-linux-peak-rss.py [BINARY] [SAMPLES] [list|watch|why] [OUTPUT]")
+    fail(
+        "usage: measure-linux-peak-rss.py "
+        "[BINARY] [SAMPLES] [list|watch|why|snapshot] [OUTPUT]"
+    )
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/dist/kick").resolve()
 try:
@@ -107,8 +110,8 @@ except ValueError:
 if samples < 1 or samples > SAMPLES_MAX:
     fail(f"samples must be in 1..={SAMPLES_MAX}")
 workload = sys.argv[3] if len(sys.argv) > 3 else "list"
-if workload not in {"list", "watch", "why"}:
-    fail("workload must be list, watch, or why")
+if workload not in {"list", "watch", "why", "snapshot"}:
+    fail("workload must be list, watch, why, or snapshot")
 output = Path(
     sys.argv[4] if len(sys.argv) > 4 else "/tmp/kickoutchi-peak-rss.tsv"
 ).resolve()
@@ -142,7 +145,7 @@ elif workload == "watch":
         "500ms",
         "--json",
     ]
-else:
+elif workload == "why":
     command = [
         str(artifact_snapshot),
         "why",
@@ -151,6 +154,8 @@ else:
         "--all-addresses",
         "--json",
     ]
+else:
+    command = [str(artifact_snapshot), "list", "--snapshot-json"]
 failures = 0
 rows: list[tuple[int, int, int]] = []
 for sample in range(1, samples + 1):

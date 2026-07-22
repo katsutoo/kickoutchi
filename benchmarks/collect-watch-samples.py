@@ -193,7 +193,7 @@ def snapshot_executable(path: Path, directory: Path) -> tuple[Path, str]:
 if len(sys.argv) not in range(2, 7):
     fail(
         "usage: collect-watch-samples.py BINARY [SAMPLES [WARMUPS "
-        "[WORKLOAD [OUTPUT]]]]; WORKLOAD must be watch or why"
+        "[WORKLOAD [OUTPUT]]]]; WORKLOAD must be watch, why, or snapshot"
     )
 
 binary = Path(sys.argv[1]).resolve()
@@ -202,8 +202,8 @@ warmups = bounded_integer(sys.argv[3] if len(sys.argv) > 3 else "2", "warmups", 
 workload = "watch"
 if len(sys.argv) > 4:
     workload = sys.argv[4]
-    if workload not in {"watch", "why"}:
-        fail("workload must be watch or why")
+    if workload not in {"watch", "why", "snapshot"}:
+        fail("workload must be watch, why, or snapshot")
 default_output = f"/tmp/kickoutchi-{workload}-latency.tsv"
 output = Path(sys.argv[5] if len(sys.argv) > 5 else default_output).resolve()
 source_patch_path = Path(f"{output}.source.patch")
@@ -235,7 +235,7 @@ if workload == "watch":
         "--json",
     ]
     successful_statuses = {0}
-else:
+elif workload == "why":
     command = [
         str(artifact),
         "why",
@@ -245,6 +245,9 @@ else:
         "--json",
     ]
     successful_statuses = {0, 3}
+else:
+    command = [str(artifact), "list", "--snapshot-json"]
+    successful_statuses = {0}
 
 for _ in range(warmups):
     result = subprocess.run(
@@ -259,7 +262,7 @@ for _ in range(warmups):
     if result.returncode not in successful_statuses:
         fail(f"benchmark warmup failed with status {result.returncode}")
 
-if workload == "why":
+if workload in {"why", "snapshot"}:
     validation = subprocess.run(
         command,
         stdin=subprocess.DEVNULL,
@@ -274,10 +277,13 @@ if workload == "why":
         document = json.loads(validation.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"benchmark validation did not emit valid JSON: {error}")
-    if len(document.get("results", [])) != 8:
-        fail("benchmark validation did not evaluate eight endpoints")
-    if document.get("aggregate_exit_code") != validation.returncode:
-        fail("benchmark aggregate exit does not match process status")
+    if workload == "why":
+        if len(document.get("results", [])) != 8:
+            fail("benchmark validation did not evaluate eight endpoints")
+        if document.get("aggregate_exit_code") != validation.returncode:
+            fail("benchmark aggregate exit does not match process status")
+    elif document.get("schema") != "kickoutchi.snapshot" or document.get("version") != 1:
+        fail("benchmark validation did not emit kickoutchi.snapshot/1")
 
 usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
 failures = 0

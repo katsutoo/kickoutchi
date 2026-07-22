@@ -121,7 +121,9 @@ pub(crate) fn write_view_json(
     let mut serializer = serde_json::Serializer::with_formatter(&mut *writer, formatter);
     let mut sequence = serializer.serialize_seq(Some(indices.len()))?;
     for &index in indices {
-        sequence.serialize_element(&entries[index])?;
+        sequence.serialize_element(&crate::public_output::LegacyListRecord::from(
+            &entries[index],
+        ))?;
     }
     sequence.end()?;
     writer.write_all(b"\n").map_err(serde_json::Error::io)

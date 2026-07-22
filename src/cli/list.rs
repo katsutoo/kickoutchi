@@ -26,6 +26,23 @@ fn run_list_snapshot_with_writer(
     snapshot: &NetworkSnapshot,
     writer: &mut impl Write,
 ) -> ExitReason {
+    if args.snapshot_json {
+        match crate::public_output::write_snapshot_json(writer, snapshot, &config.labels) {
+            Ok(()) => {}
+            Err(error) if error.io_error_kind() == Some(ErrorKind::BrokenPipe) => {
+                return ExitReason::Success;
+            }
+            Err(error) => {
+                eprintln!("error: rendering snapshot JSON failed: {error}");
+                return ExitReason::Failure;
+            }
+        }
+        return match writer.flush() {
+            Ok(()) => ExitReason::Success,
+            Err(error) => output_error_reason(&error),
+        };
+    }
+
     let descriptors = match snapshot.port_entry_descriptors(&config.protected_processes) {
         Ok(descriptors) => descriptors,
         Err(error) => {
@@ -161,6 +178,14 @@ mod tests {
             filter: None,
             sort: Some(SortMode::Port),
             json,
+            snapshot_json: false,
+        }
+    }
+
+    fn snapshot_args() -> ListArgs {
+        ListArgs {
+            snapshot_json: true,
+            ..args(false)
         }
     }
 
@@ -194,6 +219,41 @@ mod tests {
         assert_eq!(reason, ExitReason::Success);
         assert_eq!(ports, [3000, 5000]);
         assert!(output.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn snapshot_mode_bypasses_legacy_projection_and_visibility_filters() {
+        let mut row = crate::cli::test_support::entry(3000);
+        row.process_name = Some(std::sync::Arc::from("systemd"));
+        let rows = [row];
+        let config = Config {
+            hide_system_processes: true,
+            ..Config::default()
+        };
+        let mut legacy_output = Vec::new();
+        assert_eq!(
+            run_list_with_writer(&args(false), &config, &rows, &mut legacy_output),
+            ExitReason::Success,
+        );
+        assert_eq!(
+            String::from_utf8(legacy_output).expect("legacy output is UTF-8"),
+            "no open ports visible\n",
+        );
+
+        let mut snapshot = crate::observation::snapshot_from_test_rows(rows.to_vec());
+        snapshot.sockets[0].state = crate::observation::SocketState::Established;
+        let mut output = Vec::new();
+
+        let reason =
+            run_list_snapshot_with_writer(&snapshot_args(), &config, &snapshot, &mut output);
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("snapshot JSON");
+
+        assert_eq!(reason, ExitReason::Success);
+        assert_eq!(value["schema"], "kickoutchi.snapshot");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["sockets"][0]["state"]["kind"], "established");
+        assert_eq!(value["sockets"].as_array().map(Vec::len), Some(1));
+        assert!(value.is_object());
     }
 
     #[test]
@@ -326,6 +386,36 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_writer_errors_treat_only_broken_pipe_as_success() {
+        let snapshot =
+            crate::observation::snapshot_from_test_rows(vec![crate::cli::test_support::entry(
+                3000,
+            )]);
+        for flush_only in [false, true] {
+            for (kind, expected) in [
+                (io::ErrorKind::BrokenPipe, ExitReason::Success),
+                (io::ErrorKind::Other, ExitReason::Failure),
+            ] {
+                let mut writer = FailingWriter {
+                    bytes_before_failure: if flush_only { 1_000_000 } else { 1 },
+                    write_error: (!flush_only).then_some(kind),
+                    flush_error: flush_only.then_some(kind),
+                };
+                assert_eq!(
+                    run_list_snapshot_with_writer(
+                        &snapshot_args(),
+                        &Config::default(),
+                        &snapshot,
+                        &mut writer,
+                    ),
+                    expected,
+                    "flush_only={flush_only} kind={kind:?}",
+                );
             }
         }
     }

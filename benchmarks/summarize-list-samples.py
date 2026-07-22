@@ -67,7 +67,7 @@ for line in read_bounded_regular_file(input_path).splitlines():
         if workload is not None:
             fail("sample file declares its workload more than once")
         workload = line.removeprefix("# workload=")
-        if workload not in {"list", "watch", "why"}:
+        if workload not in {"list", "watch", "why", "snapshot"}:
             fail("declared workload is invalid")
         continue
     if line == "sample\tlatency_ns\tstatus":

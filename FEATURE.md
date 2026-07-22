@@ -1686,6 +1686,9 @@ Canonical ordering keys are fixed:
   lexicographic owner array.
 - Token kind order is Linux inode then macOS socket ID; a token key is kind then
   value, with a null token after every present token.
+- A null timer sorts before a present timer. A timer key is kind (`none`,
+  `retransmit`, `other`, `time_wait`, `zero_window_probe`, `unknown`), unknown
+  native code, raw ticks, then estimated remaining milliseconds with null first.
 - Endpoint scope order is IPv4/no-scope, IPv6 unscoped, IPv6 interface indexes
   numerically, then IPv6 unavailable.
 - For event ordering, baseline/bind use current token and owner-set keys, release
@@ -1835,8 +1838,8 @@ The process array does not include full command lines. `metadata_completeness`
 describes optional metadata availability regardless of cause; permission and
 other causes remain separate evidence gaps. The legacy `permission` field keeps
 its existing name and meaning. Snapshot sockets sort by protocol, address
-family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.1 state order, token
-kind/value with null last, then canonical owner-set key. Processes sort by PID,
+  family, address bytes, IPv6 scope in the order defined above, port, the Stage 0.1 state order, token
+  kind/value with null last, canonical owner-set key, then the timer key. Processes sort by PID,
   marker kind, and marker value. Evidence gaps sort by impact (`socket_set`,
   `ownership`, `metadata`, `scope`), code, the same canonical endpoint key used
   by sockets and events, PID, and message. A null endpoint sorts before every
@@ -2037,11 +2040,11 @@ requires this planning document to understand the change.
 
 ### Stage 7 gate
 
-- [ ] Every public field and enum value is documented.
-- [ ] Help and README examples match executable behavior.
-- [ ] Permanent limitations are visible, not buried.
-- [ ] Changelog identifies additive serialized-contract changes.
-- [ ] Real-binary E2E assertions pin documented commands, schema/version pairs,
+- [x] Every public field and enum value is documented.
+- [x] Help and README examples match executable behavior.
+- [x] Permanent limitations are visible, not buried.
+- [x] Changelog identifies additive serialized-contract changes.
+- [x] Real-binary E2E assertions pin documented commands, schema/version pairs,
       exit codes, and privacy-sensitive field absence against executable output.
 
 ## Stage 8: Security Review and Remediation

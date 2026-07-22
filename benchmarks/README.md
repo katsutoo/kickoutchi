@@ -49,6 +49,22 @@ wildcard addresses. Exit `0` and aggregate unavailable exit `3` are both valid;
 the harness parses one result before sampling and requires exactly eight
 endpoints with an aggregate field matching the process status.
 
+Collect the complete within-scope snapshot workload with:
+
+```sh
+python benchmarks/collect-watch-samples.py target/dist/kick 30 3 snapshot \
+  benchmarks/snapshot-complete-2026-07-22.tsv
+python benchmarks/summarize-list-samples.py \
+  benchmarks/snapshot-complete-2026-07-22.tsv
+python benchmarks/measure-linux-peak-rss.py target/dist/kick 10 snapshot \
+  benchmarks/snapshot-complete-rss-2026-07-22.tsv
+```
+
+The harness parses one release-binary result before sampling and requires the
+`kickoutchi.snapshot/1` schema/version pair. The workload includes native
+collection, canonical index construction, and streamed serialization to a
+discarded stdout consumer.
+
 The latency script records one bounded child-process invocation per row with its
 nanosecond duration and exit status. It writes environment, source, patch, and
 artifact identifiers as comment lines. It also writes an applyable
@@ -61,8 +77,8 @@ on blank context lines; verify or apply it with `git apply --unidiff-zero` from
 the recorded source commit.
 
 The collect-watch grammar is `BINARY [SAMPLES [WARMUPS [WORKLOAD [OUTPUT]]]]`,
-where `WORKLOAD` is exactly `watch` or `why`. Supplying an output therefore also
-requires an explicit workload. Collect-list follows the same tracked and
+where `WORKLOAD` is exactly `watch`, `why`, or `snapshot`. Supplying an output
+therefore also requires an explicit workload. Collect-list follows the same tracked and
 untracked companion-patch provenance policy. All latency and RSS producers
 publish completed files with exclusive creation and refuse existing TSV or
 companion-patch paths; choose a new evidence name rather than replacing one.

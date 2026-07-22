@@ -1,23 +1,26 @@
 use std::io::{self, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use clap::Args;
-use serde::Serialize;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 
 use crate::collector::{self, CollectorError};
 use crate::config::Config;
-use crate::diagnostic::verdict::{Evidence, Verdict, VerdictResult, WHY_ENDPOINTS_MAX, analyze};
+use crate::diagnostic::verdict::{Verdict, VerdictResult, WHY_ENDPOINTS_MAX, analyze};
 use crate::display::{sanitize, sanitize_bounded};
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
 use crate::model::Protocol;
-use crate::observation::{
-    EndpointIdentity, EvidenceGap, EvidenceImpact, Ipv6Scope, MetadataProfile, NetworkSnapshot,
-    ObservationError, ObservationScope, ObservationScopeKind, OwnerCompleteness, ScopeLimitation,
-    SnapshotCompleteness,
-};
+use crate::observation::{EndpointIdentity, Ipv6Scope, MetadataProfile, NetworkSnapshot};
 use crate::probe::{Ipv6Mode, ProbeRequest, ProbeResult, ReuseAddressMode, probe};
+use crate::public_output::{
+    CaptureDto, EndpointDto, EvidenceDto, EvidenceGapDto, PublicOutputError, ScopeDto,
+    certainty_name, evidence_code_name, evidence_gap_code_name, evidence_impact_name,
+    evidence_source_name, owner_completeness_name, protocol_name, scope_kind_name,
+    scope_limitation_name, snapshot_completeness_name,
+};
 
 use super::ExitReason;
 
@@ -26,10 +29,10 @@ const PUBLIC_MESSAGE_MAX_BYTES: usize = 512;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 pub(crate) struct WhyArgs {
-    /// Port to diagnose.
+    /// Port to diagnose (1..=65535).
     pub(crate) port: u32,
 
-    /// Evaluate TCP endpoints only (the default).
+    /// Evaluate TCP only (default; ordered before UDP in a matrix).
     #[arg(long, conflicts_with_all = ["udp", "all_protocols"])]
     pub(crate) tcp: bool,
 
@@ -37,27 +40,27 @@ pub(crate) struct WhyArgs {
     #[arg(long, conflicts_with_all = ["tcp", "all_protocols"])]
     pub(crate) udp: bool,
 
-    /// Evaluate both TCP and UDP endpoints.
+    /// Evaluate TCP then UDP endpoints.
     #[arg(long, conflicts_with_all = ["tcp", "udp"])]
     pub(crate) all_protocols: bool,
 
-    /// Evaluate one literal local IP address.
+    /// Evaluate one literal local IP address (no `%zone`; use --scope-id).
     #[arg(long, value_name = "ADDRESS", conflicts_with = "all_addresses")]
     pub(crate) address: Option<String>,
 
-    /// Evaluate loopback and wildcard addresses for IPv4 and IPv6.
+    /// Use `127.0.0.1`, `0.0.0.0`, `::1`, then `::`; do not enumerate interfaces.
     #[arg(long, conflicts_with = "address")]
     pub(crate) all_addresses: bool,
 
-    /// IPv6 interface index for one explicit IPv6 address.
+    /// Nonzero IPv6 interface index; requires one explicit IPv6 --address.
     #[arg(long, value_name = "ID")]
     pub(crate) scope_id: Option<u32>,
 
-    /// Require IPv6-only wildcard behavior.
+    /// Require IPv6-only behavior; valid only when every address is IPv6.
     #[arg(long, conflicts_with = "dual_stack")]
     pub(crate) ipv6_only: bool,
 
-    /// Require dual-stack IPv6 wildcard behavior.
+    /// Require dual-stack behavior; valid only when every address is IPv6.
     #[arg(long, conflicts_with = "ipv6_only")]
     pub(crate) dual_stack: bool,
 
@@ -65,7 +68,7 @@ pub(crate) struct WhyArgs {
     #[arg(long)]
     pub(crate) reuse_address: bool,
 
-    /// Print versioned JSON instead of human-readable evidence.
+    /// Print one `kickoutchi.why/1` JSON document instead of human evidence.
     #[arg(long)]
     pub(crate) json: bool,
 }
@@ -91,8 +94,7 @@ struct RequestedEndpoint {
 #[derive(Debug)]
 struct TimedProbe {
     result: ProbeResult,
-    started_unix_ms: u64,
-    completed_unix_ms: u64,
+    capture: CaptureDto,
 }
 
 #[derive(Debug)]
@@ -166,8 +168,8 @@ fn run_why_with(
         let started = runtime.now();
         let result = runtime.probe(endpoint.probe_request);
         let finished = runtime.now();
-        let (started_unix_ms, completed_unix_ms) = match wall_interval(started, finished) {
-            Ok(interval) => interval,
+        let capture = match CaptureDto::new(started, finished) {
+            Ok(capture) => capture,
             Err(error) => {
                 write_diagnostic(
                     diagnostics,
@@ -185,11 +187,7 @@ fn run_why_with(
                 &result,
                 label,
             ),
-            probe: TimedProbe {
-                result,
-                started_unix_ms,
-                completed_unix_ms,
-            },
+            probe: TimedProbe { result, capture },
         });
     }
 
@@ -348,24 +346,6 @@ fn aggregate_exit(verdicts: impl IntoIterator<Item = Verdict>) -> ExitReason {
     aggregate
 }
 
-fn wall_interval(
-    started: SystemTime,
-    completed: SystemTime,
-) -> Result<(u64, u64), ObservationError> {
-    completed
-        .duration_since(started)
-        .map_err(|_| ObservationError::InvalidWallClockInterval)?;
-    Ok((unix_milliseconds(started)?, unix_milliseconds(completed)?))
-}
-
-fn unix_milliseconds(time: SystemTime) -> Result<u64, ObservationError> {
-    let milliseconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ObservationError::ClockUnavailable)?
-        .as_millis();
-    u64::try_from(milliseconds).map_err(|_| ObservationError::ClockUnavailable)
-}
-
 fn render_document(
     output: &mut impl Write,
     options: &WhyOptions,
@@ -386,20 +366,16 @@ fn render_json(
     results: &[CompletedResult],
 ) -> Result<(), OutputError> {
     let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
-    let (started_unix_ms, completed_unix_ms) =
-        wall_interval(snapshot.capture_started_at, snapshot.capture_completed_at)?;
+    let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
     let dto = WhyDto {
         schema: "kickoutchi.why",
         version: 1,
         query: QueryDto::from(options),
-        capture: CaptureDto {
-            started_unix_ms,
-            completed_unix_ms,
-        },
-        scope: scope_dto(&snapshot.scope),
-        completeness: completeness_name(snapshot.completeness),
+        capture,
+        scope: ScopeDto::new(&snapshot.scope)?,
+        completeness: snapshot_completeness_name(snapshot.completeness),
         owner_completeness: owner_completeness_name(&snapshot.owner_completeness),
-        results: results.iter().map(result_dto).collect(),
+        results: ResultSequence(results),
         aggregate_exit_code: aggregate as u8,
     };
     serde_json::to_writer_pretty(&mut *output, &dto).map_err(OutputError::Serialization)?;
@@ -412,8 +388,7 @@ fn render_human(
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
 ) -> Result<(), OutputError> {
-    let (capture_started_unix_ms, capture_completed_unix_ms) =
-        wall_interval(snapshot.capture_started_at, snapshot.capture_completed_at)?;
+    let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
     let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
     writeln!(
         &mut *output,
@@ -436,10 +411,10 @@ fn render_human(
             .map_or_else(|| "-".to_owned(), |value| value.to_string()),
         ipv6_mode_name(options.ipv6_mode),
         options.reuse_address == ReuseAddressMode::Enabled,
-        completeness_name(snapshot.completeness),
+        snapshot_completeness_name(snapshot.completeness),
         owner_completeness_name(&snapshot.owner_completeness),
-        capture_started_unix_ms,
-        capture_completed_unix_ms,
+        capture.started_unix_ms(),
+        capture.completed_unix_ms(),
     )?;
     writeln!(
         &mut *output,
@@ -475,7 +450,7 @@ fn render_human_result(
         "{} verdict={} certainty={} label={}",
         endpoint_text(&result.verdict.endpoint),
         result.verdict.verdict.name(),
-        result.verdict.certainty.name(),
+        certainty_name(result.verdict.certainty),
         result
             .verdict
             .label
@@ -490,8 +465,8 @@ fn render_human_result(
         output,
         "  probe={} started_unix_ms={} completed_unix_ms={} raw_os_error={} message={}",
         probe_outcome_name(result.probe.result.outcome),
-        result.probe.started_unix_ms,
-        result.probe.completed_unix_ms,
+        result.probe.capture.started_unix_ms(),
+        result.probe.capture.completed_unix_ms(),
         result
             .probe
             .result
@@ -503,9 +478,9 @@ fn render_human_result(
         writeln!(
             output,
             "  evidence code={} source={} certainty={} message={}",
-            item.code.name(),
-            item.source.name(),
-            item.certainty.name(),
+            evidence_code_name(item.code),
+            evidence_source_name(item.source),
+            certainty_name(item.certainty),
             sanitize_bounded(&item.message, PUBLIC_MESSAGE_MAX_BYTES),
         )?;
     }
@@ -518,8 +493,8 @@ fn render_human_result(
         writeln!(
             output,
             "  gap code={} impact={} endpoint={} pid={} message={}",
-            gap.code.name(),
-            impact_name(gap.impact),
+            evidence_gap_code_name(gap.code),
+            evidence_impact_name(gap.impact),
             gap.endpoint
                 .as_ref()
                 .map_or_else(|| "-".to_owned(), endpoint_text),
@@ -537,22 +512,37 @@ fn render_human_result(
 }
 
 #[derive(Serialize)]
-struct WhyDto {
+struct WhyDto<'a> {
     schema: &'static str,
     version: u32,
     query: QueryDto,
     capture: CaptureDto,
-    scope: ScopeDto,
+    scope: ScopeDto<'a>,
     completeness: &'static str,
     owner_completeness: &'static str,
-    results: Vec<ResultDto>,
+    results: ResultSequence<'a>,
     aggregate_exit_code: u8,
+}
+
+struct ResultSequence<'a>(&'a [CompletedResult]);
+
+impl Serialize for ResultSequence<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for result in self.0 {
+            sequence.serialize_element(&result_dto(result))?;
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Serialize)]
 struct QueryDto {
     port: u16,
-    protocols: Vec<Protocol>,
+    protocols: Vec<&'static str>,
     addresses: Vec<String>,
     scope_id: Option<u32>,
     ipv6_mode: &'static str,
@@ -563,7 +553,12 @@ impl From<&WhyOptions> for QueryDto {
     fn from(options: &WhyOptions) -> Self {
         Self {
             port: options.port,
-            protocols: options.protocols.clone(),
+            protocols: options
+                .protocols
+                .iter()
+                .copied()
+                .map(protocol_name)
+                .collect(),
             addresses: options.addresses.iter().map(ToString::to_string).collect(),
             scope_id: options.scope_id.map(NonZeroU32::get),
             ipv6_mode: ipv6_mode_name(options.ipv6_mode),
@@ -573,28 +568,15 @@ impl From<&WhyOptions> for QueryDto {
 }
 
 #[derive(Serialize)]
-struct CaptureDto {
-    started_unix_ms: u64,
-    completed_unix_ms: u64,
-}
-
-#[derive(Serialize)]
-struct ScopeDto {
-    kind: &'static str,
-    identifier: Option<String>,
-    limitations: Vec<&'static str>,
-}
-
-#[derive(Serialize)]
-struct ResultDto {
-    endpoint: EndpointDto,
+struct ResultDto<'a> {
+    endpoint: EndpointDto<'a>,
     label: Option<String>,
     verdict: &'static str,
     certainty: &'static str,
     probe: ProbeDto,
-    evidence: Vec<EvidenceDto>,
+    evidence: Vec<EvidenceDto<'a>>,
     omitted_evidence_count: u64,
-    evidence_gaps: Vec<EvidenceGapDto>,
+    evidence_gaps: Vec<EvidenceGapDto<'a>>,
     omitted_evidence_gap_count: u64,
 }
 
@@ -607,51 +589,20 @@ struct ProbeDto {
     message: Option<String>,
 }
 
-#[derive(Serialize)]
-struct EndpointDto {
-    protocol: Protocol,
-    address: String,
-    port: u16,
-    ipv6_scope: Option<Ipv6ScopeDto>,
-}
-
-#[derive(Serialize)]
-struct Ipv6ScopeDto {
-    kind: &'static str,
-    interface_index: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct EvidenceDto {
-    code: &'static str,
-    source: &'static str,
-    certainty: &'static str,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct EvidenceGapDto {
-    code: &'static str,
-    impact: &'static str,
-    endpoint: Option<EndpointDto>,
-    pid: Option<u32>,
-    message: String,
-}
-
-fn result_dto(result: &CompletedResult) -> ResultDto {
+fn result_dto(result: &CompletedResult) -> ResultDto<'_> {
     ResultDto {
-        endpoint: endpoint_dto(&result.verdict.endpoint),
+        endpoint: EndpointDto::from(&result.verdict.endpoint),
         label: result
             .verdict
             .label
             .as_deref()
             .map(|label| sanitize_bounded(label, PUBLIC_MESSAGE_MAX_BYTES)),
         verdict: result.verdict.verdict.name(),
-        certainty: result.verdict.certainty.name(),
+        certainty: certainty_name(result.verdict.certainty),
         probe: ProbeDto {
             outcome: probe_outcome_name(result.probe.result.outcome),
-            started_unix_ms: result.probe.started_unix_ms,
-            completed_unix_ms: result.probe.completed_unix_ms,
+            started_unix_ms: result.probe.capture.started_unix_ms(),
+            completed_unix_ms: result.probe.capture.completed_unix_ms(),
             raw_os_error: result.probe.result.raw_os_error,
             message: result
                 .probe
@@ -660,72 +611,20 @@ fn result_dto(result: &CompletedResult) -> ResultDto {
                 .as_deref()
                 .map(|message| sanitize_bounded(message, PUBLIC_MESSAGE_MAX_BYTES)),
         },
-        evidence: result.verdict.evidence.iter().map(evidence_dto).collect(),
+        evidence: result
+            .verdict
+            .evidence
+            .iter()
+            .map(EvidenceDto::from)
+            .collect(),
         omitted_evidence_count: result.verdict.omitted_evidence_count,
         evidence_gaps: result
             .verdict
             .evidence_gaps
             .iter()
-            .map(evidence_gap_dto)
+            .map(EvidenceGapDto::from)
             .collect(),
         omitted_evidence_gap_count: result.verdict.omitted_evidence_gap_count,
-    }
-}
-
-fn endpoint_dto(endpoint: &EndpointIdentity) -> EndpointDto {
-    EndpointDto {
-        protocol: endpoint.protocol,
-        address: normalize_ip_address(endpoint.address).to_string(),
-        port: endpoint.port.get(),
-        ipv6_scope: endpoint.ipv6_scope.map(|scope| match scope {
-            Ipv6Scope::Unscoped => Ipv6ScopeDto {
-                kind: "unscoped",
-                interface_index: None,
-            },
-            Ipv6Scope::InterfaceIndex(index) => Ipv6ScopeDto {
-                kind: "interface_index",
-                interface_index: Some(index.get()),
-            },
-            Ipv6Scope::Unavailable => Ipv6ScopeDto {
-                kind: "unavailable",
-                interface_index: None,
-            },
-        }),
-    }
-}
-
-fn evidence_dto(evidence: &Evidence) -> EvidenceDto {
-    EvidenceDto {
-        code: evidence.code.name(),
-        source: evidence.source.name(),
-        certainty: evidence.certainty.name(),
-        message: sanitize_bounded(&evidence.message, PUBLIC_MESSAGE_MAX_BYTES),
-    }
-}
-
-fn evidence_gap_dto(gap: &EvidenceGap) -> EvidenceGapDto {
-    EvidenceGapDto {
-        code: gap.code.name(),
-        impact: impact_name(gap.impact),
-        endpoint: gap.endpoint.as_ref().map(endpoint_dto),
-        pid: gap.pid,
-        message: sanitize_bounded(gap.message(), PUBLIC_MESSAGE_MAX_BYTES),
-    }
-}
-
-fn scope_dto(scope: &ObservationScope) -> ScopeDto {
-    ScopeDto {
-        kind: scope_kind_name(scope.kind),
-        identifier: scope
-            .identifier
-            .as_deref()
-            .map(|identifier| sanitize_bounded(identifier, PUBLIC_MESSAGE_MAX_BYTES)),
-        limitations: scope
-            .limitations
-            .iter()
-            .copied()
-            .map(scope_limitation_name)
-            .collect(),
     }
 }
 
@@ -733,25 +632,25 @@ fn endpoint_text(endpoint: &EndpointIdentity) -> String {
     match (endpoint.address, endpoint.ipv6_scope) {
         (IpAddr::V4(address), None) => format!(
             "{}://{address}:{}",
-            endpoint.protocol.label().to_lowercase(),
+            protocol_name(endpoint.protocol),
             endpoint.port
         ),
         (IpAddr::V6(address), Some(Ipv6Scope::Unscoped)) => {
             format!(
                 "{}://[{address}]:{}",
-                endpoint.protocol.label().to_lowercase(),
+                protocol_name(endpoint.protocol),
                 endpoint.port
             )
         }
         (IpAddr::V6(address), Some(Ipv6Scope::InterfaceIndex(index))) => format!(
             "{}://[{address}%{}]:{}",
-            endpoint.protocol.label().to_lowercase(),
+            protocol_name(endpoint.protocol),
             index,
             endpoint.port
         ),
         (IpAddr::V6(address), Some(Ipv6Scope::Unavailable)) => format!(
             "{}://[{address}%unavailable]:{}",
-            endpoint.protocol.label().to_lowercase(),
+            protocol_name(endpoint.protocol),
             endpoint.port
         ),
         _ => unreachable!("validated endpoint address and scope agree"),
@@ -777,63 +676,11 @@ const fn ipv6_mode_name(mode: Ipv6Mode) -> &'static str {
     }
 }
 
-const fn completeness_name(completeness: SnapshotCompleteness) -> &'static str {
-    match completeness {
-        SnapshotCompleteness::Complete => "complete",
-        SnapshotCompleteness::Partial => "partial",
-        SnapshotCompleteness::Raced => "raced",
-    }
-}
-
-const fn owner_completeness_name(completeness: &OwnerCompleteness) -> &'static str {
-    match completeness {
-        OwnerCompleteness::Complete => "complete",
-        OwnerCompleteness::Partial { .. } => "partial",
-        OwnerCompleteness::Raced => "raced",
-    }
-}
-
-const fn scope_kind_name(kind: ObservationScopeKind) -> &'static str {
-    match kind {
-        ObservationScopeKind::CurrentNetworkNamespace => "current_network_namespace",
-        ObservationScopeKind::CurrentHostProcessVisibleSockets => {
-            "current_host_process_visible_sockets"
-        }
-        ObservationScopeKind::CurrentHostNetworkStack => "current_host_network_stack",
-    }
-}
-
-const fn scope_limitation_name(limitation: ScopeLimitation) -> &'static str {
-    match limitation {
-        ScopeLimitation::OtherNetworkNamespacesExcluded => "other_network_namespaces_excluded",
-        ScopeLimitation::ProcessFirstSocketVisibilityLimited => {
-            "process_first_socket_visibility_limited"
-        }
-        ScopeLimitation::WslNetworkStackExcluded => "wsl_network_stack_excluded",
-        ScopeLimitation::ProcessMetadataPermissionLimited => "process_metadata_permission_limited",
-        ScopeLimitation::Ipv6ScopeUnavailable => "ipv6_scope_unavailable",
-        ScopeLimitation::ScopedIpv6ExactMatchingUnavailable => {
-            "scoped_ipv6_exact_matching_unavailable"
-        }
-        ScopeLimitation::NativeFieldUnavailable => "native_field_unavailable",
-        ScopeLimitation::PollingIntervalBlindSpot => "polling_interval_blind_spot",
-    }
-}
-
-const fn impact_name(impact: EvidenceImpact) -> &'static str {
-    match impact {
-        EvidenceImpact::SocketSet => "socket_set",
-        EvidenceImpact::Ownership => "ownership",
-        EvidenceImpact::Metadata => "metadata",
-        EvidenceImpact::Scope => "scope",
-    }
-}
-
 #[derive(Debug)]
 enum OutputError {
     Io(io::Error),
     Serialization(serde_json::Error),
-    Clock(ObservationError),
+    Public(PublicOutputError),
 }
 
 impl OutputError {
@@ -841,7 +688,7 @@ impl OutputError {
         match self {
             Self::Io(error) => Some(error.kind()),
             Self::Serialization(error) => error.io_error_kind(),
-            Self::Clock(_) => None,
+            Self::Public(error) => error.io_error_kind(),
         }
     }
 }
@@ -851,7 +698,7 @@ impl std::fmt::Display for OutputError {
         match self {
             Self::Io(error) => error.fmt(formatter),
             Self::Serialization(error) => error.fmt(formatter),
-            Self::Clock(error) => error.fmt(formatter),
+            Self::Public(error) => error.fmt(formatter),
         }
     }
 }
@@ -862,9 +709,9 @@ impl From<io::Error> for OutputError {
     }
 }
 
-impl From<ObservationError> for OutputError {
-    fn from(error: ObservationError) -> Self {
-        Self::Clock(error)
+impl From<PublicOutputError> for OutputError {
+    fn from(error: PublicOutputError) -> Self {
+        Self::Public(error)
     }
 }
 
@@ -881,11 +728,15 @@ fn write_diagnostic(writer: &mut impl Write, message: &str) {
 mod tests {
     use std::collections::HashMap;
     use std::io;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
+    use crate::diagnostic::verdict::Evidence;
     use crate::labels::{LabelInput, LabelRegistry};
-    use crate::observation::{EvidenceGapCode, ObservationScope, ObservationScopeKind};
+    use crate::observation::{
+        EvidenceGap, EvidenceGapCode, EvidenceImpact, ObservationScope, ObservationScopeKind,
+        OwnerCompleteness, ScopeLimitation, SnapshotCompleteness,
+    };
     use crate::probe::ProbeOutcome;
 
     fn args() -> WhyArgs {
@@ -1394,8 +1245,11 @@ mod tests {
                         raw_os_error: None,
                         os_error_message: Some(quote_heavy.clone().into_boxed_str()),
                     },
-                    started_unix_ms: 20_001,
-                    completed_unix_ms: 20_002,
+                    capture: CaptureDto::new(
+                        UNIX_EPOCH + Duration::from_millis(20_001),
+                        UNIX_EPOCH + Duration::from_millis(20_002),
+                    )
+                    .expect("test probe interval is valid"),
                 },
             })
             .collect::<Vec<_>>();
@@ -1766,8 +1620,11 @@ mod tests {
                     raw_os_error: None,
                     os_error_message: Some("a".repeat(513).into_boxed_str()),
                 },
-                started_unix_ms: 20_001,
-                completed_unix_ms: 20_002,
+                capture: CaptureDto::new(
+                    UNIX_EPOCH + Duration::from_millis(20_001),
+                    UNIX_EPOCH + Duration::from_millis(20_002),
+                )
+                .expect("test probe interval is valid"),
             },
         }];
         options.json = true;

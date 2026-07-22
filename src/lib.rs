@@ -30,6 +30,7 @@ mod probe;
 mod process;
 mod process_evidence;
 mod protection;
+mod public_output;
 mod query;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
@@ -48,7 +49,7 @@ use clap::error::ErrorKind as ClapErrorKind;
 
 use crate::cli::{Cli, Command, ExitReason, WatchSignalGuard};
 use crate::config::Config;
-use crate::display::sanitize_multiline;
+use crate::display::{sanitize, sanitize_multiline};
 
 /// Run Kickoutchi and hand back the process exit code.
 ///
@@ -60,15 +61,16 @@ pub fn run() -> ExitCode {
     let args = match Cli::try_parse() {
         Ok(args) => args,
         Err(error) => {
-            let rendered = sanitize_multiline(&error.to_string());
             if matches!(
                 error.kind(),
                 ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
             ) {
+                let rendered = sanitize_multiline(&error.to_string());
                 print!("{rendered}");
                 return ExitReason::Success.into();
             }
-            eprint!("{rendered}");
+            let rendered = sanitize(&error.to_string());
+            eprintln!("{}", rendered.trim_end());
             return ExitReason::InvalidArguments.into();
         }
     };
@@ -91,7 +93,7 @@ pub fn run() -> ExitCode {
     let mut config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: {}", sanitize_multiline(&error.to_string()));
+            eprintln!("error: {}", sanitize(&error.to_string()));
             return ExitReason::Failure.into();
         }
     };

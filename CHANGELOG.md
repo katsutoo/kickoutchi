@@ -7,24 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Named endpoints, `watch`, and `why` are planned to ship together in the atomic
-`1.3.0` release rather than as separately released partial features.
-
 ### Added
 
-- A reviewed implementation contract and dependency record for the `1.3.0` release,
-  covering the shared observation model, serialized schemas, platform evidence,
-  resource limits, threat model, and boundary-test plan for named endpoints,
-  `watch`, and `why`.
+- `list --snapshot-json`, which emits one versioned `kickoutchi.snapshot/1`
+  document containing the bounded full-state native socket observation,
+  declared scope, completeness, owner attribution, process identities and
+  metadata, evidence gaps, and configured labels. Unlike legacy `list --json`,
+  snapshot mode bypasses list filters, sorting, and system-row hiding and does
+  not serialize complete process command lines.
+- Shared additive serialized contracts for endpoint labels, snapshots,
+  `kickoutchi.watch_event/1` NDJSON, and `kickoutchi.why/1` documents, including
+  bounded reusable endpoint, owner, process-identity, scope, evidence, gap,
+  certainty, and operational-code shapes. The existing `kickoutchi.list/1`
+  top-level array remains the compatibility interface and adds only its nullable
+  `label` field.
 - Native dependency contract tests for the approved socket lifecycle across TCP,
   UDP, IPv4, IPv6, wildcard, reuse-address, IPv6-only, and dual-stack modes,
   including immediate close and exact endpoint rebinding.
-- Validated endpoint labels configured through exact or wildcard `[[ports]]`
-  selectors. Labels appear in CLI and sufficiently wide TUI tables, plain
-  search, `label:` filters, and the additive nullable `label` field in
-  `kickoutchi.list/1` JSON.
-- Shared normalized `address:`, numeric `scope_id:`, and `family:ipv4|ipv6`
-  filters for endpoint-aware list and TUI queries.
+- Validated endpoint labels configured through exact literal-address or wildcard
+  `[[ports]]` selectors, with exact-before-wildcard resolution and bounded safe
+  Unicode labels. Labels appear in CLI and sufficiently wide TUI tables, list,
+  snapshot, watch, and Why output, plain search, and `label:` filters.
+- Shared AND-composed plain and structured filters across list, TUI, and watch,
+  including normalized `address:`, numeric `scope_id:`, `family:ipv4|ipv6`, and
+  label matching. Watch additionally supports the complete native `state:`
+  vocabulary and uncertainty-preserving indeterminate matches.
 - A bounded `watch` command that emits deterministic baseline, bind, release,
   replacement, and collection-gap events from full-state native socket snapshots.
   It supports human output or versioned `kickoutchi.watch_event/1` NDJSON,
@@ -40,7 +47,8 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
   snapshot and sequential bind probes. Human and versioned `kickoutchi.why/1`
   JSON output report deterministic verdicts, certainty, labels, evidence,
   evidence gaps, omitted counts, and aggregate exit status without collecting
-  full process command lines.
+  full process command lines. Why does not request Docker enrichment or spawn a
+  Docker process.
 
 ### Changed
 
@@ -83,6 +91,12 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 - Endpoint selector matching now canonicalizes IPv4-mapped IPv6 addresses,
   preserves numeric IPv6 scope identity, applies exact matches before wildcard
   matches, and rejects unsafe Unicode before any terminal rendering.
+- Structured snapshots and diagnostics now state permanent platform and timing
+  limits instead of treating in-scope completeness as machine-wide visibility:
+  Linux excludes other network namespaces and can have PID/procfs ownership
+  gaps, native Windows excludes the WSL network stack, macOS is process-first,
+  watch polling can miss transient activity, and Why's temporary bind and later
+  close cannot reserve an endpoint or eliminate the post-probe race.
 
 ### Fixed
 
