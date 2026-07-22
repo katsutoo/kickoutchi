@@ -40,6 +40,13 @@ struct RefreshWorker {
     stale: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PendingRefresh {
+    #[default]
+    None,
+    PostKill,
+}
+
 #[derive(Debug)]
 struct ContextWorker {
     key: RowKey,
@@ -231,6 +238,7 @@ pub(crate) struct App {
     tree_preview_worker: Option<TreePreviewWorker>,
     kill_status: Option<String>,
     refresh_worker: Option<RefreshWorker>,
+    pending_refresh: PendingRefresh,
     last_successful_refresh: Option<Instant>,
     last_refresh_attempt: Instant,
     modal: Modal,
@@ -297,6 +305,7 @@ impl App {
             tree_preview_worker: None,
             kill_status: None,
             refresh_worker: None,
+            pending_refresh: PendingRefresh::None,
             last_successful_refresh: None,
             last_refresh_attempt: now,
             modal: Modal::None,
@@ -346,6 +355,10 @@ impl App {
     }
 
     pub(crate) fn poll_refresh(&mut self) {
+        self.poll_refresh_with(Self::refresh);
+    }
+
+    fn poll_refresh_with(&mut self, start_refresh: impl FnOnce(&mut Self)) {
         let Some(worker) = self.refresh_worker.as_ref() else {
             return;
         };
@@ -360,6 +373,9 @@ impl App {
         self.refresh_worker = None;
         if !stale {
             self.finish_snapshot_refresh_attempt(result, Instant::now());
+        }
+        if std::mem::take(&mut self.pending_refresh) == PendingRefresh::PostKill {
+            start_refresh(self);
         }
     }
 
@@ -1375,10 +1391,24 @@ impl App {
         #[cfg(not(test))]
         {
             let _ = collect_ports;
-            self.refresh();
+            self.queue_post_kill_refresh();
         }
         #[cfg(test)]
-        self.finish_refresh_attempt(collect_ports(), Instant::now());
+        if self.refresh_worker.is_some() {
+            let _ = collect_ports;
+            self.queue_post_kill_refresh();
+        } else {
+            self.finish_refresh_attempt(collect_ports(), Instant::now());
+        }
+    }
+
+    fn queue_post_kill_refresh(&mut self) {
+        if let Some(worker) = self.refresh_worker.as_mut() {
+            worker.stale = true;
+            self.pending_refresh = PendingRefresh::PostKill;
+        } else {
+            self.refresh();
+        }
     }
 
     #[cfg(any(test, target_os = "linux", target_os = "macos"))]
@@ -1875,8 +1905,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        App, ContextRequestState, ContextWorker, Modal, RefreshWorker, RowKey, preserved_selection,
-        termination_status_line,
+        App, ContextRequestState, ContextWorker, Modal, PendingRefresh, RefreshWorker, RowKey,
+        preserved_selection, termination_status_line,
     };
     use crate::config::Config;
     use crate::input::Action;
@@ -2487,11 +2517,8 @@ mod tests {
     #[test]
     fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear() {
         // A background refresh spawned before the kill carries a pre-kill snapshot
-        // (port 3000 still listening). Once the kill's own synchronous refresh
-        // shows the port gone, that stale worker result must not be applied later
-        // and resurrect the freed port. Keeping the in-flight receiver installed
-        // also prevents a manual refresh from starting another worker before the
-        // stale one drains.
+        // (port 3000 still listening). The kill must invalidate it and queue one
+        // replacement rather than applying the stale result later.
         let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
 
         let (stale_sender, stale_receiver) = mpsc::channel();
@@ -2522,12 +2549,13 @@ mod tests {
         );
 
         assert_eq!(kill_collect_calls, 1);
-        assert_eq!(visibility_collect_calls, 1);
-
-        // The kill went through and the freed port is gone.
-        assert_eq!(app.rows().len(), 0);
-        // The pre-kill worker is still the only active worker; a manual refresh
-        // must not replace its receiver before it drains.
+        assert_eq!(visibility_collect_calls, 0);
+        assert!(
+            app.refresh_worker
+                .as_ref()
+                .is_some_and(|worker| worker.stale)
+        );
+        assert_eq!(app.pending_refresh, PendingRefresh::PostKill);
         assert!(app.refresh_in_progress());
         app.apply_action(Action::Refresh);
         stale_sender
@@ -2537,7 +2565,13 @@ mod tests {
             ))
             .expect("stale worker receiver must stay installed");
 
-        app.poll_refresh();
+        let mut fresh_collections = 0;
+        app.poll_refresh_with(|app| {
+            fresh_collections += 1;
+            app.finish_refresh_attempt(Ok(Vec::new()), Instant::now());
+        });
+        assert_eq!(fresh_collections, 1);
+        assert_eq!(app.pending_refresh, PendingRefresh::None);
         assert!(!app.refresh_in_progress());
         assert!(app.rows().all(|row| row.local_port != 3000));
     }

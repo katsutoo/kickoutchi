@@ -68,7 +68,7 @@ pub(crate) fn is_protected_process_name(
     protected_names: &[String],
 ) -> bool {
     protected_names.iter().any(|protected| match platform {
-        Platform::Windows => protected.eq_ignore_ascii_case(process_name),
+        Platform::Windows => windows_process_name_eq(protected, process_name),
         Platform::Linux => {
             protected == process_name
                 || (protected.len() > LINUX_COMM_MAX_BYTES
@@ -76,6 +76,24 @@ pub(crate) fn is_protected_process_name(
         }
         Platform::Macos => protected == process_name,
     })
+}
+
+pub(crate) fn windows_process_name_eq(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        return left.eq_ignore_ascii_case(right);
+    }
+
+    #[cfg(any(windows, test))]
+    {
+        left.chars()
+            .flat_map(char::to_uppercase)
+            .eq(right.chars().flat_map(char::to_uppercase))
+    }
+
+    // A Windows row cannot exist in a non-Windows production collector. Keep
+    // the synthetic branch small while native Windows uses Unicode casing.
+    #[cfg(all(not(windows), not(test)))]
+    left.eq_ignore_ascii_case(right)
 }
 
 fn linux_comm_prefix(name: &str) -> &str {
@@ -178,7 +196,7 @@ mod tests {
 
     #[test]
     fn windows_matching_is_exact_but_case_insensitive() {
-        let protected = vec!["explorer.exe".to_owned()];
+        let protected = vec!["explorer.exe".to_owned(), "äpp.exe".to_owned()];
 
         assert!(is_protected_process_name(
             Platform::Windows,
@@ -188,6 +206,16 @@ mod tests {
         assert!(!is_protected_process_name(
             Platform::Windows,
             "explorer.exe.old",
+            &protected
+        ));
+        assert!(is_protected_process_name(
+            Platform::Windows,
+            "ÄPP.EXE",
+            &protected
+        ));
+        assert!(!is_protected_process_name(
+            Platform::Windows,
+            "ÄPP.EXE.OLD",
             &protected
         ));
     }

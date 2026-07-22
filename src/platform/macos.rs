@@ -146,7 +146,9 @@ impl MacosCollector {
             let (records, pid_losses) = match scan_process(pid, &mut aggregate_fd_entries) {
                 Ok(scan) => scan,
                 Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
-                    return Err(crate::observation::ObservationError::NativeDataOversized.into());
+                    return Err(
+                        crate::observation::ObservationError::OwnerAttributionLimitExceeded.into(),
+                    );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
                     return Err(platform_error(
@@ -2975,11 +2977,11 @@ mod tests {
             || Ok(vec![42]),
             |_, _| Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge)),
         )
-        .expect_err("aggregate FD exhaustion is a native-data limit failure");
+        .expect_err("aggregate FD exhaustion is an owner-attribution limit failure");
         assert!(matches!(
             oversized,
             crate::collector::CollectorError::Observation(
-                crate::observation::ObservationError::NativeDataOversized
+                crate::observation::ObservationError::OwnerAttributionLimitExceeded
             )
         ));
 

@@ -21,14 +21,14 @@ use crate::model::{
     ChildProcess, ChildProcessSnapshot, ProcessContext, Protocol, RelatedProcessHint,
 };
 use crate::observation::{
-    CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EndpointIdentity, EvidenceGap,
-    EvidenceGapCode, EvidenceImpact, FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness,
-    MetadataOmission, MetadataProfile, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation,
-    NetworkSnapshot, OWNER_EDGES_MAX, ObservationScope, ObservationScopeKind, OwnerAssociations,
-    OwnerCompleteness, PROCESS_NAME_MAX_BYTES, PlatformSocketToken, ProcessIdentity,
-    ProcessObservation, ProcessRead, ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES,
-    ScopeLimitation, SnapshotCompleteness, SocketState as ObservationSocketState,
-    TcpTimerObservation, UnverifiedOwnerReason,
+    CANDIDATE_PROCESS_IDS_MAX, EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact,
+    FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness, MetadataOmission,
+    MetadataProfile, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation, NetworkSnapshot,
+    OWNER_EDGES_MAX, ObservationScope, ObservationScopeKind, OwnerAssociations, OwnerCompleteness,
+    PROCESS_NAME_MAX_BYTES, PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessRead,
+    ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES, SOCKET_OBSERVATIONS_MAX, ScopeLimitation,
+    SnapshotCompleteness, SocketState as ObservationSocketState, TcpTimerObservation,
+    UnverifiedOwnerReason,
 };
 use crate::process::{
     TreeDeliveryHandle, tree_cont, tree_cont_handle, tree_deliver_handle,
@@ -82,14 +82,14 @@ pub(crate) struct LinuxCollector {
 struct CollectionLimits {
     process_ids: usize,
     fd_entries: usize,
-    port_entries: usize,
+    socket_observations: usize,
 }
 
 impl CollectionLimits {
     const PRODUCTION: Self = Self {
         process_ids: CANDIDATE_PROCESS_IDS_MAX,
         fd_entries: FILE_DESCRIPTOR_ENTRIES_MAX,
-        port_entries: DERIVED_PORT_ENTRIES_MAX,
+        socket_observations: SOCKET_OBSERVATIONS_MAX,
     };
 }
 
@@ -213,7 +213,8 @@ impl LinuxCollector {
     fn collect_native_pass(
         &self,
     ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
-        let records = collect_socket_records_bounded(&self.proc_root, self.limits.port_entries)?;
+        let records =
+            collect_socket_records_bounded(&self.proc_root, self.limits.socket_observations)?;
         let target_inodes: HashSet<u64> = records.iter().map(|record| record.inode).collect();
         let owner_scan = collect_socket_owners_detailed(
             &self.proc_root,
@@ -221,26 +222,6 @@ impl LinuxCollector {
             self.limits.process_ids,
             self.limits.fd_entries,
         )?;
-        let projected_rows = records
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.state,
-                    ObservationSocketState::Listen | ObservationSocketState::Bound
-                )
-            })
-            .try_fold(0usize, |count, record| {
-                count.checked_add(
-                    owner_scan
-                        .owners
-                        .get(&record.inode)
-                        .map_or(1, |owners| owners.len().max(1)),
-                )
-            });
-        if projected_rows.is_none_or(|count| count > self.limits.port_entries) {
-            return Err(crate::observation::ObservationError::LegacyProjectionLimitExceeded.into());
-        }
-
         native_pass_from_records(&records, owner_scan)
     }
 
@@ -270,11 +251,11 @@ impl LinuxCollector {
         let stat_path = process_dir.join("stat");
         let marker = match read_native_process_marker(&stat_path) {
             Ok(marker) => marker,
+            Err(error) if error.kind() == ErrorKind::FileTooLarge => {
+                return Err(crate::observation::ObservationError::NativeDataOversized.into());
+            }
             Err(error) if error.kind() == ErrorKind::InvalidData => {
-                return Err(CollectorError::Read {
-                    path: stat_path,
-                    source: error,
-                });
+                return Err(crate::observation::ObservationError::NativeDataMalformed.into());
             }
             Err(error) => {
                 return Ok(ProcessRead::Unverified(unverified_reason_for_io(&error)));
@@ -303,11 +284,11 @@ impl LinuxCollector {
         };
         let marker_after = match read_native_process_marker(&stat_path) {
             Ok(marker) => marker,
+            Err(error) if error.kind() == ErrorKind::FileTooLarge => {
+                return Err(crate::observation::ObservationError::NativeDataOversized.into());
+            }
             Err(error) if error.kind() == ErrorKind::InvalidData => {
-                return Err(CollectorError::Read {
-                    path: stat_path,
-                    source: error,
-                });
+                return Err(crate::observation::ObservationError::NativeDataMalformed.into());
             }
             Err(error) => {
                 return Ok(ProcessRead::Unverified(unverified_reason_for_io(&error)));
@@ -664,6 +645,14 @@ fn read_bounded_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 }
 
 fn read_bounded_bytes(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    read_bounded_bytes_with_overflow_kind(path, max_bytes, ErrorKind::InvalidData)
+}
+
+fn read_bounded_bytes_with_overflow_kind(
+    path: &Path,
+    max_bytes: usize,
+    overflow_kind: ErrorKind,
+) -> std::io::Result<Vec<u8>> {
     let limit = u64::try_from(max_bytes)
         .expect("/proc read byte limit must fit in u64")
         .saturating_add(1);
@@ -671,7 +660,7 @@ fn read_bounded_bytes(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>>
     File::open(path)?.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
+            overflow_kind,
             format!("file exceeds {max_bytes} byte read limit"),
         ));
     }
@@ -1777,7 +1766,11 @@ fn read_process_status(path: &Path) -> std::io::Result<ProcessStatus> {
 }
 
 fn read_process_start_time_ticks(path: &Path) -> std::io::Result<u64> {
-    parse_process_start_time_ticks(&read_bounded_bytes(path, MAX_STAT_BYTES)?)
+    parse_process_start_time_ticks(&read_bounded_bytes_with_overflow_kind(
+        path,
+        MAX_STAT_BYTES,
+        ErrorKind::FileTooLarge,
+    )?)
 }
 
 fn parse_process_start_time_ticks(bytes: &[u8]) -> std::io::Result<u64> {
@@ -1934,10 +1927,10 @@ mod tests {
     };
     use crate::model::{PermissionStatus, Platform, Protocol};
     use crate::observation::{
-        CANDIDATE_PROCESS_IDS_MAX, DERIVED_PORT_ENTRIES_MAX, EvidenceGapCode, EvidenceImpact,
-        FILE_DESCRIPTOR_ENTRIES_MAX, ObservationError, OwnerCompleteness, PROCESS_NAME_MAX_BYTES,
-        PlatformSocketToken, SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness, SocketState,
-        TcpTimerKind, UnverifiedOwnerReason,
+        CANDIDATE_PROCESS_IDS_MAX, EvidenceGapCode, EvidenceImpact, FILE_DESCRIPTOR_ENTRIES_MAX,
+        ObservationError, OwnerCompleteness, PROCESS_NAME_MAX_BYTES, PlatformSocketToken,
+        SCOPE_IDENTIFIER_MAX_BYTES, SnapshotCompleteness, SocketState, TcpTimerKind,
+        UnverifiedOwnerReason,
     };
 
     #[test]
@@ -3289,22 +3282,55 @@ mod tests {
     }
 
     #[test]
-    fn malformed_identity_stat_fails_the_collection_attempt() {
+    fn malformed_identity_stat_has_the_stable_native_data_code() {
         let proc_root = temp_proc_root("malformed-native-identity");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
         write_process(&proc_root, 42, "worker", 1);
+        std::os::unix::fs::symlink("socket:[44]", proc_root.join("42/fd/0"))
+            .expect("test socket symlink must be created");
         fs::write(proc_root.join("42/stat"), "malformed stat\n")
             .expect("malformed stat fixture must be written");
         let collector = LinuxCollector::with_proc_root(proc_root.clone());
 
-        let error = collector
-            .read_native_process(
-                42,
-                crate::observation::MetadataProfile::Display,
-                crate::observation::OPTIONAL_METADATA_MAX_BYTES,
-            )
-            .expect_err("malformed identity-critical stat must fail");
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect_err("malformed identity-critical stat must fail");
 
-        assert!(error.to_string().contains("42/stat"), "{error}");
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(ObservationError::NativeDataMalformed)
+        ));
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn oversized_identity_stat_has_the_stable_native_data_code() {
+        let proc_root = temp_proc_root("oversized-native-identity");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 42, "worker", 1);
+        std::os::unix::fs::symlink("socket:[44]", proc_root.join("42/fd/0"))
+            .expect("test socket symlink must be created");
+        fs::write(
+            proc_root.join("42/stat"),
+            vec![b'x'; super::MAX_STAT_BYTES + 1],
+        )
+        .expect("oversized stat fixture must be written");
+        let collector = LinuxCollector::with_proc_root(proc_root.clone());
+
+        let error = <LinuxCollector as crate::collector::Collector>::collect(
+            &collector,
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect_err("oversized identity-critical stat must fail");
+
+        assert!(matches!(
+            error,
+            crate::collector::CollectorError::Observation(ObservationError::NativeDataOversized)
+        ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3714,8 +3740,8 @@ mod tests {
     }
 
     #[test]
-    fn collector_enforces_row_budget_through_production_orchestration() {
-        let proc_root = temp_proc_root("collector-row-budget");
+    fn display_collection_does_not_apply_the_legacy_projection_limit() {
+        let proc_root = temp_proc_root("collector-independent-projection-budget");
         write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 44)]);
         write_socket_table(&proc_root, "net/udp", &[]);
         for pid in [100, 101, 102] {
@@ -3726,23 +3752,19 @@ mod tests {
         let collector = LinuxCollector::with_proc_root_and_limits(
             proc_root.clone(),
             CollectionLimits {
-                port_entries: 2,
+                socket_observations: 2,
                 ..CollectionLimits::PRODUCTION
             },
         );
 
-        let error = <LinuxCollector as crate::collector::Collector>::collect(
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
             &collector,
-            crate::observation::MetadataProfile::LegacyList,
+            crate::observation::MetadataProfile::Display,
         )
-        .expect_err("collector must enforce row cap");
+        .expect("full-state collection must not enforce a legacy projection limit");
 
-        assert!(matches!(
-            error,
-            crate::collector::CollectorError::Observation(
-                ObservationError::LegacyProjectionLimitExceeded
-            )
-        ));
+        assert_eq!(snapshot.sockets.len(), 1);
+        assert_eq!(snapshot.sockets[0].owners.len(), 3);
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
@@ -3788,8 +3810,8 @@ mod tests {
             FILE_DESCRIPTOR_ENTRIES_MAX
         );
         assert_eq!(
-            CollectionLimits::PRODUCTION.port_entries,
-            DERIVED_PORT_ENTRIES_MAX
+            CollectionLimits::PRODUCTION.socket_observations,
+            crate::observation::SOCKET_OBSERVATIONS_MAX
         );
     }
 }

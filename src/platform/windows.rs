@@ -1463,10 +1463,7 @@ where
             > u32::try_from(NATIVE_SOCKET_TABLE_MAX_BYTES)
                 .expect("native socket-table byte limit fits the Windows API")
         {
-            return Err(CollectorError::Platform {
-                operation,
-                detail: format!("table exceeds {NATIVE_SOCKET_TABLE_MAX_BYTES} byte read limit"),
-            });
+            return Err(crate::observation::ObservationError::NativeDataOversized.into());
         }
 
         let words = usize::try_from(size)
@@ -2309,7 +2306,12 @@ mod tests {
             },
         );
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(crate::collector::CollectorError::Observation(
+                crate::observation::ObservationError::NativeDataOversized
+            ))
+        ));
         assert_eq!(calls, 1, "only the size probe may reach IP Helper");
         assert_eq!(allocations, 0);
     }

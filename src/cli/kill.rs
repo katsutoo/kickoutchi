@@ -578,9 +578,6 @@ fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> i
     (&mut *reader).take(limit).read_until(b'\n', &mut bytes)?;
 
     if bytes.len() > max_bytes {
-        if bytes.last() != Some(&b'\n') {
-            drain_line(reader)?;
-        }
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!("confirmation input exceeds the {max_bytes}-byte limit"),
@@ -588,24 +585,6 @@ fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> i
     }
 
     String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
-}
-
-fn drain_line(reader: &mut impl BufRead) -> io::Result<()> {
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            return Ok(());
-        }
-        let consumed = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buffer.len(), |index| index + 1);
-        let line_ended = buffer[consumed - 1] == b'\n';
-        reader.consume(consumed);
-        if line_ended {
-            return Ok(());
-        }
-    }
 }
 
 fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
@@ -1339,15 +1318,14 @@ mod tests {
     }
 
     #[test]
-    fn overlong_confirmation_is_rejected_and_its_line_is_drained() {
+    fn overlong_confirmation_stops_after_limit_plus_one_bytes() {
         let mut input = std::io::Cursor::new(b"force-extra\ntree\n");
 
         let error = read_confirmation_line_from(&mut input, 5).expect_err("input is over limit");
-        let next = read_confirmation_line_from(&mut input, 5).expect("next line remains intact");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("5-byte limit"));
-        assert_eq!(next, "tree\n");
+        assert_eq!(input.position(), 6);
     }
 
     fn settle_target() -> KillTarget {

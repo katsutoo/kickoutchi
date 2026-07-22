@@ -90,6 +90,7 @@ pub(crate) enum WindowsTreePostCommitIssue {
     SweepPassLimit { limit: usize },
     UnsafePid { pid: u32, reason: UnsafePidReason },
     ProtectedDescendant { pid: u32, name: Option<String> },
+    FreshConfirmationRequired,
     PartialMetadata { pid: u32 },
     SnapshotFailed(String),
 }
@@ -99,7 +100,6 @@ impl WindowsTreePostCommitIssue {
         match outcome {
             WindowsTreeKillOutcome::Completed(_)
             | WindowsTreeKillOutcome::ProtectedRoot { .. }
-            | WindowsTreeKillOutcome::FreshConfirmationRequired
             | WindowsTreeKillOutcome::OwnershipUnavailable { .. }
             | WindowsTreeKillOutcome::CommitFailed { .. }
             | WindowsTreeKillOutcome::FreezeCapabilityUnavailable { .. }
@@ -118,6 +118,9 @@ impl WindowsTreePostCommitIssue {
             }
             WindowsTreeKillOutcome::ProtectedDescendant { pid, name } => {
                 Some(Self::ProtectedDescendant { pid, name })
+            }
+            WindowsTreeKillOutcome::FreshConfirmationRequired => {
+                Some(Self::FreshConfirmationRequired)
             }
             WindowsTreeKillOutcome::PartialMetadata { pid } => Some(Self::PartialMetadata { pid }),
             WindowsTreeKillOutcome::SnapshotFailed(error) => Some(Self::SnapshotFailed(error)),
@@ -325,6 +328,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         &job,
         root.pid,
         protected_names,
+        prompt_skipped,
         &mut members,
         &mut assigned,
         &mut report,
@@ -343,6 +347,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
                     &job,
                     root.pid,
                     protected_names,
+                    prompt_skipped,
                     &mut members,
                     &mut assigned,
                     &mut report,
@@ -382,6 +387,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         return WindowsTreeKillOutcome::Completed(Box::new(report));
     }
 
+    deliver_pending_fallbacks(api, &mut members, &mut report);
     if let Err(error) = api.terminate_job(&job) {
         if job_frozen && let Err(thaw_error) = api.set_job_frozen(&job, false) {
             record_cleanup_issue(
@@ -687,7 +693,7 @@ fn assign_initial_members<Api: WindowsTreeApi>(
         if pid == root_pid {
             continue;
         }
-        assign_or_fallback(api, job, pid, members, assigned, report);
+        assign_or_defer_fallback(api, job, pid, members, assigned, report);
     }
 }
 
@@ -701,6 +707,7 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
     job: &Api::JobHandle,
     root_pid: u32,
     protected_names: &[String],
+    prompt_skipped: bool,
     members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
     assigned: &mut HashSet<u32>,
     report: &mut WindowsTreeKillReport,
@@ -726,6 +733,9 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
             return Err(WindowsTreeKillOutcome::Truncated {
                 limit: MAX_TREE_PROCESSES,
             });
+        }
+        if prompt_skipped && preview.has_warnings() {
+            return Err(WindowsTreeKillOutcome::FreshConfirmationRequired);
         }
         if let Some(pid) = first_partial_metadata_pid(&snapshot, &snapshot_index, &preview) {
             return Err(WindowsTreeKillOutcome::PartialMetadata { pid });
@@ -835,7 +845,7 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                 ));
             }
             members.insert(info.pid, process);
-            assign_or_fallback(api, job, info.pid, members, assigned, report);
+            assign_or_defer_fallback(api, job, info.pid, members, assigned, report);
             discovered = true;
         }
         if discovered {
@@ -915,7 +925,7 @@ fn handle_unknown_post_commit_child<Api: WindowsTreeApi>(
     windows_evidence_outcome(error)
 }
 
-fn assign_or_fallback<Api: WindowsTreeApi>(
+fn assign_or_defer_fallback<Api: WindowsTreeApi>(
     api: &mut Api,
     job: &Api::JobHandle,
     pid: u32,
@@ -951,26 +961,50 @@ fn assign_or_fallback<Api: WindowsTreeApi>(
                 return;
             }
             report.containment_partial = true;
-            match api.terminate_process(&process.handle) {
-                Ok(()) => {
-                    process.status = PinnedProcessStatus::FallbackTerminated;
-                    report.fallback_terminated_pids.push(pid);
-                }
-                Err(WindowsApiError::NotFound) => {
+        }
+    }
+}
+
+fn deliver_pending_fallbacks<Api: WindowsTreeApi>(
+    api: &mut Api,
+    members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
+    report: &mut WindowsTreeKillReport,
+) {
+    let mut pids = members
+        .iter()
+        .filter_map(|(pid, process)| {
+            (process.status == PinnedProcessStatus::Pending).then_some(*pid)
+        })
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    for pid in pids {
+        let process = members
+            .get_mut(&pid)
+            .expect("PID came from the same pending-fallback set");
+        if matches!(
+            api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
+            WindowsWaitResult::Exited
+        ) {
+            process.status = PinnedProcessStatus::AlreadyExited;
+            report.already_exited_pids.push(pid);
+            continue;
+        }
+        match api.terminate_process(&process.handle) {
+            Ok(()) => process.status = PinnedProcessStatus::FallbackTerminated,
+            Err(WindowsApiError::NotFound) => {
+                process.status = PinnedProcessStatus::AlreadyExited;
+                report.already_exited_pids.push(pid);
+            }
+            Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
+                if matches!(
+                    api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
+                    WindowsWaitResult::Exited
+                ) {
                     process.status = PinnedProcessStatus::AlreadyExited;
                     report.already_exited_pids.push(pid);
-                }
-                Err(WindowsApiError::PermissionDenied | WindowsApiError::Other(_)) => {
-                    if matches!(
-                        api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
-                        WindowsWaitResult::Exited
-                    ) {
-                        process.status = PinnedProcessStatus::AlreadyExited;
-                        report.already_exited_pids.push(pid);
-                    } else {
-                        process.status = PinnedProcessStatus::NotTerminated;
-                        report.not_terminated.push(pid);
-                    }
+                } else {
+                    process.status = PinnedProcessStatus::NotTerminated;
+                    report.not_terminated.push(pid);
                 }
             }
         }
@@ -1039,6 +1073,15 @@ fn finish_failed_job_report<Api: WindowsTreeApi>(
     report.job_terminated_pids.clear();
     report.fallback_terminated_pids.clear();
     report.not_terminated.extend(assigned.iter().copied());
+    report
+        .not_terminated
+        .extend(members.iter().filter_map(|(pid, process)| {
+            matches!(
+                process.status,
+                PinnedProcessStatus::Pending | PinnedProcessStatus::NotTerminated
+            )
+            .then_some(*pid)
+        }));
     let deadline_ms = api.now_ms().saturating_add(u64::from(WINDOWS_TREE_WAIT_MS));
     let mut fallback_pids = members
         .iter()
@@ -1808,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_final_window_refuses_late_protected_child_and_verifies_prior_fallback() {
+    fn frozen_final_window_refuses_late_protected_child_without_delivering_pending_fallback() {
         let initial = vec![info(100, None, 100), info(101, Some(100), 101)];
         let late = vec![
             info(100, None, 100),
@@ -1825,9 +1868,11 @@ mod tests {
             panic!("post-commit protection refusal returns a report");
         };
         assert!(report.job_termination_withheld);
-        assert_eq!(report.fallback_terminated_pids, vec![101]);
+        assert!(report.fallback_terminated_pids.is_empty());
         assert!(report.not_terminated.contains(&100));
+        assert!(report.not_terminated.contains(&101));
         assert!(report.not_terminated.contains(&102));
+        assert!(!api.events.contains(&Event::TerminateProcess(101)));
         assert!(!api.events.contains(&Event::TerminateJob));
         let freeze = api
             .events
@@ -1843,7 +1888,41 @@ mod tests {
     }
 
     #[test]
-    fn real_job_freeze_failure_withholds_job_termination_and_verifies_fallback() {
+    fn yes_skip_withholds_all_termination_when_a_late_child_adds_a_warning() {
+        let initial = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let mut late_system_child = info(102, Some(100), 102);
+        late_system_child.process_name = Some("spoolsv.exe".to_owned());
+        let late = vec![
+            info(100, None, 100),
+            info(101, Some(100), 101),
+            late_system_child,
+        ];
+        let mut api = FakeApi::new(vec![initial, late]);
+        api.deny_assign.insert(101);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, true, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("post-commit warning refusal returns a report");
+        };
+        assert!(report.job_termination_withheld);
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::FreshConfirmationRequired)
+        );
+        assert!(report.fallback_terminated_pids.is_empty());
+        assert!(report.not_terminated.contains(&101));
+        assert!(!api.events.contains(&Event::TerminateJob));
+        assert!(
+            !api.events
+                .iter()
+                .any(|event| matches!(event, Event::TerminateProcess(_)))
+        );
+        assert!(api.terminated_processes.is_empty());
+    }
+
+    #[test]
+    fn real_job_freeze_failure_withholds_job_and_pending_fallback_termination() {
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
         api.deny_assign.insert(101);
         api.fail_freeze_job = true;
@@ -1855,9 +1934,9 @@ mod tests {
             panic!("post-commit freeze failure returns a report");
         };
         assert!(report.job_termination_withheld);
-        assert_eq!(report.fallback_terminated_pids, vec![101]);
-        assert_eq!(report.not_terminated, vec![100]);
-        assert!(api.events.contains(&Event::TerminateProcess(101)));
+        assert!(report.fallback_terminated_pids.is_empty());
+        assert_eq!(report.not_terminated, vec![100, 101]);
+        assert!(!api.events.contains(&Event::TerminateProcess(101)));
         assert!(!api.events.contains(&Event::TerminateJob));
         assert!(matches!(
             report.post_commit_issue,
@@ -1995,7 +2074,7 @@ mod tests {
     }
 
     #[test]
-    fn withheld_fallback_wait_failure_is_not_terminated() {
+    fn withheld_pending_fallback_is_probed_once_and_never_delivered() {
         let initial = vec![info(100, None, 100), info(101, Some(100), 101)];
         let late = vec![
             info(100, None, 100),
@@ -2005,13 +2084,8 @@ mod tests {
         let mut api = FakeApi::new(vec![initial.clone(), initial, late]);
         api.deny_assign.insert(101);
         api.already_in_job.insert(102);
-        api.wait_results.insert(
-            101,
-            VecDeque::from([
-                WindowsWaitResult::StillRunning,
-                WindowsWaitResult::Failed("fallback wait failed".to_owned()),
-            ]),
-        );
+        api.wait_results
+            .insert(101, VecDeque::from([WindowsWaitResult::StillRunning]));
 
         let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], false, false, &mut api);
 
@@ -2020,8 +2094,15 @@ mod tests {
         };
         assert!(report.fallback_terminated_pids.is_empty());
         assert!(report.not_terminated.contains(&101));
-        assert!(api.events.contains(&Event::TerminateProcess(101)));
+        assert!(!api.events.contains(&Event::TerminateProcess(101)));
         assert!(!api.events.contains(&Event::TerminateJob));
+        assert_eq!(
+            api.events
+                .iter()
+                .filter(|event| **event == Event::Wait(101, 0))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2061,6 +2142,7 @@ mod tests {
         api.wait_results.insert(
             101,
             VecDeque::from([
+                WindowsWaitResult::StillRunning,
                 WindowsWaitResult::StillRunning,
                 WindowsWaitResult::Failed("wait failed".to_owned()),
             ]),
@@ -2140,10 +2222,9 @@ mod tests {
     }
 
     #[test]
-    fn exited_member_after_failed_fallback_is_not_reported_alive() {
+    fn exited_pending_fallback_is_not_delivered_or_reported_alive() {
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
         api.deny_assign.insert(101);
-        api.deny_terminate.insert(101);
         api.wait_results.insert(
             101,
             VecDeque::from([WindowsWaitResult::StillRunning, WindowsWaitResult::Exited]),
@@ -2158,7 +2239,59 @@ mod tests {
         assert!(report.fallback_terminated_pids.is_empty());
         assert!(report.not_terminated.is_empty());
         assert!(report.containment_partial);
+        assert!(!api.events.contains(&Event::TerminateProcess(101)));
+    }
+
+    #[test]
+    fn failed_deferred_fallback_that_exits_is_reported_already_exited() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
+        api.deny_assign.insert(101);
+        api.deny_terminate.insert(101);
+        api.wait_results.insert(
+            101,
+            VecDeque::from([
+                WindowsWaitResult::StillRunning,
+                WindowsWaitResult::StillRunning,
+                WindowsWaitResult::Exited,
+            ]),
+        );
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert_eq!(report.already_exited_pids, vec![101]);
+        assert!(report.fallback_terminated_pids.is_empty());
+        assert!(report.not_terminated.is_empty());
         assert!(api.events.contains(&Event::TerminateProcess(101)));
+        assert!(api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn failed_deferred_fallback_that_remains_is_reported_not_terminated() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
+        api.deny_assign.insert(101);
+        api.deny_terminate.insert(101);
+        api.wait_results.insert(
+            101,
+            VecDeque::from([
+                WindowsWaitResult::StillRunning,
+                WindowsWaitResult::StillRunning,
+                WindowsWaitResult::Failed("fallback wait failed".to_owned()),
+            ]),
+        );
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert!(report.already_exited_pids.is_empty());
+        assert!(report.fallback_terminated_pids.is_empty());
+        assert_eq!(report.not_terminated, vec![101]);
+        assert!(api.events.contains(&Event::TerminateProcess(101)));
+        assert!(api.events.contains(&Event::TerminateJob));
     }
 
     #[test]

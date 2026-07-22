@@ -30,7 +30,7 @@ use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
 };
-use crate::protection::is_protected_process_name;
+use crate::protection::{is_protected_process_name, windows_process_name_eq};
 
 pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 
@@ -591,7 +591,7 @@ pub(crate) fn confirmation_input_matches(
                     .process_name
                     .as_deref()
                     .is_some_and(|name| match target.platform {
-                        Platform::Windows => trimmed.eq_ignore_ascii_case(&sanitize(name)),
+                        Platform::Windows => windows_process_name_eq(trimmed, &sanitize(name)),
                         Platform::Linux | Platform::Macos => trimmed == sanitize(name),
                     })
         }
@@ -1765,6 +1765,13 @@ mod tests {
         assert!(confirmation_input_matches(
             "NODE",
             &windows_target,
+            ConfirmationRequirement::ProtectedProcess,
+        ));
+        let mut unicode_windows_target = windows_target;
+        unicode_windows_target.process_name = Some("ÄPP.EXE".to_owned());
+        assert!(confirmation_input_matches(
+            "äpp.exe",
+            &unicode_windows_target,
             ConfirmationRequirement::ProtectedProcess,
         ));
     }

@@ -81,6 +81,17 @@ Named endpoints, `watch`, and `why` are planned to ship together in the atomic
 
 ### Fixed
 
+- Windows tree kills now reapply `--yes` warning authorization during every
+  committed containment sweep and withhold all termination when a late child
+  requires fresh review. Windows custom protected names and protected-name
+  confirmation also use allocation-free Unicode-aware case matching.
+- Linux full-state collection no longer applies the independently bounded
+  legacy-row projection limit. Linux identity data, macOS aggregate FD limits,
+  and Windows IP Helper buffer limits now retain their exact stable operational
+  error categories.
+- TUI kills invalidate an in-flight pre-kill refresh and queue exactly one fresh
+  snapshot after it drains. Overlong confirmation input now stops after the
+  bounded limit-plus-one read instead of draining an unbounded stream.
 - Optional Docker enrichment now pins the CLI to a bounded local Unix socket or
   Windows named pipe and removes ambient host, context, and TLS selectors. A
   remote Docker context can no longer receive local port-diagnostic queries or

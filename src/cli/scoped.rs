@@ -1125,6 +1125,9 @@ fn windows_post_commit_issue_text(
             "protected descendant PID {pid} ({}) appeared after commit",
             sanitize(name.as_deref().unwrap_or("<unknown>"))
         ),
+        WindowsTreePostCommitIssue::FreshConfirmationRequired => {
+            "tree gained warnings after --yes; rerun without --yes to review them".to_owned()
+        }
         WindowsTreePostCommitIssue::PartialMetadata { pid } => {
             format!("process metadata for PID {pid} became incomplete during the containment sweep")
         }
@@ -1151,6 +1154,7 @@ fn windows_post_commit_issue_exit_reason(
         | WindowsTreePostCommitIssue::Truncated { .. }
         | WindowsTreePostCommitIssue::SweepPassLimit { .. }
         | WindowsTreePostCommitIssue::UnsafePid { .. }
+        | WindowsTreePostCommitIssue::FreshConfirmationRequired
         | WindowsTreePostCommitIssue::PartialMetadata { .. }
         | WindowsTreePostCommitIssue::SnapshotFailed(_) => ExitReason::Failure,
     }
@@ -2184,6 +2188,18 @@ mod tests {
         let reason = super::map_windows_tree_completed_outcome(&root, &report, &mut collect_ports);
 
         assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_post_commit_warning_refusal_is_visible_and_fails() {
+        let issue = crate::windows_tree::WindowsTreePostCommitIssue::FreshConfirmationRequired;
+
+        let text = super::windows_post_commit_issue_text(&issue);
+        let reason = super::windows_post_commit_issue_exit_reason(&issue);
+
+        assert!(text.contains("gained warnings after --yes"));
+        assert_eq!(reason, ExitReason::Failure);
     }
 
     #[cfg(windows)]
