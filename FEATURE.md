@@ -2475,14 +2475,31 @@ polls, skipped validation, fabricated certainty, or weaker kill revalidation.
 ### 12.3 Measurement discipline
 
 - Compare baseline and candidate on the same machine and workload.
+- Run the complete native protocol on both the designated Linux and Windows
+  benchmark machines. Treat each machine as a separate environment: compare the
+  baseline and candidate on that same machine, and do not present Linux versus
+  Windows results as a direct operating-system performance comparison when the
+  hardware differs.
 - Use production-equivalent release artifacts and flags.
 - Record compiler, target, CPU, RAM, OS, kernel, thermal/power state, and
   concurrent load.
 - Interleave or randomize baseline and candidate runs.
 - Capture raw samples and exact commands.
 - Report independent run count and uncertainty.
+- For fast process-level latency workloads, retain at least 10,000 observations
+  per artifact as ten independently executed 1,000-observation blocks. Alternate
+  or deterministically randomize baseline and candidate blocks, preserve the
+  ordering seed, and perform 10 to 20 unmeasured warmups before retained
+  sampling. Merge compatible raw observations for the overall percentiles and
+  report the range of block-level p99 values; never average percentiles.
+- For a long-running workload such as a 500 ms watch invocation, either retain
+  at least 10,000 directly measured poll observations across independent process
+  runs or predeclare a smaller 2,000-to-5,000 process-level sample plan with its
+  wider p99 uncertainty. Do not count correlated inner iterations as independent
+  runs, and choose the plan before seeing results.
 - Report p50, p95, p99, max, throughput, errors, CPU, peak RSS, and binary size
-  where applicable.
+  where applicable. Report the retained sample count and benchmark duration next
+  to every percentile table; a p99 without those values is incomplete.
 - Treat noisy or threshold-crossing uncertainty as inconclusive.
 - Never accept faster output that loses rows, evidence, validation, or safety.
 
@@ -2492,12 +2509,24 @@ Store reproducible commands, workload generation, raw machine-readable results,
 and a concise report in an approved repository or release-artifact location.
 Do not commit machine-specific marketing numbers without context.
 
+After the release benchmark passes, the README may include a compact table of
+representative Linux and Windows results. Every published row must identify the
+native platform and machine, workload, exact artifact SHA-256, retained sample
+count, p50, p95, p99, failures, and peak RSS where applicable. Label the values
+as machine-specific rather than universal performance promises, report
+baseline-to-candidate deltas and uncertainty, and link to the complete benchmark
+report, exact commands, environment record, and immutable raw samples. Keep the
+complete workload matrix in the benchmark report rather than selecting only the
+most favorable workloads for the README.
+
 ### Stage 12 gate
 
 - [ ] Correctness was verified before measurement.
 - [ ] Baseline and candidate were measured under equivalent conditions.
 - [ ] No practical regression budget was exceeded.
 - [ ] Results are reproducible and include uncertainty and caveats.
+- [ ] Linux and Windows results use the declared native sampling protocol, and
+      any README table remains traceable to complete immutable evidence.
 - [ ] Binary and dependency growth are justified.
 
 ## Stage 13: Final Release Review
