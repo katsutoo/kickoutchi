@@ -3068,7 +3068,17 @@ mod linux {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(records.len(), 1, "{}", stdout(&output));
+        assert!(!records.is_empty(), "{}", stdout(&output));
+        assert!(
+            records.iter().skip(1).enumerate().all(|(index, record)| {
+                record["schema"] == "kickoutchi.watch_event"
+                    && record["version"] == 1
+                    && record["sequence"] == index + 1
+                    && record["event"] == "collection_gap"
+            }),
+            "{}",
+            stdout(&output)
+        );
         assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
         assert_eq!(records[0]["version"], 1);
         assert_eq!(records[0]["sequence"], 0);
