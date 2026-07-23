@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native Linux, macOS, and Windows release-candidate gates now run formatting,
+  strict lints, tests, doctests, dual-binary optimized builds, and real-binary
+  journeys. Release packaging additionally verifies checksums, archive safety,
+  exact binary membership and versions, and executes native cargo-dist payloads
+  before upload or publication.
 - Deterministic unit, contract, and real-binary coverage for observation
   completeness, metadata budgets, labels and filters, watch recovery and event
   ordering, bind diagnostics, output schemas, configuration boundaries, safe

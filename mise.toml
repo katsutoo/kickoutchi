@@ -43,6 +43,14 @@ run = [
 description = "Run the full test suite"
 run = "cargo test --locked --all-features"
 
+[tasks.test-doc]
+description = "Run documentation tests"
+run = "cargo test --locked --all-features --doc"
+
+[tasks.build-release]
+description = "Build both optimized release binaries"
+run = "cargo build --locked --release --all-features --bin kickoutchi --bin kick"
+
 [tasks.deny]
 description = "Run cargo-deny policy checks"
 run = "cargo deny check"
@@ -53,6 +61,8 @@ run = [
   "cargo fmt --all --check",
   "cargo clippy --locked --all-targets --all-features -- -D warnings",
   "cargo test --locked --all-features",
+  "cargo test --locked --all-features --doc",
+  "cargo build --locked --release --all-features --bin kickoutchi --bin kick",
   "cargo deny check",
 ]
 
@@ -63,6 +73,8 @@ run = [
   "cargo clippy --locked --all-targets --all-features -- -D warnings",
   "KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features",
   "cargo test --locked --all-features --doc",
+  "cargo build --locked --release --all-features --bin kickoutchi --bin kick",
+  "KICKOUTCHI_RELEASE_E2E_REQUIRED=1 KICKOUTCHI_E2E_KICKOUTCHI=target/release/kickoutchi KICKOUTCHI_E2E_KICK=target/release/kick KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features --test cli_contract",
   "cargo deny check",
 ]
 

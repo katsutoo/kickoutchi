@@ -1,4 +1,5 @@
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const UNIX_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.sh");
 const WINDOWS_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.ps1");
 const BREW_STYLE: &str = r#"brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}""#;
@@ -290,6 +291,368 @@ fn validate_homebrew_style_is_unconditional(step: &str, style_command: &str) -> 
     Ok(())
 }
 
+fn workflow_job<'a>(workflow: &'a str, name: &str, next: Option<&str>) -> Result<&'a str, String> {
+    let start = format!("  {name}:\n");
+    let job = workflow
+        .split(&start)
+        .nth(1)
+        .ok_or_else(|| format!("workflow is missing job {name}"))?;
+    match next {
+        Some(next) => job
+            .split(&format!("\n  {next}:\n"))
+            .next()
+            .ok_or_else(|| format!("workflow job {name} has no boundary")),
+        None => Ok(job),
+    }
+}
+
+fn validate_native_ci_policy(workflow: &str) -> Result<(), String> {
+    const REQUIRED: [&str; 5] = [
+        "run: cargo fmt --all --check",
+        "run: cargo clippy --locked --all-targets --all-features -- -D warnings",
+        "run: cargo test --locked --all-features --doc",
+        "run: cargo build --locked --release --all-features --bin kickoutchi --bin kick",
+        "run: cargo test --locked --all-features --test cli_contract",
+    ];
+    if active_lines(workflow)
+        .filter(|line| *line == "RUST_VERSION: 1.95.0")
+        .count()
+        != 1
+    {
+        return Err("native CI must pin the approved Rust toolchain exactly once".to_owned());
+    }
+    for (name, next) in [
+        ("linux", Some("windows")),
+        ("windows", Some("macos")),
+        ("macos", None),
+    ] {
+        let job = workflow_job(workflow, name, next)?;
+        let lines = active_lines(job).collect::<Vec<_>>();
+        if !lines.contains(&"needs: supply-chain") {
+            return Err(format!(
+                "native job {name} must depend on the supply-chain gate"
+            ));
+        }
+        for command in REQUIRED {
+            if !lines.contains(&command) {
+                return Err(format!("native job {name} is missing {command}"));
+            }
+        }
+        let ordinary_test = if name == "linux" {
+            "run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features"
+        } else {
+            "run: cargo test --locked --all-features"
+        };
+        if !lines.contains(&ordinary_test)
+            || lines
+                .iter()
+                .filter(|line| **line == "KICKOUTCHI_RELEASE_E2E_REQUIRED: \"1\"")
+                .count()
+                != 1
+        {
+            return Err(format!(
+                "native job {name} must execute journeys against explicit release binaries"
+            ));
+        }
+        let expected_paths = if name == "windows" {
+            [
+                "KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\\target\\release\\kickoutchi.exe",
+                "KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\\target\\release\\kick.exe",
+            ]
+        } else {
+            [
+                "KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi",
+                "KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick",
+            ]
+        };
+        if !expected_paths.iter().all(|line| lines.contains(line)) {
+            return Err(format!(
+                "native job {name} must use release-profile binary paths"
+            ));
+        }
+        if !job.contains("persist-credentials: false")
+            || job.contains("continue-on-error:")
+            || job.contains("||")
+            || lines.iter().any(|line| line.starts_with("if:"))
+        {
+            return Err(format!("native job {name} must fail closed"));
+        }
+    }
+    let linux = workflow_job(workflow, "linux", Some("windows"))?;
+    if linux
+        .matches("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: \"1\"")
+        .count()
+        != 1
+        || !linux.contains(
+            "run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features",
+        )
+    {
+        return Err("Linux native capabilities must be required for both test passes".to_owned());
+    }
+    let supply_chain = workflow_job(workflow, "supply-chain", Some("linux"))?;
+    let supply_chain_lines = active_lines(supply_chain).collect::<Vec<_>>();
+    if !supply_chain.contains("persist-credentials: false")
+        || !supply_chain.contains("run: python3 .github/scripts/test_validate_release_artifact.py")
+        || !supply_chain.contains("run: cargo deny check")
+        || supply_chain.contains("continue-on-error:")
+        || supply_chain_lines.iter().any(|line| {
+            line.starts_with("if:") || (line.starts_with("run:") && line.contains("||"))
+        })
+    {
+        return Err(
+            "supply-chain policy must run the validator and cargo-deny fail closed".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_artifact_dependencies_and_tag(workflow: &str, local_job: &str) -> Result<(), String> {
+    let local_needs = local_job
+        .split("    needs:\n")
+        .nth(1)
+        .and_then(|needs| needs.split("\n    if:").next())
+        .ok_or_else(|| "local artifact job must declare bounded dependencies".to_owned())?;
+    if active_lines(local_needs).collect::<Vec<_>>() != ["- plan", "- verify"] {
+        return Err(
+            "local artifacts must depend on planning and exact-commit verification".to_owned(),
+        );
+    }
+    let build_step = local_job
+        .split("      - name: Build artifacts\n")
+        .nth(1)
+        .and_then(|step| step.split("      - id: cargo-dist\n").next())
+        .ok_or_else(|| "local artifact build step must be bounded".to_owned())?;
+    let build_lines = active_lines(build_step).collect::<Vec<_>>();
+    if !build_lines.contains(&"shell: bash")
+        || !build_lines.contains(&"TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}")
+        || !build_lines.contains(
+            &"dist build $TAG_FLAG --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json",
+        )
+        || build_lines.iter().any(|line| line.starts_with("if:"))
+    {
+        return Err(
+            "local artifact builds must propagate the release tag through explicit Bash"
+                .to_owned(),
+        );
+    }
+    let global = workflow_job(workflow, "build-global-artifacts", Some("host"))?;
+    let global_needs = global
+        .split("    needs:\n")
+        .nth(1)
+        .and_then(|needs| needs.split("\n    runs-on:").next())
+        .ok_or_else(|| "global artifact job must declare bounded dependencies".to_owned())?;
+    if active_lines(global_needs).collect::<Vec<_>>()
+        != ["- plan", "- verify", "- build-local-artifacts"]
+    {
+        return Err(
+            "global artifacts must depend on planning, verification, and native artifacts"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_release_archive_gate(workflow: &str) -> Result<(), String> {
+    let job = workflow_job(
+        workflow,
+        "build-local-artifacts",
+        Some("build-global-artifacts"),
+    )?;
+    validate_artifact_dependencies_and_tag(workflow, job)?;
+    let build = job
+        .find("      - name: Build artifacts\n")
+        .ok_or_else(|| "release workflow must build local artifacts".to_owned())?;
+    let unix = job
+        .find("      - name: Validate native release archive (Unix)\n")
+        .ok_or_else(|| "release workflow must validate Unix archives".to_owned())?;
+    let windows = job
+        .find("      - name: Validate native release archive (Windows)\n")
+        .ok_or_else(|| "release workflow must validate Windows archives".to_owned())?;
+    let upload = job
+        .find("      - name: \"Upload artifacts\"\n")
+        .ok_or_else(|| "release workflow must upload validated artifacts".to_owned())?;
+    if !(build < unix && unix < windows && windows < upload) {
+        return Err("native archive validation must run after build and before upload".to_owned());
+    }
+    if job
+        .matches(".github/scripts/validate-release-artifact.py")
+        .count()
+        != 2
+        || !job.contains("--targets-json")
+        || !job.contains("--runner-os")
+        || !job.contains("--runner-arch")
+    {
+        return Err("native archive validators must receive explicit matrix identity".to_owned());
+    }
+    let unix_step = job
+        .split("      - name: Validate native release archive (Unix)\n")
+        .nth(1)
+        .and_then(|step| {
+            step.split("      - name: Validate native release archive (Windows)\n")
+                .next()
+        })
+        .ok_or_else(|| "Unix archive validation step must be bounded".to_owned())?;
+    let windows_step = job
+        .split("      - name: Validate native release archive (Windows)\n")
+        .nth(1)
+        .and_then(|step| step.split("      - name: \"Upload artifacts\"\n").next())
+        .ok_or_else(|| "Windows archive validation step must be bounded".to_owned())?;
+    for (step, condition, interpreter) in [
+        (unix_step, "if: runner.os != 'Windows'", "python3"),
+        (windows_step, "if: runner.os == 'Windows'", "python"),
+    ] {
+        let conditions = active_lines(step)
+            .filter(|line| line.starts_with("if:"))
+            .collect::<Vec<_>>();
+        if conditions != [condition]
+            || !step.contains("TARGETS_JSON: ${{ toJSON(matrix.targets) }}")
+            || !step.contains("--runner-os \"${{ runner.os }}\"")
+            || !step.contains("--runner-arch \"${{ runner.arch }}\"")
+            || !step.contains(&format!(
+                "{interpreter} .github/scripts/validate-release-artifact.py"
+            ))
+        {
+            return Err("native archive validator wiring must remain exact".to_owned());
+        }
+    }
+    if job.contains("continue-on-error:") || job.contains("|| true") {
+        return Err("native archive validation must fail closed".to_owned());
+    }
+    let host = workflow_job(workflow, "host", Some("publish-homebrew-formula"))?;
+    if !host.contains("needs.build-global-artifacts.result == 'success'")
+        || !host.contains("needs.build-local-artifacts.result == 'success'")
+        || host.contains("needs.build-global-artifacts.result == 'skipped'")
+        || host.contains("needs.build-local-artifacts.result == 'skipped'")
+    {
+        return Err("publication must require successful artifact builds".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_release_verify_matrix(workflow: &str, verify: &str) -> Result<(), String> {
+    if active_lines(workflow)
+        .filter(|line| *line == "RUST_VERSION: \"1.95.0\"")
+        .count()
+        != 1
+    {
+        return Err("release verification must pin the approved Rust toolchain".to_owned());
+    }
+    let matrix = verify
+        .split("      matrix:\n")
+        .nth(1)
+        .and_then(|matrix| matrix.split("\n    runs-on:").next())
+        .ok_or_else(|| "release verification matrix must be bounded".to_owned())?;
+    let expected_matrix = [
+        "include:",
+        "- name: Linux",
+        "runner: ubuntu-latest",
+        "- name: Windows",
+        "runner: windows-latest",
+        "- name: macOS",
+        "runner: macos-latest",
+        "- name: Supply Chain",
+        "runner: ubuntu-latest",
+    ];
+    if active_lines(matrix).collect::<Vec<_>>() != expected_matrix {
+        return Err(
+            "release verification must contain the exact native and supply-chain matrix".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_release_verify_policy(workflow: &str) -> Result<(), String> {
+    let verify = workflow_job(workflow, "verify", Some("plan"))?;
+    validate_release_verify_matrix(workflow, verify)?;
+    let lines = active_lines(verify).collect::<Vec<_>>();
+    for command in [
+        "run: cargo fmt --all --check",
+        "run: cargo clippy --locked --all-targets --all-features -- -D warnings",
+        "run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features",
+        "run: cargo test --locked --all-features",
+        "run: cargo test --locked --all-features --doc",
+        "run: cargo build --locked --release --all-features --bin kickoutchi --bin kick",
+        "run: cargo test --locked --all-features --test cli_contract",
+        "run: python3 .github/scripts/test_validate_release_artifact.py",
+        "run: cargo deny check",
+    ] {
+        if !lines.contains(&command) {
+            return Err(format!("release verification is missing {command}"));
+        }
+    }
+    for path in [
+        "KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi",
+        "KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick",
+        "KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\\target\\release\\kickoutchi.exe",
+        "KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\\target\\release\\kick.exe",
+    ] {
+        if !verify.contains(path) {
+            return Err("release verification must use release-profile binaries".to_owned());
+        }
+    }
+    for (name, condition) in [
+        (
+            "Enable unprivileged user namespaces",
+            "if: matrix.name == 'Linux'",
+        ),
+        ("Check formatting", "if: matrix.name != 'Supply Chain'"),
+        ("Run strict Clippy", "if: matrix.name != 'Supply Chain'"),
+        (
+            "Run tests (Linux capabilities required)",
+            "if: matrix.name == 'Linux'",
+        ),
+        (
+            "Run tests",
+            "if: matrix.name == 'Windows' || matrix.name == 'macOS'",
+        ),
+        ("Run doctests", "if: matrix.name != 'Supply Chain'"),
+        (
+            "Build release binaries",
+            "if: matrix.name != 'Supply Chain'",
+        ),
+        (
+            "Run release binary journeys (Linux)",
+            "if: matrix.name == 'Linux'",
+        ),
+        (
+            "Run release binary journeys (Windows)",
+            "if: matrix.name == 'Windows'",
+        ),
+        (
+            "Run release binary journeys (macOS)",
+            "if: matrix.name == 'macOS'",
+        ),
+        (
+            "Test release artifact validator",
+            "if: matrix.name == 'Supply Chain'",
+        ),
+        (
+            "Run supply-chain policy",
+            "if: matrix.name == 'Supply Chain'",
+        ),
+    ] {
+        let step = verify
+            .split(&format!("      - name: {name}\n"))
+            .nth(1)
+            .and_then(|step| step.split("      - name:").next())
+            .ok_or_else(|| format!("release verification is missing step {name}"))?;
+        let conditions = active_lines(step)
+            .filter(|line| line.starts_with("if:"))
+            .collect::<Vec<_>>();
+        if conditions != [condition] {
+            return Err(format!(
+                "release verification step {name} has the wrong condition"
+            ));
+        }
+    }
+    if verify.contains("continue-on-error:")
+        || active_lines(verify).any(|line| line.starts_with("run:") && line.contains("||"))
+    {
+        return Err("release verification must fail closed".to_owned());
+    }
+    Ok(())
+}
+
 #[test]
 fn cargo_dist_archives_are_verified_before_extraction() {
     let expected = [
@@ -562,6 +925,156 @@ fn release_security_validators_reject_removed_or_miswired_controls() {
         "if ($false -and ($actualSha256 -ne $expectedSha256)) {",
     );
     assert!(validate_windows_executable_selection(&disabled_windows_checksum).is_err());
+}
+
+#[test]
+fn native_ci_and_release_archives_fail_closed() {
+    validate_native_ci_policy(CI_WORKFLOW)
+        .expect("every native CI job must run the complete release-candidate policy");
+    validate_release_archive_gate(RELEASE_WORKFLOW)
+        .expect("cargo-dist archives must pass native E2E before upload");
+    validate_release_verify_policy(RELEASE_WORKFLOW)
+        .expect("release workflow must repeat the native policy on its exact commit");
+}
+
+#[test]
+fn native_ci_policy_rejects_removed_or_bypassed_gates() {
+    let missing_doctest = CI_WORKFLOW.replacen(
+        "      - name: Run doctests\n        run: cargo test --locked --all-features --doc\n",
+        "",
+        1,
+    );
+    assert!(validate_native_ci_policy(&missing_doctest).is_err());
+    let unpinned_ci_toolchain =
+        CI_WORKFLOW.replacen("RUST_VERSION: 1.95.0", "RUST_VERSION: stable", 1);
+    assert!(validate_native_ci_policy(&unpinned_ci_toolchain).is_err());
+    let missing_supply_chain_dependency = CI_WORKFLOW.replacen("    needs: supply-chain\n", "", 1);
+    assert!(validate_native_ci_policy(&missing_supply_chain_dependency).is_err());
+    let disabled_supply_chain = CI_WORKFLOW.replacen(
+        "  supply-chain:\n    name: Supply Chain\n",
+        "  supply-chain:\n    name: Supply Chain\n    if: ${{ false }}\n",
+        1,
+    );
+    assert!(validate_native_ci_policy(&disabled_supply_chain).is_err());
+    let weakened_build = CI_WORKFLOW.replacen(
+        "cargo build --locked --release --all-features --bin kickoutchi --bin kick",
+        "cargo build --locked --release --bin kickoutchi",
+        1,
+    );
+    assert!(validate_native_ci_policy(&weakened_build).is_err());
+    let missing_artifact_paths =
+        CI_WORKFLOW.replacen("          KICKOUTCHI_RELEASE_E2E_REQUIRED: \"1\"\n", "", 1);
+    assert!(validate_native_ci_policy(&missing_artifact_paths).is_err());
+    let tolerated_failure = CI_WORKFLOW.replacen(
+        "      - name: Run release binary journeys\n",
+        "      - name: Run release binary journeys\n        continue-on-error: true\n",
+        1,
+    );
+    assert!(validate_native_ci_policy(&tolerated_failure).is_err());
+    let hidden_command = CI_WORKFLOW.replacen(
+        "        run: cargo test --locked --all-features --doc",
+        "        run: true || cargo test --locked --all-features --doc",
+        1,
+    );
+    assert!(validate_native_ci_policy(&hidden_command).is_err());
+    let debug_artifact =
+        CI_WORKFLOW.replacen("target/release/kickoutchi", "target/debug/kickoutchi", 1);
+    assert!(validate_native_ci_policy(&debug_artifact).is_err());
+    let disabled_native_job = CI_WORKFLOW.replacen(
+        "  linux:\n    name: Linux\n",
+        "  linux:\n    name: Linux\n    if: ${{ false }}\n",
+        1,
+    );
+    assert!(validate_native_ci_policy(&disabled_native_job).is_err());
+}
+
+#[test]
+fn release_archive_policy_rejects_removed_or_bypassed_gates() {
+    let missing_unix_validation = RELEASE_WORKFLOW.replacen(
+        "      - name: Validate native release archive (Unix)\n",
+        "      - name: Removed native release archive validation (Unix)\n",
+        1,
+    );
+    assert!(validate_release_archive_gate(&missing_unix_validation).is_err());
+    let missing_local_verification_dependency = RELEASE_WORKFLOW.replacen(
+        "      - plan\n      - verify\n    if:",
+        "      - plan\n    if:",
+        1,
+    );
+    assert!(validate_release_archive_gate(&missing_local_verification_dependency).is_err());
+    let missing_global_verification_dependency = RELEASE_WORKFLOW.replacen(
+        "      - plan\n      - verify\n      - build-local-artifacts\n    runs-on:",
+        "      - plan\n      - build-local-artifacts\n    runs-on:",
+        1,
+    );
+    assert!(validate_release_archive_gate(&missing_global_verification_dependency).is_err());
+    let implicit_windows_build_shell = RELEASE_WORKFLOW.replacen(
+        "      - name: Build artifacts\n        shell: bash\n",
+        "      - name: Build artifacts\n",
+        1,
+    );
+    assert!(validate_release_archive_gate(&implicit_windows_build_shell).is_err());
+    let validation_after_upload = RELEASE_WORKFLOW
+        .replacen(
+            "      - name: Validate native release archive (Unix)\n",
+            "      - name: Deferred native release archive validation (Unix)\n",
+            1,
+        )
+        .replacen(
+            "      - name: \"Upload artifacts\"\n",
+            "      - name: \"Upload artifacts\"\n      - name: Validate native release archive (Unix)\n",
+            1,
+        );
+    assert!(validate_release_archive_gate(&validation_after_upload).is_err());
+    let disabled_archive_validation = RELEASE_WORKFLOW.replacen(
+        "      - name: Validate native release archive (Unix)\n        if: runner.os != 'Windows'",
+        "      - name: Validate native release archive (Unix)\n        if: ${{ false }}",
+        1,
+    );
+    assert!(validate_release_archive_gate(&disabled_archive_validation).is_err());
+    let skipped_artifact_publication = RELEASE_WORKFLOW.replacen(
+        "needs.build-local-artifacts.result == 'success'",
+        "(needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success')",
+        1,
+    );
+    assert!(validate_release_archive_gate(&skipped_artifact_publication).is_err());
+}
+
+#[test]
+fn release_verify_policy_rejects_removed_or_bypassed_gates() {
+    let missing_release_doctest = RELEASE_WORKFLOW.replacen(
+        "        run: cargo test --locked --all-features --doc\n",
+        "        run: cargo test --locked --all-features --lib\n",
+        1,
+    );
+    assert!(validate_release_verify_policy(&missing_release_doctest).is_err());
+    let unpinned_release_toolchain =
+        RELEASE_WORKFLOW.replacen("RUST_VERSION: \"1.95.0\"", "RUST_VERSION: stable", 1);
+    assert!(validate_release_verify_policy(&unpinned_release_toolchain).is_err());
+    let missing_macos_verification = RELEASE_WORKFLOW.replacen(
+        "          - name: macOS\n            runner: macos-latest\n",
+        "",
+        1,
+    );
+    assert!(validate_release_verify_policy(&missing_macos_verification).is_err());
+    let bypassed_release_doctest = RELEASE_WORKFLOW.replacen(
+        "        run: cargo test --locked --all-features --doc\n",
+        "        run: true || cargo test --locked --all-features --doc\n",
+        1,
+    );
+    assert!(validate_release_verify_policy(&bypassed_release_doctest).is_err());
+    let disabled_release_build = RELEASE_WORKFLOW.replacen(
+        "      - name: Build release binaries\n        if: matrix.name != 'Supply Chain'",
+        "      - name: Build release binaries\n        if: ${{ false }}",
+        1,
+    );
+    assert!(validate_release_verify_policy(&disabled_release_build).is_err());
+    let disabled_release_linux_tests = RELEASE_WORKFLOW.replacen(
+        "      - name: Run tests (Linux capabilities required)\n        if: matrix.name == 'Linux'",
+        "      - name: Run tests (Linux capabilities required)\n        if: ${{ false }}",
+        1,
+    );
+    assert!(validate_release_verify_policy(&disabled_release_linux_tests).is_err());
 }
 
 #[test]

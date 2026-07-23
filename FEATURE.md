@@ -2330,6 +2330,12 @@ cargo build --locked --release --all-features --bin kickoutchi --bin kick
 cargo deny check
 ```
 
+Run formatting, Clippy, tests, doctests, and the dual-binary release build on
+each native operating-system runner. `cargo deny` is a platform-independent
+lockfile and repository-policy check, so one fail-closed job on the same exact
+commit satisfies that item; it must still gate every native matrix and artifact
+build.
+
 Before pushing platform-sensitive changes from Linux, also run the repository's
 cross-target tasks where the required targets are installed:
 
@@ -2346,6 +2352,14 @@ Also run platform-native integration tests for collectors, process identity,
 socket states, and probes, plus the applicable automated real-binary E2E journeys
 for labels, watch, why, inspect, and safe test-owned termination. Verify the exact
 release artifacts, not only test-harness binaries.
+
+The cargo-dist build must validate each archive that matches its native runner
+before uploading it: verify the adjacent checksum, reject unsafe or ambiguous
+archive members, require exactly one `kickoutchi` and one `kick` executable,
+confirm both report the candidate package version, and run the native real-binary
+journeys with explicit paths to those extracted payloads. Every cargo-dist matrix
+member must target its runner's native operating system and architecture; a
+cross-target or mismatched artifact job fails rather than becoming build-only.
 
 ### Stage 10 gate
 

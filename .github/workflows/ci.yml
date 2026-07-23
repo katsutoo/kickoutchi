@@ -28,6 +28,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal
@@ -38,17 +40,23 @@ jobs:
       - name: Install cargo-deny
         run: cargo install --locked cargo-deny --version 0.19.4
 
+      - name: Test release artifact validator
+        run: python3 .github/scripts/test_validate_release_artifact.py
+
       - name: Run cargo-deny
         run: cargo deny check
 
   linux:
     name: Linux
+    needs: supply-chain
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
@@ -71,14 +79,31 @@ jobs:
       - name: Run tests
         run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features
 
+      - name: Run doctests
+        run: cargo test --locked --all-features --doc
+
+      - name: Build release binaries
+        run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
+
+      - name: Run release binary journeys
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
+          KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
+        run: cargo test --locked --all-features --test cli_contract
+
   windows:
     name: Windows
+    needs: supply-chain
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         shell: bash
@@ -96,15 +121,31 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-features
+
+      - name: Run doctests
+        run: cargo test --locked --all-features --doc
+
+      - name: Build release binaries
+        run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
+
+      - name: Run release binary journeys
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\target\release\kickoutchi.exe
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\target\release\kick.exe
+        run: cargo test --locked --all-features --test cli_contract
 
   macos:
     name: macOS
+    needs: supply-chain
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
@@ -120,3 +161,16 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-features
+
+      - name: Run doctests
+        run: cargo test --locked --all-features --doc
+
+      - name: Build release binaries
+        run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
+
+      - name: Run release binary journeys
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
+        run: cargo test --locked --all-features --test cli_contract

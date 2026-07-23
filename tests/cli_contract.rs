@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
@@ -5,7 +6,30 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const REAL_BINARY_EXIT_WAIT: Duration = Duration::from_secs(10);
+const COMMAND_OUTPUT_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const COMMAND_RUNNER_HELPER_ENV: &str = "KICKOUTCHI_TEST_COMMAND_RUNNER_HELPER";
+const BINARY_OVERRIDE_HELPER_ENV: &str = "KICKOUTCHI_TEST_BINARY_OVERRIDE_HELPER";
+const RELEASE_E2E_REQUIRED_ENV: &str = "KICKOUTCHI_RELEASE_E2E_REQUIRED";
+const KICKOUTCHI_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICKOUTCHI";
+const KICK_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICK";
+
+fn product_binary(variable: &str, fallback: &str) -> OsString {
+    let required = std::env::var_os(RELEASE_E2E_REQUIRED_ENV).is_some();
+    match (required, std::env::var_os(variable)) {
+        (true, Some(path)) => path,
+        (true, None) => panic!("release E2E requires {variable}"),
+        (false, None) => OsString::from(fallback),
+        (false, Some(_)) => panic!("{variable} requires {RELEASE_E2E_REQUIRED_ENV}"),
+    }
+}
+
+fn kickoutchi_binary() -> OsString {
+    product_binary(KICKOUTCHI_BINARY_ENV, env!("CARGO_BIN_EXE_kickoutchi"))
+}
+
+fn kick_binary() -> OsString {
+    product_binary(KICK_BINARY_ENV, env!("CARGO_BIN_EXE_kick"))
+}
 
 struct CommandChild(Option<Child>);
 
@@ -49,11 +73,23 @@ impl Drop for CommandChild {
     }
 }
 
-fn pipe_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+fn pipe_reader(pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let result = pipe
+            .take(COMMAND_OUTPUT_BYTES_MAX + 1)
+            .read_to_end(&mut bytes)
+            .and_then(|_| {
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > COMMAND_OUTPUT_BYTES_MAX {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "command output exceeded its byte limit",
+                    ))
+                } else {
+                    Ok(bytes)
+                }
+            });
         let _ = sender.send(result);
     });
     receiver
@@ -176,11 +212,66 @@ fn command_runner_helper_process() {
                 .write_all(&bytes)
                 .expect("helper stderr must be writable");
         }
+        Ok("output-over-limit") => {
+            let bytes = vec![0xa5; usize::try_from(COMMAND_OUTPUT_BYTES_MAX + 1).unwrap()];
+            let _ = io::stdout().write_all(&bytes);
+        }
         Ok("park") => loop {
             thread::park();
         },
         _ => {}
     }
+}
+
+#[test]
+fn binary_override_helper_process() {
+    if std::env::var_os(BINARY_OVERRIDE_HELPER_ENV).is_some() {
+        drop(kickoutchi_binary());
+        drop(kick_binary());
+    }
+}
+
+#[test]
+fn binary_overrides_are_all_or_nothing() {
+    fn helper() -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test binary path resolves"));
+        command
+            .args(["--exact", "binary_override_helper_process", "--nocapture"])
+            .env(BINARY_OVERRIDE_HELPER_ENV, "1")
+            .env_remove(RELEASE_E2E_REQUIRED_ENV)
+            .env_remove(KICKOUTCHI_BINARY_ENV)
+            .env_remove(KICK_BINARY_ENV);
+        command
+    }
+
+    let stale = run_command_with_deadline(
+        helper().env(KICKOUTCHI_BINARY_ENV, env!("CARGO_BIN_EXE_kickoutchi")),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("stale override helper must exit before its deadline");
+    assert!(!stale.status.success());
+
+    let incomplete = run_command_with_deadline(
+        helper()
+            .env(RELEASE_E2E_REQUIRED_ENV, "1")
+            .env(KICKOUTCHI_BINARY_ENV, env!("CARGO_BIN_EXE_kickoutchi")),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("incomplete override helper must exit before its deadline");
+    assert!(!incomplete.status.success());
+
+    let complete = run_command_with_deadline(
+        helper()
+            .env(RELEASE_E2E_REQUIRED_ENV, "1")
+            .env(KICKOUTCHI_BINARY_ENV, env!("CARGO_BIN_EXE_kickoutchi"))
+            .env(KICK_BINARY_ENV, env!("CARGO_BIN_EXE_kick")),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("complete override helper must exit before its deadline");
+    assert!(complete.status.success());
 }
 
 #[test]
@@ -207,6 +298,19 @@ fn command_runner_drains_large_stdout_and_stderr_without_deadlock() {
         output.stderr.iter().filter(|byte| **byte == 0xa5).count(),
         256 * 1024,
     );
+}
+
+#[test]
+fn command_runner_rejects_output_past_its_byte_limit() {
+    let error = run_command_with_deadline(
+        Command::new(std::env::current_exe().expect("test binary path resolves"))
+            .env(COMMAND_RUNNER_HELPER_ENV, "output-over-limit")
+            .args(["--exact", "command_runner_helper_process", "--nocapture"]),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect_err("over-limit command output must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]
@@ -239,13 +343,38 @@ fn command_runner_timeout_kills_and_reaps_child() {
 }
 
 #[test]
+fn required_release_artifact_paths_are_complete_and_versioned() {
+    if std::env::var_os(RELEASE_E2E_REQUIRED_ENV).is_none() {
+        return;
+    }
+
+    let canonical = kickoutchi_binary();
+    let short = kick_binary();
+    assert_ne!(canonical, short, "release binary paths must be distinct");
+    for path in [canonical, short] {
+        let metadata = std::fs::metadata(&path).expect("release binary path must be readable");
+        assert!(metadata.is_file(), "release binary must be a regular file");
+        assert!(metadata.len() > 0, "release binary must not be empty");
+
+        let output = run_command_with_deadline(
+            Command::new(&path).arg("--version"),
+            None,
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("release binary version command must finish before its deadline");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("version output must be UTF-8"),
+            format!("kickoutchi {}\n", env!("CARGO_PKG_VERSION")),
+        );
+    }
+}
+
+#[test]
 fn cli_and_config_errors_sanitize_terminal_controls() {
     let argument = run_command_with_deadline(
-        Command::new(env!("CARGO_BIN_EXE_kickoutchi")).args([
-            "list",
-            "--sort",
-            "evil\u{202e}value",
-        ]),
+        Command::new(kickoutchi_binary()).args(["list", "--sort", "evil\u{202e}value"]),
         None,
         REAL_BINARY_EXIT_WAIT,
     )
@@ -255,7 +384,7 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
     assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
 
     let config = run_command_with_deadline(
-        Command::new(env!("CARGO_BIN_EXE_kickoutchi")).args([
+        Command::new(kickoutchi_binary()).args([
             "--config",
             "missing\x1b]0;spoof\x07.toml",
             "list",
@@ -272,7 +401,7 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
 
 #[cfg(any(target_os = "macos", windows))]
 mod why_native {
-    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
+    use super::{REAL_BINARY_EXIT_WAIT, kickoutchi_binary, run_command_with_deadline};
     use std::fs;
     use std::net::{Ipv6Addr, TcpListener, UdpSocket};
     use std::path::PathBuf;
@@ -305,7 +434,7 @@ mod why_native {
     fn run_why(args: &[&str]) -> Output {
         let config = ConfigGuard::new();
         run_command_with_deadline(
-            Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            Command::new(kickoutchi_binary())
                 .arg("--config")
                 .arg(&config.0)
                 .arg("why")
@@ -406,10 +535,254 @@ mod why_native {
     }
 }
 
+#[cfg(any(target_os = "macos", windows))]
+mod portable_native {
+    use super::{
+        COMMAND_OUTPUT_BYTES_MAX, CommandChild, REAL_BINARY_EXIT_WAIT, finish_pipe, kick_binary,
+        kickoutchi_binary, pipe_reader, run_command_with_deadline,
+    };
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::{self, BufRead, BufReader, Read};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct ConfigGuard(PathBuf);
+
+    impl ConfigGuard {
+        fn new(contents: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kickoutchi-portable-native-{}-{unique}.toml",
+                std::process::id()
+            ));
+            fs::write(&path, contents).expect("isolated config must be written");
+            Self(path)
+        }
+    }
+
+    impl Drop for ConfigGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn run_with_binary(
+        binary: impl AsRef<OsStr>,
+        config: &ConfigGuard,
+        args: &[&str],
+    ) -> std::process::Output {
+        run_command_with_deadline(
+            Command::new(binary)
+                .arg("--config")
+                .arg(&config.0)
+                .args(args),
+            None,
+            REAL_BINARY_EXIT_WAIT,
+        )
+        .expect("native command must finish before its deadline")
+    }
+
+    fn run_with_config(config: &ConfigGuard, args: &[&str]) -> std::process::Output {
+        run_with_binary(kickoutchi_binary(), config, args)
+    }
+
+    fn watch_until_release(
+        config: &ConfigGuard,
+        port_text: &str,
+        listener: TcpListener,
+    ) -> Vec<serde_json::Value> {
+        let mut child = Command::new(kickoutchi_binary())
+            .arg("--config")
+            .arg(&config.0)
+            .args([
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                port_text,
+                "--filter",
+                "state:listen label:artifact",
+                "--interval",
+                "100ms",
+                "--duration",
+                "2s",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("native watch must start");
+        let stdout = child.stdout.take().expect("watch stdout must be piped");
+        let stderr = pipe_reader(child.stderr.take().expect("watch stderr must be piped"));
+        let mut child = CommandChild(Some(child));
+        let (sender, receiver) = mpsc::channel();
+        let stdout_reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut retained = 0_u64;
+            loop {
+                let mut line = Vec::new();
+                let result = (&mut reader)
+                    .take(COMMAND_OUTPUT_BYTES_MAX - retained + 1)
+                    .read_until(b'\n', &mut line)
+                    .and_then(|read| {
+                        retained += u64::try_from(read).unwrap_or(u64::MAX);
+                        if retained > COMMAND_OUTPUT_BYTES_MAX {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "watch output exceeded its byte limit",
+                            ));
+                        }
+                        if read == 0 {
+                            return Ok(None);
+                        }
+                        String::from_utf8(line)
+                            .map(Some)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    });
+                match result {
+                    Ok(Some(line)) => {
+                        if sender.send(Ok(line)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        });
+        let deadline = Instant::now() + REAL_BINARY_EXIT_WAIT;
+        let baseline = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("watch must emit its baseline before the deadline")
+            .expect("watch baseline must be UTF-8");
+        drop(listener);
+
+        let status = loop {
+            match child.child_mut().try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => panic!("native watch did not exit before its deadline"),
+                Err(error) => panic!("native watch wait failed: {error}"),
+            }
+        };
+        child.disarm();
+        let stderr = finish_pipe(Some(stderr), "stderr", deadline)
+            .expect("watch stderr must drain before the deadline");
+        let mut lines = vec![baseline];
+        lines.extend(receiver.into_iter().collect::<Result<Vec<_>, _>>().unwrap());
+        stdout_reader.join().expect("watch stdout reader must join");
+        assert_eq!(status.code(), Some(0));
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("watch line must be JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn labels_and_watch_run_through_the_native_binary() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
+        let port = listener.local_addr().expect("TCP address is known").port();
+        let port_text = port.to_string();
+        let config = ConfigGuard::new(&format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard fixture\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"native artifact fixture\"\n"
+        ));
+
+        let list = run_with_config(
+            &config,
+            &[
+                "list",
+                "--port",
+                port_text.as_str(),
+                "--filter",
+                "label:artifact",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            list.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        assert!(list.stderr.is_empty());
+        let rows: serde_json::Value =
+            serde_json::from_slice(&list.stdout).expect("list stdout must be JSON");
+        assert_eq!(rows.as_array().map(Vec::len), Some(1));
+        assert_eq!(rows[0]["local_port"], port);
+        assert_eq!(rows[0]["label"], "native artifact fixture");
+
+        let alias = run_with_binary(
+            kick_binary(),
+            &config,
+            &[
+                "list",
+                "--port",
+                port_text.as_str(),
+                "--filter",
+                "label:artifact",
+                "--json",
+            ],
+        );
+        assert_eq!(alias.status.code(), Some(0));
+        assert!(alias.stderr.is_empty());
+        let alias_rows: serde_json::Value =
+            serde_json::from_slice(&alias.stdout).expect("short binary list must be JSON");
+        assert_eq!(alias_rows[0]["label"], "native artifact fixture");
+
+        let why = run_with_config(
+            &config,
+            &[
+                "why",
+                port_text.as_str(),
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--json",
+            ],
+        );
+        assert_eq!(
+            why.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&why.stderr)
+        );
+        assert!(why.stderr.is_empty());
+        let why_value: serde_json::Value =
+            serde_json::from_slice(&why.stdout).expect("why stdout must be JSON");
+        assert_eq!(why_value["results"][0]["label"], "native artifact fixture");
+
+        let records = watch_until_release(&config, port_text.as_str(), listener);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
+        assert_eq!(records[0]["event"], "baseline");
+        assert_eq!(records[0]["data"]["endpoint"]["port"], port);
+        assert_eq!(records[0]["data"]["label"], "native artifact fixture");
+        assert_eq!(records[0]["data"]["filter_result"], "matched");
+        assert_eq!(records[1]["event"], "release");
+        assert_eq!(records[1]["data"]["endpoint"]["port"], port);
+        assert_eq!(records[1]["data"]["label"], "native artifact fixture");
+        assert_eq!(records[1]["data"]["filter_result"], "matched");
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        CommandChild, REAL_BINARY_EXIT_WAIT, collect_child_output, run_command_with_deadline,
+        CommandChild, REAL_BINARY_EXIT_WAIT, collect_child_output, kick_binary, kickoutchi_binary,
+        run_command_with_deadline,
     };
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -771,11 +1144,11 @@ mod linux {
     }
 
     fn kickoutchi(args: &[&str]) -> Output {
-        run_binary(env!("CARGO_BIN_EXE_kickoutchi"), args, None)
+        run_binary(kickoutchi_binary(), args, None)
     }
 
     fn kickoutchi_with_stdin(args: &[&str], stdin: &str) -> Output {
-        run_binary(env!("CARGO_BIN_EXE_kickoutchi"), args, Some(stdin))
+        run_binary(kickoutchi_binary(), args, Some(stdin))
     }
 
     fn kickoutchi_with_config(args: &[&str], config_text: &str) -> Output {
@@ -783,16 +1156,11 @@ mod linux {
     }
 
     fn kickoutchi_with_config_deadline(args: &[&str], config_text: &str) -> Output {
-        binary_with_config_deadline_with_env(
-            env!("CARGO_BIN_EXE_kickoutchi"),
-            args,
-            config_text,
-            &[],
-        )
+        binary_with_config_deadline_with_env(kickoutchi_binary(), args, config_text, &[])
     }
 
     fn binary_with_config_deadline_with_env(
-        path: &str,
+        path: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
         config_text: &str,
         environment: &[(&str, &std::ffi::OsStr)],
@@ -832,7 +1200,7 @@ mod linux {
         let mut command_args = Vec::with_capacity(args.len() + 1);
         command_args.push("why");
         command_args.extend_from_slice(args);
-        binary_with_config_deadline_with_env(env!("CARGO_BIN_EXE_kick"), &command_args, "", &[])
+        binary_with_config_deadline_with_env(kick_binary(), &command_args, "", &[])
     }
 
     fn why_with_bind_faults(args: &[&str], library: &Path, mode: &str) -> Output {
@@ -840,7 +1208,7 @@ mod linux {
         command_args.push("why");
         command_args.extend_from_slice(args);
         binary_with_config_deadline_with_env(
-            env!("CARGO_BIN_EXE_kickoutchi"),
+            kickoutchi_binary(),
             &command_args,
             "",
             &[
@@ -929,10 +1297,10 @@ mod linux {
     }
 
     fn kick(args: &[&str]) -> Output {
-        run_binary(env!("CARGO_BIN_EXE_kick"), args, None)
+        run_binary(kick_binary(), args, None)
     }
 
-    fn run_binary(path: &str, args: &[&str], stdin: Option<&str>) -> Output {
+    fn run_binary(path: impl AsRef<std::ffi::OsStr>, args: &[&str], stdin: Option<&str>) -> Output {
         let config_home = isolated_config_home();
         let config_guard = DirectoryGuard(config_home.clone());
         let mut command = Command::new(path);
@@ -952,7 +1320,7 @@ mod linux {
         let config_guard = DirectoryGuard(config_home.clone());
         let (reader, writer) = UnixStream::pair().expect("test pipe must be created");
         drop(reader);
-        let child = Command::new(env!("CARGO_BIN_EXE_kick"))
+        let child = Command::new(kick_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .arg("why")
             .args(args)
@@ -971,7 +1339,7 @@ mod linux {
         let config_guard = DirectoryGuard(config_home.clone());
         let (reader, writer) = UnixStream::pair().expect("test pipe must be created");
         drop(reader);
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .arg("list")
             .args(args)
@@ -990,7 +1358,7 @@ mod linux {
         let config_guard = DirectoryGuard(config_home.clone());
         let (reader, writer) = UnixStream::pair().expect("test pipe must be created");
         drop(reader);
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .arg(subcommand)
             .args(args)
@@ -1011,7 +1379,7 @@ mod linux {
             .write(true)
             .open("/dev/full")
             .expect("Linux exposes /dev/full");
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .arg("list")
             .args(args)
@@ -1689,7 +2057,7 @@ mod linux {
     impl InteractiveKick {
         fn spawn(args: &[&str]) -> Self {
             let config_home = isolated_config_home();
-            let mut child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            let mut child = Command::new(kickoutchi_binary())
                 .env("XDG_CONFIG_HOME", &config_home)
                 .args(args)
                 .stdin(Stdio::piped())
@@ -2870,7 +3238,7 @@ mod linux {
         let _config_guard = DirectoryGuard(config_dir.clone());
         let config_path = config_dir.join("config.toml");
         fs::write(&config_path, config).expect("watch config must be written");
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .arg("--config")
             .arg(&config_path)
             .args([
@@ -3028,7 +3396,7 @@ mod linux {
             SocketLifecycle::spawn(&binary, &["tcp4", "exact", "default", "1"]);
         let config_home = isolated_config_home();
         let _config_guard = DirectoryGuard(config_home.clone());
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .args([
                 "watch",
@@ -3115,7 +3483,7 @@ mod linux {
             .port();
         let config_home = isolated_config_home();
         let _config_guard = DirectoryGuard(config_home.clone());
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .env("LD_PRELOAD", &library)
             .args([
@@ -3245,7 +3613,7 @@ mod linux {
         let port = listener.local_addr().expect("listener address").port();
         let config_home = isolated_config_home();
         let config_guard = DirectoryGuard(config_home.clone());
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .env("XDG_CONFIG_HOME", &config_home)
             .args([
                 "watch",
@@ -3315,7 +3683,7 @@ mod linux {
             .write(true)
             .open(&config_path)
             .expect("test must hold the FIFO open without completing its read");
-        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+        let child = Command::new(kickoutchi_binary())
             .arg("--config")
             .arg(&config_path)
             .args(["watch", "--duration", "1s"])
@@ -3540,7 +3908,7 @@ mod linux {
                     "sh",
                 ])
                 .arg(test_binary)
-                .arg(env!("CARGO_BIN_EXE_kickoutchi"))
+                .arg(kickoutchi_binary())
                 .arg(&ready_file),
             None,
             CHILD_EXIT_WAIT,
@@ -3976,7 +4344,7 @@ mod linux {
 
 #[cfg(windows)]
 mod windows {
-    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
+    use super::{REAL_BINARY_EXIT_WAIT, kickoutchi_binary, run_command_with_deadline};
     use std::fs;
     use std::net::TcpListener;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
@@ -4037,7 +4405,7 @@ mod windows {
 
     fn kickoutchi_with_stdin(args: &[&str], stdin: Option<&str>) -> Output {
         let config_home = isolated_config_home();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
+        let mut command = Command::new(kickoutchi_binary());
         command.env("APPDATA", &config_home).args(args);
         let output = run_command_with_deadline(
             &mut command,
@@ -4596,7 +4964,7 @@ mod windows {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{REAL_BINARY_EXIT_WAIT, run_command_with_deadline};
+    use super::{REAL_BINARY_EXIT_WAIT, kickoutchi_binary, run_command_with_deadline};
     use std::fs;
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -4704,7 +5072,7 @@ mod macos {
         let config_dir = isolated_config_dir();
         let config_path = config_dir.join("config.toml");
         fs::write(&config_path, "").expect("isolated config file must be written");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kickoutchi"));
+        let mut command = Command::new(kickoutchi_binary());
         command.args(args).arg("--config").arg(&config_path);
         let output = run_command_with_deadline(
             &mut command,

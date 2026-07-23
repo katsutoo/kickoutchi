@@ -1,5 +1,7 @@
 /target
 tmp/
+__pycache__/
+*.py[cod]
 
 # Arch package build output from makepkg. Keep PKGBUILD and .SRCINFO tracked.
 /packaging/arch/**/pkg/

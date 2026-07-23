@@ -76,7 +76,7 @@ jobs:
           - name: Supply Chain
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -107,7 +107,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Check formatting
-        if: matrix.name == 'Linux'
+        if: matrix.name != 'Supply Chain'
         run: cargo fmt --all --check
       - name: Run strict Clippy
         if: matrix.name != 'Supply Chain'
@@ -118,6 +118,37 @@ jobs:
       - name: Run tests
         if: matrix.name == 'Windows' || matrix.name == 'macOS'
         run: cargo test --locked --all-features
+      - name: Run doctests
+        if: matrix.name != 'Supply Chain'
+        run: cargo test --locked --all-features --doc
+      - name: Build release binaries
+        if: matrix.name != 'Supply Chain'
+        run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
+      - name: Run release binary journeys (Linux)
+        if: matrix.name == 'Linux'
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
+          KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
+        run: cargo test --locked --all-features --test cli_contract
+      - name: Run release binary journeys (Windows)
+        if: matrix.name == 'Windows'
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\target\release\kickoutchi.exe
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\target\release\kick.exe
+        run: cargo test --locked --all-features --test cli_contract
+      - name: Run release binary journeys (macOS)
+        if: matrix.name == 'macOS'
+        env:
+          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
+          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
+          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
+        run: cargo test --locked --all-features --test cli_contract
+      - name: Test release artifact validator
+        if: matrix.name == 'Supply Chain'
+        run: python3 .github/scripts/test_validate_release_artifact.py
       - name: Run supply-chain policy
         if: matrix.name == 'Supply Chain'
         run: cargo deny check
@@ -190,6 +221,7 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -244,6 +276,7 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        shell: bash
         env:
           # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
@@ -264,6 +297,35 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Enable native Linux capabilities for artifact journeys
+        if: runner.os == 'Linux' && !matrix.container
+        shell: bash
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Validate native release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGETS_JSON: ${{ toJSON(matrix.targets) }}
+        run: |
+          python3 .github/scripts/validate-release-artifact.py \
+            --distrib target/distrib \
+            --targets-json "$TARGETS_JSON" \
+            --runner-os "${{ runner.os }}" \
+            --runner-arch "${{ runner.arch }}"
+      - name: Validate native release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGETS_JSON: ${{ toJSON(matrix.targets) }}
+        run: |
+          python .github/scripts/validate-release-artifact.py `
+            --distrib target/distrib `
+            --targets-json $env:TARGETS_JSON `
+            --runner-os "${{ runner.os }}" `
+            --runner-arch "${{ runner.arch }}"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -334,7 +396,7 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' }}
     runs-on: "ubuntu-22.04"
     permissions:
       contents: write
