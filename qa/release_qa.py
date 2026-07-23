@@ -100,9 +100,23 @@ def read_windows_tui_evidence(path: Path, binary_sha256: str) -> dict[str, Any]:
         "output_oversized": False,
         "entered_alternate_screen": True,
         "left_alternate_screen": True,
+        "cleanup_verified": True,
+        "pywinpty_version": "3.0.5",
     }
     if not isinstance(value, dict) or any(value.get(key) != expected for key, expected in required.items()):
         raise HarnessError("Windows TUI evidence does not prove the required console lifecycle")
+    terminal_bytes = value.get("terminal_output_bytes")
+    terminal_hash = value.get("terminal_output_sha256")
+    if (
+        isinstance(terminal_bytes, bool)
+        or not isinstance(terminal_bytes, int)
+        or not 1 <= terminal_bytes <= 4 * 1024 * 1024
+        or not isinstance(terminal_hash, str)
+        or len(terminal_hash) != 64
+        or any(character not in "0123456789abcdef" for character in terminal_hash)
+        or value.get("harness_diagnostic") != ""
+    ):
+        raise HarnessError("Windows TUI evidence has invalid bounded terminal output metadata")
     return value
 
 
@@ -210,6 +224,10 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> list[str]:
     except subprocess.TimeoutExpired:
         notes.append("process did not reap before cleanup deadline")
     return notes
+
+
+def _cleanup_proven(notes: Sequence[str]) -> bool:
+    return not any("did not reap" in note or "termination error" in note for note in notes)
 
 
 def run_command(
@@ -700,6 +718,25 @@ class QaSession:
             }
             for listener in self.listeners
         ]
+        cleanup_failed = any(
+            not _cleanup_proven(listener.cleanup) for listener in self.listeners
+        )
+        if cleanup_failed:
+            reason = "one or more helper processes could not be proven reaped"
+            self.report["checks"].append(
+                {
+                    "name": "harness-owned resource cleanup",
+                    "status": "INCONCLUSIVE",
+                    "reason": reason,
+                    "evidence": {"cleanup": self.report["cleanup"]},
+                    "duration_ms": 0.0,
+                }
+            )
+            if self.report["first_failure"] is None:
+                self.report["first_failure"] = {
+                    "check": "harness-owned resource cleanup",
+                    "reason": reason,
+                }
 
     def run(self) -> None:
         self.check("canonical and short version parity", self._version_parity)

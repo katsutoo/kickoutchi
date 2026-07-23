@@ -82,11 +82,13 @@ def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
     return value
 
 
-def validate_plan(plan: Any) -> dict[str, Any]:
+def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, Any]:
     if not isinstance(plan, dict) or plan.get("schema") != "kickoutchi.release_benchmark_plan" or plan.get("version") != 1:
         raise EvidenceError("plan must be kickoutchi.release_benchmark_plan/1")
     if plan.get("immutable") is not True or plan.get("gate_mode") != "final":
         raise EvidenceError("plan must declare immutable=true and gate_mode=final")
+    if require_gate_ready and plan.get("gate_ready") is not True:
+        raise EvidenceError("plan is not ready for gate-eligible collection")
     for role, expected in (("baseline", "1.2.0"), ("candidate", "1.3.0")):
         identity = plan.get("artifacts", {}).get(role)
         if not isinstance(identity, dict) or identity.get("version") != expected:

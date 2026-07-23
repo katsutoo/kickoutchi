@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journeys. Release packaging additionally verifies checksums, archive safety,
   exact binary membership and versions, and executes native cargo-dist payloads
   before upload or publication.
+- A read-only release qualification workflow now downloads immutable candidate
+  artifacts by run identity, executes bounded user-level charters on Linux,
+  macOS, and Windows, records the Windows TUI lifecycle with native ConPTY, and
+  preserves redacted machine-readable evidence with exact artifact checksums and
+  cleanup results.
 - Deterministic unit, contract, and real-binary coverage for observation
   completeness, metadata budgets, labels and filters, watch recovery and event
   ordering, bind diagnostics, output schemas, configuration boundaries, safe

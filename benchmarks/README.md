@@ -133,6 +133,11 @@ sample counts, timeouts, output limits, helper-socket limits, and cleanup rules.
 Do not edit a plan after collection; a plan hash is carried by every raw row and
 the manifest. Create and review a new plan instead.
 
+The checked-in plan currently declares `gate_ready=false` because its workload
+matrix is incomplete. It may be used only with `--smoke`; the controller refuses
+gate-eligible collection until a replacement plan covers every required
+workload and passes review.
+
 Use extracted native release binaries, not Cargo wrappers. The candidate must
 come from the source commit declared by the plan. The reviewed native executable
 checksums in `sha256_by_platform` are mandatory; the controller refuses a

@@ -22,8 +22,8 @@ class PlanValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
 
-    def test_shipped_plan_is_valid_and_declares_required_sample_shapes(self) -> None:
-        validate_plan(self.plan)
+    def test_draft_plan_is_valid_for_smoke_and_declares_sample_shapes(self) -> None:
+        validate_plan(self.plan, require_gate_ready=False)
         fast = [item for item in self.plan["workloads"] if item["comparison"] == "baseline_candidate"]
         fast_process = [item for item in self.plan["workloads"] if item["kind"] in {"list", "snapshot", "why"}]
         watch = next(item for item in self.plan["workloads"] if item["kind"] == "watch")
@@ -32,17 +32,21 @@ class PlanValidationTests(unittest.TestCase):
         self.assertTrue(all(item["blocks"] * item["samples_per_block"] >= 10_000 for item in fast_process))
         self.assertEqual(watch["blocks"] * watch["samples_per_block"], 2000)
 
+    def test_draft_plan_is_rejected_for_gate_collection(self) -> None:
+        with self.assertRaisesRegex(EvidenceError, "not ready"):
+            validate_plan(self.plan)
+
     def test_odd_comparison_samples_are_rejected(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["workloads"][0]["samples_per_block"] = 999
         with self.assertRaisesRegex(EvidenceError, "even"):
-            validate_plan(changed)
+            validate_plan(changed, require_gate_ready=False)
 
     def test_baseline_comparison_for_new_command_is_rejected(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["workloads"][2]["comparison"] = "baseline_candidate"
         with self.assertRaisesRegex(EvidenceError, "only list"):
-            validate_plan(changed)
+            validate_plan(changed, require_gate_ready=False)
 
 
 class OrderingAndPercentileTests(unittest.TestCase):

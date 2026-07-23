@@ -175,6 +175,11 @@ class StructuredParsingTests(unittest.TestCase):
                         "output_oversized": False,
                         "entered_alternate_screen": True,
                         "left_alternate_screen": True,
+                        "cleanup_verified": True,
+                        "pywinpty_version": "3.0.5",
+                        "terminal_output_bytes": 1,
+                        "terminal_output_sha256": "c" * 64,
+                        "harness_diagnostic": "",
                     }
                 ),
                 encoding="utf-8",
@@ -184,6 +189,11 @@ class StructuredParsingTests(unittest.TestCase):
 
 
 class CommandBoundTests(unittest.TestCase):
+    def test_cleanup_notes_fail_closed_on_unreaped_or_termination_error(self) -> None:
+        self.assertTrue(release_qa._cleanup_proven(["listener stopped and reaped"]))
+        self.assertFalse(release_qa._cleanup_proven(["process did not reap before cleanup deadline"]))
+        self.assertFalse(release_qa._cleanup_proven(["termination error: denied"]))
+
     def test_runner_bounds_stdout_and_stderr_without_deadlock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = release_qa.run_command(

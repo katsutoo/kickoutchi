@@ -288,12 +288,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        plan, plan_bytes = read_json(args.plan, PLAN_BYTES_MAX); validate_plan(plan)
+        plan, plan_bytes = read_json(args.plan, PLAN_BYTES_MAX)
         manifest, _ = read_json(args.manifest, MANIFEST_BYTES_MAX)
+        if not isinstance(manifest, dict):
+            raise EvidenceError("manifest must be a JSON object")
+        validate_plan(plan, require_gate_ready=manifest.get("mode") != "smoke")
         raw = read_regular(args.raw, RAW_BYTES_MAX)
         require_absent(args.output.absolute())
         plan_hash = sha256_bytes(plan_bytes)
-        if not isinstance(manifest, dict) or manifest.get("schema") != "kickoutchi.release_benchmark_manifest" or manifest.get("version") != 1 or not manifest.get("complete"):
+        if manifest.get("schema") != "kickoutchi.release_benchmark_manifest" or manifest.get("version") != 1 or not manifest.get("complete"):
             raise EvidenceError("manifest is not a complete kickoutchi.release_benchmark_manifest/1")
         validate_manifest(plan, manifest)
         if manifest.get("plan_sha256") != plan_hash or manifest.get("raw_sha256") != sha256_bytes(raw):

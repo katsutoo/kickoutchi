@@ -32,11 +32,11 @@ def regular_file(path: Path, label: str, *, allow_empty: bool = False) -> bytes:
     return data
 
 
-def terminate_process_tree(pid: int | None) -> None:
+def terminate_process_tree(pid: int | None) -> bool:
     if pid is None:
-        return
+        return False
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
             check=False,
             stdout=subprocess.DEVNULL,
@@ -44,8 +44,9 @@ def terminate_process_tree(pid: int | None) -> None:
             timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
-        pass
+        return False
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -82,13 +83,16 @@ def main() -> int:
     oversized = False
     diagnostic = ""
     sent_quit = False
+    cleanup_verified = False
     started_at = time.monotonic()
     deadline = started_at + TIMEOUT_SECONDS
     try:
         while terminal.isalive() and time.monotonic() < deadline:
             chunk = terminal.read(blocking=False)
             if chunk:
-                captured.extend(chunk.encode("utf-8"))
+                encoded = chunk.encode("utf-8")
+                remaining = STREAM_BYTES_MAX + 1 - len(captured)
+                captured.extend(encoded[: max(remaining, 0)])
                 if len(captured) > STREAM_BYTES_MAX:
                     oversized = True
                     break
@@ -103,7 +107,9 @@ def main() -> int:
         while time.monotonic() < drain_deadline and len(captured) <= STREAM_BYTES_MAX:
             chunk = terminal.read(blocking=False)
             if chunk:
-                captured.extend(chunk.encode("utf-8"))
+                encoded = chunk.encode("utf-8")
+                remaining = STREAM_BYTES_MAX + 1 - len(captured)
+                captured.extend(encoded[: max(remaining, 0)])
                 continue
             if terminal.iseof() or not terminal.isalive():
                 break
@@ -114,12 +120,25 @@ def main() -> int:
         if terminal.isalive():
             terminate_process_tree(terminal.pid)
             terminal.cancel_io()
+        cleanup_deadline = time.monotonic() + 1.0
+        while terminal.isalive() and time.monotonic() < cleanup_deadline:
+            time.sleep(0.01)
+        cleanup_verified = not terminal.isalive()
 
     oversized = oversized or len(captured) > STREAM_BYTES_MAX
     entered = b"\x1b[?1049h" in captured
     left = b"\x1b[?1049l" in captured
     exit_code = terminal.get_exitstatus()
-    passed = started and exit_code == 0 and not timed_out and not oversized and entered and left
+    passed = (
+        started
+        and exit_code == 0
+        and not timed_out
+        and not oversized
+        and entered
+        and left
+        and cleanup_verified
+        and not diagnostic
+    )
     report = {
         "schema": "kickoutchi.windows_tui_smoke",
         "version": 1,
@@ -132,11 +151,10 @@ def main() -> int:
         "output_oversized": oversized,
         "entered_alternate_screen": entered,
         "left_alternate_screen": left,
-        "stdout_bytes": len(captured),
-        "stderr_bytes": 0,
-        "stdout_sha256": sha256(bytes(captured)),
-        "stderr_sha256": sha256(b""),
-        "stderr_diagnostic": diagnostic,
+        "cleanup_verified": cleanup_verified,
+        "terminal_output_bytes": len(captured),
+        "terminal_output_sha256": sha256(bytes(captured)),
+        "harness_diagnostic": diagnostic,
     }
     write_report(output, report)
     return 0 if passed else 1

@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         plan, plan_bytes = read_json(args.plan, PLAN_BYTES_MAX)
-        validate_plan(plan)
+        validate_plan(plan, require_gate_ready=not args.smoke)
         output = args.output.absolute()
         manifest_path = args.manifest.absolute()
         output.parent.mkdir(parents=True, exist_ok=True)
