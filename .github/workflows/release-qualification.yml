@@ -163,11 +163,14 @@ jobs:
         shell: pwsh
         run: |
           $emptyConfig = "$env:RUNNER_TEMP\qa-empty.toml"
+          $tuiEvidence = "$env:RUNNER_TEMP\windows-tui.json"
           New-Item -ItemType File -Path $emptyConfig | Out-Null
           qa\windows_tui_smoke.ps1 `
             -Binary '${{ steps.windows-artifact.outputs.canonical }}' `
             -Config $emptyConfig `
-            -Output "$env:GITHUB_WORKSPACE\windows-tui.json"
+            -Output $tuiEvidence
+          if (-not (Test-Path -LiteralPath $tuiEvidence -PathType Leaf)) { throw "WinPTY evidence was not published" }
+          "evidence=$tuiEvidence" >> $env:GITHUB_OUTPUT
 
       - id: qa-unix
         name: Run Unix exploratory charters
@@ -196,8 +199,9 @@ jobs:
             '--archive-sha256', '${{ steps.windows-artifact.outputs.archive_sha256 }}',
             '--output', 'qa-${{ matrix.name }}.json'
           )
-          if (Test-Path -LiteralPath "$env:GITHUB_WORKSPACE\windows-tui.json" -PathType Leaf) {
-            $arguments += @('--windows-tui-evidence', "$env:GITHUB_WORKSPACE\windows-tui.json")
+          $tuiEvidence = '${{ steps.windows-tui.outputs.evidence }}'
+          if ($tuiEvidence -and (Test-Path -LiteralPath $tuiEvidence -PathType Leaf)) {
+            $arguments += @('--windows-tui-evidence', $tuiEvidence)
           }
           python @arguments
 
@@ -208,7 +212,7 @@ jobs:
           name: release-qa-${{ matrix.name }}
           path: |
             qa-${{ matrix.name }}.json
-            windows-tui.json
+            ${{ steps.windows-tui.outputs.evidence }}
           if-no-files-found: error
           retention-days: 90
 
