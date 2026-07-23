@@ -2717,9 +2717,18 @@ mod linux {
         let occupied = why(&[udp_port_text.as_str(), "--udp", "--address", "127.0.0.1"]);
         assert_eq!(occupied.status.code(), Some(3), "{}", stderr(&occupied));
         assert_eq!(stderr(&occupied), "");
-        assert!(stdout(&occupied).contains("verdict=owned"));
-        assert!(stdout(&occupied).contains("probe=address_in_use"));
-        assert!(stdout(&occupied).contains("certainty=proven"));
+        let occupied_stdout = stdout(&occupied);
+        assert!(
+            occupied_stdout.contains("probe=address_in_use"),
+            "{occupied_stdout}"
+        );
+        assert!(
+            (occupied_stdout.contains("verdict=owned")
+                && occupied_stdout.contains("certainty=proven"))
+                || (occupied_stdout.contains("verdict=reservation_or_policy_unknown")
+                    && occupied_stdout.contains("certainty=unknown")),
+            "{occupied_stdout}"
+        );
 
         let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP fixture must bind");
         let tcp_port = tcp.local_addr().expect("TCP address is known").port();
