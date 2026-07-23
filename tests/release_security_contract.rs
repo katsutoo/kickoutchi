@@ -407,6 +407,21 @@ fn validate_native_ci_policy(workflow: &str) -> Result<(), String> {
 }
 
 fn validate_artifact_dependencies_and_tag(workflow: &str, local_job: &str) -> Result<(), String> {
+    for required in [
+        "  workflow_dispatch:",
+        "tag: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}",
+        "tag-flag: ${{ startsWith(github.ref, 'refs/tags/') && format('--tag={0}', github.ref_name) || '' }}",
+        "publishing: ${{ startsWith(github.ref, 'refs/tags/') }}",
+        "PLAN_ARGS: ${{ (startsWith(github.ref, 'refs/tags/') && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }}",
+    ] {
+        if !workflow.contains(required) {
+            return Err("manual release validation must remain non-publishing".to_owned());
+        }
+    }
+    if workflow.contains("!github.event.pull_request") {
+        return Err("only version tags may enable release publication".to_owned());
+    }
+
     let local_needs = local_job
         .split("    needs:\n")
         .nth(1)
@@ -993,31 +1008,38 @@ fn native_ci_policy_rejects_removed_or_bypassed_gates() {
 
 #[test]
 fn release_archive_policy_rejects_removed_or_bypassed_gates() {
-    let missing_unix_validation = RELEASE_WORKFLOW.replacen(
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
+    let publishing_manual_dispatch = workflow.replacen(
+        "publishing: ${{ startsWith(github.ref, 'refs/tags/') }}",
+        "publishing: ${{ !github.event.pull_request }}",
+        1,
+    );
+    assert!(validate_release_archive_gate(&publishing_manual_dispatch).is_err());
+    let missing_unix_validation = workflow.replacen(
         "      - name: Validate native release archive (Unix)\n",
         "      - name: Removed native release archive validation (Unix)\n",
         1,
     );
     assert!(validate_release_archive_gate(&missing_unix_validation).is_err());
-    let missing_local_verification_dependency = RELEASE_WORKFLOW.replacen(
+    let missing_local_verification_dependency = workflow.replacen(
         "      - plan\n      - verify\n    if:",
         "      - plan\n    if:",
         1,
     );
     assert!(validate_release_archive_gate(&missing_local_verification_dependency).is_err());
-    let missing_global_verification_dependency = RELEASE_WORKFLOW.replacen(
+    let missing_global_verification_dependency = workflow.replacen(
         "      - plan\n      - verify\n      - build-local-artifacts\n    runs-on:",
         "      - plan\n      - build-local-artifacts\n    runs-on:",
         1,
     );
     assert!(validate_release_archive_gate(&missing_global_verification_dependency).is_err());
-    let implicit_windows_build_shell = RELEASE_WORKFLOW.replacen(
+    let implicit_windows_build_shell = workflow.replacen(
         "      - name: Build artifacts\n        shell: bash\n",
         "      - name: Build artifacts\n",
         1,
     );
     assert!(validate_release_archive_gate(&implicit_windows_build_shell).is_err());
-    let validation_after_upload = RELEASE_WORKFLOW
+    let validation_after_upload = workflow
         .replacen(
             "      - name: Validate native release archive (Unix)\n",
             "      - name: Deferred native release archive validation (Unix)\n",
@@ -1029,13 +1051,13 @@ fn release_archive_policy_rejects_removed_or_bypassed_gates() {
             1,
         );
     assert!(validate_release_archive_gate(&validation_after_upload).is_err());
-    let disabled_archive_validation = RELEASE_WORKFLOW.replacen(
+    let disabled_archive_validation = workflow.replacen(
         "      - name: Validate native release archive (Unix)\n        if: runner.os != 'Windows'",
         "      - name: Validate native release archive (Unix)\n        if: ${{ false }}",
         1,
     );
     assert!(validate_release_archive_gate(&disabled_archive_validation).is_err());
-    let skipped_artifact_publication = RELEASE_WORKFLOW.replacen(
+    let skipped_artifact_publication = workflow.replacen(
         "needs.build-local-artifacts.result == 'success'",
         "(needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success')",
         1,
@@ -1045,34 +1067,35 @@ fn release_archive_policy_rejects_removed_or_bypassed_gates() {
 
 #[test]
 fn release_verify_policy_rejects_removed_or_bypassed_gates() {
-    let missing_release_doctest = RELEASE_WORKFLOW.replacen(
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
+    let missing_release_doctest = workflow.replacen(
         "        run: cargo test --locked --all-features --doc\n",
         "        run: cargo test --locked --all-features --lib\n",
         1,
     );
     assert!(validate_release_verify_policy(&missing_release_doctest).is_err());
     let unpinned_release_toolchain =
-        RELEASE_WORKFLOW.replacen("RUST_VERSION: \"1.95.0\"", "RUST_VERSION: stable", 1);
+        workflow.replacen("RUST_VERSION: \"1.95.0\"", "RUST_VERSION: stable", 1);
     assert!(validate_release_verify_policy(&unpinned_release_toolchain).is_err());
-    let missing_macos_verification = RELEASE_WORKFLOW.replacen(
+    let missing_macos_verification = workflow.replacen(
         "          - name: macOS\n            runner: macos-latest\n",
         "",
         1,
     );
     assert!(validate_release_verify_policy(&missing_macos_verification).is_err());
-    let bypassed_release_doctest = RELEASE_WORKFLOW.replacen(
+    let bypassed_release_doctest = workflow.replacen(
         "        run: cargo test --locked --all-features --doc\n",
         "        run: true || cargo test --locked --all-features --doc\n",
         1,
     );
     assert!(validate_release_verify_policy(&bypassed_release_doctest).is_err());
-    let disabled_release_build = RELEASE_WORKFLOW.replacen(
+    let disabled_release_build = workflow.replacen(
         "      - name: Build release binaries\n        if: matrix.name != 'Supply Chain'",
         "      - name: Build release binaries\n        if: ${{ false }}",
         1,
     );
     assert!(validate_release_verify_policy(&disabled_release_build).is_err());
-    let disabled_release_linux_tests = RELEASE_WORKFLOW.replacen(
+    let disabled_release_linux_tests = workflow.replacen(
         "      - name: Run tests (Linux capabilities required)\n        if: matrix.name == 'Linux'",
         "      - name: Run tests (Linux capabilities required)\n        if: ${{ false }}",
         1,
