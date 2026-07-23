@@ -10,7 +10,7 @@ $TimeoutMilliseconds = 15000
 $StreamBytesMax = 4 * 1024 * 1024
 
 foreach ($value in @($Binary, $Config, $Output)) {
-    if ($value.Contains('"')) { throw "paths containing quotes are unsupported" }
+    if ($value.Contains('"') -or $value.Contains("'")) { throw "paths containing quotes are unsupported" }
 }
 if (Test-Path -LiteralPath $Output) { throw "refusing to overwrite $Output" }
 if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) { throw "binary must be a regular file" }
@@ -22,25 +22,37 @@ try {
 }
 if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw "config must be a regular file" }
 
-$winptyCandidates = @(@(
-    (Get-Command winpty.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
-    "$env:ProgramFiles\Git\usr\bin\winpty.exe"
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
-if ($winptyCandidates.Count -lt 1) { throw "winpty.exe is unavailable" }
-$winpty = $winptyCandidates[0]
+$bash = "$env:ProgramFiles\Git\bin\bash.exe"
+$script = "$env:ProgramFiles\Git\usr\bin\script.exe"
+$winpty = "$env:ProgramFiles\Git\usr\bin\winpty.exe"
+foreach ($tool in @($bash, $script, $winpty)) {
+    if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw "required pseudo-console tool is unavailable" }
+}
+
+function Convert-ToMsysPath([string]$Path) {
+    $converted = & $bash -lc 'cygpath -u -- "$1"' -- $Path
+    if ($LASTEXITCODE -ne 0 -or -not $converted) { throw "failed to convert pseudo-console path" }
+    return $converted.Trim()
+}
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("kickoutchi-tui-" + [guid]::NewGuid().ToString("N"))
 [IO.Directory]::CreateDirectory($temporary) | Out-Null
 $stdoutPath = Join-Path $temporary "stdout.bin"
 $stderrPath = Join-Path $temporary "stderr.bin"
-$command = "(echo q)| `"$winpty`" -Xallow-non-tty `"$Binary`" --config `"$Config`" >`"$stdoutPath`" 2>`"$stderrPath`""
+$binaryMsys = Convert-ToMsysPath $Binary
+$configMsys = Convert-ToMsysPath $Config
+$stdoutMsys = Convert-ToMsysPath $stdoutPath
+$stderrMsys = Convert-ToMsysPath $stderrPath
+$ptyCommand = "stty rows 25 cols 80; exec /usr/bin/winpty '$binaryMsys' --config '$configMsys'"
+$command = "(sleep 1; printf q) | /usr/bin/script -q -e -c `"$ptyCommand`" /dev/null >'$stdoutMsys' 2>'$stderrMsys'"
 $process = $null
 $timedOut = $false
 $oversized = $false
 try {
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = "$env:SystemRoot\System32\cmd.exe"
-    $startInfo.Arguments = "/d /s /c `"$command`""
+    $startInfo.FileName = $bash
+    $startInfo.ArgumentList.Add("-lc")
+    $startInfo.ArgumentList.Add($command)
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $process = New-Object System.Diagnostics.Process
