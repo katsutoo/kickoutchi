@@ -5575,7 +5575,7 @@ mod macos {
     }
 
     #[test]
-    fn macos_interactive_normal_kill_accepts_y_and_port_disappears() {
+    fn macos_interactive_normal_kill_accepts_y_or_refuses_a_raced_observation() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
@@ -5587,8 +5587,22 @@ mod macos {
         assert!(stdout_table_has_pid(&before, helper.id()));
 
         let killed = kickoutchi_with_stdin(&["kill", "--pid", pid_text.as_str()], Some("y\n"));
-        assert_eq!(killed.status.code(), Some(0));
         let killed_stderr = stderr(&killed);
+        if killed.status.code() == Some(1) {
+            assert!(
+                killed_stderr == "error: collecting ports failed: observation raced\n"
+                    || killed_stderr
+                        .contains("collecting ports before kill failed: observation raced"),
+                "{killed_stderr}",
+            );
+            assert!(
+                pid_exists(helper.id()),
+                "a raced observation must fail before signaling the fixture"
+            );
+            let _ = fs::remove_file(ready_file);
+            return;
+        }
+        assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
         assert!(
             killed_stderr.contains(&format!("Terminate PID {pid_text}")),
             "{killed_stderr}",
