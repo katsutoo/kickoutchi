@@ -22,7 +22,8 @@ bounded result metadata and stream digests, harness-owned listener PIDs and
 sockets, cleanup evidence, and a status for every check. Captured stream contents
 and the unique privacy marker are redacted before publication. `BLOCKED`
 identifies a missing harness/platform capability rather than a product failure
-and returns a nonzero status. On Windows, run `windows_tui_smoke.ps1` first and
+and returns a nonzero status. On Windows, install `windows-tui-requirements.txt`
+with hash checking, run `windows_tui_smoke.py` first, and
 pass its JSON through `--windows-tui-evidence`; the harness validates the
 artifact hash, WinPTY console lifecycle, terminal restoration, exit status, and
 stream bounds before accepting that check.

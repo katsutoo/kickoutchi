@@ -93,7 +93,7 @@ def read_windows_tui_evidence(path: Path, binary_sha256: str) -> dict[str, Any]:
         "schema": "kickoutchi.windows_tui_smoke",
         "version": 1,
         "status": "PASS",
-        "mechanism": "winpty",
+        "mechanism": "conpty",
         "binary_sha256": binary_sha256,
         "exit_code": 0,
         "timed_out": False,
@@ -719,7 +719,7 @@ class QaSession:
             self.check(
                 "TUI pseudo-console smoke",
                 lambda: dict(self.windows_tui_evidence or {}),
-                capability=(self.windows_tui_evidence is not None, "validated WinPTY console evidence was not supplied"),
+                capability=(self.windows_tui_evidence is not None, "validated ConPTY console evidence was not supplied"),
             )
 
     def _version_parity(self) -> dict[str, Any]:

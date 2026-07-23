@@ -168,7 +168,7 @@ class StructuredParsingTests(unittest.TestCase):
                         "schema": "kickoutchi.windows_tui_smoke",
                         "version": 1,
                         "status": "PASS",
-                        "mechanism": "winpty",
+                        "mechanism": "conpty",
                         "binary_sha256": "a" * 64,
                         "exit_code": 0,
                         "timed_out": False,
