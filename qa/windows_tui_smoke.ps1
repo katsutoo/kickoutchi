@@ -68,6 +68,10 @@ try {
     if (Test-Path -LiteralPath $stderrPath) { $stderr = [IO.File]::ReadAllBytes($stderrPath) }
     if ($stdout.Length -gt $StreamBytesMax -or $stderr.Length -gt $StreamBytesMax) { $oversized = $true }
     $text = [Text.Encoding]::UTF8.GetString($stdout)
+    $diagnostic = [Text.Encoding]::UTF8.GetString($stderr)
+    $diagnostic = $diagnostic.Replace($Binary, "<binary>").Replace($winpty, "<winpty>")
+    $diagnostic = [Text.RegularExpressions.Regex]::Replace($diagnostic, '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '?')
+    if ($diagnostic.Length -gt 1024) { $diagnostic = $diagnostic.Substring(0, 1024) }
     $enteredAlternateScreen = $text.Contains("$([char]27)[?1049h")
     $leftAlternateScreen = $text.Contains("$([char]27)[?1049l")
     $passed = $process.ExitCode -eq 0 -and -not $timedOut -and -not $oversized -and $enteredAlternateScreen -and $leftAlternateScreen
@@ -87,6 +91,7 @@ try {
         stderr_bytes = $stderr.Length
         stdout_sha256 = ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($stdout))).Replace("-", "").ToLowerInvariant()
         stderr_sha256 = ([BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($stderr))).Replace("-", "").ToLowerInvariant()
+        stderr_diagnostic = $diagnostic
     }
     $json = $report | ConvertTo-Json -Depth 4
     $stream = [IO.File]::Open($Output, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)

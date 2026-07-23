@@ -201,7 +201,10 @@ jobs:
           )
           $tuiEvidence = '${{ steps.windows-tui.outputs.evidence }}'
           if ($tuiEvidence -and (Test-Path -LiteralPath $tuiEvidence -PathType Leaf)) {
-            $arguments += @('--windows-tui-evidence', $tuiEvidence)
+            $tuiReport = Get-Content -LiteralPath $tuiEvidence -Raw | ConvertFrom-Json
+            if ($tuiReport.status -eq 'PASS') {
+              $arguments += @('--windows-tui-evidence', $tuiEvidence)
+            }
           }
           python @arguments
 
