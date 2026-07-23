@@ -693,6 +693,9 @@ mod portable_native {
 
     #[test]
     fn labels_and_watch_run_through_the_native_binary() {
+        #[cfg(target_os = "macos")]
+        let _host_observation = super::macos::lock_host_observation();
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
         let port = listener.local_addr().expect("TCP address is known").port();
         let port_text = port.to_string();
@@ -4983,7 +4986,7 @@ mod macos {
     const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
     static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
         HOST_OBSERVATION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

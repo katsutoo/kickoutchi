@@ -5,8 +5,8 @@ const WINDOWS_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-ca
 const BREW_STYLE: &str = r#"brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}""#;
 const BREW_RELEASE_LOOP: &str = r#"for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do"#;
 
-fn normalized_workflow() -> String {
-    RELEASE_WORKFLOW.replace("\r\n", "\n")
+fn normalized_workflow(workflow: &str) -> String {
+    workflow.replace("\r\n", "\n")
 }
 
 fn active_lines(text: &str) -> impl Iterator<Item = &str> {
@@ -749,7 +749,7 @@ fn explicit_github_tokens_are_step_scoped_and_globally_accounted_for() {
 fn homebrew_validation_fails_closed_and_pat_exists_only_for_push() {
     const TAP_TOKEN: &str = "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}";
 
-    let workflow = normalized_workflow();
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
     validate_checkout_credentials(&workflow)
         .expect("every checkout must explicitly disable persisted credentials");
     assert!(!workflow.contains("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}"));
@@ -825,7 +825,7 @@ fn homebrew_validation_fails_closed_and_pat_exists_only_for_push() {
 
 #[test]
 fn release_security_validators_reject_removed_or_miswired_controls() {
-    let workflow = normalized_workflow();
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
     let missing_checkout_control =
         workflow.replacen("          persist-credentials: false\n", "", 1);
     assert!(validate_checkout_credentials(&missing_checkout_control).is_err());
@@ -929,58 +929,61 @@ fn release_security_validators_reject_removed_or_miswired_controls() {
 
 #[test]
 fn native_ci_and_release_archives_fail_closed() {
-    validate_native_ci_policy(CI_WORKFLOW)
+    let ci_workflow = normalized_workflow(CI_WORKFLOW);
+    let release_workflow = normalized_workflow(RELEASE_WORKFLOW);
+    validate_native_ci_policy(&ci_workflow)
         .expect("every native CI job must run the complete release-candidate policy");
-    validate_release_archive_gate(RELEASE_WORKFLOW)
+    validate_release_archive_gate(&release_workflow)
         .expect("cargo-dist archives must pass native E2E before upload");
-    validate_release_verify_policy(RELEASE_WORKFLOW)
+    validate_release_verify_policy(&release_workflow)
         .expect("release workflow must repeat the native policy on its exact commit");
 }
 
 #[test]
 fn native_ci_policy_rejects_removed_or_bypassed_gates() {
-    let missing_doctest = CI_WORKFLOW.replacen(
+    let workflow = normalized_workflow(CI_WORKFLOW);
+    let missing_doctest = workflow.replacen(
         "      - name: Run doctests\n        run: cargo test --locked --all-features --doc\n",
         "",
         1,
     );
     assert!(validate_native_ci_policy(&missing_doctest).is_err());
     let unpinned_ci_toolchain =
-        CI_WORKFLOW.replacen("RUST_VERSION: 1.95.0", "RUST_VERSION: stable", 1);
+        workflow.replacen("RUST_VERSION: 1.95.0", "RUST_VERSION: stable", 1);
     assert!(validate_native_ci_policy(&unpinned_ci_toolchain).is_err());
-    let missing_supply_chain_dependency = CI_WORKFLOW.replacen("    needs: supply-chain\n", "", 1);
+    let missing_supply_chain_dependency = workflow.replacen("    needs: supply-chain\n", "", 1);
     assert!(validate_native_ci_policy(&missing_supply_chain_dependency).is_err());
-    let disabled_supply_chain = CI_WORKFLOW.replacen(
+    let disabled_supply_chain = workflow.replacen(
         "  supply-chain:\n    name: Supply Chain\n",
         "  supply-chain:\n    name: Supply Chain\n    if: ${{ false }}\n",
         1,
     );
     assert!(validate_native_ci_policy(&disabled_supply_chain).is_err());
-    let weakened_build = CI_WORKFLOW.replacen(
+    let weakened_build = workflow.replacen(
         "cargo build --locked --release --all-features --bin kickoutchi --bin kick",
         "cargo build --locked --release --bin kickoutchi",
         1,
     );
     assert!(validate_native_ci_policy(&weakened_build).is_err());
     let missing_artifact_paths =
-        CI_WORKFLOW.replacen("          KICKOUTCHI_RELEASE_E2E_REQUIRED: \"1\"\n", "", 1);
+        workflow.replacen("          KICKOUTCHI_RELEASE_E2E_REQUIRED: \"1\"\n", "", 1);
     assert!(validate_native_ci_policy(&missing_artifact_paths).is_err());
-    let tolerated_failure = CI_WORKFLOW.replacen(
+    let tolerated_failure = workflow.replacen(
         "      - name: Run release binary journeys\n",
         "      - name: Run release binary journeys\n        continue-on-error: true\n",
         1,
     );
     assert!(validate_native_ci_policy(&tolerated_failure).is_err());
-    let hidden_command = CI_WORKFLOW.replacen(
+    let hidden_command = workflow.replacen(
         "        run: cargo test --locked --all-features --doc",
         "        run: true || cargo test --locked --all-features --doc",
         1,
     );
     assert!(validate_native_ci_policy(&hidden_command).is_err());
     let debug_artifact =
-        CI_WORKFLOW.replacen("target/release/kickoutchi", "target/debug/kickoutchi", 1);
+        workflow.replacen("target/release/kickoutchi", "target/debug/kickoutchi", 1);
     assert!(validate_native_ci_policy(&debug_artifact).is_err());
-    let disabled_native_job = CI_WORKFLOW.replacen(
+    let disabled_native_job = workflow.replacen(
         "  linux:\n    name: Linux\n",
         "  linux:\n    name: Linux\n    if: ${{ false }}\n",
         1,
@@ -1079,7 +1082,7 @@ fn release_verify_policy_rejects_removed_or_bypassed_gates() {
 
 #[test]
 fn release_plan_installer_has_no_repository_token() {
-    let workflow = normalized_workflow();
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
     let plan_job = workflow
         .split("  plan:\n")
         .nth(1)
@@ -1104,7 +1107,7 @@ fn release_plan_installer_has_no_repository_token() {
 
 #[test]
 fn explicit_release_token_is_scoped_to_publication_commands() {
-    let workflow = normalized_workflow();
+    let workflow = normalized_workflow(RELEASE_WORKFLOW);
     let host_job = workflow
         .split("  host:\n")
         .nth(1)
