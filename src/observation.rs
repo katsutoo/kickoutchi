@@ -2587,6 +2587,31 @@ mod tests {
     }
 
     #[test]
+    fn owner_reasons_are_deduplicated_in_public_name_order() {
+        let completeness = OwnerCompleteness::partial([
+            EvidenceGapCode::ScopeExcluded,
+            EvidenceGapCode::OwnerPermissionDenied,
+            EvidenceGapCode::NativeFieldUnavailable,
+            EvidenceGapCode::OwnerPermissionDenied,
+            EvidenceGapCode::ObservationRaced,
+        ])
+        .expect("distinct reasons fit");
+        let OwnerCompleteness::Partial { reasons } = completeness else {
+            panic!("nonempty reasons must remain partial");
+        };
+
+        assert_eq!(
+            owner_reason_names(&reasons).collect::<Vec<_>>(),
+            [
+                "native_field_unavailable",
+                "observation_raced",
+                "owner_permission_denied",
+                "scope_excluded",
+            ]
+        );
+    }
+
+    #[test]
     fn ninth_scope_limitation_is_rejected() {
         assert_eq!(
             super::bounded_scope_limitations(0..=SCOPE_LIMITATIONS_MAX),
@@ -3095,6 +3120,58 @@ mod tests {
                 .local_completeness
                 .iter()
                 .all(|completeness| completeness == &expected)
+        );
+    }
+
+    #[test]
+    fn attempt_merge_keeps_global_and_socket_local_owner_reasons_separate() {
+        let global_a = OwnerCompleteness::partial([
+            EvidenceGapCode::OwnerPermissionDenied,
+            EvidenceGapCode::OwnerPermissionDenied,
+        ])
+        .unwrap();
+        let global_b = OwnerCompleteness::partial([EvidenceGapCode::OwnerDisappeared]).unwrap();
+        let local_a =
+            OwnerCompleteness::partial([EvidenceGapCode::ProcessIdentityUnavailable]).unwrap();
+        let local_b =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete]).unwrap();
+        let associations = |global_completeness, local_completeness| OwnerAssociations {
+            owners_by_socket: vec![Vec::new()],
+            local_completeness: vec![local_completeness],
+            global_completeness,
+            evidence_gaps: Vec::new(),
+            omitted_evidence_gap_count: 0,
+        };
+        let mut pass_a = CollectedPass {
+            sockets: vec![socket(80)],
+            associations: associations(global_a, local_a),
+            processes_by_pid: BTreeMap::new(),
+            omitted_evidence_gap_count: 0,
+        };
+        let mut pass_b = CollectedPass {
+            sockets: vec![socket(80)],
+            associations: associations(global_b, local_b),
+            processes_by_pid: BTreeMap::new(),
+            omitted_evidence_gap_count: 0,
+        };
+
+        merge_attempt_uncertainty(&mut pass_a, &mut pass_b).expect("bounded reasons merge");
+
+        assert_eq!(
+            pass_b.associations.global_completeness,
+            OwnerCompleteness::partial([
+                EvidenceGapCode::OwnerDisappeared,
+                EvidenceGapCode::OwnerPermissionDenied,
+            ])
+            .unwrap()
+        );
+        assert_eq!(
+            pass_b.associations.local_completeness,
+            [OwnerCompleteness::partial([
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                EvidenceGapCode::ProcessIdentityUnavailable,
+            ])
+            .unwrap()]
         );
     }
 
@@ -4097,6 +4174,74 @@ mod tests {
             [EvidenceGapCode::NoncriticalEvidenceTruncated]
         );
         assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn metadata_budget_omits_fields_in_order_without_changing_identity_or_socket() {
+        let expected_fields = [
+            (None, None, None, None),
+            (Some("n"), None, None, None),
+            (Some("n"), Some(Path::new("x")), None, None),
+            (Some("n"), Some(Path::new("x")), Some("p"), None),
+            (Some("n"), Some(Path::new("x")), Some("p"), Some("c")),
+        ];
+
+        for (budget, expected) in expected_fields.into_iter().enumerate() {
+            let row = socket(80);
+            let token = row.token;
+            let full = ProcessRead::Verified {
+                marker: ProcessStartMarker::linux(7).unwrap(),
+                observation: ProcessObservation {
+                    name: Some(Arc::from("n")),
+                    executable_path: Some(Arc::from(Path::new("x"))),
+                    command_line: Some(Arc::from("c")),
+                    parent_pid: Some(99),
+                    parent_process_name: Some(Arc::from("p")),
+                    metadata_omission: None,
+                    metadata_completeness: MetadataCompleteness::Complete,
+                },
+            };
+            let steps = vec![
+                Step::Clock(1),
+                Step::Sockets(vec![row.clone()]),
+                Step::Owners(owners(&[&[42]])),
+                Step::Process(42, MetadataProfile::IdentityOnly, verified(7, None)),
+                Step::Sockets(vec![row]),
+                Step::Owners(owners(&[&[42]])),
+                Step::Process(42, MetadataProfile::Display, full),
+                Step::Clock(2),
+            ];
+            let mut source = FakeSource::new(steps);
+            let mut test_limits = limits(8);
+            test_limits.optional_metadata_bytes = budget;
+
+            let snapshot = collect_consistent_with_limits(
+                &mut source,
+                scope(),
+                MetadataProfile::Display,
+                test_limits,
+            )
+            .expect("metadata omission retains authoritative identity");
+            let owner = snapshot.sockets[0].owners[0].clone();
+            let OwnerObservation::Verified(identity) = owner else {
+                panic!("owner identity must remain verified");
+            };
+            let process = snapshot.processes.get(&identity).unwrap();
+
+            assert_eq!(identity.pid, 42);
+            assert_eq!(identity.start_marker, ProcessStartMarker::linux(7).unwrap());
+            assert_eq!(snapshot.sockets[0].local_endpoint, endpoint(80));
+            assert_eq!(snapshot.sockets[0].socket_token, token);
+            assert_eq!(process.name.as_deref(), expected.0);
+            assert_eq!(process.executable_path.as_deref(), expected.1);
+            assert_eq!(process.parent_process_name.as_deref(), expected.2);
+            assert_eq!(process.command_line.as_deref(), expected.3);
+            assert_eq!(process.parent_pid, Some(99));
+            assert_eq!(
+                process.metadata_omission,
+                (budget < 4).then_some(MetadataOmission::BudgetExceeded)
+            );
+        }
     }
 
     #[test]

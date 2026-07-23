@@ -2306,12 +2306,12 @@ treated as unprotected, and signal delivery before final revalidation.
 
 ### Stage 9 gate
 
-- [ ] Tests assert concrete behavior and negative space.
-- [ ] No flaky retry policy hides failures.
-- [ ] No timing test relies on arbitrary sleeps.
-- [ ] Critical tests were mutation-confirmed.
-- [ ] The full suite passes repeatedly and in parallel where supported.
-- [ ] The focused real-binary E2E suite covers every critical public journey,
+- [x] Tests assert concrete behavior and negative space.
+- [x] No flaky retry policy hides failures.
+- [x] No timing test relies on arbitrary sleeps.
+- [x] Critical tests were mutation-confirmed.
+- [x] The full suite passes repeatedly and in parallel where supported.
+- [x] The focused real-binary E2E suite covers every critical public journey,
       asserts negative space, and proves helper cleanup without retries.
 
 ## Stage 10: Native Continuous Integration

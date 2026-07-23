@@ -600,7 +600,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, Parser};
+    use clap::{Parser, error::ErrorKind};
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use super::kill::KillTargetError;
@@ -613,11 +613,10 @@ mod tests {
     use crate::model::SortMode;
 
     fn long_help(subcommand: &str) -> String {
-        let mut command = Cli::command();
-        let subcommand = command
-            .find_subcommand_mut(subcommand)
-            .expect("subcommand exists");
-        subcommand.render_long_help().to_string().replace('`', "")
+        let error = Cli::try_parse_from(["kickoutchi", subcommand, "--help"])
+            .expect_err("--help exits through clap");
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        error.to_string().replace('`', "")
     }
 
     #[test]
@@ -670,6 +669,9 @@ mod tests {
     fn list_help_distinguishes_legacy_rows_from_complete_snapshots() {
         let help = long_help("list");
 
+        assert!(help.contains("Usage: kickoutchi list [OPTIONS]"));
+        assert!(help.contains("--json"));
+        assert!(help.contains("--snapshot-json"));
         assert!(help.contains("legacy visible-row kickoutchi.list/1"));
         assert!(help.contains("complete, unfiltered within-scope kickoutchi.snapshot/1"));
         assert!(help.contains("scope_id:"));
@@ -682,6 +684,9 @@ mod tests {
         let help = long_help("watch");
 
         for required in [
+            "Usage: kickoutchi watch [OPTIONS]",
+            "--interval <DURATION>",
+            "--duration <DURATION>",
             "Polling can miss sockets",
             "Neither protocol flag means both TCP and UDP",
             "watch-only state:",
@@ -707,6 +712,9 @@ mod tests {
         let help = long_help("why");
 
         for required in [
+            "Usage: kickoutchi why [OPTIONS] <PORT>",
+            "--all-protocols",
+            "--all-addresses",
             "TCP on 127.0.0.1, then ::1",
             "127.0.0.1, 0.0.0.0, ::1, then ::",
             "eight endpoints",
@@ -966,6 +974,17 @@ mod tests {
         // caught at parse time instead of leaking into config validation.
         assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "0"]).is_err());
         assert!(Cli::try_parse_from(["kickoutchi", "--refresh-interval", "3601"]).is_err());
+    }
+
+    #[test]
+    fn refresh_interval_accepts_both_inclusive_boundaries() {
+        let minimum = Cli::try_parse_from(["kickoutchi", "--refresh-interval", "1"])
+            .expect("minimum refresh interval parses");
+        let maximum = Cli::try_parse_from(["kickoutchi", "--refresh-interval", "3600"])
+            .expect("maximum refresh interval parses");
+
+        assert_eq!(minimum.refresh_interval, Some(1));
+        assert_eq!(maximum.refresh_interval, Some(3600));
     }
 
     #[test]

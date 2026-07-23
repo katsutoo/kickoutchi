@@ -808,6 +808,24 @@ mod tests {
     }
 
     #[test]
+    fn family_filters_ignore_transport_protocol() {
+        let mut tcp_v4 = entry(3000, "tcp-v4");
+        tcp_v4.local_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut udp_v4 = entry(3001, "udp-v4");
+        udp_v4.protocol = Protocol::Udp;
+        udp_v4.local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let mut tcp_v6 = entry(3002, "tcp-v6");
+        tcp_v6.local_addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let mut udp_v6 = entry(3003, "udp-v6");
+        udp_v6.protocol = Protocol::Udp;
+        udp_v6.local_addr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let rows = [tcp_v4, udp_v4, tcp_v6, udp_v6];
+
+        assert_eq!(matching_ports(&rows, "family:ipv4"), [3000, 3001]);
+        assert_eq!(matching_ports(&rows, "family:ipv6"), [3002, 3003]);
+    }
+
+    #[test]
     fn mapped_address_filters_normalize_and_scope_conflicts_fail() {
         let row = entry(3000, "node");
         assert_eq!(matching_ports(&[row], "address:::ffff:127.0.0.1"), [3000]);
@@ -877,6 +895,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn family_scope_and_address_filters_reject_malformed_values() {
+        let cases = [
+            ("family:ip", "family"),
+            ("family:", "family"),
+            ("scope:wan", "scope"),
+            ("scope:", "scope"),
+            ("scope_id:0", "scope_id"),
+            ("scope_id:4294967296", "scope_id"),
+            ("scope_id:not-a-number", "scope_id"),
+            ("address:", "address"),
+            ("address:localhost", "address"),
+            ("address:127.0.0.999", "address"),
+            ("address:gggg::1", "address"),
+        ];
+
+        for (filter, expected_field) in cases {
+            assert!(matches!(
+                super::validate_filter_text(filter, QueryCapabilities::LIST),
+                Err(QueryError::InvalidValue { field, .. }) if field == expected_field
+            ));
+        }
     }
 
     #[test]

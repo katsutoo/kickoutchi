@@ -864,11 +864,35 @@ mod tests {
 
         assert_eq!(identity.sockets, display.sockets);
         assert_eq!(display.sockets, legacy.sockets);
+        assert_eq!(
+            identity
+                .processes
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            display
+                .processes
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(
+            display
+                .processes
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            legacy
+                .processes
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
         assert!(
             identity
                 .processes
                 .values()
-                .all(|process| process.name.is_none())
+                .all(|process| process.name.is_none()
+                    && process.executable_path.is_none()
+                    && process.command_line.is_none()
+                    && process.parent_pid.is_none()
+                    && process.parent_process_name.is_none())
         );
         assert!(
             display
@@ -882,6 +906,12 @@ mod tests {
                 .values()
                 .all(|process| process.command_line.is_none())
         );
+        assert!(display.processes.values().any(|process| {
+            process.name.is_some()
+                && process.executable_path.is_some()
+                && process.parent_pid.is_some()
+                && process.parent_process_name.is_some()
+        }));
         assert!(
             legacy
                 .processes

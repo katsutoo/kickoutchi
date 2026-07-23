@@ -1282,6 +1282,29 @@ mod tests {
     }
 
     #[test]
+    fn evidence_retention_handles_zero_maximum_and_first_omitted_item() {
+        let item = || Evidence {
+            code: EvidenceCode::ExactBindOtherError,
+            source: EvidenceSource::Analysis,
+            certainty: Certainty::Unknown,
+            message: "bounded evidence".to_owned(),
+        };
+
+        for (count, retained, omitted) in [
+            (0, 0, 0),
+            (WHY_EVIDENCE_MAX, WHY_EVIDENCE_MAX, 0),
+            (WHY_EVIDENCE_MAX + 1, WHY_EVIDENCE_MAX, 1),
+        ] {
+            let mut evidence = BoundedEvidence::default();
+            for _ in 0..count {
+                evidence.push_with(item);
+            }
+            assert_eq!(evidence.items.len(), retained, "count={count}");
+            assert_eq!(evidence.omitted, omitted, "count={count}");
+        }
+    }
+
+    #[test]
     fn time_wait_timer_is_estimated_and_never_promises_future_bindability() {
         let target = endpoint(Protocol::Tcp, IpAddr::V4(Ipv4Addr::LOCALHOST));
         let mut observed_socket = socket(

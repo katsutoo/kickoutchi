@@ -885,6 +885,10 @@ mod tests {
             .push(OwnerObservation::Verified(second));
         let current = snapshot(vec![current_socket]);
         assert!(events(&previous, &current).is_empty());
+
+        let previous = snapshot(vec![current.sockets[0].clone()]);
+        let current = snapshot(vec![socket(3000, Some(first))]);
+        assert!(events(&previous, &current).is_empty());
     }
 
     #[test]

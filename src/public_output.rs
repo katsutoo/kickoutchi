@@ -1847,8 +1847,8 @@ mod tests {
     }
 
     #[test]
-    fn large_snapshot_is_written_incrementally() {
-        const SOCKETS: usize = 8_192;
+    fn production_maximum_snapshot_is_written_incrementally() {
+        const SOCKETS: usize = crate::observation::SOCKET_OBSERVATIONS_MAX;
         let sockets = (0..SOCKETS)
             .map(|offset| {
                 let port = u32::try_from(offset % usize::from(u16::MAX) + 1).expect("fixture port");

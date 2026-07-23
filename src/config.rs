@@ -174,7 +174,11 @@ impl Config {
         if let Some(path) = path_override {
             return Self::load_from(path);
         }
-        let Some(path) = default_config_path() else {
+        Self::load_default(default_config_path())
+    }
+
+    fn load_default(path: Option<PathBuf>) -> Result<Self, ConfigError> {
+        let Some(path) = path else {
             // No config directory on this system, so there's nothing to read.
             return Ok(Self::default());
         };
@@ -366,6 +370,7 @@ fn default_config_path() -> Option<PathBuf> {
 mod tests {
     use std::fmt::Write as _;
     use std::fs;
+    use std::io::{self, Read};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
     use std::time::Duration;
@@ -589,6 +594,15 @@ label = "web"
     }
 
     #[test]
+    fn refresh_interval_accepts_both_inclusive_boundaries() {
+        let minimum = parse("refresh_interval_seconds = 1").expect("minimum is valid");
+        let maximum = parse("refresh_interval_seconds = 3600").expect("maximum is valid");
+
+        assert_eq!(minimum.refresh_interval, Duration::from_secs(1));
+        assert_eq!(maximum.refresh_interval, Duration::from_hours(1));
+    }
+
+    #[test]
     fn oversized_protected_list_is_rejected() {
         let names: Vec<String> = (0..=PROTECTED_PROCESSES_MAX)
             .map(|index| format!("\"process-{index}\""))
@@ -615,6 +629,30 @@ label = "web"
             "/nonexistent/kickoutchi-test/never-here.toml",
         )));
         assert!(matches!(result, Err(ConfigError::Read { .. })));
+    }
+
+    #[test]
+    fn absent_default_config_yields_defaults() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock must be after the epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "kickoutchi-absent-default-config-{}-{unique}",
+            std::process::id(),
+        ));
+        fs::create_dir(&directory).expect("test directory must be created");
+        let path = directory.join("config.toml");
+
+        let config = Config::load_default(Some(path)).expect("an absent default is valid");
+
+        assert_eq!(config.refresh_interval, Config::default().refresh_interval);
+        assert_eq!(config.default_sort, Config::default().default_sort);
+        assert_eq!(
+            config.protected_processes,
+            Config::default().protected_processes
+        );
+        fs::remove_dir(directory).expect("test directory must be removed");
     }
 
     #[test]
@@ -649,6 +687,33 @@ label = "web"
             other => panic!("expected oversized ConfigError::Invalid, got {other:?}"),
         };
         assert!(detail.contains("exceeds"), "detail: {detail}");
+    }
+
+    #[test]
+    fn config_reader_reports_an_error_after_a_successful_prefix() {
+        struct FailedReader;
+
+        impl Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "lost input"))
+            }
+        }
+
+        let reader = io::Cursor::new(b"refresh_interval_seconds = 3\n").chain(FailedReader);
+        let path = Path::new("interrupted.toml");
+        let error = read_config_from(reader, path).expect_err("trailing read failure must win");
+
+        match error {
+            ConfigError::Read {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path, path);
+                assert_eq!(source.kind(), io::ErrorKind::ConnectionReset);
+                assert_eq!(source.to_string(), "lost input");
+            }
+            ConfigError::Invalid { .. } => panic!("expected ConfigError::Read"),
+        }
     }
 
     #[test]

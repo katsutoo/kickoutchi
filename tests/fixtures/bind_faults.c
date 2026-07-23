@@ -21,6 +21,15 @@ int bind(int socket_fd, const struct sockaddr *address, socklen_t length) {
         return call_native == NULL ? -1 : call_native(socket_fd, address, length);
     }
 
+    if (strcmp(mode, "unavailable") == 0) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    if (strcmp(mode, "unsupported") == 0) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
     if (address->sa_family == AF_INET && length >= sizeof(struct sockaddr_in)) {
         const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)address;
         uint32_t host = ntohl(ipv4->sin_addr.s_addr);

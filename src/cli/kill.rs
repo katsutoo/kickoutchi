@@ -351,7 +351,6 @@ where
             return Err(TerminationOutcome::UnsafePid(reason));
         }
     };
-
     if require_protection_name {
         process::validate_single_delivery_evidence(confirmed, &fresh)?;
     }
@@ -570,13 +569,19 @@ pub(super) fn read_confirmation_line(max_bytes: usize) -> std::io::Result<String
 fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<String> {
     let limit = u64::try_from(max_bytes)
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large"))?
-        .checked_add(1)
+        .checked_add(2)
         .ok_or_else(|| {
             io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large")
         })?;
-    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(2));
     (&mut *reader).take(limit).read_until(b'\n', &mut bytes)?;
 
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
     if bytes.len() > max_bytes {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
@@ -665,7 +670,8 @@ mod tests {
         ObservationError, OwnerCompleteness, OwnerObservation, UnverifiedOwnerReason,
     };
     use crate::process::{
-        ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
+        CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
+        TerminationOutcome, UnsafePidReason,
     };
 
     fn kill_pid(pid: u32, force: bool, yes: bool) -> KillArgs {
@@ -1310,22 +1316,57 @@ mod tests {
 
     #[test]
     fn confirmation_input_accepts_utf8_at_the_byte_limit() {
-        let mut input = std::io::Cursor::new("é\n".as_bytes());
+        let exact_payload = format!("{}é", "x".repeat(CONFIRMATION_INPUT_MAX_BYTES - 2));
+        assert_eq!(exact_payload.len(), CONFIRMATION_INPUT_MAX_BYTES);
 
-        let answer = read_confirmation_line_from(&mut input, 3).expect("input fits exactly");
+        for framed in [
+            exact_payload.clone(),
+            format!("{exact_payload}\n"),
+            format!("{exact_payload}\r\n"),
+        ] {
+            let mut input = std::io::Cursor::new(framed.into_bytes());
+            let answer = read_confirmation_line_from(&mut input, CONFIRMATION_INPUT_MAX_BYTES)
+                .expect("exact payload must fit with any supported line framing");
 
-        assert_eq!(answer, "é\n");
+            assert_eq!(answer, exact_payload);
+        }
     }
 
     #[test]
     fn overlong_confirmation_stops_after_limit_plus_one_bytes() {
-        let mut input = std::io::Cursor::new(b"force-extra\ntree\n");
+        let mut bytes = vec![b'x'; CONFIRMATION_INPUT_MAX_BYTES + 1];
+        bytes.push(b'\n');
+        let mut input = std::io::Cursor::new(bytes);
 
-        let error = read_confirmation_line_from(&mut input, 5).expect_err("input is over limit");
+        let error = read_confirmation_line_from(&mut input, CONFIRMATION_INPUT_MAX_BYTES)
+            .expect_err("first excess payload byte must be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("5-byte limit"));
-        assert_eq!(input.position(), 6);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{CONFIRMATION_INPUT_MAX_BYTES}-byte limit"))
+        );
+        assert_eq!(
+            input.position(),
+            u64::try_from(CONFIRMATION_INPUT_MAX_BYTES + 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn confirmation_input_handles_empty_lines_and_invalid_utf8() {
+        for bytes in [b"".as_slice(), b"\n".as_slice(), b"\r\n".as_slice()] {
+            let mut input = std::io::Cursor::new(bytes);
+            assert_eq!(
+                read_confirmation_line_from(&mut input, CONFIRMATION_INPUT_MAX_BYTES).unwrap(),
+                ""
+            );
+        }
+
+        let mut invalid = std::io::Cursor::new([0xff, b'\n']);
+        let error = read_confirmation_line_from(&mut invalid, CONFIRMATION_INPUT_MAX_BYTES)
+            .expect_err("invalid UTF-8 must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     fn settle_target() -> KillTarget {

@@ -243,15 +243,7 @@ impl WhyOptions {
         } else {
             ReuseAddressMode::Disabled
         };
-        let endpoint_count = protocols
-            .len()
-            .checked_mul(addresses.len())
-            .ok_or_else(|| "endpoint matrix size overflowed".to_owned())?;
-        if endpoint_count == 0 || endpoint_count > WHY_ENDPOINTS_MAX {
-            return Err(format!(
-                "endpoint matrix must contain 1..={WHY_ENDPOINTS_MAX} entries"
-            ));
-        }
+        let endpoint_count = endpoint_count(protocols.len(), addresses.len())?;
         let mut endpoints = Vec::with_capacity(endpoint_count);
         for protocol in &protocols {
             for address in &addresses {
@@ -290,6 +282,18 @@ impl WhyOptions {
             json: args.json,
         })
     }
+}
+
+fn endpoint_count(protocols: usize, addresses: usize) -> Result<usize, String> {
+    let count = protocols
+        .checked_mul(addresses)
+        .ok_or_else(|| "endpoint matrix size overflowed".to_owned())?;
+    if count == 0 || count > WHY_ENDPOINTS_MAX {
+        return Err(format!(
+            "endpoint matrix must contain 1..={WHY_ENDPOINTS_MAX} entries"
+        ));
+    }
+    Ok(count)
 }
 
 fn parse_addresses(args: &WhyArgs) -> Result<Vec<IpAddr>, String> {
@@ -777,6 +781,7 @@ mod tests {
 
     struct FakeRuntime {
         snapshot: NetworkSnapshot,
+        collect_error: bool,
         outcomes: Vec<ProbeOutcome>,
         collect_profiles: Vec<MetadataProfile>,
         probes: usize,
@@ -789,6 +794,7 @@ mod tests {
         fn new(outcomes: Vec<ProbeOutcome>) -> Self {
             Self {
                 snapshot: snapshot(),
+                collect_error: false,
                 outcomes,
                 collect_profiles: Vec::new(),
                 probes: 0,
@@ -802,7 +808,11 @@ mod tests {
     impl WhyRuntime for FakeRuntime {
         fn collect(&mut self, profile: MetadataProfile) -> Result<NetworkSnapshot, CollectorError> {
             self.collect_profiles.push(profile);
-            Ok(self.snapshot.clone())
+            if self.collect_error {
+                Err(crate::observation::ObservationError::SocketTableUnavailable.into())
+            } else {
+                Ok(self.snapshot.clone())
+            }
         }
 
         fn now(&mut self) -> SystemTime {
@@ -925,6 +935,17 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_count_accepts_only_the_contract_range() {
+        assert!(endpoint_count(0, 1).is_err());
+        assert_eq!(
+            endpoint_count(2, WHY_ENDPOINTS_MAX / 2).unwrap(),
+            WHY_ENDPOINTS_MAX
+        );
+        assert!(endpoint_count(1, WHY_ENDPOINTS_MAX + 1).is_err());
+        assert!(endpoint_count(usize::MAX, 2).is_err());
+    }
+
+    #[test]
     fn port_scope_and_address_boundaries_are_validated_exactly() {
         assert!(WhyOptions::parse(&WhyArgs { port: 1, ..args() }).is_ok());
         assert!(
@@ -1005,6 +1026,34 @@ mod tests {
             assert!(runtime.collect_profiles.is_empty());
             assert_eq!(runtime.probes, 0);
         }
+    }
+
+    #[test]
+    fn collection_failure_happens_before_probes_or_output() {
+        let mut runtime = FakeRuntime::new(Vec::new());
+        runtime.collect_error = true;
+        let mut output = RecordingWriter::default();
+        let mut diagnostics = Vec::new();
+
+        let reason = run_why_with(
+            &args(),
+            &Config::default(),
+            &mut runtime,
+            &mut output,
+            &mut diagnostics,
+        );
+
+        assert_eq!(reason, ExitReason::Failure);
+        assert_eq!(runtime.collect_profiles, [MetadataProfile::Display]);
+        assert_eq!(runtime.probes, 0);
+        assert_eq!(runtime.clock_calls, 0);
+        assert!(output.bytes.is_empty());
+        assert_eq!(output.writes, 0);
+        assert!(
+            String::from_utf8(diagnostics)
+                .unwrap()
+                .contains("collecting endpoint evidence failed")
+        );
     }
 
     #[test]
@@ -1094,6 +1143,31 @@ mod tests {
             assert!(diagnostics.is_empty());
             assert_eq!(runtime.probes, 1);
         }
+    }
+
+    #[test]
+    fn every_endpoint_is_evaluated_before_broken_output_is_observed() {
+        let mut input = args();
+        input.all_protocols = true;
+        input.all_addresses = true;
+        let mut runtime = FakeRuntime::new(vec![ProbeOutcome::Unsupported; WHY_ENDPOINTS_MAX]);
+        let mut diagnostics = Vec::new();
+
+        let reason = run_why_with(
+            &input,
+            &Config::default(),
+            &mut runtime,
+            &mut BrokenWriter,
+            &mut diagnostics,
+        );
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(runtime.probes, WHY_ENDPOINTS_MAX);
+        assert_eq!(
+            runtime.clock_calls,
+            u64::try_from(WHY_ENDPOINTS_MAX * 2).unwrap()
+        );
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

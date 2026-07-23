@@ -191,7 +191,7 @@ cross-machine performance.
 - No added code comment uses numbered stage or phase terminology.
 - `FEATURE.md` records the completed gate and remains the internal planning
   document.
-- The requested review record is `STATE6_REVIEW.md`.
+- The requested review record is `STAGE6_REVIEW.md`.
 
 ## Residual Risk
 

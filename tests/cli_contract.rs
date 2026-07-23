@@ -408,15 +408,18 @@ mod why_native {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{REAL_BINARY_EXIT_WAIT, collect_child_output, run_command_with_deadline};
+    use super::{
+        CommandChild, REAL_BINARY_EXIT_WAIT, collect_child_output, run_command_with_deadline,
+    };
     use std::fs;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, UdpSocket};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Output, Stdio};
-    use std::sync::{Arc, Mutex};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -450,6 +453,7 @@ mod linux {
     const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
     const HELPER_BIND_ANY_ENV: &str = "KICKOUTCHI_TEST_HELPER_BIND_ANY";
     const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
+    const IPC_WAIT: Duration = Duration::from_secs(10);
     static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
     // Port 0 never hosts a real listening socket (the kernel reads it as "assign an
     // ephemeral port"), so `list --port 0` deterministically finds no confirmed
@@ -503,11 +507,255 @@ mod linux {
         }
     }
 
+    struct DeepChainGuard {
+        root: Option<Child>,
+        process_group: u32,
+        pids: Vec<u32>,
+        _directory: DirectoryGuard,
+    }
+
+    impl DeepChainGuard {
+        fn root_id(&self) -> u32 {
+            self.root
+                .as_ref()
+                .expect("deep-chain root must be owned")
+                .id()
+        }
+
+        fn wait_for_all_gone(&mut self) {
+            let deadline = Instant::now() + GROUP_CLEAR_WAIT;
+            loop {
+                let exited = self
+                    .root
+                    .as_mut()
+                    .expect("deep-chain root must be owned")
+                    .try_wait()
+                    .expect("deep-chain root status must be readable")
+                    .is_some();
+                if exited {
+                    self.root.take();
+                    break;
+                }
+                assert!(Instant::now() < deadline, "deep-chain root did not exit");
+                thread::sleep(Duration::from_millis(10));
+            }
+            for &pid in &self.pids {
+                while pid_exists(pid) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "deep-chain PID {pid} survived termination"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        fn cleanup(&mut self, deadline: Instant) {
+            let Ok(process_group) = libc::pid_t::try_from(self.process_group) else {
+                return;
+            };
+            // SAFETY: a negative PID targets the dedicated process group created
+            // for this test fixture; no pointer or borrowed memory crosses FFI.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+            let mut root = CommandChild(self.root.take());
+            let _ = root.kill_and_reap(deadline);
+            while Instant::now() < deadline {
+                if self.pids.iter().all(|pid| !pid_exists(*pid)) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for DeepChainGuard {
+        fn drop(&mut self) {
+            self.cleanup(Instant::now() + GROUP_CLEAR_WAIT);
+        }
+    }
+
     struct FileGuard(PathBuf);
 
     impl Drop for FileGuard {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    struct SocketLifecycle {
+        child: Option<Child>,
+        stdin: Option<std::process::ChildStdin>,
+        lines: mpsc::Receiver<io::Result<String>>,
+        reader: Option<thread::JoinHandle<()>>,
+        reader_done: mpsc::Receiver<()>,
+    }
+
+    fn finish_reader_thread(
+        reader: &mut Option<thread::JoinHandle<()>>,
+        reader_done: &mpsc::Receiver<()>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if reader.is_none() {
+            return Ok(());
+        }
+        let completion =
+            reader_done.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        match completion {
+            Ok(()) => reader
+                .take()
+                .expect("completed helper reader must be owned")
+                .join()
+                .map_err(|_| io::Error::other("helper reader panicked")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let joined = reader
+                    .take()
+                    .expect("disconnected helper reader must be owned")
+                    .join();
+                match joined {
+                    Ok(()) => Err(io::Error::other("helper reader stopped without completion")),
+                    Err(_) => Err(io::Error::other("helper reader panicked")),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper reader exceeded its exit deadline",
+            )),
+        }
+    }
+
+    impl SocketLifecycle {
+        fn spawn(binary: &Path, args: &[&str]) -> (Self, u16) {
+            let mut child = Command::new(binary)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("socket lifecycle helper must start");
+            let stdin = child.stdin.take().expect("helper stdin must be piped");
+            let stdout = child.stdout.take().expect("helper stdout must be piped");
+            let (sender, lines) = mpsc::channel();
+            let (done_sender, reader_done) = mpsc::channel();
+            let mut helper = Self {
+                child: Some(child),
+                stdin: Some(stdin),
+                lines,
+                reader: None,
+                reader_done,
+            };
+            helper.reader = Some(
+                thread::Builder::new()
+                    .name("socket-lifecycle-reader".to_owned())
+                    .spawn(move || {
+                        for line in BufReader::new(stdout).lines() {
+                            if sender.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = done_sender.send(());
+                    })
+                    .expect("socket lifecycle reader must start"),
+            );
+            let ready = helper.response();
+            let port = ready
+                .strip_prefix("READY ")
+                .expect("helper must acknowledge readiness with its port")
+                .parse::<u16>()
+                .expect("helper port must be a u16");
+            (helper, port)
+        }
+
+        fn command(&mut self, command: &str) {
+            let stdin = self.stdin.as_mut().expect("helper stdin must remain open");
+            writeln!(stdin, "{command}").expect("helper command must be writable");
+            stdin.flush().expect("helper command must be flushed");
+            assert_eq!(self.response(), command);
+        }
+
+        fn id(&self) -> u32 {
+            self.child
+                .as_ref()
+                .expect("helper child must be owned")
+                .id()
+        }
+
+        fn response(&self) -> String {
+            self.lines
+                .recv_timeout(IPC_WAIT)
+                .expect("helper acknowledgement must arrive before its deadline")
+                .expect("helper acknowledgement must be readable")
+        }
+
+        fn exit(&mut self) {
+            self.command("EXIT");
+            drop(self.stdin.take());
+            let deadline = Instant::now() + IPC_WAIT;
+            let status = self
+                .wait_for_exit(deadline)
+                .expect("helper must exit after acknowledging EXIT");
+            assert!(status.success(), "helper must exit successfully");
+            self.finish_reader(deadline)
+                .expect("helper reader must finish before its deadline");
+        }
+
+        fn wait_for_exit(&mut self, deadline: Instant) -> io::Result<ExitStatus> {
+            let child = self
+                .child
+                .as_mut()
+                .ok_or_else(|| io::Error::other("helper child is not owned"))?;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    self.child.take();
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "helper exceeded its exit deadline",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn finish_reader(&mut self, deadline: Instant) -> io::Result<()> {
+            finish_reader_thread(&mut self.reader, &self.reader_done, deadline)
+        }
+
+        fn cleanup(&mut self, deadline: Instant) -> io::Result<()> {
+            drop(self.stdin.take());
+            let mut first_error = None;
+            if let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.child.take();
+                    }
+                    Ok(None) => {
+                        first_error = child.kill().err();
+                    }
+                    Err(error) => first_error = Some(error),
+                }
+            }
+            if self.child.is_some()
+                && let Err(error) = self.wait_for_exit(deadline)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if let Err(error) = self.finish_reader(deadline)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            first_error.map_or(Ok(()), Err)
+        }
+    }
+
+    impl Drop for SocketLifecycle {
+        fn drop(&mut self) {
+            let _ = self.cleanup(Instant::now() + IPC_WAIT);
         }
     }
 
@@ -630,6 +878,56 @@ mod linux {
         (guard, library)
     }
 
+    fn build_collect_fault_library() -> (DirectoryGuard, PathBuf) {
+        let directory = temp_file_path("collect-faults");
+        fs::create_dir(&directory).expect("collect-fault directory must be created");
+        let guard = DirectoryGuard(directory.clone());
+        let library = directory.join("libkickoutchi_collect_faults.so");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/collect_faults.c");
+        let output = run_command_with_deadline(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+                .arg(&source)
+                .arg("-ldl")
+                .arg("-o")
+                .arg(&library),
+            None,
+            CHILD_EXIT_WAIT,
+        )
+        .expect("C compiler must build the collect-fault fixture before its deadline");
+        assert!(
+            output.status.success(),
+            "collect-fault fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (guard, library)
+    }
+
+    fn build_socket_lifecycle_helper() -> (DirectoryGuard, PathBuf) {
+        let directory = temp_file_path("socket-lifecycle");
+        fs::create_dir(&directory).expect("socket lifecycle directory must be created");
+        let guard = DirectoryGuard(directory.clone());
+        let binary = directory.join("socket-lifecycle");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/socket_lifecycle.c");
+        let output = run_command_with_deadline(
+            Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary),
+            None,
+            CHILD_EXIT_WAIT,
+        )
+        .expect("C compiler must build the socket helper before its deadline");
+        assert!(
+            output.status.success(),
+            "socket helper compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (guard, binary)
+    }
+
     fn kick(args: &[&str]) -> Output {
         run_binary(env!("CARGO_BIN_EXE_kick"), args, None)
     }
@@ -683,6 +981,25 @@ mod linux {
             .expect("list binary must run with a closed stdout reader");
         let output = collect_child_output(child, None, KICK_EXIT_WAIT)
             .expect("list output must be collected before its deadline");
+        drop(config_guard);
+        output
+    }
+
+    fn run_subcommand_with_closed_stdout(subcommand: &str, args: &[&str]) -> Output {
+        let config_home = isolated_config_home();
+        let config_guard = DirectoryGuard(config_home.clone());
+        let (reader, writer) = UnixStream::pair().expect("test pipe must be created");
+        drop(reader);
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .arg(subcommand)
+            .args(args)
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("binary must run with a closed stdout reader");
+        let output = collect_child_output(child, None, KICK_EXIT_WAIT)
+            .expect("closed-stdout command must finish before its deadline");
         drop(config_guard);
         output
     }
@@ -1114,23 +1431,29 @@ mod linux {
         }
     }
 
-    /// One link of the deep static chain: every link but the leaf spawns the
-    /// next link and parks; the leaf publishes its own PID (the deepest member
-    /// the kill must reach) and parks.
+    fn chain_pid_file(ready_file: &Path, depth: usize) -> PathBuf {
+        ready_file.with_extension(format!("chain-{depth}-pid"))
+    }
+
+    fn chain_ready_file(ready_file: &Path, depth: usize) -> PathBuf {
+        ready_file.with_extension(format!("chain-{depth}-ready"))
+    }
+
+    /// One link of the deep static chain. Each link publishes its PID and does
+    /// not report subtree readiness until every descendant has done the same.
     fn run_chain_link_helper(mode: &str, ready_file: &Path) -> ! {
         let depth = mode
             .strip_prefix("chain-")
             .expect("chain mode must carry a depth")
             .parse::<usize>()
             .expect("chain depth must be numeric");
-        if depth <= 1 {
-            let ready_tmp = ready_file.with_extension("tmp");
-            fs::write(&ready_tmp, std::process::id().to_string())
-                .expect("chain leaf ready file must be written");
-            fs::rename(&ready_tmp, ready_file).expect("chain leaf ready file must publish");
-        } else {
-            // The handle is dropped without killing: the next link lives on as
-            // a chain member until the kill (or its own bounded park) ends it.
+        let pid_file = chain_pid_file(ready_file, depth);
+        let pid_tmp = pid_file.with_extension("tmp");
+        fs::write(&pid_tmp, std::process::id().to_string())
+            .expect("chain PID file must be written");
+        fs::rename(&pid_tmp, &pid_file).expect("chain PID file must publish");
+
+        let _next_guard = if depth > 1 {
             let next =
                 Command::new(std::env::current_exe().expect("test binary path must resolve"))
                     .env(HELPER_TREE_ENV, format!("chain-{}", depth - 1))
@@ -1140,8 +1463,19 @@ mod linux {
                     .stderr(Stdio::null())
                     .spawn()
                     .expect("next chain link must spawn");
-            drop(next);
-        }
+            wait_for_file_within(
+                &chain_ready_file(ready_file, depth - 1),
+                DEEP_CHAIN_READY_WAIT,
+            );
+            Some(ChildGuard { child: next })
+        } else {
+            None
+        };
+
+        let subtree_ready = chain_ready_file(ready_file, depth);
+        let subtree_tmp = subtree_ready.with_extension("tmp");
+        fs::write(&subtree_tmp, "ready").expect("chain subtree marker must be written");
+        fs::rename(&subtree_tmp, &subtree_ready).expect("chain subtree marker must publish");
         park_bounded()
     }
 
@@ -1217,24 +1551,40 @@ mod linux {
         std::process::exit(0)
     }
 
-    fn spawn_deep_chain_process(depth: usize) -> (ChildGuard, u32, PathBuf) {
-        let ready_file = temp_file_path("chain-ready");
+    fn spawn_deep_chain_process(depth: usize) -> DeepChainGuard {
+        let directory = temp_file_path("chain-ready");
+        fs::create_dir(&directory).expect("chain ready directory must be created");
+        let ready_file = directory.join("state");
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, format!("chain-{depth}"))
             .env(HELPER_READY_ENV, &ready_file)
             .args(["--exact", "linux::helper_process_tree", "--nocapture"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("chain helper process must start");
-        let guard = ChildGuard { child };
-        wait_for_file_within(&ready_file, DEEP_CHAIN_READY_WAIT);
-        let leaf_pid = fs::read_to_string(&ready_file)
-            .expect("chain ready file must be readable")
-            .trim()
-            .parse::<u32>()
-            .expect("chain leaf pid must be a u32");
-        (guard, leaf_pid, ready_file)
+        let process_group = child.id();
+        let mut guard = DeepChainGuard {
+            root: Some(child),
+            process_group,
+            pids: Vec::new(),
+            _directory: DirectoryGuard(directory),
+        };
+        wait_for_file_within(&chain_ready_file(&ready_file, depth), DEEP_CHAIN_READY_WAIT);
+        guard.pids = (1..=depth)
+            .rev()
+            .map(|link_depth| {
+                fs::read_to_string(chain_pid_file(&ready_file, link_depth))
+                    .expect("chain PID file must be readable")
+                    .trim()
+                    .parse::<u32>()
+                    .expect("chain PID must be a u32")
+            })
+            .collect();
+        assert_eq!(guard.pids.len(), depth);
+        assert_eq!(guard.pids.first().copied(), Some(guard.root_id()));
+        guard
     }
 
     fn spawn_live_spawner_process() -> (ChildGuard, PathBuf) {
@@ -1744,35 +2094,53 @@ mod linux {
     }
 
     #[test]
-    fn configured_endpoint_label_reaches_real_table_filter_and_json() {
+    fn exact_label_precedes_wildcard_through_search_filter_table_and_json() {
         let _host_observation = lock_host_observation();
         let (_helper, port, ready_file) = spawn_listener_process();
+        let _ready_file = FileGuard(ready_file);
         let port_text = port.to_string();
         let config = format!(
-            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"web dev\"\n"
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"Wildcard Preview\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"Exact Web Dev\"\n"
         );
-
         let table = kickoutchi_with_config(
             &[
                 "list",
                 "--port",
                 port_text.as_str(),
                 "--filter",
-                "label:web",
+                "exact web label:web dev",
             ],
             &config,
         );
         assert_eq!(table.status.code(), Some(0), "{}", stderr(&table));
         assert!(stdout(&table).lines().next().unwrap().ends_with("LABEL"));
-        assert!(stdout(&table).contains("web dev"), "{}", stdout(&table));
-        assert!(!stdout(&table).contains("wildcard"), "{}", stdout(&table));
+        assert!(
+            stdout(&table).contains("Exact Web Dev"),
+            "{}",
+            stdout(&table)
+        );
+        assert!(
+            !stdout(&table).contains("Wildcard Preview"),
+            "{}",
+            stdout(&table)
+        );
 
-        let json =
-            kickoutchi_with_config(&["list", "--port", port_text.as_str(), "--json"], &config);
+        let json = kickoutchi_with_config(
+            &[
+                "list",
+                "--port",
+                port_text.as_str(),
+                "--filter",
+                "label:exact web",
+                "--json",
+            ],
+            &config,
+        );
         assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
         let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
         assert_eq!(value.as_array().map(Vec::len), Some(1));
-        assert_eq!(value[0]["label"], "web dev");
+        assert_eq!(value[0]["label"], "Exact Web Dev");
+        assert!(!stdout(&json).contains("Wildcard Preview"));
 
         let unconfigured = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(
@@ -1788,7 +2156,6 @@ mod linux {
                 .unwrap()
                 .contains("LABEL")
         );
-        let _ = fs::remove_file(ready_file);
     }
 
     #[test]
@@ -2032,7 +2399,82 @@ mod linux {
     }
 
     #[test]
-    fn why_applies_labels_and_rejects_invalid_scope_before_output() {
+    fn why_bare_query_emits_the_default_public_matrix() {
+        let _host_observation = lock_host_observation();
+        let (_library_guard, library) = build_bind_fault_library();
+        let temporary =
+            TcpListener::bind(("127.0.0.1", 0)).expect("temporary matrix port must bind");
+        let port = temporary
+            .local_addr()
+            .expect("matrix address is known")
+            .port();
+        drop(temporary);
+        let port = port.to_string();
+
+        let output = why_with_bind_faults(&[port.as_str(), "--json"], &library, "unavailable");
+
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert_eq!(stderr(&output), "");
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout(&output)).expect("bare why output must be JSON");
+        assert_eq!(value["query"]["protocols"], serde_json::json!(["tcp"]));
+        assert_eq!(
+            value["query"]["addresses"],
+            serde_json::json!(["127.0.0.1", "::1"])
+        );
+        assert_eq!(value["results"].as_array().map(Vec::len), Some(2));
+        assert!(
+            value["results"]
+                .as_array()
+                .is_some_and(|results| results.iter().all(|result| {
+                    result["verdict"] == "address_unavailable"
+                        && result["probe"]["outcome"] == "address_unavailable"
+                }))
+        );
+        assert_eq!(value["aggregate_exit_code"], 3);
+    }
+
+    #[test]
+    fn why_human_and_json_agree_for_unavailable_and_unsupported_probes() {
+        let _host_observation = lock_host_observation();
+        let (_library_guard, library) = build_bind_fault_library();
+        let temporary =
+            TcpListener::bind(("127.0.0.1", 0)).expect("temporary parity port must bind");
+        let port = temporary
+            .local_addr()
+            .expect("parity address is known")
+            .port();
+        drop(temporary);
+        let port = port.to_string();
+
+        for (mode, expected) in [
+            ("unavailable", "address_unavailable"),
+            ("unsupported", "unsupported"),
+        ] {
+            let base = [port.as_str(), "--tcp", "--address", "127.0.0.1"];
+            let human = why_with_bind_faults(&base, &library, mode);
+            let mut json_args = base.to_vec();
+            json_args.push("--json");
+            let json = why_with_bind_faults(&json_args, &library, mode);
+
+            assert_eq!(human.status.code(), Some(3), "{}", stderr(&human));
+            assert_eq!(json.status.code(), Some(3), "{}", stderr(&json));
+            assert_eq!(stderr(&human), "");
+            assert_eq!(stderr(&json), "");
+            let value: serde_json::Value =
+                serde_json::from_str(&stdout(&json)).expect("why parity output must be JSON");
+            assert_eq!(value["results"][0]["verdict"], expected);
+            assert_eq!(value["results"][0]["probe"]["outcome"], expected);
+            assert_eq!(value["aggregate_exit_code"], 3);
+            let human = stdout(&human);
+            assert!(human.contains(&format!("verdict={expected}")), "{human}");
+            assert!(human.contains(&format!("probe={expected}")), "{human}");
+            assert!(human.contains("aggregate_exit_code=3"), "{human}");
+        }
+    }
+
+    #[test]
+    fn why_applies_exact_and_wildcard_labels_and_rejects_invalid_scope_before_output() {
         let _host_observation = lock_host_observation();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
         let port = listener
@@ -2040,18 +2482,22 @@ mod linux {
             .expect("listener address is known")
             .port();
         let port_text = port.to_string();
-        let config = format!(
-            "[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"web fixture\"\n"
-        );
-
-        let labeled = why_with_config(
-            &[port_text.as_str(), "--address", "127.0.0.1", "--json"],
-            &config,
-        );
-        assert_eq!(labeled.status.code(), Some(3), "{}", stderr(&labeled));
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout(&labeled)).expect("why output must be JSON");
-        assert_eq!(value["results"][0]["label"], "web fixture");
+        for (selector, label) in [
+            ("127.0.0.1", "exact web fixture"),
+            ("*", "wildcard web fixture"),
+        ] {
+            let config = format!(
+                "[[ports]]\nprotocol = \"tcp\"\naddress = \"{selector}\"\nport = {port}\nlabel = \"{label}\"\n"
+            );
+            let labeled = why_with_config(
+                &[port_text.as_str(), "--address", "127.0.0.1", "--json"],
+                &config,
+            );
+            assert_eq!(labeled.status.code(), Some(3), "{}", stderr(&labeled));
+            let value: serde_json::Value =
+                serde_json::from_str(&stdout(&labeled)).expect("why output must be JSON");
+            assert_eq!(value["results"][0]["label"], label);
+        }
 
         let invalid = why(&[
             port_text.as_str(),
@@ -2328,6 +2774,452 @@ mod linux {
         assert!(records[0]["data"]["omitted_evidence_gap_count"].is_u64());
         assert!(!stdout(&output).contains("command_line"));
         drop(listener);
+    }
+
+    #[test]
+    fn socket_lifecycle_helper_covers_protocol_family_bind_and_sharing_modes() {
+        let _host_observation = lock_host_observation();
+        let (_binary_guard, binary) = build_socket_lifecycle_helper();
+        let mut modes = vec![
+            (["tcp4", "exact", "default", "1"], "tcp", "127.0.0.1", 1),
+            (["tcp4", "wildcard", "default", "2"], "tcp", "0.0.0.0", 2),
+            (["udp4", "exact", "default", "1"], "udp", "127.0.0.1", 1),
+            (["udp4", "wildcard", "default", "1"], "udp", "0.0.0.0", 1),
+        ];
+        let tcp6_supported = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok();
+        let udp6_supported = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok();
+        let dual_tcp_supported = dual_stack_probe(socket2::Type::STREAM, socket2::Protocol::TCP);
+        let dual_udp_supported = dual_stack_probe(socket2::Type::DGRAM, socket2::Protocol::UDP);
+        if required_linux_capabilities() {
+            assert!(tcp6_supported && udp6_supported && dual_tcp_supported && dual_udp_supported);
+        }
+        if tcp6_supported {
+            modes.extend([
+                (["tcp6", "exact", "v6only", "1"], "tcp", "::1", 1),
+                (["tcp6", "wildcard", "v6only", "1"], "tcp", "::", 1),
+            ]);
+        }
+        if dual_tcp_supported {
+            modes.push((["tcp6", "wildcard", "dual", "1"], "tcp", "::", 1));
+        }
+        if udp6_supported {
+            modes.extend([
+                (["udp6", "exact", "v6only", "1"], "udp", "::1", 1),
+                (["udp6", "wildcard", "v6only", "1"], "udp", "::", 1),
+            ]);
+        }
+        if dual_udp_supported {
+            modes.push((["udp6", "wildcard", "dual", "1"], "udp", "::", 1));
+        }
+
+        for (args, protocol, address, multiplicity) in modes {
+            let (mut helper, port) = SocketLifecycle::spawn(&binary, &args);
+            assert_ne!(port, 0, "mode {args:?} must use a dynamic port");
+            let output = kickoutchi(&["list", "--snapshot-json"]);
+            assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+            let snapshot: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+            let matching = snapshot["sockets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|socket| {
+                    socket["endpoint"]["protocol"] == protocol
+                        && socket["endpoint"]["address"] == address
+                        && socket["endpoint"]["port"] == port
+                })
+                .count();
+            assert_eq!(matching, multiplicity, "mode {args:?}: {}", stdout(&output));
+
+            if args[0] == "tcp6" {
+                let ipv4 = TcpListener::bind(("0.0.0.0", port));
+                assert_eq!(ipv4.is_ok(), args[2] == "v6only", "mode {args:?}");
+            } else if args[0] == "udp6" {
+                let ipv4 = UdpSocket::bind(("0.0.0.0", port));
+                assert_eq!(ipv4.is_ok(), args[2] == "v6only", "mode {args:?}");
+            }
+            helper.command("CLOSE");
+            helper.command("REBIND");
+            helper.exit();
+        }
+    }
+
+    fn dual_stack_probe(socket_type: socket2::Type, protocol: socket2::Protocol) -> bool {
+        let Ok(socket) = socket2::Socket::new(socket2::Domain::IPV6, socket_type, Some(protocol))
+        else {
+            return false;
+        };
+        socket.set_only_v6(false).is_ok()
+            && socket
+                .bind(&std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())
+                .is_ok()
+    }
+
+    #[test]
+    fn watch_wildcard_label_reaches_filtered_output() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("watch fixture must bind");
+        let port = listener
+            .local_addr()
+            .expect("watch address is known")
+            .port();
+        let config = format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard watch fixture\"\n"
+        );
+        let config_dir = temp_file_path("wildcard-watch-config");
+        fs::create_dir(&config_dir).expect("watch config directory must be created");
+        let _config_guard = DirectoryGuard(config_dir.clone());
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, config).expect("watch config must be written");
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .arg("--config")
+            .arg(&config_path)
+            .args([
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--filter",
+                "label:wildcard watch",
+                "--interval",
+                "100ms",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("wildcard watch process must start");
+        let mut child = ChildGuard { child };
+        let mut stdout = BufReader::new(
+            child
+                .child
+                .stdout
+                .take()
+                .expect("wildcard watch stdout must be piped"),
+        );
+        let (sender, record) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let result = stdout.read_line(&mut line).map(|_| line);
+            let _ = sender.send(result);
+        });
+        let record = record
+            .recv_timeout(IPC_WAIT)
+            .expect("wildcard watch baseline must arrive before its deadline")
+            .expect("wildcard watch baseline must be readable");
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["event"], "baseline");
+        assert_eq!(record["data"]["label"], "wildcard watch fixture");
+        assert_eq!(record["data"]["filter_result"], "matched");
+
+        let platform_pid = libc::pid_t::try_from(child.id()).expect("watch PID must fit pid_t");
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch status must be readable")
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "wildcard watch did not exit");
+            thread::yield_now();
+        };
+        reader.join().expect("wildcard watch reader must finish");
+        let mut diagnostics = String::new();
+        child
+            .child
+            .stderr
+            .take()
+            .expect("wildcard watch stderr must be piped")
+            .read_to_string(&mut diagnostics)
+            .expect("wildcard watch stderr must be readable");
+        assert_eq!(status.code(), Some(0), "{diagnostics}");
+        assert!(diagnostics.is_empty(), "{diagnostics}");
+    }
+
+    #[test]
+    fn socket_lifecycle_drop_forces_process_and_reader_cleanup() {
+        let (_binary_guard, binary) = build_socket_lifecycle_helper();
+        let pid = {
+            let (helper, _port) =
+                SocketLifecycle::spawn(&binary, &["tcp4", "exact", "default", "1"]);
+            helper.id()
+        };
+        assert!(!pid_exists(pid), "dropped helper process must be reaped");
+    }
+
+    #[test]
+    fn reader_panic_is_joined_and_reported() {
+        let (done_sender, reader_done) = mpsc::channel();
+        let mut reader = Some(thread::spawn(move || {
+            drop(done_sender);
+            panic!("injected reader panic");
+        }));
+
+        let error = finish_reader_thread(&mut reader, &reader_done, Instant::now() + IPC_WAIT)
+            .expect_err("reader panic must be reported");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("reader panicked"));
+        assert!(reader.is_none(), "panicked reader must still be joined");
+    }
+
+    #[test]
+    fn deep_chain_drop_terminates_every_owned_process() {
+        let pids = {
+            let helper = spawn_deep_chain_process(4);
+            helper.pids.clone()
+        };
+        for pid in pids {
+            assert!(!pid_exists(pid), "dropped deep-chain PID {pid} must exit");
+        }
+    }
+
+    #[test]
+    fn socket_lifecycle_helper_hands_an_endpoint_to_a_replacement_process() {
+        let _host_observation = lock_host_observation();
+        let (_binary_guard, binary) = build_socket_lifecycle_helper();
+        let (mut original, port) =
+            SocketLifecycle::spawn(&binary, &["tcp4", "exact", "default", "1"]);
+        let original_pid = original.id();
+        original.command("CLOSE");
+        let port_text = port.to_string();
+        let (mut replacement, replacement_port) = SocketLifecycle::spawn(
+            &binary,
+            &["tcp4", "exact", "default", "1", port_text.as_str()],
+        );
+        assert_eq!(replacement_port, port);
+        assert_ne!(replacement.id(), original_pid);
+
+        let output = kickoutchi(&["list", "--snapshot-json"]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let snapshot: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        let socket = snapshot["sockets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|socket| {
+                socket["endpoint"]["protocol"] == "tcp"
+                    && socket["endpoint"]["address"] == "127.0.0.1"
+                    && socket["endpoint"]["port"] == port
+            })
+            .expect("replacement endpoint must be observed");
+        let owner_pids = socket["owners"]["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|owner| owner["identity"]["pid"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(owner_pids, [u64::from(replacement.id())]);
+        assert!(!owner_pids.contains(&u64::from(original_pid)));
+
+        original.exit();
+        replacement.exit();
+    }
+
+    #[test]
+    fn watch_real_binary_observes_baseline_release_and_bind() {
+        let _host_observation = lock_host_observation();
+        let (_binary_guard, binary) = build_socket_lifecycle_helper();
+        let (mut helper, port) =
+            SocketLifecycle::spawn(&binary, &["tcp4", "exact", "default", "1"]);
+        let config_home = isolated_config_home();
+        let _config_guard = DirectoryGuard(config_home.clone());
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .args([
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--interval",
+                "100ms",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("watch process must start");
+        let mut child = ChildGuard { child };
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .expect("watch stdout must be piped");
+        let (sender, lines) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let receive_event = |expected: &str| {
+            let line = lines
+                .recv_timeout(IPC_WAIT)
+                .expect("watch event must arrive before its deadline")
+                .expect("watch event must be readable");
+            let value: serde_json::Value =
+                serde_json::from_str(&line).expect("watch event must be JSON");
+            assert_eq!(value["event"], expected, "{line}");
+            assert_eq!(value["data"]["endpoint"]["port"], port, "{line}");
+        };
+
+        receive_event("baseline");
+        helper.command("CLOSE");
+        receive_event("release");
+        helper.command("REBIND");
+        receive_event("bind");
+
+        let platform_pid = libc::pid_t::try_from(child.id()).expect("watch PID must fit pid_t");
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGINT) }, 0);
+        let deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch status must be readable")
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "watch did not exit after SIGINT");
+            thread::yield_now();
+        };
+        reader.join().expect("watch stdout reader must finish");
+        let mut diagnostics = String::new();
+        child
+            .child
+            .stderr
+            .take()
+            .expect("watch stderr must be piped")
+            .read_to_string(&mut diagnostics)
+            .expect("watch stderr must be readable");
+        assert_eq!(status.code(), Some(0), "{diagnostics}");
+        assert!(diagnostics.is_empty(), "{diagnostics}");
+        helper.exit();
+    }
+
+    #[test]
+    fn watch_real_binary_recovers_after_one_native_collection_failure() {
+        let _host_observation = lock_host_observation();
+        let (_library_guard, library) = build_collect_fault_library();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("watch fixture must bind");
+        let port = listener
+            .local_addr()
+            .expect("watch address is known")
+            .port();
+        let config_home = isolated_config_home();
+        let _config_guard = DirectoryGuard(config_home.clone());
+        let child = Command::new(env!("CARGO_BIN_EXE_kickoutchi"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("LD_PRELOAD", &library)
+            .args([
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--interval",
+                "100ms",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("watch recovery process must start");
+        let mut child = ChildGuard { child };
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .expect("watch recovery stdout must be piped");
+        let (sender, lines) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let baseline = lines
+            .recv_timeout(IPC_WAIT)
+            .expect("watch must emit a baseline before its deadline")
+            .expect("baseline must be readable");
+        let baseline: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(baseline["event"], "baseline");
+        assert_eq!(baseline["data"]["endpoint"]["port"], port);
+
+        let platform_pid = libc::pid_t::try_from(child.id()).expect("watch PID must fit pid_t");
+        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGUSR2) }, 0);
+        let gap = lines
+            .recv_timeout(IPC_WAIT)
+            .expect("watch must emit the armed collection gap before its deadline")
+            .expect("collection gap must be readable");
+        let gap: serde_json::Value = serde_json::from_str(&gap).unwrap();
+        assert_eq!(gap["event"], "collection_gap");
+        assert_eq!(gap["data"]["consecutive_failures"], 1);
+        assert_eq!(gap["data"]["certainty"], "unknown");
+        assert!(
+            matches!(
+                lines.recv_timeout(IPC_WAIT),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "recovery must close stdout without fabricating an event"
+        );
+        reader.join().expect("watch recovery reader must finish");
+        let deadline = Instant::now() + KICK_EXIT_WAIT;
+        let status = loop {
+            if let Some(status) = child
+                .child
+                .try_wait()
+                .expect("watch recovery status must be readable")
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "recovered watch did not exit");
+            thread::yield_now();
+        };
+        let mut diagnostics = String::new();
+        child
+            .child
+            .stderr
+            .take()
+            .expect("watch recovery stderr must be piped")
+            .read_to_string(&mut diagnostics)
+            .expect("watch recovery stderr must be readable");
+        assert_eq!(status.code(), Some(0), "{diagnostics}");
+        assert!(diagnostics.is_empty(), "{diagnostics}");
+    }
+
+    #[test]
+    fn watch_closed_stdout_is_success() {
+        let _host_observation = lock_host_observation();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("watch fixture must bind");
+        let port = listener
+            .local_addr()
+            .expect("watch address is known")
+            .port();
+
+        let output = run_subcommand_with_closed_stdout(
+            "watch",
+            &[
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--json",
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(output.stderr.is_empty(), "{}", stderr(&output));
     }
 
     #[test]
@@ -2833,9 +3725,8 @@ mod linux {
     #[test]
     fn tree_kill_by_pid_reaches_deep_static_chain() {
         let _host_observation = lock_host_observation();
-        let (mut helper, leaf_pid, ready_file) = spawn_deep_chain_process(DEEP_CHAIN_DEPTH);
-        let _leaf_cleanup = PidGuard { pid: leaf_pid };
-        let root_pid_text = helper.id().to_string();
+        let mut helper = spawn_deep_chain_process(DEEP_CHAIN_DEPTH);
+        let root_pid_text = helper.root_id().to_string();
 
         let killed = kickoutchi_with_stdin(
             &["kill", "--pid", root_pid_text.as_str(), "--tree"],
@@ -2849,9 +3740,7 @@ mod linux {
             killed_stderr.contains(&format!("{DEEP_CHAIN_DEPTH} processes")),
             "{killed_stderr}",
         );
-        wait_for_child_exit(&mut helper);
-        wait_for_pid_gone(leaf_pid);
-        let _ = fs::remove_file(ready_file);
+        helper.wait_for_all_gone();
     }
 
     #[test]
@@ -3031,6 +3920,20 @@ mod linux {
         assert_eq!(missing.status.code(), Some(3));
 
         let _ = fs::remove_file(ready_file);
+    }
+
+    #[test]
+    fn inspect_closed_stdout_is_success() {
+        let _host_observation = lock_host_observation();
+        let (helper, port, ready_file) = spawn_listener_process();
+        let _ready_file = FileGuard(ready_file);
+
+        let output =
+            run_subcommand_with_closed_stdout("inspect", &["--port", port.to_string().as_str()]);
+
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty(), "{}", stderr(&output));
+        assert!(pid_exists(helper.id()), "inspect must remain read-only");
     }
 
     #[test]

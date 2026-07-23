@@ -321,6 +321,54 @@ mod tests {
     }
 
     #[test]
+    fn exact_labels_keep_ipv4_and_ipv6_endpoints_separate() {
+        let registry = LabelRegistry::from_inputs(vec![
+            input("tcp", "0.0.0.0", 8080, "ipv4"),
+            input("tcp", "::", 8080, "ipv6"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            registry.resolve(&endpoint(
+                Protocol::Tcp,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                8080,
+            )),
+            Some("ipv4")
+        );
+        assert_eq!(
+            registry.resolve(&endpoint(
+                Protocol::Tcp,
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                8080,
+            )),
+            Some("ipv6")
+        );
+    }
+
+    #[test]
+    fn duplicate_exact_and_wildcard_selectors_report_the_first_index() {
+        for inputs in [
+            vec![
+                input("tcp", "127.0.0.1", 80, "first"),
+                input("tcp", "127.0.0.1", 80, "second"),
+            ],
+            vec![
+                input("udp", "*", 53, "first"),
+                input("udp", "*", 53, "second"),
+            ],
+        ] {
+            assert_eq!(
+                LabelRegistry::from_inputs(inputs).unwrap_err(),
+                LabelError::DuplicateSelector {
+                    index: 1,
+                    first_index: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn ipv6_scope_matching_is_exact_and_wildcard_ignores_scope() {
         let mut scoped = input("tcp", "fe80::1", 8080, "scoped");
         scoped.scope_id = Some(7);

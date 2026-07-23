@@ -1336,6 +1336,7 @@ fn write_endpoint_event(
     } else {
         Vec::new()
     };
+    let (evidence, omitted_evidence_count) = retain_event_evidence(evidence);
     let data = EndpointEventData {
         endpoint: EndpointDto::from(&socket.local_endpoint),
         state: SocketStateDto::from(socket.state),
@@ -1357,11 +1358,8 @@ fn write_endpoint_event(
         label: config.labels.resolve(&socket.local_endpoint),
         filter_result: filter_result.name(),
         certainty: event.certainty.name(),
-        evidence: evidence
-            .into_iter()
-            .take(WATCH_EVENT_EVIDENCE_MAX)
-            .collect(),
-        omitted_evidence_count: 0,
+        evidence,
+        omitted_evidence_count,
         evidence_gaps,
         omitted_evidence_gap_count: omitted_gap_count,
     };
@@ -1375,6 +1373,17 @@ fn write_endpoint_event(
             observation,
             data,
         },
+    )
+}
+
+fn retain_event_evidence(evidence: Vec<EvidenceDto<'static>>) -> (Vec<EvidenceDto<'static>>, u64) {
+    let omitted = evidence.len().saturating_sub(WATCH_EVENT_EVIDENCE_MAX);
+    (
+        evidence
+            .into_iter()
+            .take(WATCH_EVENT_EVIDENCE_MAX)
+            .collect(),
+        u64::try_from(omitted).unwrap_or(u64::MAX),
     )
 }
 
@@ -1985,7 +1994,7 @@ mod tests {
     use super::{
         BoundedRecord, FilterCache, FilterResult, GapIndex, ObservationTimes, Truth,
         WATCH_DURATION_MAX, WATCH_DURATION_MIN, WATCH_INTERVAL_DEFAULT, WATCH_INTERVAL_MAX,
-        WATCH_INTERVAL_MIN, WatchArgs, WatchOptions, WatchRuntime, evaluate_side,
+        WATCH_INTERVAL_MIN, WatchArgs, WatchOptions, WatchRuntime, evaluate_event, evaluate_side,
         human_endpoint_text, parse_duration_token, run_watch_loop, write_human_event,
         write_ordered_events,
     };
@@ -1996,7 +2005,8 @@ mod tests {
     use crate::observation::{
         EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact, Ipv6Scope,
         MetadataCompleteness, MetadataProfile, NetworkSnapshot, ObservationError,
-        OwnerCompleteness, OwnerObservation, Protocol, SnapshotCompleteness, UnverifiedOwnerReason,
+        OwnerCompleteness, OwnerObservation, ProcessIdentity, ProcessObservation,
+        ProcessStartMarker, Protocol, SnapshotCompleteness, UnverifiedOwnerReason,
     };
     use crate::query::QueryCapabilities;
     use crate::watch::{Certainty, EventKind, WatchEvent, baseline_events, diff_snapshots};
@@ -2154,6 +2164,172 @@ mod tests {
         }
     }
 
+    fn filtered_options(text: &str) -> WatchOptions {
+        let mut filter = options(Duration::from_millis(100));
+        filter.port = None;
+        filter.terms = crate::query::parse_filter_text(text, QueryCapabilities::WATCH).unwrap();
+        filter
+    }
+
+    fn owned_snapshot(
+        pid: u32,
+        name: Option<&str>,
+        metadata: MetadataCompleteness,
+    ) -> NetworkSnapshot {
+        let mut observed = snapshot();
+        observed.sockets.truncate(1);
+        observed.processes.clear();
+        let identity = ProcessIdentity {
+            pid,
+            start_marker: ProcessStartMarker::linux(u64::from(pid) + 1).unwrap(),
+        };
+        observed.sockets[0].owners = vec![OwnerObservation::Verified(identity)];
+        observed.processes.insert(
+            identity,
+            ProcessObservation {
+                name: name.map(Into::into),
+                executable_path: None,
+                command_line: None,
+                parent_pid: None,
+                parent_process_name: None,
+                metadata_omission: None,
+                metadata_completeness: metadata,
+            },
+        );
+        observed
+    }
+
+    #[test]
+    fn event_filter_uses_the_documented_side_and_three_valued_matrix() {
+        let previous = owned_snapshot(10, Some("alpha"), MetadataCompleteness::Complete);
+        let current = owned_snapshot(20, Some("beta"), MetadataCompleteness::Complete);
+        let config = Config::default();
+        let event = |kind| WatchEvent {
+            kind,
+            previous_snapshot: (kind != EventKind::Baseline).then_some(&previous),
+            current_snapshot: (kind != EventKind::Release).then_some(&current),
+            previous_socket: matches!(kind, EventKind::Release | EventKind::Replacement)
+                .then_some(&previous.sockets[0]),
+            current_socket: matches!(
+                kind,
+                EventKind::Baseline | EventKind::Bind | EventKind::Replacement
+            )
+            .then_some(&current.sockets[0]),
+            multiplicity: 1,
+            certainty: Certainty::Proven,
+        };
+
+        for kind in [EventKind::Baseline, EventKind::Bind] {
+            assert_eq!(
+                evaluate_event(
+                    event(kind),
+                    &filtered_options("pid:20 beta"),
+                    &config,
+                    None,
+                    Some(&mut FilterCache::default()),
+                ),
+                Some(FilterResult::Matched),
+                "{kind:?} must use current facts"
+            );
+        }
+        assert_eq!(
+            evaluate_event(
+                event(EventKind::Release),
+                &filtered_options("pid:10 alpha"),
+                &config,
+                Some(&mut FilterCache::default()),
+                None,
+            ),
+            Some(FilterResult::Matched)
+        );
+        for text in ["pid:10 alpha", "pid:20 beta"] {
+            assert_eq!(
+                evaluate_event(
+                    event(EventKind::Replacement),
+                    &filtered_options(text),
+                    &config,
+                    Some(&mut FilterCache::default()),
+                    Some(&mut FilterCache::default()),
+                ),
+                Some(FilterResult::Matched),
+                "replacement must match either complete side"
+            );
+        }
+
+        let unknown = owned_snapshot(20, None, MetadataCompleteness::Partial);
+        let unknown_event = WatchEvent {
+            current_snapshot: Some(&unknown),
+            current_socket: Some(&unknown.sockets[0]),
+            ..event(EventKind::Bind)
+        };
+        assert_eq!(
+            evaluate_event(
+                unknown_event,
+                &filtered_options("missing"),
+                &config,
+                None,
+                Some(&mut FilterCache::default()),
+            ),
+            Some(FilterResult::Indeterminate)
+        );
+        assert_eq!(
+            evaluate_event(
+                unknown_event,
+                &filtered_options("port:1 missing"),
+                &config,
+                None,
+                Some(&mut FilterCache::default()),
+            ),
+            None,
+            "a definite false term suppresses an otherwise unknown event"
+        );
+    }
+
+    #[test]
+    fn owner_terms_must_be_satisfied_by_the_same_owner() {
+        let mut observed = owned_snapshot(10, Some("alpha"), MetadataCompleteness::Complete);
+        let second = ProcessIdentity {
+            pid: 20,
+            start_marker: ProcessStartMarker::linux(21).unwrap(),
+        };
+        observed.sockets[0]
+            .owners
+            .push(OwnerObservation::Verified(second));
+        observed.processes.insert(
+            second,
+            ProcessObservation {
+                name: Some("beta".into()),
+                executable_path: None,
+                command_line: None,
+                parent_pid: None,
+                parent_process_name: None,
+                metadata_omission: None,
+                metadata_completeness: MetadataCompleteness::Complete,
+            },
+        );
+
+        assert_eq!(
+            evaluate_side(
+                &observed,
+                &observed.sockets[0],
+                &filtered_options("pid:10 beta"),
+                &Config::default(),
+                &mut FilterCache::default(),
+            ),
+            Truth::False
+        );
+        assert_eq!(
+            evaluate_side(
+                &observed,
+                &observed.sockets[0],
+                &filtered_options("pid:10 alpha"),
+                &Config::default(),
+                &mut FilterCache::default(),
+            ),
+            Truth::True
+        );
+    }
+
     #[test]
     fn third_consecutive_failure_flushes_three_gaps_and_stops_collection() {
         let snapshots = vec![
@@ -2265,6 +2441,133 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(events, ["collection_gap"]);
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn ownership_and_metadata_partial_snapshot_advances_the_comparison_baseline() {
+        let mut first = snapshot();
+        first.sockets.truncate(1);
+        first.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(10);
+        first.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(11);
+        let mut partial = snapshot();
+        partial.sockets = vec![partial.sockets[1].clone()];
+        partial.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(20);
+        partial.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(21);
+        partial.completeness = SnapshotCompleteness::Partial;
+        partial.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete]).unwrap();
+        partial.processes.values_mut().for_each(|process| {
+            process.metadata_completeness = MetadataCompleteness::Partial;
+        });
+        let mut final_snapshot = first.clone();
+        final_snapshot.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(30);
+        final_snapshot.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(31);
+        let mut runtime = FakeRuntime::new(vec![Ok(first), Ok(partial), Ok(final_snapshot)]);
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut watch_options = options(Duration::from_millis(250));
+        watch_options.port = None;
+        watch_options.filter_active = false;
+
+        let reason = run_watch_loop(
+            &watch_options,
+            &Config::default(),
+            &mut runtime,
+            &mut output,
+            &mut diagnostics,
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(events, ["baseline", "release", "bind", "bind", "release"]);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unsafe_snapshot_does_not_advance_the_comparison_baseline() {
+        let mut first = snapshot();
+        first.sockets.truncate(1);
+        first.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(10);
+        first.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(11);
+        let mut changed = snapshot();
+        changed.sockets = vec![changed.sockets[1].clone()];
+        changed.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(20);
+        changed.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(21);
+        let mut unsafe_snapshot = changed.clone();
+        unsafe_snapshot.completeness = SnapshotCompleteness::Partial;
+        unsafe_snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::SocketSet,
+            EvidenceGapCode::NativeFieldUnavailable,
+            None,
+            None,
+            "socket set incomplete",
+        ));
+        changed.capture_started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(30);
+        changed.capture_completed_at = SystemTime::UNIX_EPOCH + Duration::from_millis(31);
+        let mut runtime = FakeRuntime::new(vec![Ok(first), Ok(unsafe_snapshot), Ok(changed)]);
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut watch_options = options(Duration::from_millis(250));
+        watch_options.port = None;
+        watch_options.filter_active = false;
+
+        let reason = run_watch_loop(
+            &watch_options,
+            &Config::default(),
+            &mut runtime,
+            &mut output,
+            &mut diagnostics,
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(events, ["baseline", "collection_gap", "release", "bind"]);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn successful_poll_resets_the_failure_budget() {
+        let observed = snapshot();
+        let mut runtime = FakeRuntime::new(vec![
+            Ok(observed.clone()),
+            Err(ObservationError::SocketTableUnavailable.into()),
+            Ok(observed),
+            Err(ObservationError::SocketTableUnavailable.into()),
+            Err(ObservationError::SocketTableUnavailable.into()),
+        ]);
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        let reason = run_watch_loop(
+            &options(Duration::from_millis(450)),
+            &Config::default(),
+            &mut runtime,
+            &mut output,
+            &mut diagnostics,
+        );
+
+        assert_eq!(reason, ExitReason::Success);
+        assert_eq!(runtime.collect_count, 5);
+        let failures = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["data"]
+                    ["consecutive_failures"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures, [1, 1, 2]);
+        assert!(diagnostics.is_empty());
     }
 
     struct FailingWriter {
@@ -3614,5 +3917,31 @@ mod tests {
         assert_eq!(record.write(&vec![0; 65_536]).unwrap(), 65_536);
         assert!(record.write(&[0]).is_err());
         assert_eq!(record.bytes.len(), 65_536);
+    }
+
+    #[test]
+    fn event_evidence_retains_zero_maximum_and_counts_the_first_omission() {
+        for (count, retained, omitted) in [
+            (0, 0, 0),
+            (
+                crate::watch::WATCH_EVENT_EVIDENCE_MAX,
+                crate::watch::WATCH_EVENT_EVIDENCE_MAX,
+                0,
+            ),
+            (
+                crate::watch::WATCH_EVENT_EVIDENCE_MAX + 1,
+                crate::watch::WATCH_EVENT_EVIDENCE_MAX,
+                1,
+            ),
+        ] {
+            let evidence = (0..count)
+                .map(|_| {
+                    super::EvidenceDto::literal("fixture", "analysis", "proven", "fixture evidence")
+                })
+                .collect();
+            let (evidence, actual_omitted) = super::retain_event_evidence(evidence);
+            assert_eq!(evidence.len(), retained, "count={count}");
+            assert_eq!(actual_omitted, omitted, "count={count}");
+        }
     }
 }

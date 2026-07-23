@@ -1,0 +1,54 @@
+# artifact_sha256=0b1d6123693ebb238c40bd80098078d4760c587969c8c96299ccc51e14681fb0
+# artifact_bytes=3830872
+# source_commit=2ef547eba4e54fe97eb5135e386c8701c9dff597
+# source_dirty=true
+# source_patch_sha256=91bc2a854d4b62947f94bc27a9002572251d8a5da07da1c1117a123d6b077856
+# source_patch_file=stage9-remediation-snapshot-2026-07-23.tsv.source.patch
+# build_command=cargo build --locked --profile dist --all-features --bin kickoutchi --bin kick
+# python=3.14.4
+# rustc=rustc 1.95.0 (59807616e 2026-04-14)
+# kernel=Linux 7.1.4-arch1-1 x86_64
+# cpu=unavailable
+# cpu_count=32
+# physical_memory_bytes=66658836480
+# load_average=1.70,1.81,1.80
+# config=isolated_empty
+# command=list --snapshot-json
+# workload=snapshot
+# warmups=3
+# samples=30
+# child_timeout_seconds=10
+sample	latency_ns	status
+1	15760465	0
+2	31686118	0
+3	15669434	0
+4	15630392	0
+5	15453481	0
+6	15477977	0
+7	15591519	0
+8	15679313	0
+9	31701066	0
+10	15612217	0
+11	15677129	0
+12	31693071	0
+13	31967864	0
+14	32506110	0
+15	32180201	0
+16	31885310	0
+17	32048264	0
+18	32040169	0
+19	32133924	0
+20	32054596	0
+21	32117233	0
+22	32314843	0
+23	31995886	0
+24	31758874	0
+25	31834034	0
+26	32623239	0
+27	31859712	0
+28	31784092	0
+29	31711516	0
+30	15577894	0
+# failures=0
+# user_cpu_seconds=0.103773
+# system_cpu_seconds=0.394244

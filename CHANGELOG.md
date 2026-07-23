@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deterministic unit, contract, and real-binary coverage for observation
+  completeness, metadata budgets, labels and filters, watch recovery and event
+  ordering, bind diagnostics, output schemas, configuration boundaries, safe
+  termination revalidation, and socket-helper cleanup across protocol, address
+  family, wildcard, dual-stack, and shared-endpoint modes.
 - `list --snapshot-json`, which emits one versioned `kickoutchi.snapshot/1`
   document containing the bounded full-state native socket observation,
   declared scope, completeness, owner attribution, process identities and
@@ -100,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Confirmation input now applies its 128-byte limit to the entered UTF-8 payload
+  rather than counting the terminal line ending, keeping CLI and TUI boundaries
+  consistent while still rejecting the first excess payload byte.
+- Real-binary test helpers now use bounded process and reader cleanup, own and
+  verify every member of deep process-chain fixtures, and require broken-output
+  watch tests to terminate through the closed consumer rather than duration.
+- Release workflow contracts now require credential-free checkout explicitly,
+  validate each cargo-dist archive-to-checksum association and Windows
+  executable uniqueness guard, and reject alternate repository-token aliases or
+  scopes through mutation-sensitive tests.
 - macOS single-process termination now records the identity observed after
   `SIGSTOP` and uses that identity for guarded rollback, so a detected PID-reuse
   replacement is resumed without receiving the unauthorized terminating signal.
