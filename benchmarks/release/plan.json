@@ -1,0 +1,107 @@
+{
+  "schema": "kickoutchi.release_benchmark_plan",
+  "version": 1,
+  "immutable": true,
+  "gate_mode": "final",
+  "decision": "Reject practical native release regressions while withholding a decision when baseline A/A noise is too high.",
+  "ordering_seed": 731294887,
+  "artifacts": {
+    "baseline": {
+      "identity": "published-kickoutchi-v1.2.0",
+      "version": "1.2.0",
+      "tag": "v1.2.0",
+      "published": true,
+      "release_url": "https://github.com/nuggocto/kickoutchi/releases/tag/v1.2.0",
+      "sha256_by_platform": {
+        "linux-x86_64": "f8a3174ec13689348def30f69801103d1640e796de4195d3acf7faba797be3cc",
+        "windows-amd64": "e21a7d01ed920370a85b1064908600bf0db4e38cfe73d6ddade934f90adb01bb"
+      }
+    },
+    "candidate": {
+      "identity": "kickoutchi-v1.3.0-source-7393b56a5d86a5e2afb298cf6d1eb185a77bf02a",
+      "version": "1.3.0",
+      "repository": "https://github.com/nuggocto/kickoutchi",
+      "source_commit": "7393b56a5d86a5e2afb298cf6d1eb185a77bf02a",
+      "sha256_by_platform": {
+        "linux-x86_64": "847fcf0ab12648cd0ccd3b2f30870e26a3b263b69956c5a2206d6f9c8a159855",
+        "windows-amd64": "431a4bec837e32f4daf7f206286e007072f4373c5a9636ab81a97c1930df897d"
+      }
+    }
+  },
+  "bounds": {
+    "artifact_bytes_max": 268435456,
+    "output_bytes_max": 33554432,
+    "child_timeout_seconds": 10,
+    "run_timeout_seconds": 28800,
+    "max_failures": 20
+  },
+  "stop_cleanup_rules": {
+    "stop_on_preflight_or_warmup_failure": true,
+    "stop_after_measured_failures": 20,
+    "kill_child_on_timeout_or_output_limit": true,
+    "controller_owns_and_closes_all_helper_sockets": true,
+    "publish_only_complete_exclusively_created_evidence": true
+  },
+  "noise_rule": {
+    "metric": "p99_latency_ns",
+    "aa_p99_delta_limit_percent": 5.0,
+    "aa_multiplier": 1.5,
+    "classification": "INCONCLUSIVE when A/A exceeds its limit; FAIL when candidate regression exceeds both its practical budget and A/A delta times the multiplier; otherwise PASS. Any validation failure is FAIL."
+  },
+  "artifact_budgets": {
+    "candidate_size_delta_percent_max": 35.0,
+    "candidate_size_bytes_max": 8388608
+  },
+  "workloads": [
+    {
+      "name": "list_typical",
+      "kind": "list",
+      "comparison": "baseline_candidate",
+      "blocks": 10,
+      "samples_per_block": 1000,
+      "warmups": 12,
+      "semantics": {"command": ["list", "--json"], "sockets_per_variant": 8, "variants": ["tcp_ipv4", "udp_ipv4", "tcp_ipv6", "udp_ipv6"], "load_model": "closed_process_invocations", "host_state": "controlled helper endpoints are required in output; unrelated native host sockets remain included and are shared by each interleaved pair"},
+      "budgets": {"p50_delta_percent_max": 100.0, "p95_delta_percent_max": 125.0, "p99_delta_percent_max": 150.0, "p99_latency_ns_max": 100000000, "max_delta_percent_max": 300.0, "cpu_delta_percent_max": 200.0, "rss_delta_percent_max": 30.0, "failures_max": 0}
+    },
+    {
+      "name": "list_high",
+      "kind": "list",
+      "comparison": "baseline_candidate",
+      "blocks": 10,
+      "samples_per_block": 1000,
+      "warmups": 16,
+      "semantics": {"command": ["list", "--json"], "sockets_per_variant": 64, "variants": ["tcp_ipv4", "udp_ipv4", "tcp_ipv6", "udp_ipv6"], "load_model": "closed_process_invocations", "host_state": "controlled helper endpoints are required in output; unrelated native host sockets remain included and are shared by each interleaved pair"},
+      "budgets": {"p50_delta_percent_max": 100.0, "p95_delta_percent_max": 125.0, "p99_delta_percent_max": 150.0, "p99_latency_ns_max": 100000000, "max_delta_percent_max": 300.0, "cpu_delta_percent_max": 200.0, "rss_delta_percent_max": 30.0, "failures_max": 0}
+    },
+    {
+      "name": "snapshot_candidate",
+      "kind": "snapshot",
+      "comparison": "candidate_only",
+      "blocks": 10,
+      "samples_per_block": 1000,
+      "warmups": 12,
+      "semantics": {"command": ["list", "--snapshot-json"], "contract": "kickoutchi.snapshot/1", "baseline_support": false},
+      "budgets": {"p99_latency_ns_max": 250000000, "max_latency_ns_max": 1000000000, "failures_max": 0}
+    },
+    {
+      "name": "why_candidate",
+      "kind": "why",
+      "comparison": "candidate_only",
+      "blocks": 10,
+      "samples_per_block": 1000,
+      "warmups": 12,
+      "semantics": {"command": ["why", "{controller_selected_port}", "--all-protocols", "--all-addresses", "--json"], "contract": "kickoutchi.why/1", "expected_endpoints": 8, "port_selection": "controller binds an ephemeral IPv4 loopback TCP port and releases it before preflight; the command's documented bind race remains", "baseline_support": false},
+      "budgets": {"p99_latency_ns_max": 250000000, "max_latency_ns_max": 1000000000, "failures_max": 0}
+    },
+    {
+      "name": "watch_stable_500ms_candidate",
+      "kind": "watch",
+      "comparison": "candidate_only",
+      "blocks": 10,
+      "samples_per_block": 200,
+      "warmups": 12,
+      "semantics": {"command": ["watch", "--tcp", "--address", "127.0.0.1", "--port", "{controller_watch_port}", "--interval", "100ms", "--duration", "500ms", "--json"], "contract": "kickoutchi.watch_event/1", "stability": "one controller-owned listener remains unchanged for the invocation", "baseline_support": false},
+      "budgets": {"p99_latency_ns_max": 900000000, "max_latency_ns_max": 2000000000, "failures_max": 0}
+    }
+  ]
+}

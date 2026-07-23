@@ -122,3 +122,72 @@ benchmarks\windows-native-validation.ps1 -Mode qa `
 benchmarks\windows-native-validation.ps1 -Mode benchmark `
   -Output benchmarks\windows-watch-NEW.tsv
 ```
+
+## Native Release Controller
+
+The standard-library-only controller in `benchmarks/release/` is the final
+native release comparison harness. Its immutable JSON plan identifies the
+published v1.2.0 baseline and the v1.3.0 candidate source, fixes the ordering
+seed, workload semantics, practical budgets, A/A noise policy, warmups, blocks,
+sample counts, timeouts, output limits, helper-socket limits, and cleanup rules.
+Do not edit a plan after collection; a plan hash is carried by every raw row and
+the manifest. Create and review a new plan instead.
+
+Use extracted native release binaries, not Cargo wrappers. The candidate must
+come from the source commit declared by the plan. The reviewed native executable
+checksums in `sha256_by_platform` are mandatory; the controller refuses a
+platform without both artifact identities and refuses a private snapshot that
+does not match.
+
+Exact final collection and summary commands are:
+
+```sh
+python3 benchmarks/release/controller.py \
+  --plan benchmarks/release/plan.json \
+  --baseline /absolute/path/to/extracted/v1.2.0/kick \
+  --candidate /absolute/path/to/extracted/v1.3.0/kick \
+  --output /absolute/new/path/release-raw.jsonl \
+  --manifest /absolute/new/path/release-manifest.json
+python3 benchmarks/release/summarize.py \
+  --plan benchmarks/release/plan.json \
+  --raw /absolute/new/path/release-raw.jsonl \
+  --manifest /absolute/new/path/release-manifest.json \
+  --output /absolute/new/path/release-summary.json
+```
+
+Run the same controller command with `--smoke` for a two-to-four sample local
+check. Smoke output is marked `gate_eligible=false`; its summary is always
+`INCONCLUSIVE` and is never release evidence.
+
+The controller privately copies and hashes both binaries, validates exact
+`--version` output, validates every workload before warmup and timing, and
+publishes only to absent paths. It records per-process latency, status, output
+count and digest, user/system CPU when the host exposes it, Linux peak RSS, and
+Windows peak working set when the native API is available. The manifest records
+the exact arguments as executed, the deliberately minimal environment,
+artifact identities and sizes, platform, interpreter, source commit, counts,
+and evidence hashes. A child timeout kills the owned child. Helper TCP and UDP
+sockets are bounded, non-inheritable, IPv4/IPv6 loopback sockets and are closed
+on every exit path.
+
+Only `list --json` is compared with v1.2.0. Snapshot, Why, and the stable 500 ms
+watch are candidate-only absolute-budget checks because v1.2.0 does not support
+those commands. Reports explicitly set `comparison_supported=false` for them;
+they must not be described as baseline improvements or regressions.
+
+The final list, snapshot, and Why workloads retain at least ten blocks of 1,000
+process samples. Each block receives 12 or 16 unmeasured warmups and comparison
+blocks are exactly balanced from the recorded seed. The stable watch uses 2,000
+process-level samples in ten bounded blocks.
+The summarizer validates schema, all declared bounds and counts, deterministic
+order, plan/raw/artifact hash consistency, and complete manifests before merging
+raw observations. It computes nearest-rank p50/p95/p99/max and block-p99 range
+from raw values, never averages percentiles, and reports latency, CPU, memory,
+size, failures, thresholds, A/A noise, deltas, and `PASS`, `FAIL`, or
+`INCONCLUSIVE`.
+
+Run the unit tests with:
+
+```sh
+python3 -m unittest benchmarks.release.test_release_benchmark
+```

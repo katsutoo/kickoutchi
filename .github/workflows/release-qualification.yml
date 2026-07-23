@@ -1,0 +1,352 @@
+name: Release Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful non-publishing Release workflow run containing candidate archives
+        required: true
+        default: "30046834702"
+        type: string
+      run_benchmarks:
+        description: Run the full native Linux and Windows benchmark protocol after QA passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CANDIDATE_COMMIT: 7393b56a5d86a5e2afb298cf6d1eb185a77bf02a
+
+jobs:
+  authorize-artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify immutable candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        shell: bash
+        run: |
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || {
+            echo "candidate run ID must be decimal" >&2
+            exit 1
+          }
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}")"
+          [[ "$(jq -r .head_sha <<<"$run_json")" == "$CANDIDATE_COMMIT" ]] || {
+            echo "candidate run belongs to another commit" >&2
+            exit 1
+          }
+          [[ "$(jq -r .name <<<"$run_json")" == "Release" ]] || {
+            echo "candidate artifacts must come from the Release workflow" >&2
+            exit 1
+          }
+          [[ "$(jq -r .status <<<"$run_json")" == "completed" && "$(jq -r .conclusion <<<"$run_json")" == "success" ]] || {
+            echo "candidate Release run did not complete successfully" >&2
+            exit 1
+          }
+
+  qa:
+    needs: authorize-artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            artifact: artifacts-build-local-x86_64-unknown-linux-gnu
+            archive: kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+            root: kickoutchi-x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            artifact: artifacts-build-local-aarch64-unknown-linux-gnu
+            archive: kickoutchi-aarch64-unknown-linux-gnu.tar.xz
+            root: kickoutchi-aarch64-unknown-linux-gnu
+          - name: macos-x86_64
+            runner: macos-15-intel
+            artifact: artifacts-build-local-x86_64-apple-darwin
+            archive: kickoutchi-x86_64-apple-darwin.tar.xz
+            root: kickoutchi-x86_64-apple-darwin
+          - name: macos-aarch64
+            runner: macos-14
+            artifact: artifacts-build-local-aarch64-apple-darwin
+            archive: kickoutchi-aarch64-apple-darwin.tar.xz
+            root: kickoutchi-aarch64-apple-darwin
+          - name: windows-x86_64
+            runner: windows-2022
+            artifact: artifacts-build-local-x86_64-pc-windows-msvc
+            archive: kickoutchi-x86_64-pc-windows-msvc.zip
+            root: .
+    name: QA (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout qualification harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Test QA harness
+        run: python3 -m unittest -v qa.test_release_qa
+
+      - name: Download exact candidate archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - id: unix-artifact
+        name: Verify and extract Unix candidate
+        if: runner.os != 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ROOT: ${{ matrix.root }}
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/candidate"
+          expected="$(cut -d ' ' -f 1 "${ARCHIVE}.sha256")"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "candidate checksum sidecar is malformed" >&2
+            exit 1
+          }
+          actual="$(shasum -a 256 "$ARCHIVE" | cut -d ' ' -f 1)"
+          [[ "$actual" == "$expected" ]] || {
+            echo "candidate archive checksum mismatch" >&2
+            exit 1
+          }
+          mkdir extracted
+          tar -xJf "$ARCHIVE" -C extracted
+          [[ -x "extracted/${ROOT}/kickoutchi" && -x "extracted/${ROOT}/kick" ]] || {
+            echo "candidate archive did not preserve both executable payloads" >&2
+            exit 1
+          }
+          echo "canonical=${RUNNER_TEMP}/candidate/extracted/${ROOT}/kickoutchi" >> "$GITHUB_OUTPUT"
+          echo "short=${RUNNER_TEMP}/candidate/extracted/${ROOT}/kick" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$actual" >> "$GITHUB_OUTPUT"
+
+      - id: windows-artifact
+        name: Verify and extract Windows candidate
+        if: runner.os == 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        shell: pwsh
+        run: |
+          $candidate = "$env:RUNNER_TEMP\candidate"
+          $sidecar = (Get-Content -LiteralPath "$candidate\$env:ARCHIVE.sha256" -Raw).Trim()
+          if ($sidecar -notmatch '^([0-9a-f]{64}) [ *][^\r\n]+$') { throw "candidate checksum sidecar is malformed" }
+          $expected = $Matches[1]
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath "$candidate\$env:ARCHIVE").Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "candidate archive checksum mismatch" }
+          Expand-Archive -LiteralPath "$candidate\$env:ARCHIVE" -DestinationPath "$candidate\extracted"
+          foreach ($binary in @('kickoutchi.exe', 'kick.exe')) {
+            if (-not (Test-Path -LiteralPath "$candidate\extracted\$binary" -PathType Leaf)) { throw "candidate archive is missing $binary" }
+          }
+          "canonical=$candidate\extracted\kickoutchi.exe" >> $env:GITHUB_OUTPUT
+          "short=$candidate\extracted\kick.exe" >> $env:GITHUB_OUTPUT
+          "archive_sha256=$actual" >> $env:GITHUB_OUTPUT
+
+      - name: Exercise Windows pseudo-console lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $emptyConfig = "$env:RUNNER_TEMP\qa-empty.toml"
+          New-Item -ItemType File -Path $emptyConfig | Out-Null
+          qa\windows_tui_smoke.ps1 `
+            -Binary '${{ steps.windows-artifact.outputs.canonical }}' `
+            -Config $emptyConfig `
+            -Output "$env:GITHUB_WORKSPACE\windows-tui.json"
+
+      - id: qa-unix
+        name: Run Unix exploratory charters
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 -m qa.release_qa \
+            --canonical '${{ steps.unix-artifact.outputs.canonical }}' \
+            --short '${{ steps.unix-artifact.outputs.short }}' \
+            --candidate-commit "$CANDIDATE_COMMIT" \
+            --archive-sha256 '${{ steps.unix-artifact.outputs.archive_sha256 }}' \
+            --output "qa-${{ matrix.name }}.json"
+
+      - id: qa-windows
+        name: Run Windows exploratory charters
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python -m qa.release_qa `
+            --canonical '${{ steps.windows-artifact.outputs.canonical }}' `
+            --short '${{ steps.windows-artifact.outputs.short }}' `
+            --candidate-commit $env:CANDIDATE_COMMIT `
+            --archive-sha256 '${{ steps.windows-artifact.outputs.archive_sha256 }}' `
+            --windows-tui-evidence "$env:GITHUB_WORKSPACE\windows-tui.json" `
+            --output "qa-${{ matrix.name }}.json"
+
+      - name: Upload QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-qa-${{ matrix.name }}
+          path: |
+            qa-${{ matrix.name }}.json
+            windows-tui.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Require a passing QA verdict
+        if: always()
+        env:
+          REPORT: qa-${{ matrix.name }}.json
+        shell: bash
+        run: |
+          python3 - "$REPORT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if report.get("overall") != "PASS":
+              raise SystemExit(f"QA verdict is {report.get('overall')}")
+          PY
+
+  benchmark:
+    needs: qa
+    if: inputs.run_benchmarks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            artifact: artifacts-build-local-x86_64-unknown-linux-gnu
+            archive: kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+            root: kickoutchi-x86_64-unknown-linux-gnu
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+            baseline_sha256: f855ba6c0c0e4a08096aa180de67999d918d2b883a84f201922012d47504548c
+          - name: windows-x86_64
+            runner: windows-2022
+            artifact: artifacts-build-local-x86_64-pc-windows-msvc
+            archive: kickoutchi-x86_64-pc-windows-msvc.zip
+            root: .
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-x86_64-pc-windows-msvc.zip
+            baseline_sha256: 71a5004a8d503284034659e70e1d5a861e26d9f362ea0f42c097518718db8d24
+    name: Benchmark (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout qualification harness
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Test benchmark harness
+        run: python3 -m unittest -v benchmarks.release.test_release_benchmark
+
+      - name: Download exact candidate archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - id: prepare-unix
+        name: Prepare Unix artifacts
+        if: runner.os != 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ROOT: ${{ matrix.root }}
+          BASELINE_URL: ${{ matrix.baseline_url }}
+          BASELINE_SHA256: ${{ matrix.baseline_sha256 }}
+        shell: bash
+        run: |
+          candidate_expected="$(cut -d ' ' -f 1 "$RUNNER_TEMP/candidate/${ARCHIVE}.sha256")"
+          candidate_actual="$(shasum -a 256 "$RUNNER_TEMP/candidate/$ARCHIVE" | cut -d ' ' -f 1)"
+          [[ "$candidate_actual" == "$candidate_expected" ]] || exit 1
+          mkdir "$RUNNER_TEMP/candidate/extracted" "$RUNNER_TEMP/baseline"
+          tar -xJf "$RUNNER_TEMP/candidate/$ARCHIVE" -C "$RUNNER_TEMP/candidate/extracted"
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/baseline/$ARCHIVE" "$BASELINE_URL"
+          baseline_actual="$(shasum -a 256 "$RUNNER_TEMP/baseline/$ARCHIVE" | cut -d ' ' -f 1)"
+          [[ "$baseline_actual" == "$BASELINE_SHA256" ]] || exit 1
+          tar -xJf "$RUNNER_TEMP/baseline/$ARCHIVE" -C "$RUNNER_TEMP/baseline"
+          echo "candidate=${RUNNER_TEMP}/candidate/extracted/${ROOT}/kick" >> "$GITHUB_OUTPUT"
+          echo "baseline=${RUNNER_TEMP}/baseline/${ROOT}/kick" >> "$GITHUB_OUTPUT"
+
+      - id: prepare-windows
+        name: Prepare Windows artifacts
+        if: runner.os == 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          BASELINE_URL: ${{ matrix.baseline_url }}
+          BASELINE_SHA256: ${{ matrix.baseline_sha256 }}
+        shell: pwsh
+        run: |
+          $candidate = "$env:RUNNER_TEMP\candidate"
+          $baseline = "$env:RUNNER_TEMP\baseline"
+          $sidecar = (Get-Content -LiteralPath "$candidate\$env:ARCHIVE.sha256" -Raw).Trim()
+          if ($sidecar -notmatch '^([0-9a-f]{64}) [ *][^\r\n]+$') { throw "candidate checksum sidecar is malformed" }
+          $candidateActual = (Get-FileHash -Algorithm SHA256 -LiteralPath "$candidate\$env:ARCHIVE").Hash.ToLowerInvariant()
+          if ($candidateActual -ne $Matches[1]) { throw "candidate checksum mismatch" }
+          Expand-Archive -LiteralPath "$candidate\$env:ARCHIVE" -DestinationPath "$candidate\extracted"
+          New-Item -ItemType Directory -Path $baseline | Out-Null
+          Invoke-WebRequest -Uri $env:BASELINE_URL -OutFile "$baseline\$env:ARCHIVE"
+          $baselineActual = (Get-FileHash -Algorithm SHA256 -LiteralPath "$baseline\$env:ARCHIVE").Hash.ToLowerInvariant()
+          if ($baselineActual -ne $env:BASELINE_SHA256) { throw "baseline checksum mismatch" }
+          Expand-Archive -LiteralPath "$baseline\$env:ARCHIVE" -DestinationPath "$baseline\extracted"
+          "candidate=$candidate\extracted\kick.exe" >> $env:GITHUB_OUTPUT
+          "baseline=$baseline\extracted\kick.exe" >> $env:GITHUB_OUTPUT
+
+      - id: collect
+        name: Collect full native benchmark
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 benchmarks/release/controller.py \
+            --plan benchmarks/release/plan.json \
+            --baseline '${{ steps.prepare-unix.outputs.baseline || steps.prepare-windows.outputs.baseline }}' \
+            --candidate '${{ steps.prepare-unix.outputs.candidate || steps.prepare-windows.outputs.candidate }}' \
+            --output release-raw.jsonl \
+            --manifest release-manifest.json
+          python3 benchmarks/release/summarize.py \
+            --plan benchmarks/release/plan.json \
+            --raw release-raw.jsonl \
+            --manifest release-manifest.json \
+            --output release-summary.json
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-benchmark-${{ matrix.name }}
+          path: |
+            release-raw.jsonl
+            release-manifest.json
+            release-summary.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Require a passing benchmark verdict
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          report = json.loads(pathlib.Path("release-summary.json").read_text(encoding="utf-8"))
+          if report.get("verdict") != "PASS" or not report.get("gate_eligible"):
+              raise SystemExit(f"benchmark verdict is {report.get('verdict')}")
+          PY

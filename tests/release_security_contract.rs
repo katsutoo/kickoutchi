@@ -1,5 +1,6 @@
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const QUALIFICATION_WORKFLOW: &str = include_str!("../.github/workflows/release-qualification.yml");
 const UNIX_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.sh");
 const WINDOWS_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.ps1");
 const BREW_STYLE: &str = r#"brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}""#;
@@ -1164,4 +1165,51 @@ fn explicit_release_token_is_scoped_to_publication_commands() {
         .nth(1)
         .expect("GitHub release step");
     assert!(release_step.contains("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"));
+}
+
+#[test]
+fn qualification_workflow_is_read_only_and_bound_to_exact_artifacts() {
+    let workflow = normalized_workflow(QUALIFICATION_WORKFLOW);
+    assert!(workflow.contains("on:\n  workflow_dispatch:"));
+    assert!(!workflow.contains("\n  push:"));
+    assert!(!workflow.contains("\n  pull_request:"));
+    assert!(workflow.contains("permissions:\n  actions: read\n  contents: read"));
+    assert!(!workflow.contains("contents: write"));
+    assert!(!workflow.contains("secrets."));
+    assert!(workflow.contains("CANDIDATE_COMMIT: 7393b56a5d86a5e2afb298cf6d1eb185a77bf02a"));
+    assert!(workflow.contains("candidate run belongs to another commit"));
+    assert!(workflow.contains("candidate Release run did not complete successfully"));
+    assert_eq!(
+        workflow
+            .matches("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0")
+            .count(),
+        2
+    );
+    assert_eq!(workflow.matches("persist-credentials: false").count(), 2);
+    assert_eq!(
+        workflow
+            .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+            .count(),
+        2
+    );
+    assert_eq!(
+        workflow
+            .matches("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+            .count(),
+        2
+    );
+    assert!(workflow.contains("needs: qa\n    if: inputs.run_benchmarks"));
+    assert!(workflow.contains("if report.get(\"overall\") != \"PASS\":"));
+    assert!(
+        workflow.contains(
+            "if report.get(\"verdict\") != \"PASS\" or not report.get(\"gate_eligible\"):"
+        )
+    );
+    assert!(workflow.contains("--proto '=https' --tlsv1.2"));
+    assert!(workflow.contains(
+        "baseline_sha256: f855ba6c0c0e4a08096aa180de67999d918d2b883a84f201922012d47504548c"
+    ));
+    assert!(workflow.contains(
+        "baseline_sha256: 71a5004a8d503284034659e70e1d5a861e26d9f362ea0f42c097518718db8d24"
+    ));
 }
