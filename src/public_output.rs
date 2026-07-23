@@ -427,10 +427,6 @@ impl CaptureDto {
 }
 
 #[derive(Debug, Serialize)]
-#[allow(
-    dead_code,
-    reason = "shared by public verdict and watch envelopes when they adopt this layer"
-)]
 pub(crate) struct EvidenceDto<'a> {
     code: &'static str,
     source: &'static str,
@@ -975,36 +971,8 @@ fn compare_gap_index(snapshot: &NetworkSnapshot, left: &GapIndex, right: &GapInd
         .then_with(|| left.message.cmp(&right.message))
 }
 
-#[allow(
-    dead_code,
-    reason = "shared by public verdict and watch envelopes when they adopt this layer"
-)]
-pub(crate) fn compare_evidence(left: &EvidenceDto<'_>, right: &EvidenceDto<'_>) -> Ordering {
-    evidence_source_order(left.source)
-        .cmp(&evidence_source_order(right.source))
-        .then_with(|| left.code.cmp(right.code))
-        .then_with(|| certainty_order(left.certainty).cmp(&certainty_order(right.certainty)))
-        .then_with(|| left.message.cmp(&right.message))
-}
-
 pub(crate) const fn socket_state_name(state: SocketState) -> &'static str {
-    match state {
-        SocketState::Closed => "closed",
-        SocketState::Listen => "listen",
-        SocketState::SynSent => "syn_sent",
-        SocketState::SynReceived => "syn_received",
-        SocketState::Established => "established",
-        SocketState::FinWait1 => "fin_wait1",
-        SocketState::FinWait2 => "fin_wait2",
-        SocketState::CloseWait => "close_wait",
-        SocketState::Closing => "closing",
-        SocketState::LastAck => "last_ack",
-        SocketState::TimeWait => "time_wait",
-        SocketState::DeleteTcb => "delete_tcb",
-        SocketState::NewSynReceived => "new_syn_received",
-        SocketState::Bound => "bound",
-        SocketState::Unknown(_) => "unknown",
-    }
+    state.name()
 }
 
 pub(crate) const fn protocol_name(protocol: Protocol) -> &'static str {
@@ -1060,26 +1028,14 @@ pub(crate) const fn evidence_gap_code_name(code: EvidenceGapCode) -> &'static st
     code.name()
 }
 
-#[allow(
-    dead_code,
-    reason = "shared by public verdict and watch envelopes when they adopt this layer"
-)]
 pub(crate) const fn evidence_code_name(code: EvidenceCode) -> &'static str {
     code.name()
 }
 
-#[allow(
-    dead_code,
-    reason = "shared by public verdict and watch envelopes when they adopt this layer"
-)]
 pub(crate) const fn evidence_source_name(source: EvidenceSource) -> &'static str {
     source.name()
 }
 
-#[allow(
-    dead_code,
-    reason = "shared by public verdict and watch envelopes when they adopt this layer"
-)]
 pub(crate) const fn certainty_name(certainty: Certainty) -> &'static str {
     certainty.name()
 }
@@ -1149,32 +1105,6 @@ fn owner_completeness_order(name: &str) -> u8 {
         "partial" => 1,
         "raced" => 2,
         _ => unreachable!("owner completeness names are closed"),
-    }
-}
-
-#[allow(dead_code, reason = "supports the reusable public evidence comparator")]
-fn evidence_source_order(name: &str) -> u8 {
-    match name {
-        "linux_procfs" => 0,
-        "macos_libproc" => 1,
-        "macos_sysctl" => 2,
-        "windows_ip_helper" => 3,
-        "windows_process_api" => 4,
-        "bind_probe" => 5,
-        "docker" => 6,
-        "analysis" => 7,
-        _ => unreachable!("evidence source names are closed"),
-    }
-}
-
-#[allow(dead_code, reason = "supports the reusable public evidence comparator")]
-fn certainty_order(name: &str) -> u8 {
-    match name {
-        "proven" => 0,
-        "estimated" => 1,
-        "heuristic" => 2,
-        "unknown" => 3,
-        _ => unreachable!("certainty names are closed"),
     }
 }
 

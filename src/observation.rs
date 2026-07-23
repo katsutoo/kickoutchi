@@ -272,6 +272,26 @@ pub(crate) enum SocketState {
 }
 
 impl SocketState {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Listen => "listen",
+            Self::SynSent => "syn_sent",
+            Self::SynReceived => "syn_received",
+            Self::Established => "established",
+            Self::FinWait1 => "fin_wait1",
+            Self::FinWait2 => "fin_wait2",
+            Self::CloseWait => "close_wait",
+            Self::Closing => "closing",
+            Self::LastAck => "last_ack",
+            Self::TimeWait => "time_wait",
+            Self::DeleteTcb => "delete_tcb",
+            Self::NewSynReceived => "new_syn_received",
+            Self::Bound => "bound",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
     pub(crate) const fn order_key(self) -> (u8, u32) {
         match self {
             Self::Closed => (0, 0),
@@ -541,14 +561,6 @@ pub(crate) enum SnapshotCompleteness {
     Raced,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "derived from snapshots for watch consumers")]
-pub(crate) enum DiffReadiness {
-    Unsafe,
-    SocketMultiplicityOnly,
-    ReplacementSafe,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code, reason = "limitations are host and capability specific")]
 pub(crate) enum ScopeLimitation {
@@ -774,39 +786,6 @@ impl NetworkSnapshot {
         snapshot_platform(self)
     }
 
-    #[allow(dead_code, reason = "derived from snapshots for watch consumers")]
-    pub(crate) fn diff_readiness(&self, endpoint: &EndpointIdentity) -> DiffReadiness {
-        #[cfg(test)]
-        DIFF_READINESS_CALLS.with(|calls| calls.set(calls.get() + 1));
-        if self.completeness == SnapshotCompleteness::Raced
-            || self.omitted_evidence_gap_count != 0
-            || self
-                .evidence_gaps
-                .iter()
-                .any(|gap| gap.impact == EvidenceImpact::SocketSet)
-        {
-            return DiffReadiness::Unsafe;
-        }
-
-        let ownership_gap = self.evidence_gaps.iter().any(|gap| {
-            gap.impact == EvidenceImpact::Ownership
-                && gap
-                    .endpoint
-                    .as_ref()
-                    .is_none_or(|affected| affected == endpoint)
-        });
-        let local_ownership_incomplete = self
-            .sockets
-            .iter()
-            .filter(|socket| &socket.local_endpoint == endpoint)
-            .any(|socket| !socket.owner_completeness.is_complete());
-        if !self.owner_completeness.is_complete() || ownership_gap || local_ownership_incomplete {
-            DiffReadiness::SocketMultiplicityOnly
-        } else {
-            DiffReadiness::ReplacementSafe
-        }
-    }
-
     pub(crate) fn port_entry_descriptors(
         &self,
         protected_names: &[String],
@@ -950,21 +929,6 @@ impl NetworkSnapshot {
             label: None,
         }
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static DIFF_READINESS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_diff_readiness_call_count() {
-    DIFF_READINESS_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn diff_readiness_call_count() -> usize {
-    DIFF_READINESS_CALLS.with(std::cell::Cell::get)
 }
 
 fn snapshot_platform(snapshot: &NetworkSnapshot) -> Platform {
@@ -2148,95 +2112,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<PortEntryDescriptor>(), 12);
         assert!(std::mem::size_of::<crate::model::PortEntry>() <= 176);
         assert!(std::mem::size_of::<crate::model::PortEntryView<'_>>() <= 160);
-    }
-
-    #[test]
-    fn diff_readiness_distinguishes_socket_ownership_and_metadata_gaps() {
-        let mut snapshot = crate::collector::Collector::collect(
-            &crate::collector::FakeCollector,
-            MetadataProfile::Display,
-        )
-        .expect("fake snapshot is valid");
-        let endpoint = snapshot.sockets[0].local_endpoint.clone();
-        snapshot.owner_completeness = OwnerCompleteness::Complete;
-        let baseline = snapshot.clone();
-        assert_eq!(
-            snapshot.diff_readiness(&endpoint),
-            DiffReadiness::ReplacementSafe
-        );
-
-        snapshot.owner_completeness =
-            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
-                .expect("one reason fits");
-        assert_eq!(
-            snapshot.diff_readiness(&endpoint),
-            DiffReadiness::SocketMultiplicityOnly
-        );
-        snapshot.owner_completeness = OwnerCompleteness::Complete;
-
-        snapshot.evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::Metadata,
-            EvidenceGapCode::ProcessMetadataUnavailable,
-            Some(endpoint.clone()),
-            Some(3000),
-            "metadata unavailable",
-        ));
-        assert_eq!(
-            snapshot.diff_readiness(&endpoint),
-            DiffReadiness::ReplacementSafe
-        );
-
-        snapshot.evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::Ownership,
-            EvidenceGapCode::OwnerAttributionIncomplete,
-            Some(endpoint.clone()),
-            None,
-            "owner unavailable",
-        ));
-        assert_eq!(
-            snapshot.diff_readiness(&endpoint),
-            DiffReadiness::SocketMultiplicityOnly
-        );
-
-        snapshot.evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::SocketSet,
-            EvidenceGapCode::NativeFieldUnavailable,
-            None,
-            None,
-            "socket set unavailable",
-        ));
-        assert_eq!(snapshot.diff_readiness(&endpoint), DiffReadiness::Unsafe);
-
-        let mut raced = baseline.clone();
-        raced.completeness = SnapshotCompleteness::Raced;
-        assert_eq!(raced.diff_readiness(&endpoint), DiffReadiness::Unsafe);
-
-        let mut omitted = baseline.clone();
-        omitted.omitted_evidence_gap_count = 1;
-        assert_eq!(omitted.diff_readiness(&endpoint), DiffReadiness::Unsafe);
-
-        let mut local = baseline.clone();
-        local.sockets[0].owner_completeness =
-            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
-                .expect("one reason fits");
-        assert_eq!(
-            local.diff_readiness(&endpoint),
-            DiffReadiness::SocketMultiplicityOnly
-        );
-
-        let unrelated_endpoint = baseline.sockets[1].local_endpoint.clone();
-        let mut unrelated = baseline;
-        unrelated.evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::Ownership,
-            EvidenceGapCode::OwnerAttributionIncomplete,
-            Some(unrelated_endpoint),
-            None,
-            "unrelated owner unavailable",
-        ));
-        assert_eq!(
-            unrelated.diff_readiness(&endpoint),
-            DiffReadiness::ReplacementSafe
-        );
     }
 
     #[test]

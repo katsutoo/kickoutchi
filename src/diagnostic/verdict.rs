@@ -444,7 +444,7 @@ fn append_kernel_evidence(
                 code: EvidenceCode::NonListeningKernelState,
                 source,
                 certainty: Certainty::Proven,
-                message: format!("the kernel reports TCP state {}", state_name(socket.state)),
+                message: format!("the kernel reports TCP state {}", socket.state.name()),
             });
         }
     }
@@ -672,26 +672,6 @@ fn owner_source(snapshot: &NetworkSnapshot) -> EvidenceSource {
         crate::observation::ObservationScopeKind::CurrentHostNetworkStack => {
             EvidenceSource::WindowsProcessApi
         }
-    }
-}
-
-fn state_name(state: SocketState) -> &'static str {
-    match state {
-        SocketState::Closed => "closed",
-        SocketState::Listen => "listen",
-        SocketState::SynSent => "syn_sent",
-        SocketState::SynReceived => "syn_received",
-        SocketState::Established => "established",
-        SocketState::FinWait1 => "fin_wait1",
-        SocketState::FinWait2 => "fin_wait2",
-        SocketState::CloseWait => "close_wait",
-        SocketState::Closing => "closing",
-        SocketState::LastAck => "last_ack",
-        SocketState::TimeWait => "time_wait",
-        SocketState::DeleteTcb => "delete_tcb",
-        SocketState::NewSynReceived => "new_syn_received",
-        SocketState::Bound => "bound",
-        SocketState::Unknown(_) => "unknown",
     }
 }
 

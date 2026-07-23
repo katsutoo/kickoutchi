@@ -107,3 +107,18 @@ python benchmarks/generate-max-label-config.py /tmp/max-labels.toml
 ```
 
 The generator uses exclusive creation so it cannot overwrite existing evidence.
+
+The historical Windows native-validation bundle consists of
+`windows-native-validation.ps1`, `windows-native-qa-postfix-2026-07-22.json`,
+and `windows-watch-postfix-2026-07-22.tsv`. The two `postfix` outputs record the
+post-remediation native QA and 100-sample stable-watch run from commit
+`4151d8c558e584508c2c0547527fde3ef29cc5ba`; they are supporting historical
+evidence, not the final release gate or interleaved release benchmark. Run the
+harness on Windows with an unused output path, for example:
+
+```powershell
+benchmarks\windows-native-validation.ps1 -Mode qa `
+  -Output benchmarks\windows-native-qa-NEW.json
+benchmarks\windows-native-validation.ps1 -Mode benchmark `
+  -Output benchmarks\windows-watch-NEW.tsv
+```

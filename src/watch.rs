@@ -932,20 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn replacement_readiness_is_indexed_once_per_snapshot() {
-        let sockets = (1..=4_096)
-            .map(|port| socket(port, None))
-            .collect::<Vec<_>>();
-        let previous = snapshot(sockets.clone());
-        let current = snapshot(sockets);
-        crate::observation::reset_diff_readiness_call_count();
-        let diff = SnapshotDiff::with_limit(&previous, &current, 1).unwrap();
-
-        assert_eq!(diff.count(), 0);
-        assert_eq!(crate::observation::diff_readiness_call_count(), 0);
-    }
-
-    #[test]
     fn one_bucket_streams_across_the_batch_boundary_without_pending_indexes() {
         let previous = snapshot(vec![socket(3_000, None); super::WATCH_EVENT_BATCH_MAX + 1]);
         let current = snapshot(Vec::new());

@@ -1,4 +1,8 @@
 /target
+/result
+/artifacts/
+/dist-manifest.json
+/plan-dist-manifest.json
 tmp/
 __pycache__/
 *.py[cod]
