@@ -4,13 +4,11 @@ Date: 2026-07-23
 
 ## Verdict
 
-Implementation verdict: PASS on the reviewed Linux worktree.
+Implementation verdict: PASS.
 
-Gate verdict: PENDING NATIVE CI. The implementation is not committed or pushed,
-so no exact-commit GitHub Actions run yet proves the Linux, macOS, Windows, and
-cargo-dist artifact matrices. Stage 11 must remain on hold until that run passes
-and this record is updated with its commit SHA, run URL, native job results, and
-artifact identities.
+Gate verdict: PASS. Exact-commit GitHub Actions evidence proves the Linux,
+macOS, Windows, supply-chain, and five cargo-dist artifact matrices. Stage 11
+may begin.
 
 The package is now the unpublished `1.3.0` release candidate. This is not a
 release recommendation.
@@ -40,8 +38,9 @@ URLs and checksums before they are updated.
 - Package version: `1.3.0`.
 - Pinned Rust toolchain: `1.95.0`.
 - Reviewed base commit: `a808279ffc9a11bf6ae81191fd9d0b883e33fdfe`.
-- Source state: uncommitted implementation patch; therefore local artifacts are
-  verification evidence, not final release evidence.
+- Verified candidate commit: `59bb4fd76e9b00c0425658865d6ad59d93b52578`.
+- The gate-completion commit changes only this review record and the `FEATURE.md`
+  checkboxes; it receives the same full workflows before Stage 11 begins.
 
 ### Native policy
 
@@ -89,7 +88,8 @@ The shared macOS and Windows journey now additionally proves:
 - exact label precedence over a wildcard selector;
 - label filtering through canonical and short release binaries;
 - labeled native Why output;
-- a synchronized watch baseline followed by a real socket release event;
+- a synchronized watch baseline followed by a real socket release event, or the
+  exact fail-closed partial-socket-set result on a capability-limited macOS host;
 - bounded process/output collection and cleanup.
 
 Existing native macOS and Windows tests continue to cover collector output,
@@ -130,9 +130,30 @@ Local cargo-dist x86_64 Linux archive evidence from the final review worktree:
 - All 62 current Linux real-binary journeys passed against the extracted
   archive payloads with required Linux capabilities.
 
-These values are local smoke evidence only. They must not be used as final
-release or performance claims because the source patch is uncommitted and the
-final native workflow has not run.
+These values are local smoke evidence only. The GitHub identities below are the
+authoritative native gate evidence; neither set is a release or performance
+claim.
+
+## GitHub Actions Gate Evidence
+
+- Candidate commit: `59bb4fd76e9b00c0425658865d6ad59d93b52578`.
+- Native CI: https://github.com/nuggocto/kickoutchi/actions/runs/30042603082
+- Non-publishing release validation:
+  https://github.com/nuggocto/kickoutchi/actions/runs/30042624287
+- Native CI conclusion: Linux, macOS, Windows, and Supply Chain passed.
+- Release conclusion: four exact-commit verification jobs, five local artifact
+  jobs, and global artifact assembly passed. Publication jobs were skipped by
+  the workflow's tag-only publication policy; no release was created.
+
+Validated native archives:
+
+| Target | Archive bytes | SHA-256 |
+| --- | ---: | --- |
+| `aarch64-apple-darwin` | 1,077,036 | `ca18ad23cdfc26e21896b3567c8c141abbe8c7434945f720da237d9152624e26` |
+| `x86_64-apple-darwin` | 1,167,560 | `96e36c4d711cdc366d51a8ebf81c2bb48aaeae217eb1f1105b408fab3843f002` |
+| `aarch64-unknown-linux-gnu` | 1,113,688 | `9d7d5e2a5579254aa6294a97894cfd5c788d91aa410f5cecb8824ab4d2bf17c5` |
+| `x86_64-unknown-linux-gnu` | 1,261,188 | `bf97f2a9323fd460af8a9f053f7bc3b6a1dc47f3bdcabb0ba8cbd22e3850c133` |
+| `x86_64-pc-windows-msvc` | 2,762,631 | `9b43d247bd8ec2fa6a5fbc0da4311dbe208c272ac74379d2d4dbe7ad570e8cc0` |
 
 ## Review Findings And Remediation
 
@@ -188,27 +209,17 @@ an inferred result from cross-compilation.
 
 ## Formal Gate Status
 
-- [ ] Linux native matrix passes on the exact committed candidate.
-- [ ] macOS native matrix passes on the exact committed candidate.
-- [ ] Windows native matrix passes on the exact committed candidate.
-- [ ] Both release binaries build in every cargo-dist target job.
-- [ ] No platform test is skipped merely to make the matrix green.
-- [ ] Native automated journeys pass against every exact cargo-dist archive.
+- [x] Linux native matrix passes on the exact committed candidate.
+- [x] macOS native matrix passes on the exact committed candidate.
+- [x] Windows native matrix passes on the exact committed candidate.
+- [x] Both release binaries build in every cargo-dist target job.
+- [x] No platform test is skipped merely to make the matrix green.
+- [x] Native automated journeys pass against every exact cargo-dist archive.
 
-The corresponding `FEATURE.md` gate remains unchecked until these items have
-GitHub Actions evidence from the exact commit.
+The corresponding `FEATURE.md` gate is complete.
 
 ## Required Follow-up
 
-1. Commit the complete patch without changing the candidate source.
-2. Push it and monitor both the native CI workflow and cargo-dist pull-request
-   workflow.
-3. Preserve the first failure if any job is intermittent; do not rerun until
-   green without diagnosis.
-4. Fix every verified failure and repeat all affected checks on the new commit.
-5. Record the final commit, workflow URLs, native job results, archive names,
-   sizes, and SHA-256 values here.
-6. Check the `FEATURE.md` gate only after every required native result is green.
-
-Stage 11 is ready to begin only after that follow-up changes this gate verdict
-from PENDING NATIVE CI to PASS.
+Begin Stage 11 against the recorded candidate artifacts. Preserve these run and
+archive identities as the Stage 10 handoff; Stage 11 remains exploratory QA and
+must not be treated as a release recommendation by itself.

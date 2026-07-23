@@ -2363,12 +2363,12 @@ cross-target or mismatched artifact job fails rather than becoming build-only.
 
 ### Stage 10 gate
 
-- [ ] Linux native matrix passes.
-- [ ] macOS native matrix passes.
-- [ ] Windows native matrix passes.
-- [ ] Both release binaries build on every target.
-- [ ] No platform test is skipped merely to make the matrix green.
-- [ ] Automated E2E journeys pass natively against exact release artifacts on
+- [x] Linux native matrix passes.
+- [x] macOS native matrix passes.
+- [x] Windows native matrix passes.
+- [x] Both release binaries build on every target.
+- [x] No platform test is skipped merely to make the matrix green.
+- [x] Automated E2E journeys pass natively against exact release artifacts on
       Linux, macOS, and Windows, with unsupported host capabilities reported
       explicitly rather than silently skipped.
 
