@@ -19,10 +19,10 @@ if (-not $binaryInfo.Exists -or $binaryInfo.PSIsContainer -or $binaryInfo.Length
 }
 if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw "config must be a regular file" }
 
-$winptyCandidates = @(
+$winptyCandidates = @(@(
     (Get-Command winpty.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
     "$env:ProgramFiles\Git\usr\bin\winpty.exe"
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
 if ($winptyCandidates.Count -lt 1) { throw "winpty.exe is unavailable" }
 $winpty = $winptyCandidates[0]
 

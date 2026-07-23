@@ -145,6 +145,19 @@ class StructuredParsingTests(unittest.TestCase):
         self.assertNotIn("stderr", redacted["nested"])
         self.assertEqual(redacted["nested"]["command"][-1], "<redacted-marker>")
 
+    def test_macos_watch_limitation_accepts_only_exact_fail_closed_diagnostics(self) -> None:
+        result = {"exit_code": 1, "stdout": "", "stderr": "error: initial observation has a partial socket set\n"}
+        original = release_qa.platform.system
+        release_qa.platform.system = lambda: "Darwin"
+        try:
+            self.assertEqual(release_qa._macos_watch_limitation(result), "partial_socket_set")
+            changed = dict(result, stderr="error: unrelated failure\n")
+            self.assertIsNone(release_qa._macos_watch_limitation(changed))
+            changed = dict(result, stdout="{}\n")
+            self.assertIsNone(release_qa._macos_watch_limitation(changed))
+        finally:
+            release_qa.platform.system = original
+
     @unittest.skipUnless(os.name == "nt", "Windows evidence is native-only")
     def test_windows_tui_evidence_requires_matching_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

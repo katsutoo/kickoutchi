@@ -426,6 +426,16 @@ def _expect_exit(result: dict[str, Any], accepted: Iterable[int]) -> None:
     _expect(not result["stderr_truncated"], "stderr exceeded the harness bound")
 
 
+def _macos_watch_limitation(result: dict[str, Any]) -> Optional[str]:
+    if platform.system() != "Darwin" or result["exit_code"] != 1 or result["stdout"]:
+        return None
+    diagnostics = {
+        "error: initial observation has a partial socket set\n": "partial_socket_set",
+        "error: initial observation raced\n": "observation_raced",
+    }
+    return diagnostics.get(result["stderr"])
+
+
 def _helper_main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--_qa-helper", action="store_true")
@@ -806,6 +816,13 @@ class QaSession:
             config=self.config_labels,
             timeout=max(self.timeout, WATCH_TIMEOUT_SECONDS),
         )
+        limitation = _macos_watch_limitation(result)
+        if limitation is not None:
+            return {
+                "command": result,
+                "platform_limitation": limitation,
+                "outcome": "fail_closed_before_baseline",
+            }
         _expect_exit(result, {0})
         try:
             records = parse_ndjson(result["stdout"])
@@ -897,10 +914,20 @@ class QaSession:
             )
         )
         _expect(not json_result["timed_out"] and json_result["exit_code"] == 0, "early-closing JSON consumer was not successful")
-        _expect(not watch_result["timed_out"] and watch_result["exit_code"] == 0, "early-closing NDJSON consumer was not successful")
+        watch_limitation = _macos_watch_limitation(watch_result)
+        _expect(
+            watch_limitation is not None
+            or (not watch_result["timed_out"] and watch_result["exit_code"] == 0),
+            "early-closing NDJSON consumer was not successful",
+        )
         _expect(bool(json_result["first_stdout_byte_hex"]), "JSON producer emitted no byte")
-        _expect(bool(watch_result["first_stdout_byte_hex"]), "NDJSON producer emitted no byte")
-        return {"json": json_result, "ndjson": watch_result}
+        if watch_limitation is None:
+            _expect(bool(watch_result["first_stdout_byte_hex"]), "NDJSON producer emitted no byte")
+        return {
+            "json": json_result,
+            "ndjson": watch_result,
+            "ndjson_platform_limitation": watch_limitation,
+        }
 
     def _inspect(self) -> dict[str, Any]:
         by_pid = self.command(["inspect", "--pid", str(self.tcp["pid"])], config=self.config_labels)
