@@ -38,6 +38,17 @@ impl CommandChild {
         self.0.as_mut().expect("command child must be owned")
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    fn wait_until(&mut self, deadline: Instant) -> io::Result<ExitStatus> {
+        loop {
+            match self.child_mut().try_wait()? {
+                Some(status) => return Ok(status),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => return Err(io::Error::new(io::ErrorKind::TimedOut, "command deadline")),
+            }
+        }
+    }
+
     fn kill_and_reap(&mut self, deadline: Instant) -> io::Result<()> {
         if let Some(mut child) = self.0.take() {
             let kill_error = child.kill().err();
@@ -549,7 +560,7 @@ mod portable_native {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct ConfigGuard(PathBuf);
 
@@ -663,20 +674,28 @@ mod portable_native {
             }
         });
         let deadline = Instant::now() + REAL_BINARY_EXIT_WAIT;
-        let baseline = receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("watch must emit its baseline before the deadline")
-            .expect("watch baseline must be UTF-8");
+        let baseline =
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result.expect("watch baseline must be UTF-8"),
+                Err(error) => {
+                    let status = child
+                        .wait_until(deadline)
+                        .expect("native watch must exit before its deadline");
+                    child.disarm();
+                    let stderr = finish_pipe(Some(stderr), "stderr", deadline)
+                        .expect("watch stderr must drain before the deadline");
+                    stdout_reader.join().expect("watch stdout reader must join");
+                    panic!(
+                        "watch emitted no baseline ({error}); status {status}; stderr: {}",
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            };
         drop(listener);
 
-        let status = loop {
-            match child.child_mut().try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) => panic!("native watch did not exit before its deadline"),
-                Err(error) => panic!("native watch wait failed: {error}"),
-            }
-        };
+        let status = child
+            .wait_until(deadline)
+            .expect("native watch must exit before its deadline");
         child.disarm();
         let stderr = finish_pipe(Some(stderr), "stderr", deadline)
             .expect("watch stderr must drain before the deadline");
