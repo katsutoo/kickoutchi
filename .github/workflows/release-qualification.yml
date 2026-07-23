@@ -156,8 +156,10 @@ jobs:
           "short=$candidate\extracted\kick.exe" >> $env:GITHUB_OUTPUT
           "archive_sha256=$actual" >> $env:GITHUB_OUTPUT
 
-      - name: Exercise Windows pseudo-console lifecycle
+      - id: windows-tui
+        name: Exercise Windows pseudo-console lifecycle
         if: runner.os == 'Windows'
+        continue-on-error: true
         shell: pwsh
         run: |
           $emptyConfig = "$env:RUNNER_TEMP\qa-empty.toml"
@@ -186,13 +188,18 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python -m qa.release_qa `
-            --canonical '${{ steps.windows-artifact.outputs.canonical }}' `
-            --short '${{ steps.windows-artifact.outputs.short }}' `
-            --candidate-commit $env:CANDIDATE_COMMIT `
-            --archive-sha256 '${{ steps.windows-artifact.outputs.archive_sha256 }}' `
-            --windows-tui-evidence "$env:GITHUB_WORKSPACE\windows-tui.json" `
-            --output "qa-${{ matrix.name }}.json"
+          $arguments = @(
+            '-m', 'qa.release_qa',
+            '--canonical', '${{ steps.windows-artifact.outputs.canonical }}',
+            '--short', '${{ steps.windows-artifact.outputs.short }}',
+            '--candidate-commit', $env:CANDIDATE_COMMIT,
+            '--archive-sha256', '${{ steps.windows-artifact.outputs.archive_sha256 }}',
+            '--output', 'qa-${{ matrix.name }}.json'
+          )
+          if (Test-Path -LiteralPath "$env:GITHUB_WORKSPACE\windows-tui.json" -PathType Leaf) {
+            $arguments += @('--windows-tui-evidence', "$env:GITHUB_WORKSPACE\windows-tui.json")
+          }
+          python @arguments
 
       - name: Upload QA evidence
         if: always()

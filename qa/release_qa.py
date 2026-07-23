@@ -427,7 +427,12 @@ def _expect_exit(result: dict[str, Any], accepted: Iterable[int]) -> None:
 
 
 def _macos_watch_limitation(result: dict[str, Any]) -> Optional[str]:
-    if platform.system() != "Darwin" or result["exit_code"] != 1 or result["stdout"]:
+    if (
+        platform.system() != "Darwin"
+        or result["exit_code"] != 1
+        or result.get("stdout")
+        or result.get("first_stdout_byte_hex")
+    ):
         return None
     diagnostics = {
         "error: initial observation has a partial socket set\n": "partial_socket_set",

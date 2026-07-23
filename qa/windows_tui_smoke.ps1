@@ -13,9 +13,12 @@ foreach ($value in @($Binary, $Config, $Output)) {
     if ($value.Contains('"')) { throw "paths containing quotes are unsupported" }
 }
 if (Test-Path -LiteralPath $Output) { throw "refusing to overwrite $Output" }
-$binaryInfo = Get-Item -LiteralPath $Binary
-if (-not $binaryInfo.Exists -or $binaryInfo.PSIsContainer -or $binaryInfo.Length -lt 1) {
-    throw "binary must be a nonempty regular file"
+if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) { throw "binary must be a regular file" }
+$binaryStream = [IO.File]::Open($Binary, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try {
+    if ($binaryStream.Length -lt 1) { throw "binary must be nonempty" }
+} finally {
+    $binaryStream.Dispose()
 }
 if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw "config must be a regular file" }
 
