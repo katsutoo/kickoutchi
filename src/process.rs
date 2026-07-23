@@ -1716,7 +1716,13 @@ mod tests {
             },
         );
 
-        assert_eq!(outcome, TerminationOutcome::TargetChanged);
+        assert_eq!(
+            outcome,
+            TerminationOutcome::UnknownFailure(
+                "fresh process identity or protection name changed; refusing termination"
+                    .to_owned()
+            )
+        );
         assert_eq!(continued, [(42, Some(replacement_marker))]);
     }
 

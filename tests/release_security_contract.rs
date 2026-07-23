@@ -2,6 +2,10 @@ const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const UNIX_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.sh");
 const WINDOWS_DIST_INSTALLER: &str = include_str!("../.github/scripts/install-cargo-dist.ps1");
 
+fn normalized_workflow() -> String {
+    RELEASE_WORKFLOW.replace("\r\n", "\n")
+}
+
 #[test]
 fn cargo_dist_archives_are_verified_before_extraction() {
     for (variable, archive, hash) in [
@@ -111,17 +115,18 @@ fn homebrew_validation_fails_closed_and_pat_exists_only_for_push() {
     const TAP_TOKEN: &str = "GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}";
     const BREW_STYLE: &str = r#"brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}""#;
 
-    assert!(!RELEASE_WORKFLOW.contains("persist-credentials: true"));
-    assert!(!RELEASE_WORKFLOW.contains("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}"));
+    let workflow = normalized_workflow();
+    assert!(!workflow.contains("persist-credentials: true"));
+    assert!(!workflow.contains("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}"));
     assert_eq!(
-        RELEASE_WORKFLOW
+        workflow
             .matches("${{ secrets.HOMEBREW_TAP_TOKEN }}")
             .count(),
         1,
         "the tap PAT must have exactly one workflow reference"
     );
 
-    let homebrew_job = RELEASE_WORKFLOW
+    let homebrew_job = workflow
         .split("  publish-homebrew-formula:\n")
         .nth(1)
         .and_then(|rest| rest.split("  announce:\n").next())
@@ -183,7 +188,8 @@ fn homebrew_validation_fails_closed_and_pat_exists_only_for_push() {
 
 #[test]
 fn release_plan_installer_has_no_repository_token() {
-    let plan_job = RELEASE_WORKFLOW
+    let workflow = normalized_workflow();
+    let plan_job = workflow
         .split("  plan:\n")
         .nth(1)
         .and_then(|rest| rest.split("  build-local-artifacts:\n").next())
@@ -207,7 +213,8 @@ fn release_plan_installer_has_no_repository_token() {
 
 #[test]
 fn explicit_release_token_is_scoped_to_publication_commands() {
-    let host_job = RELEASE_WORKFLOW
+    let workflow = normalized_workflow();
+    let host_job = workflow
         .split("  host:\n")
         .nth(1)
         .and_then(|rest| rest.split("  publish-homebrew-formula:\n").next())
