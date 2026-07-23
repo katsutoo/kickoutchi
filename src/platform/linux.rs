@@ -544,6 +544,13 @@ pub(crate) fn process_command_line(pid: u32) -> Option<String> {
         .and_then(|(command_line, _)| command_line)
 }
 
+pub(crate) fn process_start_time_marker(pid: u32) -> Option<ProcessStartMarker> {
+    let path = PathBuf::from(PROC_ROOT).join(pid.to_string()).join("stat");
+    read_process_start_time_ticks(&path)
+        .ok()
+        .and_then(|ticks| ProcessStartMarker::linux(ticks).ok())
+}
+
 #[cfg(test)]
 fn collect_socket_records(proc_root: &Path) -> Result<Vec<SocketRecord>, CollectorError> {
     collect_socket_records_bounded(proc_root, crate::observation::SOCKET_OBSERVATIONS_MAX)
@@ -1468,17 +1475,34 @@ fn collect_child_processes_from(proc_root: &Path, parent_pid: u32) -> ChildProce
 }
 
 fn collect_related_process_hints_from(proc_root: &Path, port: u16) -> Vec<RelatedProcessHint> {
+    collect_related_process_hints_from_with_limit(
+        proc_root,
+        port,
+        diagnostic::RELATED_PROCESS_COMMAND_READS_MAX,
+    )
+}
+
+fn collect_related_process_hints_from_with_limit(
+    proc_root: &Path,
+    port: u16,
+    command_read_limit: usize,
+) -> Vec<RelatedProcessHint> {
     let Ok(pids) = process_ids(proc_root) else {
         return Vec::new();
     };
     let current_pid = std::process::id();
     let excluded_pids = process_ancestor_pids_from(proc_root, current_pid);
     let mut hints = Vec::new();
+    let mut command_reads = 0usize;
 
-    for pid in pids {
+    for pid in pids.into_iter().rev() {
         if excluded_pids.contains(&pid) {
             continue;
         }
+        if command_reads == command_read_limit {
+            break;
+        }
+        command_reads += 1;
         let process_dir = proc_root.join(pid.to_string());
         let Ok((Some(command_line), _truncated)) = read_cmdline(&process_dir.join("cmdline"))
         else {
@@ -1945,13 +1969,14 @@ mod tests {
         OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord,
         ancestor_pid_visibility_not_proven, append_sorted_owner, bounded_scope_identifier,
         collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
-        collect_related_process_hints_from, collect_socket_owners, collect_socket_owners_detailed,
-        collect_socket_records, collect_tree_process_infos, decode_cmdline,
-        native_pass_from_records, parse_process_group_id, parse_process_start_time_ticks,
-        parse_process_status, parse_socket_inode, parse_socket_line, parse_socket_table,
-        proc_visibility_restricted, read_bounded_text, read_cmdline, read_cmdline_bounded,
-        read_fresh_process_evidence, read_link_bounded, read_process_metadata_bounded,
-        read_process_status, read_socket_table_bounded,
+        collect_related_process_hints_from, collect_related_process_hints_from_with_limit,
+        collect_socket_owners, collect_socket_owners_detailed, collect_socket_records,
+        collect_tree_process_infos, decode_cmdline, native_pass_from_records,
+        parse_process_group_id, parse_process_start_time_ticks, parse_process_status,
+        parse_socket_inode, parse_socket_line, parse_socket_table, proc_visibility_restricted,
+        read_bounded_text, read_cmdline, read_cmdline_bounded, read_fresh_process_evidence,
+        read_link_bounded, read_process_metadata_bounded, read_process_status,
+        read_socket_table_bounded,
     };
     use crate::model::{PermissionStatus, Platform, Protocol};
     use crate::observation::{
@@ -3739,6 +3764,39 @@ mod tests {
         assert_eq!(oversized[0].pid, 100);
         assert_eq!(oversized[0].process_name, None);
 
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
+    fn related_process_hints_refuse_the_first_command_past_the_read_budget() {
+        let proc_root = temp_proc_root("hint-read-budget");
+        for pid in [100, 101, 102] {
+            write_process(&proc_root, pid, "candidate", 1);
+        }
+        fs::write(
+            proc_root.join("100/cmdline"),
+            b"python3\0-m\0http.server\x003000\0",
+        )
+        .expect("over-budget matching command line");
+        fs::write(
+            proc_root.join("101/cmdline"),
+            b"python3\0-m\0http.server\x003000\0",
+        )
+        .expect("second matching command line");
+        fs::write(
+            proc_root.join("102/cmdline"),
+            b"worker\0--timeout\x003000\0",
+        )
+        .expect("first nonmatch command line");
+
+        let exact = collect_related_process_hints_from_with_limit(&proc_root, 3000, 2);
+        let plus_one = collect_related_process_hints_from_with_limit(&proc_root, 3000, 3);
+
+        assert_eq!(exact.iter().map(|hint| hint.pid).collect::<Vec<_>>(), [101]);
+        assert_eq!(
+            plus_one.iter().map(|hint| hint.pid).collect::<Vec<_>>(),
+            [101, 100]
+        );
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 

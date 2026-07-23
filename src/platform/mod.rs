@@ -1,6 +1,8 @@
 //! Home of the platform-specific collectors.
 
 use crate::model::{ProcessContext, RelatedProcessHint};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use crate::observation::ProcessIdentity;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -60,21 +62,39 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 /// Windows snapshots are relatively expensive, so the Windows reader captures
 /// one process snapshot and reuses it for every PID rendered in the same report.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub(crate) fn inspect_command_line_reader(pids: &[u32]) -> impl FnMut(u32) -> Option<String> {
+pub(crate) fn inspect_command_line_reader(
+    identities: &[ProcessIdentity],
+) -> impl FnMut(u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let _ = pids;
-        linux::process_command_line
+        let expected = identities
+            .iter()
+            .map(|identity| (identity.pid, identity.start_marker))
+            .collect::<std::collections::HashMap<_, _>>();
+        move |pid| {
+            let marker = expected.get(&pid).copied()?;
+            (linux::process_start_time_marker(pid) == Some(marker)).then_some(())?;
+            let command = linux::process_command_line(pid)?;
+            (linux::process_start_time_marker(pid) == Some(marker)).then_some(command)
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
-        let _ = pids;
-        macos::process_command_line
+        let expected = identities
+            .iter()
+            .map(|identity| (identity.pid, identity.start_marker))
+            .collect::<std::collections::HashMap<_, _>>();
+        move |pid| {
+            let marker = expected.get(&pid).copied()?;
+            (macos::process_start_time_marker(pid) == Some(marker)).then_some(())?;
+            let command = macos::process_command_line(pid)?;
+            (macos::process_start_time_marker(pid) == Some(marker)).then_some(command)
+        }
     }
 
     #[cfg(windows)]
     {
-        windows::process_command_line_reader(pids)
+        windows::process_command_line_reader(identities)
     }
 }

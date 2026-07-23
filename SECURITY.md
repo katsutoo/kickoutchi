@@ -70,11 +70,74 @@ before output is rendered or acted upon, so `bindable_now` is not a reservation
 or future guarantee. Snapshot ownership evidence can also change before a later
 probe. Run Why only against endpoints where this short-lived bind is acceptable.
 
+The optional related-process hint shown after an empty human `list --port`
+result is best-effort evidence. Linux and macOS read at most 64 command lines;
+Windows uses the separately bounded process snapshot. A hint may omit a process,
+never creates an ownership claim, and never changes structured output.
+Optional Docker enrichment retains at most 256 KiB from either child stream and
+closes a stream at the first excess byte. A timed-out Docker child is handed to a
+cleanup worker, which attempts termination and retains ownership through confirmed
+reap. An indeterminate wait retains the child and capacity slot indefinitely
+without retrying. Cleanup workers are reserved before process spawn and capped at
+four, so a stuck kernel wait does not block the enrichment caller or permit
+unbounded child accumulation. Another synchronous OS operation can still exceed
+an application-controlled duration.
+
+## Process Authority
+
+Kickoutchi uses only the authority already held by the current process and never
+elevates itself. Linux termination retains pidfds and Windows termination retains
+process handles across final validation and delivery. macOS has no equivalent
+stable process handle: it stops the numeric PID, validates fresh identity and
+protection evidence, and guards continuation with the identity observed after
+the stop. This prevents a detected first PID replacement from being left stopped,
+but a small unavoidable race remains between the final marker read and each raw
+PID signal. A second replacement during that interval can make guarded cleanup
+fail closed and require manual recovery.
+
 Kickoutchi does not require elevated privileges for ordinary use. Do not run it
 as root or Administrator merely to obtain more metadata unless you understand
 the expanded process visibility and termination authority. PATH-based Docker
 enrichment is disabled while elevated, but structured host data remains
 sensitive.
+
+## Security Model
+
+The relevant attacker is a local unprivileged user or process able to influence
+configuration, CLI arguments, process metadata, socket churn, child-process
+output, or a downstream output consumer. Kernel and native APIs provide
+authority but are not trusted for stable sizes or timing. Docker output,
+downloaded build tools, GitHub Actions, package registries, release hosting, and
+the Homebrew tap cross separate trust boundaries.
+
+Security objectives are correct process identity and signal delivery, truthful
+scope and certainty claims, memory safety at native boundaries, bounded resource
+use, terminal and structured-output integrity, process-metadata privacy, and
+reproducible dependency and release inputs. Config and native input are bounded
+before retention; terminal sinks sanitize hostile text; structured output uses
+dedicated serializers; destructive actions revalidate fresh identity and
+protection evidence; retries and retained event state have fixed limits; watch
+and Why never invoke Docker.
+
+Release workflows pin actions by commit and cargo-dist archives by version and
+platform digest before execution. Homebrew credentials are absent during formula
+download and validation and exist only for the final push; update or style
+failures stop before formula staging. Release planning has read-only repository
+permission; no write-scoped token is exported to checkout or release-tool
+installation. Explicit repository `GH_TOKEN` environment values exist only on
+the dist plan, dist host, and final release steps. GitHub permissions remain
+job-scoped, so full-SHA actions in the host job still run where `contents: write`
+is available. Release checksums are published through the same repository
+authority as their artifacts, so they
+detect accidental corruption but are not an independent signature or provenance
+channel. Release-candidate verification must recheck advisories, hashes, native
+artifacts, and publisher settings against the exact commit being shipped.
+
+Read-only inspect reports join socket owners, process-table rows, and optional
+command lines only when PID and process start identity agree. A port owner that
+changes between network and process collection is refused rather than attached
+to the replacement process. Human watch output retains IPv6 interface scope;
+`%unavailable` means the collector could not establish an interface index.
 
 The canonical contracts and privacy distinctions are documented in the
 [structured output reference](docs/structured-output.md). Configuration labels

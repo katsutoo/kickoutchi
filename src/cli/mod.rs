@@ -436,22 +436,31 @@ fn run_inspect(
         }
     };
 
+    if !inspect_port_owner_matches_snapshot(args, target_pid, &initial_entries, &snapshot) {
+        eprintln!(
+            "error: the port owner changed or could not be identity-verified before inspection"
+        );
+        return ExitReason::NoMatch;
+    }
+
     let report_scope = inspect::build_scope(
         target_pid,
         &snapshot,
         TREE_HOST_PLATFORM,
         &config.protected_processes,
     );
-    let entries =
-        match crate::observation::project_legacy_pids(network_snapshot, report_scope.port_pids()) {
-            Ok(entries) => entries,
-            Err(error) => {
-                eprintln!("error: projecting inspect report ports failed: {error}");
-                return ExitReason::Failure;
-            }
-        };
-    let command_line_pids = inspect::command_line_scope_pids(target_pid, &snapshot);
-    let command_line = platform::inspect_command_line_reader(&command_line_pids);
+    let entries = match crate::observation::project_legacy_identities(
+        network_snapshot,
+        report_scope.port_identities(),
+    ) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("error: projecting inspect report ports failed: {error}");
+            return ExitReason::Failure;
+        }
+    };
+    let command_line_identities = inspect::command_line_scope_identities(target_pid, &snapshot);
+    let command_line = platform::inspect_command_line_reader(&command_line_identities);
     match inspect::render_family_report_with_scope(
         target_pid,
         &snapshot,
@@ -491,6 +500,37 @@ fn resolve_inspect_target(
             unreachable!("clap requires exactly one inspect target")
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn inspect_port_owner_matches_snapshot(
+    args: &InspectArgs,
+    target_pid: u32,
+    entries: &[PortEntry],
+    snapshot: &[crate::tree::TreeProcessInfo],
+) -> bool {
+    if args.port.is_none() {
+        return true;
+    }
+
+    let mut expected = None;
+    for entry in entries.iter().filter(|entry| entry.pid == Some(target_pid)) {
+        let Some(identity) = entry.process_identity else {
+            return false;
+        };
+        if expected.is_some_and(|prior| prior != identity) {
+            return false;
+        }
+        expected = Some(identity);
+    }
+    let Some(expected) = expected else {
+        return false;
+    };
+    snapshot
+        .iter()
+        .find(|info| info.pid == target_pid)
+        .and_then(|info| info.start_time_marker)
+        == Some(expected.start_marker)
 }
 
 /// The platform a tree target built from the local process table lives on.
@@ -841,6 +881,68 @@ mod tests {
         assert!(matches!(
             resolve_inspect_target(&by_port(3000), &shared),
             Err(KillTargetError::AmbiguousPort { port: 3000, .. }),
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn inspect_port_owner_must_match_the_later_process_identity() {
+        use super::{InspectArgs, inspect_port_owner_matches_snapshot};
+
+        let by_port = InspectArgs {
+            pid: None,
+            port: Some(3000),
+        };
+        let by_pid = InspectArgs {
+            pid: Some(18_422),
+            port: None,
+        };
+        let rows = vec![entry(3000)];
+        let process = |marker| crate::tree::TreeProcessInfo {
+            pid: 18_422,
+            parent_pid: None,
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node".to_owned()),
+            start_time_marker: marker,
+            owner_uid: None,
+            process_group: None,
+        };
+        let matching = crate::observation::ProcessStartMarker::linux(55).ok();
+        let recycled = crate::observation::ProcessStartMarker::linux(56).ok();
+
+        assert!(inspect_port_owner_matches_snapshot(
+            &by_port,
+            18_422,
+            &rows,
+            &[process(matching)]
+        ));
+        assert!(!inspect_port_owner_matches_snapshot(
+            &by_port,
+            18_422,
+            &rows,
+            &[process(recycled)]
+        ));
+        assert!(!inspect_port_owner_matches_snapshot(
+            &by_port,
+            18_422,
+            &rows,
+            &[process(None)]
+        ));
+        assert!(inspect_port_owner_matches_snapshot(
+            &by_pid,
+            18_422,
+            &rows,
+            &[process(recycled)]
+        ));
+
+        let mut unverified = rows;
+        unverified[0].process_identity = None;
+        assert!(!inspect_port_owner_matches_snapshot(
+            &by_port,
+            18_422,
+            &unverified,
+            &[process(matching)]
         ));
     }
 

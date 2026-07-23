@@ -19,6 +19,7 @@ use std::fmt::Write as _;
 
 use crate::display::sanitize;
 use crate::model::{Platform, PortEntry};
+use crate::observation::ProcessIdentity;
 use crate::protection::is_protected_process_name;
 use crate::tree::{
     MAX_TREE_PROCESSES, ProcessTreeNode, ProcessTreeTarget, TreePlanError, TreeProcessInfo,
@@ -46,30 +47,36 @@ pub(crate) enum InspectError {
     TargetMissing,
 }
 
-pub(crate) fn command_line_scope_pids(target_pid: u32, snapshot: &[TreeProcessInfo]) -> Vec<u32> {
+pub(crate) fn command_line_scope_identities(
+    target_pid: u32,
+    snapshot: &[TreeProcessInfo],
+) -> Vec<ProcessIdentity> {
     let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
         return Vec::new();
     };
-    let mut pids = vec![target_pid];
-    pids.extend(
+    let mut processes = vec![target];
+    processes.extend(
         ancestor_chain(target, snapshot)
             .into_iter()
-            .take(ANCESTORS_DISPLAY_MAX)
-            .map(|info| info.pid),
+            .take(ANCESTORS_DISPLAY_MAX),
     );
-    pids.sort_unstable();
-    pids.dedup();
-    pids
+    let mut identities = processes
+        .into_iter()
+        .filter_map(process_identity)
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    identities.dedup();
+    identities
 }
 
 pub(crate) struct InspectScope {
-    port_pids: BTreeSet<u32>,
+    port_identities: BTreeSet<ProcessIdentity>,
     tree: Result<ProcessTreeTarget, TreePlanError>,
 }
 
 impl InspectScope {
-    pub(crate) fn port_pids(&self) -> &BTreeSet<u32> {
-        &self.port_pids
+    pub(crate) fn port_identities(&self) -> &BTreeSet<ProcessIdentity> {
+        &self.port_identities
     }
 }
 
@@ -81,7 +88,7 @@ pub(crate) fn build_scope(
 ) -> InspectScope {
     let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
         return InspectScope {
-            port_pids: BTreeSet::new(),
+            port_identities: BTreeSet::new(),
             tree: Err(TreePlanError::RootMissing),
         };
     };
@@ -126,8 +133,13 @@ pub(crate) fn build_scope(
         members.sort_unstable();
         pids.extend(members.into_iter().take(GROUP_DISPLAY_MAX));
     }
+    let port_identities = pids
+        .into_iter()
+        .filter_map(|pid| snapshot.iter().find(|info| info.pid == pid))
+        .filter_map(process_identity)
+        .collect();
     InspectScope {
-        port_pids: pids,
+        port_identities,
         tree,
     }
 }
@@ -179,7 +191,7 @@ where
         .find(|info| info.pid == target_pid)
         .ok_or(InspectError::TargetMissing)?;
 
-    let ports_by_pid = ports_by_pid(entries);
+    let ports_by_pid = ports_by_pid(entries, snapshot);
     let mut out = String::new();
 
     render_target(
@@ -502,13 +514,20 @@ fn ancestor_chain<'snapshot>(
     chain
 }
 
-fn ports_by_pid(entries: &[PortEntry]) -> HashMap<u32, Vec<String>> {
+fn ports_by_pid(entries: &[PortEntry], snapshot: &[TreeProcessInfo]) -> HashMap<u32, Vec<String>> {
+    let identities = snapshot
+        .iter()
+        .filter_map(process_identity)
+        .collect::<BTreeSet<_>>();
     let mut ports: HashMap<u32, Vec<String>> = HashMap::new();
     for entry in entries {
-        let Some(pid) = entry.pid else {
+        let Some(identity) = entry.process_identity else {
             continue;
         };
-        ports.entry(pid).or_default().push(format!(
+        if !identities.contains(&identity) {
+            continue;
+        }
+        ports.entry(identity.pid).or_default().push(format!(
             "{} {}:{}",
             entry.protocol.label(),
             entry.local_addr,
@@ -516,6 +535,13 @@ fn ports_by_pid(entries: &[PortEntry]) -> HashMap<u32, Vec<String>> {
         ));
     }
     ports
+}
+
+fn process_identity(info: &TreeProcessInfo) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        pid: info.pid,
+        start_marker: info.start_time_marker?,
+    })
 }
 
 fn member_label(info: &TreeProcessInfo, protected_names: &[String], platform: Platform) -> String {
@@ -615,6 +641,29 @@ mod tests {
             |pid| (pid == 300).then(|| "npm run dev".to_owned()),
         )
         .expect("target is present")
+    }
+
+    #[test]
+    fn report_attaches_ports_only_to_the_exact_process_identity() {
+        let snapshot = family_snapshot();
+        let matching = port_entry(400, 3000);
+        let mut recycled = matching.clone();
+        recycled.process_identity = Some(crate::observation::ProcessIdentity {
+            pid: 400,
+            start_marker: crate::observation::ProcessStartMarker::linux(999)
+                .expect("test marker is nonzero"),
+        });
+
+        let matching_report =
+            render_family_report(400, &snapshot, &[matching], &[], Platform::Linux, |_| None)
+                .expect("target is present");
+        let recycled_report =
+            render_family_report(400, &snapshot, &[recycled], &[], Platform::Linux, |_| None)
+                .expect("target is present");
+
+        assert!(matching_report.contains("Ports: TCP 127.0.0.1:3000"));
+        assert!(recycled_report.contains("Ports: none visible"));
+        assert!(!recycled_report.contains("127.0.0.1:3000"));
     }
 
     #[test]

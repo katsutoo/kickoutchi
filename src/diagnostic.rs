@@ -11,6 +11,8 @@ use crate::display::{REPLACEMENT, is_default_ignorable, sanitize};
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) const RELATED_PROCESS_COMMAND_READS_MAX: usize = 64;
 
 /// Pull a single, unambiguous port to diagnose out of the CLI list filters.
 pub(crate) fn requested_diagnostic_port(port_arg: Option<u16>, filter_text: &str) -> Option<u16> {
@@ -41,28 +43,32 @@ pub(crate) fn requested_diagnostic_port(port_arg: Option<u16>, filter_text: &str
 /// number that happens to look like the port.
 pub(crate) fn command_mentions_port(command_line: &str, port: u16) -> bool {
     let port_text = port.to_string();
-    let tokens: Vec<&str> = command_line.split_whitespace().collect();
+    command_tokens_mention_port(command_line.split_whitespace(), &port_text)
+}
 
-    for (index, token) in tokens.iter().enumerate() {
-        if socket_token_mentions_port(token, &port_text)
-            || assignment_mentions_port(token, &port_text)
-            || flag_assignment_mentions_port(token, &port_text)
+fn command_tokens_mention_port<'a>(tokens: impl Iterator<Item = &'a str>, port_text: &str) -> bool {
+    let mut tokens = tokens.peekable();
+
+    while let Some(token) = tokens.next() {
+        if socket_token_mentions_port(token, port_text)
+            || assignment_mentions_port(token, port_text)
+            || flag_assignment_mentions_port(token, port_text)
         {
             return true;
         }
 
         if is_port_flag(token)
             && tokens
-                .get(index + 1)
-                .is_some_and(|value| exact_port_value(value, &port_text))
+                .peek()
+                .is_some_and(|value| exact_port_value(value, port_text))
         {
             return true;
         }
 
         if is_port_positional_command(token)
             && tokens
-                .get(index + 1)
-                .is_some_and(|value| exact_port_value(value, &port_text))
+                .peek()
+                .is_some_and(|value| exact_port_value(value, port_text))
         {
             return true;
         }
@@ -144,9 +150,13 @@ fn assignment_mentions_port(token: &str, port_text: &str) -> bool {
     let Some((name, value)) = token.split_once('=') else {
         return false;
     };
-    let name_upper = name.to_ascii_uppercase();
-    (name_upper == "PORT" || name_upper.ends_with("_PORT"))
-        && exact_or_socket_port_value(value, port_text)
+    let is_port_name = name.eq_ignore_ascii_case("PORT")
+        || name
+            .len()
+            .checked_sub(5)
+            .and_then(|start| name.get(start..))
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("_PORT"));
+    is_port_name && exact_or_socket_port_value(value, port_text)
 }
 
 fn exact_or_socket_port_value(value: &str, port_text: &str) -> bool {
@@ -158,19 +168,13 @@ fn exact_port_value(value: &str, port_text: &str) -> bool {
 }
 
 fn socket_token_mentions_port(token: &str, port_text: &str) -> bool {
-    let needle = format!(":{port_text}");
-    let mut search_from = 0;
-    while let Some(relative_index) = token[search_from..].find(&needle) {
-        let index = search_from + relative_index;
-        let after_index = index + needle.len();
-        if token[after_index..]
-            .chars()
-            .next()
-            .is_none_or(is_socket_port_terminator)
-        {
+    for value in token.split(':').skip(1) {
+        let Some(after) = value.strip_prefix(port_text) else {
+            continue;
+        };
+        if after.chars().next().is_none_or(is_socket_port_terminator) {
             return true;
         }
-        search_from = after_index;
     }
     false
 }
@@ -184,7 +188,10 @@ fn is_socket_port_terminator(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_mentions_port, diagnostic_message, requested_diagnostic_port};
+    use super::{
+        RELATED_PROCESS_COMMAND_READS_MAX, command_mentions_port, command_tokens_mention_port,
+        diagnostic_message, requested_diagnostic_port,
+    };
     use crate::model::RelatedProcessHint;
 
     #[test]
@@ -220,6 +227,34 @@ mod tests {
         assert!(!command_mentions_port("IMPORTANT=3000 node", 3000));
         assert!(!command_mentions_port("worker duration:3000ms", 3000));
         assert!(!command_mentions_port("worker host:3000abc", 3000));
+    }
+
+    #[test]
+    fn related_process_scan_has_a_fixed_command_read_budget() {
+        assert_eq!(RELATED_PROCESS_COMMAND_READS_MAX, 64);
+    }
+
+    #[test]
+    fn command_matcher_handles_many_tokens_without_retaining_an_index() {
+        let command = std::iter::repeat_n("x", 100_000)
+            .chain(["--port", "3000"])
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(command_mentions_port(&command, 3000));
+    }
+
+    #[test]
+    fn command_matcher_stops_consuming_tokens_after_a_match() {
+        use std::cell::Cell;
+
+        let consumed = Cell::new(0);
+        let tokens = ["--port", "3000", "must-not-be-read"]
+            .into_iter()
+            .inspect(|_| consumed.set(consumed.get() + 1));
+
+        assert!(command_tokens_mention_port(tokens, "3000"));
+        assert_eq!(consumed.get(), 2);
     }
 
     #[test]

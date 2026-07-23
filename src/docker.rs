@@ -7,7 +7,7 @@
 
 use std::io::{self, Read};
 use std::net::IpAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
@@ -25,10 +25,10 @@ const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 // (Docker Desktop shims, credential helpers) can hold the write end open
 // indefinitely, and an unbounded join would hang with it.
 const DOCKER_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
-const DOCKER_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const DOCKER_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 const DOCKER_OUTPUT_READ_CHUNK_BYTES: usize = 8 * 1024;
 const DOCKER_OUTPUT_DRAIN_WORKERS_MAX: usize = 8;
+const DOCKER_CHILD_CLEANUP_WORKERS_MAX: usize = 4;
 const DOCKER_ROWS_MAX: usize = 128;
 const DOCKER_MATCHES_MAX: usize = 8;
 const DOCKER_FIELD_MAX_BYTES: usize = 4 * 1024;
@@ -431,6 +431,102 @@ fn global_drain_capacity() -> Arc<DrainCapacity> {
     )
 }
 
+#[derive(Debug)]
+struct ChildCleanupCapacity {
+    active: AtomicUsize,
+    maximum: usize,
+}
+
+impl ChildCleanupCapacity {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            maximum,
+        }
+    }
+
+    fn reserve(self: &Arc<Self>) -> Option<ChildCleanupPermit> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.maximum {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(ChildCleanupPermit(Arc::clone(self))),
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChildCleanupPermit(Arc<ChildCleanupCapacity>);
+
+impl Drop for ChildCleanupPermit {
+    fn drop(&mut self) {
+        let previous = self.0.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "child cleanup worker reservation underflow");
+    }
+}
+
+struct ChildCleanup {
+    child: mpsc::SyncSender<Child>,
+    completed: mpsc::Receiver<()>,
+}
+
+impl ChildCleanup {
+    fn handoff(self, child: Child) -> mpsc::Receiver<()> {
+        self.child
+            .try_send(child)
+            .expect("new child cleanup channel must be empty and connected");
+        self.completed
+    }
+}
+
+fn global_child_cleanup_capacity() -> Arc<ChildCleanupCapacity> {
+    static CAPACITY: OnceLock<Arc<ChildCleanupCapacity>> = OnceLock::new();
+    Arc::clone(
+        CAPACITY
+            .get_or_init(|| Arc::new(ChildCleanupCapacity::new(DOCKER_CHILD_CLEANUP_WORKERS_MAX))),
+    )
+}
+
+fn spawn_child_cleanup(capacity: &Arc<ChildCleanupCapacity>) -> io::Result<ChildCleanup> {
+    let permit = capacity.reserve().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "docker child cleanup worker capacity exhausted",
+        )
+    })?;
+    let (child_sender, child_receiver) = mpsc::sync_channel(1);
+    let (completed_sender, completed_receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("kickoutchi-docker-child-cleanup".to_owned())
+        .spawn(move || {
+            let _permit = permit;
+            let Ok(mut child) = child_receiver.recv() else {
+                return;
+            };
+            if terminate_and_reap(&mut child) == ReapOutcome::OwnershipUncertain {
+                // No later code may assume this child was reaped. Retain both
+                // the handle and capacity slot without retrying or spinning.
+                loop {
+                    thread::park();
+                }
+            }
+            let _ = completed_sender.send(());
+        })?;
+    Ok(ChildCleanup {
+        child: child_sender,
+        completed: completed_receiver,
+    })
+}
+
 fn run_command_bounded(command: &mut Command) -> Option<std::process::Output> {
     run_command_bounded_with(command, DOCKER_COMMAND_TIMEOUT, DOCKER_OUTPUT_MAX_BYTES)
 }
@@ -450,6 +546,13 @@ fn run_command_bounded_with_capacity(
     drain_capacity: &Arc<DrainCapacity>,
 ) -> Option<std::process::Output> {
     let [stdout_permit, stderr_permit] = drain_capacity.reserve_pair()?;
+    let cleanup = match spawn_child_cleanup(&global_child_cleanup_capacity()) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            debug!(%error, "docker CLI child cleanup worker unavailable");
+            return None;
+        }
+    };
     let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -464,12 +567,12 @@ fn run_command_bounded_with_capacity(
     };
 
     let Some(stdout) = child.stdout.take() else {
-        terminate_and_reap(&mut child);
+        let _ = cleanup.handoff(child);
         debug!("docker CLI stdout pipe was unavailable");
         return None;
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_and_reap(&mut child);
+        let _ = cleanup.handoff(child);
         debug!("docker CLI stderr pipe was unavailable");
         return None;
     };
@@ -481,7 +584,7 @@ fn run_command_bounded_with_capacity(
     ) {
         Ok(worker) => worker,
         Err(error) => {
-            terminate_and_reap(&mut child);
+            let _ = cleanup.handoff(child);
             debug!(%error, "docker CLI stdout drain worker failed to start");
             return None;
         }
@@ -496,7 +599,7 @@ fn run_command_bounded_with_capacity(
         Err(error) => {
             // The stdout worker is detached by design; killing the child
             // closed its pipe, so the worker exits on its own.
-            terminate_and_reap(&mut child);
+            let _ = cleanup.handoff(child);
             debug!(%error, "docker CLI stderr drain worker failed to start");
             return None;
         }
@@ -506,7 +609,7 @@ fn run_command_bounded_with_capacity(
     let status = loop {
         let now = Instant::now();
         if now >= deadline {
-            terminate_and_reap(&mut child);
+            let _ = cleanup.handoff(child);
             let drain_deadline = Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT;
             let _ = finish_output_drain_before(&stdout_worker, "stdout", drain_deadline);
             let _ = finish_output_drain_before(&stderr_worker, "stderr", drain_deadline);
@@ -521,7 +624,7 @@ fn run_command_bounded_with_capacity(
                 );
             }
             Err(error) => {
-                terminate_and_reap(&mut child);
+                let _ = cleanup.handoff(child);
                 let drain_deadline = Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT;
                 let _ = finish_output_drain_before(&stdout_worker, "stdout", drain_deadline);
                 let _ = finish_output_drain_before(&stderr_worker, "stderr", drain_deadline);
@@ -584,19 +687,27 @@ fn read_output_bounded(
     output_max_bytes: usize,
 ) -> io::Result<BoundedOutput> {
     let mut bytes = Vec::with_capacity(output_max_bytes);
-    let mut exceeded = false;
     let mut chunk = [0_u8; DOCKER_OUTPUT_READ_CHUNK_BYTES];
     loop {
-        let count = reader.read(&mut chunk)?;
+        let remaining = output_max_bytes.saturating_sub(bytes.len());
+        let read_capacity = remaining.saturating_add(1).min(chunk.len());
+        let count = reader.read(&mut chunk[..read_capacity])?;
         if count == 0 {
             break;
         }
-        let remaining = output_max_bytes.saturating_sub(bytes.len());
         let retained = count.min(remaining);
         bytes.extend_from_slice(&chunk[..retained]);
-        exceeded |= retained < count;
+        if retained < count {
+            return Ok(BoundedOutput {
+                bytes,
+                exceeded: true,
+            });
+        }
     }
-    Ok(BoundedOutput { bytes, exceeded })
+    Ok(BoundedOutput {
+        bytes,
+        exceeded: false,
+    })
 }
 
 #[cfg(test)]
@@ -636,27 +747,41 @@ fn finish_output_drain_before(
     }
 }
 
-fn terminate_and_reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let deadline = Instant::now() + DOCKER_REAP_TIMEOUT;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            debug!(
-                pid = child.id(),
-                "docker CLI did not become reapable before cleanup deadline"
-            );
-            return;
-        }
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => thread::sleep(
-                Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
-            ),
-            Err(error) => {
-                debug!(%error, pid = child.id(), "docker CLI cleanup wait failed");
-                return;
-            }
+trait ReapChild {
+    fn process_id(&self) -> u32;
+    fn terminate(&mut self) -> io::Result<()>;
+    fn wait_for_exit(&mut self) -> io::Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapOutcome {
+    Reaped,
+    OwnershipUncertain,
+}
+
+impl ReapChild for std::process::Child {
+    fn process_id(&self) -> u32 {
+        self.id()
+    }
+
+    fn terminate(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+
+    fn wait_for_exit(&mut self) -> io::Result<()> {
+        self.wait().map(|_| ())
+    }
+}
+
+fn terminate_and_reap(child: &mut impl ReapChild) -> ReapOutcome {
+    if let Err(error) = child.terminate() {
+        debug!(%error, pid = child.process_id(), "docker CLI cleanup termination failed");
+    }
+    match child.wait_for_exit() {
+        Ok(()) => ReapOutcome::Reaped,
+        Err(error) => {
+            debug!(%error, pid = child.process_id(), "docker CLI cleanup wait failed; retaining ownership and capacity");
+            ReapOutcome::OwnershipUncertain
         }
     }
 }
@@ -954,13 +1079,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        DEFAULT_LOCAL_DOCKER_HOST, DOCKER_HOST_MAX_BYTES, DOCKER_MATCHES_MAX,
-        DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity, TEST_ELEVATION_OVERRIDE,
-        docker_container_ls_with_host_and_runner, docker_container_ls_with_runner,
-        docker_context_from_ps_output, docker_host_is_local, finish_output_drain,
-        host_addr_matches, local_docker_host, looks_like_docker_owner, parse_published_ports,
-        read_output_bounded, run_command_bounded_with, run_command_bounded_with_capacity,
-        should_try_docker_enrichment, spawn_output_drain,
+        ChildCleanupCapacity, DEFAULT_LOCAL_DOCKER_HOST, DOCKER_HOST_MAX_BYTES, DOCKER_MATCHES_MAX,
+        DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity, ReapChild, ReapOutcome,
+        TEST_ELEVATION_OVERRIDE, docker_container_ls_with_host_and_runner,
+        docker_container_ls_with_runner, docker_context_from_ps_output, docker_host_is_local,
+        finish_output_drain, host_addr_matches, local_docker_host, looks_like_docker_owner,
+        parse_published_ports, read_output_bounded, run_command_bounded_with,
+        run_command_bounded_with_capacity, should_try_docker_enrichment, spawn_child_cleanup,
+        spawn_output_drain, terminate_and_reap,
     };
     use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
 
@@ -973,8 +1099,58 @@ mod tests {
     const LARGE_OUTPUT_HELPER_ENV: &str = "KICKOUTCHI_TEST_DOCKER_LARGE_OUTPUT";
     const INHERITED_PIPE_PARENT_ENV: &str = "KICKOUTCHI_TEST_DOCKER_PIPE_PARENT";
     const INHERITED_PIPE_GRANDCHILD_ENV: &str = "KICKOUTCHI_TEST_DOCKER_PIPE_GRANDCHILD";
+    #[cfg(unix)]
+    const REAP_CHILD_HELPER_ENV: &str = "KICKOUTCHI_TEST_DOCKER_REAP_CHILD";
 
     struct ChannelReader(std::sync::mpsc::Receiver<()>);
+
+    struct ExcessThenPanicReader {
+        bytes: Vec<u8>,
+        read: bool,
+    }
+
+    struct ReapChildProbe {
+        events: Vec<&'static str>,
+        terminate_error: bool,
+        wait_error: bool,
+    }
+
+    impl ReapChild for ReapChildProbe {
+        fn process_id(&self) -> u32 {
+            42
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.events.push("terminate");
+            if self.terminate_error {
+                Err(io::Error::other("injected termination failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_exit(&mut self) -> io::Result<()> {
+            self.events.push("wait");
+            if self.wait_error {
+                Err(io::Error::other("injected wait failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Read for ExcessThenPanicReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                !self.read,
+                "the reader was polled after the first excess byte"
+            );
+            self.read = true;
+            let count = self.bytes.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            Ok(count)
+        }
+    }
 
     #[cfg(target_os = "linux")]
     struct ErrorReader;
@@ -1107,6 +1283,15 @@ mod tests {
             return;
         }
         thread::sleep(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_waits_to_be_reaped() {
+        if std::env::var_os(REAP_CHILD_HELPER_ENV).is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(30));
     }
 
     #[test]
@@ -1352,14 +1537,114 @@ mod tests {
     }
 
     #[test]
-    fn output_reader_retains_the_cap_and_drains_the_rest() {
-        let input = vec![b'x'; DOCKER_OUTPUT_MAX_BYTES + 1];
+    fn output_reader_stops_after_the_first_excess_byte() {
+        let reader = ExcessThenPanicReader {
+            bytes: vec![b'x'; 4],
+            read: false,
+        };
+
+        let output = read_output_bounded(reader, 3).expect("in-memory output read must succeed");
+
+        assert_eq!(output.bytes, b"xxx");
+        assert!(output.exceeded);
+    }
+
+    #[test]
+    fn output_reader_accepts_the_exact_cap() {
+        let input = vec![b'x'; DOCKER_OUTPUT_MAX_BYTES];
 
         let output = read_output_bounded(Cursor::new(input), DOCKER_OUTPUT_MAX_BYTES)
-            .expect("in-memory output read must succeed");
+            .expect("exact-limit output read must succeed");
 
         assert_eq!(output.bytes.len(), DOCKER_OUTPUT_MAX_BYTES);
-        assert!(output.exceeded);
+        assert!(!output.exceeded);
+    }
+
+    #[test]
+    fn docker_cleanup_waits_once_even_when_termination_fails() {
+        let mut child = ReapChildProbe {
+            events: Vec::new(),
+            terminate_error: true,
+            wait_error: false,
+        };
+
+        let outcome = terminate_and_reap(&mut child);
+
+        assert_eq!(child.events, ["terminate", "wait"]);
+        assert_eq!(outcome, ReapOutcome::Reaped);
+    }
+
+    #[test]
+    fn docker_cleanup_does_not_retry_a_failed_wait() {
+        let mut child = ReapChildProbe {
+            events: Vec::new(),
+            terminate_error: false,
+            wait_error: true,
+        };
+
+        let outcome = terminate_and_reap(&mut child);
+
+        assert_eq!(child.events, ["terminate", "wait"]);
+        assert_eq!(outcome, ReapOutcome::OwnershipUncertain);
+    }
+
+    #[test]
+    fn docker_cleanup_worker_capacity_refuses_spawn_until_ownership_returns() {
+        let capacity = Arc::new(ChildCleanupCapacity::new(1));
+        let cleanup = spawn_child_cleanup(&capacity).expect("first cleanup worker must start");
+
+        let error = spawn_child_cleanup(&capacity)
+            .err()
+            .expect("second cleanup worker must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(cleanup);
+        let release_deadline = Instant::now() + Duration::from_secs(1);
+        while capacity.active.load(Ordering::Acquire) != 0 && Instant::now() < release_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(capacity.active.load(Ordering::Acquire), 0);
+        assert!(spawn_child_cleanup(&capacity).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_cleanup_reaps_a_real_direct_child() {
+        let capacity = Arc::new(ChildCleanupCapacity::new(1));
+        let cleanup = spawn_child_cleanup(&capacity).expect("cleanup worker must start");
+        let child = Command::new(std::env::current_exe().expect("test binary must resolve"))
+            .env(REAP_CHILD_HELPER_ENV, "1")
+            .args([
+                "--exact",
+                "docker::tests::helper_waits_to_be_reaped",
+                "--nocapture",
+            ])
+            .spawn()
+            .expect("reap test helper must start");
+        let pid = libc::pid_t::try_from(child.id()).expect("child PID must fit pid_t");
+
+        let started = Instant::now();
+        let completed = cleanup.handoff(child);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        completed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cleanup worker must terminate and reap the child");
+
+        let mut status = 0;
+        let result = unsafe {
+            // SAFETY: pid came from the direct child and status is writable.
+            libc::waitpid(pid, &raw mut status, libc::WNOHANG)
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        let release_deadline = Instant::now() + Duration::from_secs(1);
+        while capacity.active.load(Ordering::Acquire) != 0 && Instant::now() < release_deadline {
+            thread::yield_now();
+        }
+        assert_eq!(capacity.active.load(Ordering::Acquire), 0);
     }
 
     #[test]

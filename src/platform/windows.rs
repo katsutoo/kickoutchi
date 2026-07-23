@@ -1119,13 +1119,21 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
     }
 }
 
-pub(crate) fn process_command_line_reader(pids: &[u32]) -> impl FnMut(u32) -> Option<String> {
+pub(crate) fn process_command_line_reader(
+    identities: &[crate::observation::ProcessIdentity],
+) -> impl FnMut(u32) -> Option<String> {
+    let expected = identities
+        .iter()
+        .map(|identity| (identity.pid, identity.start_marker))
+        .collect::<HashMap<_, _>>();
+    let pids = expected.keys().copied().collect::<Vec<_>>();
     let processes =
-        ProcessSnapshot::collect(MetadataProfile::LegacyList, ProcessSelection::Exact(pids))
+        ProcessSnapshot::collect(MetadataProfile::LegacyList, ProcessSelection::Exact(&pids))
             .unwrap_or_else(|_| ProcessSnapshot::default());
     move |pid| {
         processes
             .metadata(pid)
+            .filter(|metadata| metadata.start_time_marker == expected.get(&pid).copied())
             .and_then(|metadata| metadata.command_line.clone())
     }
 }

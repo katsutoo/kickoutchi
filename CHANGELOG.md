@@ -100,6 +100,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- macOS single-process termination now records the identity observed after
+  `SIGSTOP` and uses that identity for guarded rollback, so a detected PID-reuse
+  replacement is resumed without receiving the unauthorized terminating signal.
+- Tree and process-group termination now captures rollback identity immediately
+  after every successful stop and uses the same process snapshot to prove both
+  sweep convergence and final frozen-set identity.
+- Single-process confirmation content is bounded to the modal height without
+  wrapping long process or port text over the actionable prompt, input, error,
+  and cancellation lines.
+- Linux and macOS related-process diagnostics now inspect at most 64 command
+  lines and match tokens without a token index or per-token allocation. Windows
+  retains its separately bounded process-snapshot path.
+- Inspect now joins process, port, and command-line observations by PID and start
+  identity, refusing a changed port owner instead of attributing sockets or
+  metadata to a recycled PID. Human watch output now preserves IPv6 interface
+  scope and explicitly reports unavailable scope.
+- Docker enrichment stops reading each output pipe at the first byte beyond its
+  retention cap and hands each timed-out direct child to a capped cleanup worker
+  that terminates it and retains ownership through confirmed reap. An indeterminate
+  wait permanently consumes its bounded slot instead of releasing ownership,
+  preventing stuck waits from blocking the caller or accumulating unbounded work.
 - macOS tree and group rollback now resumes the post-stop process identity when
   PID reuse is detected, while still withholding termination from identities the
   user did not authorize.
@@ -162,6 +183,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Release jobs now download cargo-dist executables from versioned archives,
+  verify platform-specific SHA-256 pins before extraction, and refuse execution
+  when verification fails. Homebrew validation runs without tap credentials;
+  validation failures stop before formula staging, and the tap token is
+  introduced only for the final authenticated push. Release planning is
+  read-only, and explicit repository-token environment values exist only on the
+  three commands that plan or publish a release.
 - Added a private vulnerability-reporting policy and documented the sensitivity
   of command lines exposed by the legacy JSON compatibility interface.
 

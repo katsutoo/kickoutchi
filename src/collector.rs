@@ -553,8 +553,9 @@ mod tests {
     use crate::model::{PermissionStatus, Protocol, SocketState};
     use crate::observation::{
         EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot,
-        ObservationError, OwnerCompleteness, OwnerObservation, SnapshotCompleteness,
-        UnverifiedOwnerReason, project_legacy, project_legacy_pids,
+        ObservationError, OwnerCompleteness, OwnerObservation, ProcessIdentity,
+        SnapshotCompleteness, UnverifiedOwnerReason, project_legacy, project_legacy_identities,
+        project_legacy_pids,
     };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::observation::{NativeObservationPass, ObservationSource};
@@ -745,6 +746,46 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.local_addr.is_ipv6()));
         // The collector never pre-marks protection — that's config's job.
         assert!(entries.iter().all(|entry| !entry.protected));
+    }
+
+    #[test]
+    fn identity_projection_excludes_recycled_and_unverified_pid_owners() {
+        let mut snapshot = FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake collection succeeds");
+        let matching = snapshot
+            .sockets
+            .iter()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("fixture has target listener")
+            .clone();
+        let identity = matching
+            .owners
+            .iter()
+            .find_map(|owner| match owner {
+                OwnerObservation::Verified(identity) => Some(*identity),
+                OwnerObservation::UnverifiedPid { .. } => None,
+            })
+            .expect("fixture listener has a verified owner");
+        let mut recycled = matching.clone();
+        recycled.owners = vec![OwnerObservation::Verified(ProcessIdentity {
+            pid: identity.pid,
+            start_marker: crate::observation::ProcessStartMarker::linux(999)
+                .expect("test marker is nonzero"),
+        })];
+        let mut unverified = matching.clone();
+        unverified.owners = vec![OwnerObservation::UnverifiedPid {
+            pid: identity.pid,
+            reason: UnverifiedOwnerReason::IdentityUnavailable,
+        }];
+        snapshot.sockets = vec![matching, recycled, unverified];
+
+        let entries =
+            project_legacy_identities(&snapshot, &std::collections::BTreeSet::from([identity]))
+                .expect("identity projection succeeds");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].process_identity, Some(identity));
     }
 
     #[test]

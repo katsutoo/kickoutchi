@@ -847,11 +847,16 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
     };
     let excluded_pids = process_ancestor_pids(std::process::id());
     let mut hints = Vec::new();
+    let mut command_reads = 0usize;
 
-    for pid in pids {
+    for pid in pids.into_iter().rev() {
         if excluded_pids.contains(&pid) {
             continue;
         }
+        if command_reads == diagnostic::RELATED_PROCESS_COMMAND_READS_MAX {
+            break;
+        }
+        command_reads += 1;
         let Ok(Some(command_line)) = read_command_line(pid) else {
             continue;
         };
@@ -930,6 +935,16 @@ impl MacosTreeOps {
             Err(_) => Err(TreeSignalResult::Denied),
         }
     }
+
+    fn rollback_identity_after_stop_with<Read>(
+        pid: u32,
+        read_marker: Read,
+    ) -> Option<ProcessStartMarker>
+    where
+        Read: FnOnce(u32) -> std::io::Result<Option<ProcessStartMarker>>,
+    {
+        read_marker(pid).ok().flatten()
+    }
 }
 
 impl TreeProcessOps for MacosTreeOps {
@@ -943,6 +958,17 @@ impl TreeProcessOps for MacosTreeOps {
 
     fn stop(&mut self, pid: u32) -> TreeSignalResult {
         tree_stop(pid)
+    }
+
+    fn rollback_identity_after_stop(
+        &mut self,
+        pid: u32,
+        _prior_marker: Option<ProcessStartMarker>,
+    ) -> Option<ProcessStartMarker> {
+        Self::rollback_identity_after_stop_with(pid, |pid| {
+            read_process_bsdinfo(pid)
+                .map(|info| process_start_time_marker_from_bsd_info(&info).ok())
+        })
     }
 
     fn cont(&mut self, pid: u32) -> TreeSignalResult {
@@ -2370,6 +2396,30 @@ mod tests {
         ops.prepare_thaw(42, Some(marker));
 
         assert_eq!(ops.verified_markers.get(&42), Some(&marker));
+    }
+
+    #[test]
+    fn rollback_identity_after_stop_uses_the_immediate_marker() {
+        let prior =
+            crate::observation::ProcessStartMarker::macos(1, 0).expect("test marker is valid");
+        let stopped =
+            crate::observation::ProcessStartMarker::macos(2, 0).expect("test marker is valid");
+
+        assert_eq!(
+            super::MacosTreeOps::rollback_identity_after_stop_with(42, |_| Ok(Some(stopped))),
+            Some(stopped)
+        );
+        assert_ne!(Some(prior), Some(stopped));
+    }
+
+    #[test]
+    fn unreadable_post_stop_identity_does_not_fall_back_to_prior_identity() {
+        assert_eq!(
+            super::MacosTreeOps::rollback_identity_after_stop_with(42, |_| {
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            }),
+            None
+        );
     }
 
     #[test]

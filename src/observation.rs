@@ -1713,6 +1713,7 @@ pub(crate) fn project_legacy_target(
     project_legacy_with_limit(snapshot, DERIVED_PORT_ENTRIES_MAX, pid, port)
 }
 
+#[cfg(test)]
 pub(crate) fn project_legacy_pids(
     snapshot: &NetworkSnapshot,
     pids: &std::collections::BTreeSet<u32>,
@@ -1746,6 +1747,41 @@ pub(crate) fn project_legacy_pids(
                 Some(pid),
                 identity,
                 process,
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+pub(crate) fn project_legacy_identities(
+    snapshot: &NetworkSnapshot,
+    identities: &std::collections::BTreeSet<ProcessIdentity>,
+) -> Result<Vec<PortEntry>, ObservationError> {
+    let platform = snapshot_platform(snapshot);
+    let mut entries = Vec::new();
+    for socket in &snapshot.sockets {
+        let state = match socket.state {
+            SocketState::Listen => LegacySocketState::Listen,
+            SocketState::Bound => LegacySocketState::Bound,
+            _ => continue,
+        };
+        for owner in &socket.owners {
+            let OwnerObservation::Verified(identity) = owner else {
+                continue;
+            };
+            if !identities.contains(identity) {
+                continue;
+            }
+            if entries.len() == DERIVED_PORT_ENTRIES_MAX {
+                return Err(ObservationError::LegacyProjectionLimitExceeded);
+            }
+            entries.push(legacy_entry(
+                socket,
+                state,
+                platform,
+                Some(identity.pid),
+                Some(*identity),
+                snapshot.processes.get(identity),
             ));
         }
     }

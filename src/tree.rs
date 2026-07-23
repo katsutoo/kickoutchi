@@ -166,6 +166,18 @@ pub(crate) trait TreeProcessOps {
     }
     /// `SIGSTOP` a process.
     fn stop(&mut self, pid: u32) -> TreeSignalResult;
+    /// Capture the identity that accepted `SIGSTOP`, for guarded rollback.
+    ///
+    /// Linux continuation is pinned by pidfd, so retaining the previously
+    /// observed marker is sufficient there. macOS overrides this to read the
+    /// identity immediately after the raw-PID stop succeeds.
+    fn rollback_identity_after_stop(
+        &mut self,
+        _pid: u32,
+        prior_marker: Option<ProcessStartMarker>,
+    ) -> Option<ProcessStartMarker> {
+        prior_marker
+    }
     /// `SIGCONT` a process. `NotFound` leaves no stopped survivor; `Denied`
     /// must be reported as a cleanup failure.
     fn cont(&mut self, pid: u32) -> TreeSignalResult;
@@ -673,8 +685,8 @@ struct FrozenNode {
     owner_uid: Option<u32>,
     /// Identity authorized for termination. This never changes after discovery.
     start_time_marker: Option<ProcessStartMarker>,
-    /// Latest identity observed after this PID accepted `SIGSTOP`, used only to
-    /// guard rollback when termination authorization fails.
+    /// Identity observed immediately after this PID accepted `SIGSTOP`, used
+    /// only to guard rollback when termination authorization fails.
     rollback_start_time_marker: Option<ProcessStartMarker>,
     depth: usize,
 }
@@ -914,13 +926,15 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
     // Stop the root before anything else: a stopped process cannot fork, so
     // this freezes the member set's growth from the confirmed process before we
     // ever look at it.
-    match ops.stop(root.pid) {
-        TreeSignalResult::Delivered => {}
+    let rollback_start_time_marker = match ops.stop(root.pid) {
+        TreeSignalResult::Delivered => {
+            ops.rollback_identity_after_stop(root.pid, root.process_start_time_marker)
+        }
         TreeSignalResult::NotFound => return TreeKillOutcome::RootAlreadyExited,
         TreeSignalResult::Denied => return TreeKillOutcome::PermissionDenied { pid: root.pid },
-    }
+    };
 
-    let mut frozen = match verify_root_after_stop(root, scope, ops) {
+    let mut frozen = match verify_root_after_stop(root, scope, rollback_start_time_marker, ops) {
         Ok(node) => vec![node],
         Err((outcome, observed_root)) => {
             // Only the root is stopped at this point.
@@ -932,7 +946,7 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
                     process_name: root.process_name.clone(),
                     owner_uid: root.owner_uid,
                     start_time_marker: root.process_start_time_marker,
-                    rollback_start_time_marker: root.process_start_time_marker,
+                    rollback_start_time_marker,
                     depth: 0,
                 },
                 |node| *node,
@@ -941,10 +955,11 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
         }
     };
 
-    if let Err(outcome) = freeze_sweep(&mut frozen, scope, ops) {
-        return refuse_after_thaw(outcome, &frozen, ops);
-    }
-    if let Err(outcome) = verify_frozen_identities(&mut frozen, scope, ops) {
+    let convergence_snapshot = match freeze_sweep(&mut frozen, scope, ops) {
+        Ok(snapshot) => snapshot,
+        Err(outcome) => return refuse_after_thaw(outcome, &frozen, ops),
+    };
+    if let Err(outcome) = verify_frozen_identities(&mut frozen, scope, &convergence_snapshot) {
         return refuse_after_thaw(outcome, &frozen, ops);
     }
     if let Err(outcome) = prepare_delivery_handles(&frozen, ops) {
@@ -966,6 +981,7 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
 fn verify_root_after_stop<Ops: TreeProcessOps>(
     root: &KillTarget,
     scope: SweepScope,
+    rollback_start_time_marker: Option<ProcessStartMarker>,
     ops: &mut Ops,
 ) -> Result<FrozenNode, (TreeKillOutcome, Option<Box<FrozenNode>>)> {
     let snapshot = ops
@@ -978,6 +994,7 @@ fn verify_root_after_stop<Ops: TreeProcessOps>(
     // The post-stop marker is rollback evidence only. Keep the marker that the
     // user authorized as the termination identity even on this refusal path.
     observed.start_time_marker = root.process_start_time_marker;
+    observed.rollback_start_time_marker = rollback_start_time_marker;
     if !root_identity_matches(root, info) {
         return Err((
             TreeKillOutcome::TargetChanged { pid: root.pid },
@@ -1029,7 +1046,7 @@ fn freeze_sweep<Ops: TreeProcessOps>(
     frozen: &mut Vec<FrozenNode>,
     scope: SweepScope,
     ops: &mut Ops,
-) -> Result<(), TreeKillOutcome> {
+) -> Result<Vec<TreeProcessInfo>, TreeKillOutcome> {
     let member_cap = scope.member_cap();
     for _ in 0..MAX_FREEZE_PASSES {
         let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
@@ -1074,7 +1091,12 @@ fn freeze_sweep<Ops: TreeProcessOps>(
                     return Err(TreeKillOutcome::PartialMetadata { pid: member.pid });
                 }
                 match ops.stop(member.pid) {
-                    TreeSignalResult::Delivered => frozen.push(member),
+                    TreeSignalResult::Delivered => {
+                        let mut member = member;
+                        member.rollback_start_time_marker =
+                            ops.rollback_identity_after_stop(member.pid, member.start_time_marker);
+                        frozen.push(member);
+                    }
                     TreeSignalResult::NotFound => {
                         vanished.insert(member.pid);
                     }
@@ -1085,7 +1107,7 @@ fn freeze_sweep<Ops: TreeProcessOps>(
             }
         }
         if !discovered_in_pass {
-            return Ok(());
+            return Ok(snapshot);
         }
     }
     // Never reached a clean empty pass: the member set kept changing, so we
@@ -1149,28 +1171,19 @@ fn unfrozen_group_members(
     discovered
 }
 
-/// After the sweep, re-read every frozen node once more: a stopped process
-/// cannot exec or exit, so its start marker and its scope relation (parent PID
-/// for trees, group ID for groups) must be unchanged. A mismatch means
-/// something impossible-if-safe happened; refuse.
+/// Use the snapshot that proved sweep convergence to verify every frozen node.
+/// A stopped process cannot exec or exit, so its start marker and scope relation
+/// (parent PID for trees, group ID for groups) must be unchanged. A mismatch
+/// means something impossible-if-safe happened; refuse.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn verify_frozen_identities<Ops: TreeProcessOps>(
+fn verify_frozen_identities(
     frozen: &mut [FrozenNode],
     scope: SweepScope,
-    ops: &mut Ops,
+    snapshot: &[TreeProcessInfo],
 ) -> Result<(), TreeKillOutcome> {
-    let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
-    let index = ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(|error| {
+    let index = ProcessTreeIndex::new(snapshot, PROCESS_TREE_INDEX_MAX).map_err(|error| {
         TreeKillOutcome::SnapshotFailed(format!("process index construction failed: {error:?}"))
     })?;
-    // Capture rollback identities for the complete present set before any one
-    // member can fail validation. Termination authorization remains in
-    // start_time_marker and is checked separately below.
-    for node in frozen.iter_mut() {
-        if let Some(info) = index.process(node.pid) {
-            node.rollback_start_time_marker = info.start_time_marker;
-        }
-    }
     for node in frozen.iter_mut() {
         let Some(info) = index.process(node.pid) else {
             return Err(TreeKillOutcome::TargetChanged { pid: node.pid });
@@ -1492,6 +1505,7 @@ mod tests {
         deny_deliver: Vec<u32>,
         deny_cont: Vec<u32>,
         missing_cont: Vec<u32>,
+        rollback_markers_after_stop: HashMap<u32, Option<crate::observation::ProcessStartMarker>>,
         prepared_thaws: HashMap<u32, Option<crate::observation::ProcessStartMarker>>,
         fresh_evidence: HashMap<u32, Result<FreshProcessEvidence, ProcessEvidenceError>>,
     }
@@ -1508,6 +1522,7 @@ mod tests {
                 deny_deliver: Vec::new(),
                 deny_cont: Vec::new(),
                 missing_cont: Vec::new(),
+                rollback_markers_after_stop: HashMap::new(),
                 prepared_thaws: HashMap::new(),
                 fresh_evidence: HashMap::new(),
             }
@@ -1540,6 +1555,17 @@ mod tests {
                 return TreeSignalResult::NotFound;
             }
             TreeSignalResult::Delivered
+        }
+
+        fn rollback_identity_after_stop(
+            &mut self,
+            pid: u32,
+            prior_marker: Option<crate::observation::ProcessStartMarker>,
+        ) -> Option<crate::observation::ProcessStartMarker> {
+            self.rollback_markers_after_stop
+                .get(&pid)
+                .copied()
+                .unwrap_or(prior_marker)
         }
 
         fn cont(&mut self, pid: u32) -> TreeSignalResult {
@@ -1648,6 +1674,45 @@ mod tests {
         assert_eq!(ops.events, [Event::Cont(42)]);
     }
 
+    #[test]
+    fn stopped_replacement_uses_immediate_identity_when_later_member_refuses() {
+        let root = root_target(100, "root", 10);
+        let root_snapshot = vec![info(100, None, "root", 10)];
+        let mut partial = info(102, Some(100), "partial", 12);
+        partial.start_time_marker = None;
+        let sweep_snapshot = vec![
+            info(100, None, "root", 10),
+            info(101, Some(100), "child", 11),
+            partial,
+        ];
+        let replacement_marker = crate::observation::ProcessStartMarker::linux(777).ok();
+        let mut ops = FakeOps::new(vec![root_snapshot, sweep_snapshot]);
+        ops.rollback_markers_after_stop
+            .insert(101, replacement_marker);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(outcome, TreeKillOutcome::PartialMetadata { pid: 102 });
+        assert_eq!(ops.prepared_thaws.get(&101), Some(&replacement_marker));
+        assert_eq!(
+            ops.events,
+            [
+                Event::Stop(100),
+                Event::Stop(101),
+                Event::Cont(101),
+                Event::Cont(100),
+            ]
+        );
+        assert!(ops.delivered_pids().is_empty());
+    }
+
     fn info(pid: u32, parent: Option<u32>, name: &str, marker: u64) -> TreeProcessInfo {
         TreeProcessInfo {
             pid,
@@ -1708,31 +1773,6 @@ mod tests {
 
     #[test]
     fn production_index_bound_is_wired_through_planning_and_final_verification() {
-        struct OneSnapshot(Option<Vec<TreeProcessInfo>>);
-        impl TreeProcessOps for OneSnapshot {
-            fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
-                self.0
-                    .take()
-                    .ok_or_else(|| "snapshot already read".to_owned())
-            }
-            fn stop(&mut self, _pid: u32) -> TreeSignalResult {
-                TreeSignalResult::Denied
-            }
-            fn cont(&mut self, _pid: u32) -> TreeSignalResult {
-                TreeSignalResult::Denied
-            }
-            fn prepare_delivery(
-                &mut self,
-                _pid: u32,
-                _marker: Option<crate::observation::ProcessStartMarker>,
-            ) -> TreeSignalResult {
-                TreeSignalResult::Denied
-            }
-            fn deliver(&mut self, _pid: u32, _mode: KillMode) -> TreeSignalResult {
-                TreeSignalResult::Denied
-            }
-        }
-
         let mut exact = Vec::with_capacity(PROCESS_TREE_INDEX_MAX + 1);
         exact.push(info(2, None, "root", 2));
         for offset in 1..PROCESS_TREE_INDEX_MAX {
@@ -1756,8 +1796,7 @@ mod tests {
 
         let root = FrozenNode::from_info(&exact[0], 0);
         let mut frozen = [root];
-        let mut exact_ops = OneSnapshot(Some(exact.clone()));
-        verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &mut exact_ops)
+        verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &exact)
             .expect("exact production index maximum verifies");
 
         exact.push(TreeProcessInfo {
@@ -1776,9 +1815,8 @@ mod tests {
                 limit: PROCESS_TREE_INDEX_MAX
             })
         );
-        let mut over_ops = OneSnapshot(Some(exact));
         assert!(matches!(
-            verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &mut over_ops),
+            verify_frozen_identities(&mut frozen, super::SweepScope::Tree, &exact),
             Err(TreeKillOutcome::SnapshotFailed(message))
                 if message.contains("process index construction failed")
         ));
@@ -1994,6 +2032,8 @@ mod tests {
         let root = root_target(100, "node", 10);
         // Same PID, different start marker: a reused PID. Refuse, and thaw.
         let mut ops = FakeOps::new(vec![vec![info(100, Some(1), "node", 999)]]);
+        ops.rollback_markers_after_stop
+            .insert(100, crate::observation::ProcessStartMarker::linux(999).ok());
 
         let outcome = execute_tree_kill(
             &root,
@@ -2021,8 +2061,8 @@ mod tests {
             info(101, Some(100), "first-child", 11),
             info(102, Some(100), "second-child", 12),
         ];
-        // Both descendants were replaced after discovery. Validation fails on
-        // 101 first, but rollback must already retain 102's stopped identity.
+        // Both stops landed on replacements. Validation fails on 101 first,
+        // but rollback must already retain both immediately observed identities.
         let drifted = vec![
             info(100, Some(1), "root", 10),
             info(101, Some(100), "first-child", 777),
@@ -2030,10 +2070,13 @@ mod tests {
         ];
         let mut ops = FakeOps::new(vec![
             stable.clone(), // verify root
-            stable.clone(), // sweep pass 1: discovers 101
-            stable,         // sweep pass 2: converged
-            drifted,        // final verify: 101 drifted
+            stable,         // sweep pass 1: discovers both children
+            drifted,        // sweep pass 2: converged and verifies drift
         ]);
+        ops.rollback_markers_after_stop
+            .insert(101, crate::observation::ProcessStartMarker::linux(777).ok());
+        ops.rollback_markers_after_stop
+            .insert(102, crate::observation::ProcessStartMarker::linux(888).ok());
 
         let outcome = execute_tree_kill(
             &root,
@@ -2598,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn group_sweep_converges_on_first_empty_pass_and_ignores_later_joins() {
+    fn group_final_verification_reuses_the_convergence_snapshot() {
         let root = root_target(100, "root", 10);
         let base = vec![ginfo(100, Some(1), "root", 10, 42)];
         let grown = vec![
@@ -2608,10 +2651,17 @@ mod tests {
         let mut ops = FakeOps::new(vec![
             base.clone(), // verify root
             base,         // sweep pass 1: nothing new yet
-            grown.clone(),
-            grown.clone(),
             grown,
         ]);
+        ops.fresh_evidence.insert(
+            100,
+            Ok(FreshProcessEvidence {
+                pid: 100,
+                start_marker: crate::observation::ProcessStartMarker::linux(10)
+                    .expect("test marker is valid"),
+                name: "root".to_owned(),
+            }),
+        );
 
         let outcome = execute_group_kill(
             &root,
@@ -2623,14 +2673,15 @@ mod tests {
             &mut ops,
         );
 
-        // An empty first pass converges immediately with only the root frozen —
-        // the late member must NOT be reachable then. This pins the sweep
-        // semantics: convergence means "a pass discovered nothing new".
         let TreeKillOutcome::Completed(report) = outcome else {
             panic!("expected completion, got {outcome:?}");
         };
         assert_eq!(report.total, 1);
         assert_eq!(ops.delivered_pids(), vec![100]);
+        assert_eq!(
+            ops.next, 2,
+            "no later snapshot may replace convergence evidence"
+        );
     }
 
     #[test]
@@ -2651,8 +2702,7 @@ mod tests {
         let mut ops = FakeOps::new(vec![
             before.clone(), // verify root
             before.clone(), // sweep pass 1: discovers 150
-            before,         // sweep pass 2: converged
-            reparented,     // final verify: ppid changed, pgid unchanged
+            reparented,     // sweep pass 2: converged after reparenting
         ]);
 
         let outcome = execute_group_kill(
@@ -2685,7 +2735,7 @@ mod tests {
             ginfo(100, Some(1), "root", 10, 42),
             ginfo(150, Some(1), "worker", 11, 77),
         ];
-        let mut ops = FakeOps::new(vec![before.clone(), before.clone(), before, moved]);
+        let mut ops = FakeOps::new(vec![before.clone(), before, moved]);
 
         let outcome = execute_group_kill(
             &root,
@@ -2847,8 +2897,8 @@ mod tests {
                 info(pid, Some(parent), "link", 10 + u64::from(index))
             })
             .collect();
-        // One static snapshot serves the root verify, the draining pass, the
-        // converging pass, and the final verify (the fake repeats the last).
+        // One static snapshot serves root verification, both sweep passes, and
+        // fresh delivery evidence because the fake repeats its last snapshot.
         let mut ops = FakeOps::new(vec![chain]);
 
         let outcome = execute_tree_kill(
@@ -2938,9 +2988,8 @@ mod tests {
         ];
         let mut ops = FakeOps::new(vec![
             stable.clone(), // verify root
-            stable.clone(), // sweep pass 1: discovers and freezes 101
-            stable,         // sweep pass 2: converged
-            reparented,     // final verify: 101 reparented
+            stable,         // sweep pass 1: discovers and freezes 101
+            reparented,     // sweep pass 2: converged and verifies relation
         ]);
 
         let outcome = execute_tree_kill(
@@ -2965,9 +3014,8 @@ mod tests {
         let before = vec![info(100, Some(250), "root", 10)];
         let reparented = vec![info(100, Some(1), "root", 10)];
         let mut ops = FakeOps::new(vec![
-            before.clone(), // verify root
-            before,         // sweep pass 1: no descendants
-            reparented,     // final verify: only the root's parent changed
+            before,     // verify root
+            reparented, // converged with only the root's parent changed
         ]);
 
         let outcome = execute_tree_kill(

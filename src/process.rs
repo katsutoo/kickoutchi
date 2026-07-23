@@ -868,40 +868,92 @@ fn terminate_handle_checked_platform(
     if stop != 0 {
         return macos_signal_outcome("kill(SIGSTOP)", &std::io::Error::last_os_error());
     }
-    if let Err(outcome) = check_final_evidence(
+    let fresh = crate::platform::macos::fresh_process_evidence(handle.pid);
+    finish_macos_stopped_process(
+        handle.pid,
         target,
         protected_names,
-        crate::platform::macos::fresh_process_evidence(handle.pid),
-    ) {
-        return outcome_after_thaw(handle.pid, outcome, macos_cont_if_matches(handle));
+        mode,
+        fresh,
+        |mode| {
+            let signal = match mode {
+                KillMode::Terminate => libc::SIGTERM,
+                KillMode::Force => libc::SIGKILL,
+            };
+            let result = unsafe {
+                // SAFETY: pid is range checked and signal is one of two fixed values.
+                libc::kill(pid, signal)
+            };
+            if result == 0 {
+                TerminationOutcome::Success
+            } else {
+                macos_signal_outcome("kill", &std::io::Error::last_os_error())
+            }
+        },
+        macos_cont_if_matches,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_stopped_process<Terminate, Continue>(
+    pid: u32,
+    target: &KillTarget,
+    protected_names: &[String],
+    mode: KillMode,
+    fresh: Result<FreshProcessEvidence, ProcessEvidenceError>,
+    terminate: Terminate,
+    continue_process: Continue,
+) -> TerminationOutcome
+where
+    Terminate: FnOnce(KillMode) -> TerminationOutcome,
+    Continue: FnOnce(u32, Option<ProcessStartMarker>) -> crate::tree::TreeSignalResult,
+{
+    let rollback_marker = fresh
+        .as_ref()
+        .ok()
+        .map(|evidence| evidence.start_marker)
+        .or(target.process_start_time_marker);
+    if let Err(outcome) = check_final_evidence(target, protected_names, fresh) {
+        return outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker));
     }
-    let signal = match mode {
-        KillMode::Terminate => libc::SIGTERM,
-        KillMode::Force => libc::SIGKILL,
-    };
-    let result = unsafe {
-        // SAFETY: pid is range checked and signal is one of two fixed values.
-        libc::kill(pid, signal)
-    };
-    let outcome = if result == 0 {
-        TerminationOutcome::Success
-    } else {
-        macos_signal_outcome("kill", &std::io::Error::last_os_error())
-    };
+    let outcome = terminate(mode);
     if mode == KillMode::Terminate || outcome != TerminationOutcome::Success {
-        return outcome_after_thaw(handle.pid, outcome, macos_cont_if_matches(handle));
+        return outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker));
     }
     outcome
 }
 
 #[cfg(target_os = "macos")]
-fn macos_cont_if_matches(handle: &TerminationHandle) -> crate::tree::TreeSignalResult {
-    if crate::platform::macos::process_start_time_marker(handle.pid)
-        != Some(handle.process_start_time_marker)
-    {
+fn macos_cont_if_matches(
+    pid: u32,
+    rollback_marker: Option<ProcessStartMarker>,
+) -> crate::tree::TreeSignalResult {
+    macos_cont_if_matches_with(
+        pid,
+        rollback_marker,
+        crate::platform::macos::process_start_time_marker,
+        tree_cont,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cont_if_matches_with<ReadMarker, Continue>(
+    pid: u32,
+    rollback_marker: Option<ProcessStartMarker>,
+    read_marker: ReadMarker,
+    continue_process: Continue,
+) -> crate::tree::TreeSignalResult
+where
+    ReadMarker: FnOnce(u32) -> Option<ProcessStartMarker>,
+    Continue: FnOnce(u32) -> crate::tree::TreeSignalResult,
+{
+    let Some(rollback_marker) = rollback_marker else {
+        return crate::tree::TreeSignalResult::Denied;
+    };
+    if read_marker(pid) != Some(rollback_marker) {
         return crate::tree::TreeSignalResult::Denied;
     }
-    tree_cont(handle.pid)
+    continue_process(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -1504,12 +1556,16 @@ mod tests {
         kill_target_has_port_with, revalidate_confirmed_target, target_still_matches_confirmation,
         unsafe_pid_reason,
     };
+    #[cfg(target_os = "macos")]
+    use super::{finish_macos_stopped_process, macos_cont_if_matches_with};
     #[cfg(windows)]
     use super::{native_utf16_prefix, windows_api_outcome, windows_still_active_exit_code};
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
         Protocol, SocketState,
     };
+    #[cfg(target_os = "macos")]
+    use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
     #[cfg(windows)]
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
 
@@ -1597,6 +1653,126 @@ mod tests {
             TerminationOutcome::ThawFailed { pid: 42, prior }
                 if *prior == TerminationOutcome::TargetChanged
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cleanup_continues_the_identity_observed_after_stop() {
+        let rollback_marker = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("rollback marker is valid");
+        let mut continued = Vec::new();
+
+        let result = macos_cont_if_matches_with(
+            42,
+            Some(rollback_marker),
+            |_| Some(rollback_marker),
+            |pid| {
+                continued.push(pid);
+                crate::tree::TreeSignalResult::Delivered
+            },
+        );
+
+        assert_eq!(result, crate::tree::TreeSignalResult::Delivered);
+        assert_eq!(continued, [42]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_change_rolls_back_the_post_stop_process_without_terminating_it() {
+        let original_marker = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("original marker is valid");
+        let replacement_marker = crate::observation::ProcessStartMarker::macos(21, 30)
+            .expect("replacement marker is valid");
+        let target = KillTarget {
+            pid: 42,
+            process_name: Some("node".to_owned()),
+            platform: Platform::Macos,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: Some(original_marker),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let fresh = Ok(FreshProcessEvidence {
+            pid: 42,
+            start_marker: replacement_marker,
+            name: "replacement".to_owned(),
+        });
+        let mut continued = Vec::new();
+
+        let outcome = finish_macos_stopped_process(
+            42,
+            &target,
+            &[],
+            KillMode::Terminate,
+            fresh,
+            |_| panic!("replacement identity must not receive a terminating signal"),
+            |pid, rollback_marker| {
+                continued.push((pid, rollback_marker));
+                crate::tree::TreeSignalResult::Delivered
+            },
+        );
+
+        assert_eq!(outcome, TerminationOutcome::TargetChanged);
+        assert_eq!(continued, [(42, Some(replacement_marker))]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_evidence_failure_rechecks_and_rolls_back_the_authorized_identity() {
+        let original_marker = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("original marker is valid");
+        let target = KillTarget {
+            pid: 42,
+            process_name: Some("node".to_owned()),
+            platform: Platform::Macos,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: Some(original_marker),
+            child_count: 0,
+            children_truncated: false,
+        };
+        let mut continued = Vec::new();
+
+        let outcome = finish_macos_stopped_process(
+            42,
+            &target,
+            &[],
+            KillMode::Terminate,
+            Err(ProcessEvidenceError::PermissionDenied { pid: 42 }),
+            |_| panic!("incomplete evidence must prevent termination"),
+            |pid, rollback_marker| {
+                continued.push((pid, rollback_marker));
+                crate::tree::TreeSignalResult::Delivered
+            },
+        );
+
+        assert_eq!(outcome, TerminationOutcome::PermissionDenied);
+        assert_eq!(continued, [(42, Some(original_marker))]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cleanup_refuses_a_second_identity_change() {
+        let rollback_marker = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("rollback marker is valid");
+        let changed_marker =
+            crate::observation::ProcessStartMarker::macos(21, 30).expect("changed marker is valid");
+
+        let result = macos_cont_if_matches_with(
+            42,
+            Some(rollback_marker),
+            |_| Some(changed_marker),
+            |_| panic!("changed identity must not receive SIGCONT"),
+        );
+
+        assert_eq!(result, crate::tree::TreeSignalResult::Denied);
     }
 
     #[test]

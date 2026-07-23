@@ -381,6 +381,9 @@ authorized security-test target under this plan.
 | A special config file, stalled filesystem, or stalled output consumer blocks synchronous I/O | Retain byte/memory caps, stream output without accumulation, and document host-OS backpressure as residual risk | Bounded-reader and early-closing consumer tests |
 | New output leaks full command lines or unstable OS errors | Omit command lines by default; stable error codes plus sanitized messages | Schema and privacy contract tests |
 | Dependency compromise or known unsoundness reaches release artifacts | Locked dependency, advisory applicability review, cargo-deny policy, native builds, and checksum verification | Recorded dependency and artifact review |
+| Related-process hints scan a hostile local process population | Cap Linux/macOS command-line reads, use the bounded Windows process snapshot, retain at most eight hints, and match tokens without a token index | Exact-read-limit and many-token tests |
+| Docker descendants retain pipes or direct children after timeout | Stop at the first excess output byte and reap the direct child before releasing ownership | Overflow-reader and owned-child cleanup tests |
+| Downloaded release tools or publishing steps overexpose authority | Verify executable archives before extraction; keep release planning read-only; introduce repository credentials only to the dist planning or final publishing step that needs them | Workflow contract tests and corrupted-archive QA |
 
 Residual risks that must remain documented are polling blind spots between
 snapshots, a successful probe losing a later bind race, the probe itself briefly
@@ -392,8 +395,10 @@ Windows Job Object freeze ABI changing semantics, and the remaining macOS
 interval between final identity check and signal delivery. A kernel API or stdout
 consumer may also block a synchronous OS call beyond an application-controlled
 duration; the implementation bounds retained memory and side effects but does
-not claim a portable write deadline. These risks may not be described as proven
-absence or future availability.
+not claim a portable write deadline. Related-process hints may stop before a
+later matching process, and same-channel release checksums are corruption checks
+rather than independent signatures or provenance. These risks may not be
+described as proven absence or future availability.
 
 ### 0.7 Resource bounds
 
@@ -421,6 +426,7 @@ API cannot safely support the shared maximum.
 | Executable path | 128 KiB |
 | Process command line read | 1 MiB on every supported platform |
 | Aggregate optional process metadata per snapshot | 64 MiB |
+| Linux/macOS related-process diagnostic command-line reads | 64; at most 64 MiB of source text. Windows uses the separately bounded process snapshot. |
 | Fresh protection name read | 4 KiB per target; 2 MiB across a 512-member scope |
 | Consistency collection attempts | 2 total |
 | Native changing-size buffer attempts | 3 per independent bounded native read |
@@ -534,9 +540,10 @@ deadlines use injected clocks; tests do not sleep until a real deadline.
 | Post-kill settle | Zero attempts is impossible for a requested settle | Port disappearance on attempt ten succeeds | Attempt eleven never starts; timeout remains truthful |
 | Windows single-process wait | Zero-time probe remains nonblocking | Exit at the five-second deadline succeeds | No wait beyond the shared deadline; survivor is unconfirmed |
 | Windows tree wait | Zero-time per-handle probes remain nonblocking | All members share exactly five seconds | No member extends the shared deadline; survivors are reported |
-| Docker command/drain time | Zero deadline returns immediately in injected-clock tests | Completion at 1,500 ms / 250 ms accepted | No poll or wait occurs after either deadline |
+| Docker command/drain time | Zero deadline returns immediately in injected-clock tests | Completion at 1,500 ms / 250 ms accepted | No caller poll or drain wait occurs after either deadline; child cleanup retains ownership asynchronously |
 | Docker output bytes | Empty stream accepted | 256 KiB retained | Byte 262,145 drained but not retained |
 | Docker drain workers | Zero available capacity refuses spawn | Eight workers acquired | Ninth refused until capacity returns |
+| Docker child cleanup workers | Zero available capacity refuses process spawn | Four workers acquired | Fifth refused until a prior child is reaped |
 | Docker rows/matches | Empty output yields none | 128 rows and eight matches retained | Row 129 ignored; match nine omitted deterministically |
 | Docker field bytes | Empty fields handled by parser rules | 4 KiB accepted | 4 KiB+1 row rejected without prefix retention |
 | Docker port segments | Empty segment list matches nothing | 64 parsed | Segment 65 rejects the row |
@@ -2093,10 +2100,10 @@ not permanent evidence that no later advisory exists.
 
 ### Stage 8 gate
 
-- [ ] Threat model reflects final architecture.
-- [ ] Confirmed findings have regression tests and fixes.
-- [ ] No unresolved release-blocking security finding remains.
-- [ ] Residual risks are documented with evidence confidence.
+- [x] Threat model reflects final architecture.
+- [x] Confirmed findings have regression tests and fixes.
+- [x] No unresolved release-blocking security finding remains.
+- [x] Residual risks are documented with evidence confidence.
 
 ## Stage 9: Automated Test Completion
 

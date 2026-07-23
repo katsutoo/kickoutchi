@@ -1513,10 +1513,7 @@ fn write_human_event(
         let _ = std::fmt::Write::write_fmt(&mut owners, format_args!(",+{omitted_owners}"));
     }
     let label = config.labels.resolve(endpoint).map(label_display_text);
-    let endpoint_text = match endpoint.address {
-        IpAddr::V4(address) => format!("{address}:{}", endpoint.port),
-        IpAddr::V6(address) => format!("[{address}]:{}", endpoint.port),
-    };
+    let endpoint_text = human_endpoint_text(endpoint);
     writeln!(
         writer,
         "{} {} {} {} owners={}{} filter={} certainty={} observed={}..{} previous_completed={}",
@@ -1537,6 +1534,22 @@ fn write_human_event(
             .map_or_else(|| "-".to_owned(), |value| value.to_string()),
     )
     .map_err(OutputError::from)
+}
+
+fn human_endpoint_text(endpoint: &EndpointIdentity) -> String {
+    match (endpoint.address, endpoint.ipv6_scope) {
+        (IpAddr::V4(address), None) => format!("{address}:{}", endpoint.port),
+        (IpAddr::V6(address), Some(Ipv6Scope::Unscoped)) => {
+            format!("[{address}]:{}", endpoint.port)
+        }
+        (IpAddr::V6(address), Some(Ipv6Scope::InterfaceIndex(index))) => {
+            format!("[{address}%{index}]:{}", endpoint.port)
+        }
+        (IpAddr::V6(address), Some(Ipv6Scope::Unavailable)) => {
+            format!("[{address}%unavailable]:{}", endpoint.port)
+        }
+        _ => unreachable!("validated endpoint address and scope agree"),
+    }
 }
 
 fn write_gap(
@@ -1966,22 +1979,24 @@ impl WatchSignalGuard {
 mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Write};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, SystemTime};
 
     use super::{
         BoundedRecord, FilterCache, FilterResult, GapIndex, ObservationTimes, Truth,
         WATCH_DURATION_MAX, WATCH_DURATION_MIN, WATCH_INTERVAL_DEFAULT, WATCH_INTERVAL_MAX,
         WATCH_INTERVAL_MIN, WatchArgs, WatchOptions, WatchRuntime, evaluate_side,
-        parse_duration_token, run_watch_loop, write_human_event, write_ordered_events,
+        human_endpoint_text, parse_duration_token, run_watch_loop, write_human_event,
+        write_ordered_events,
     };
     use crate::cli::ExitReason;
     use crate::collector::{Collector, CollectorError, FakeCollector};
     use crate::config::Config;
     use crate::labels::{LabelInput, LabelRegistry};
     use crate::observation::{
-        EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataCompleteness, MetadataProfile,
-        NetworkSnapshot, ObservationError, OwnerCompleteness, OwnerObservation,
-        SnapshotCompleteness, UnverifiedOwnerReason,
+        EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact, Ipv6Scope,
+        MetadataCompleteness, MetadataProfile, NetworkSnapshot, ObservationError,
+        OwnerCompleteness, OwnerObservation, Protocol, SnapshotCompleteness, UnverifiedOwnerReason,
     };
     use crate::query::QueryCapabilities;
     use crate::watch::{Certainty, EventKind, WatchEvent, baseline_events, diff_snapshots};
@@ -3129,6 +3144,40 @@ mod tests {
         assert!(output.contains("64,+1"));
         assert!(!output.contains(",65"));
         assert!(output.contains(&format!("label={}…", "x".repeat(31))));
+    }
+
+    #[test]
+    fn human_endpoint_text_preserves_ipv6_scope() {
+        let endpoint = |address, ipv6_scope| {
+            EndpointIdentity::new(Protocol::Tcp, address, 3000, ipv6_scope)
+                .expect("test endpoint is valid")
+        };
+
+        assert_eq!(
+            human_endpoint_text(&endpoint(IpAddr::V4(Ipv4Addr::LOCALHOST), None)),
+            "127.0.0.1:3000"
+        );
+        assert_eq!(
+            human_endpoint_text(&endpoint(
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                Some(Ipv6Scope::Unscoped)
+            )),
+            "[::1]:3000"
+        );
+        assert_eq!(
+            human_endpoint_text(&endpoint(
+                IpAddr::V6("fe80::1".parse().expect("valid IPv6 address")),
+                Some(Ipv6Scope::interface_index(3).expect("valid scope"))
+            )),
+            "[fe80::1%3]:3000"
+        );
+        assert_eq!(
+            human_endpoint_text(&endpoint(
+                IpAddr::V6("fe80::1".parse().expect("valid IPv6 address")),
+                Some(Ipv6Scope::Unavailable)
+            )),
+            "[fe80::1%unavailable]:3000"
+        );
     }
 
     #[test]

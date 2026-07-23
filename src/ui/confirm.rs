@@ -3,7 +3,9 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use ratatui::widgets::Wrap;
+use ratatui::widgets::{Block, Clear, Paragraph};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use unicode_width::UnicodeWidthStr;
 
@@ -30,6 +32,7 @@ const TREE_MODAL_PREVIEW_MAX: usize = 8;
 const TREE_MODAL_PREVIEW_MIN: usize = 1;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let content_rows = usize::from(area.height.saturating_sub(2));
     let lines = app.kill_confirmation().map_or_else(
         || {
             vec![Line::styled(
@@ -37,10 +40,11 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
                 theme.muted(),
             )]
         },
-        |confirmation| confirmation_lines(confirmation, theme),
+        |confirmation| confirmation_lines(confirmation, theme, content_rows),
     );
 
-    let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    let scroll = u16::try_from(lines.len().saturating_sub(content_rows)).unwrap_or(u16::MAX);
+    let modal = Paragraph::new(lines).scroll((scroll, 0)).block(
         Block::bordered()
             .title("Confirm Termination")
             .title_style(theme.title())
@@ -382,7 +386,11 @@ fn tree_instruction_line(confirmation: &TreeKillConfirmation, theme: Theme) -> L
     }
 }
 
-fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line<'static>> {
+fn confirmation_lines(
+    confirmation: &KillConfirmation,
+    theme: Theme,
+    content_rows: usize,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
             format!(
@@ -432,6 +440,9 @@ fn confirmation_lines(confirmation: &KillConfirmation, theme: Theme) -> Vec<Line
         Span::raw(" cancels."),
     ]));
 
+    if lines.len() > content_rows {
+        lines.retain(|line| line.width() != 0);
+    }
     lines
 }
 
@@ -550,7 +561,7 @@ mod tests {
             input: "for".to_owned(),
             error: Some("keep typing".to_owned()),
         };
-        let text = confirmation_lines(&confirmation, Theme::from_environment())
+        let text = confirmation_lines(&confirmation, Theme::from_environment(), 40)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -571,7 +582,7 @@ mod tests {
             input: String::new(),
             error: None,
         };
-        let text = confirmation_lines(&confirmation, Theme::from_environment())
+        let text = confirmation_lines(&confirmation, Theme::from_environment(), 40)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -772,6 +783,37 @@ mod tests {
         assert!(ports.chars().count() <= 32, "{ports}");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn crowded_single_confirmation_keeps_actionable_lines_visible() {
+        let mut crowded_target = target_with_port_count(20);
+        crowded_target.process_name = Some("very-long-process-name".repeat(8));
+        crowded_target.protected = true;
+        crowded_target.system_process = true;
+        crowded_target.permission = PermissionStatus::Partial;
+        crowded_target.child_count = 4;
+        let confirmation = KillConfirmation {
+            target: crowded_target,
+            mode: KillMode::Force,
+            requirement: ConfirmationRequirement::ForceWord,
+            input: "for".to_owned(),
+            error: Some("keep typing".to_owned()),
+        };
+
+        let lines = confirmation_lines(&confirmation, Theme::from_environment(), 13);
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.len() <= 13, "emitted {} lines", lines.len());
+        assert!(text.contains("Type force"), "{text}");
+        assert!(text.contains("Input: for"), "{text}");
+        assert!(text.contains("Error: keep typing"), "{text}");
+        assert!(text.contains("Esc cancels."), "{text}");
+    }
+
     #[test]
     fn yes_confirmation_names_force_kill_when_force_is_selected() {
         let confirmation = KillConfirmation {
@@ -781,7 +823,7 @@ mod tests {
             input: String::new(),
             error: None,
         };
-        let text = confirmation_lines(&confirmation, Theme::from_environment())
+        let text = confirmation_lines(&confirmation, Theme::from_environment(), 40)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
