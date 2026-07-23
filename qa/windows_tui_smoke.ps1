@@ -62,8 +62,10 @@ try {
         & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F | Out-Null
         $process.WaitForExit()
     }
-    $stdout = if (Test-Path -LiteralPath $stdoutPath) { [IO.File]::ReadAllBytes($stdoutPath) } else { [byte[]]@() }
-    $stderr = if (Test-Path -LiteralPath $stderrPath) { [IO.File]::ReadAllBytes($stderrPath) } else { [byte[]]@() }
+    [byte[]]$stdout = @()
+    [byte[]]$stderr = @()
+    if (Test-Path -LiteralPath $stdoutPath) { $stdout = [IO.File]::ReadAllBytes($stdoutPath) }
+    if (Test-Path -LiteralPath $stderrPath) { $stderr = [IO.File]::ReadAllBytes($stderrPath) }
     if ($stdout.Length -gt $StreamBytesMax -or $stderr.Length -gt $StreamBytesMax) { $oversized = $true }
     $text = [Text.Encoding]::UTF8.GetString($stdout)
     $enteredAlternateScreen = $text.Contains("$([char]27)[?1049h")
