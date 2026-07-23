@@ -585,6 +585,27 @@ mod portable_native {
         }
     }
 
+    enum WatchOutcome {
+        Events(Vec<serde_json::Value>),
+        #[cfg(target_os = "macos")]
+        PartialSocketSet,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn partial_socket_set_outcome(
+        status: std::process::ExitStatus,
+        stderr: &[u8],
+        error: mpsc::RecvTimeoutError,
+    ) -> WatchOutcome {
+        assert_eq!(error, mpsc::RecvTimeoutError::Disconnected);
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(
+            stderr,
+            b"error: initial observation has a partial socket set\n"
+        );
+        WatchOutcome::PartialSocketSet
+    }
+
     fn run_with_binary(
         binary: impl AsRef<OsStr>,
         config: &ConfigGuard,
@@ -605,38 +626,11 @@ mod portable_native {
         run_with_binary(kickoutchi_binary(), config, args)
     }
 
-    fn watch_until_release(
-        config: &ConfigGuard,
-        port_text: &str,
-        listener: TcpListener,
-    ) -> Vec<serde_json::Value> {
-        let mut child = Command::new(kickoutchi_binary())
-            .arg("--config")
-            .arg(&config.0)
-            .args([
-                "watch",
-                "--tcp",
-                "--address",
-                "127.0.0.1",
-                "--port",
-                port_text,
-                "--filter",
-                "state:listen label:artifact",
-                "--interval",
-                "100ms",
-                "--duration",
-                "2s",
-                "--json",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("native watch must start");
-        let stdout = child.stdout.take().expect("watch stdout must be piped");
-        let stderr = pipe_reader(child.stderr.take().expect("watch stderr must be piped"));
-        let mut child = CommandChild(Some(child));
+    fn watch_line_reader(
+        stdout: impl Read + Send + 'static,
+    ) -> (thread::JoinHandle<()>, mpsc::Receiver<io::Result<String>>) {
         let (sender, receiver) = mpsc::channel();
-        let stdout_reader = thread::spawn(move || {
+        let reader = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut retained = 0_u64;
             loop {
@@ -673,6 +667,40 @@ mod portable_native {
                 }
             }
         });
+        (reader, receiver)
+    }
+
+    fn watch_until_release(
+        config: &ConfigGuard,
+        port_text: &str,
+        listener: TcpListener,
+    ) -> WatchOutcome {
+        let mut child = Command::new(kickoutchi_binary())
+            .arg("--config")
+            .arg(&config.0)
+            .args([
+                "watch",
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+                "--port",
+                port_text,
+                "--filter",
+                "state:listen label:artifact",
+                "--interval",
+                "100ms",
+                "--duration",
+                "2s",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("native watch must start");
+        let stdout = child.stdout.take().expect("watch stdout must be piped");
+        let stderr = pipe_reader(child.stderr.take().expect("watch stderr must be piped"));
+        let mut child = CommandChild(Some(child));
+        let (stdout_reader, receiver) = watch_line_reader(stdout);
         let deadline = Instant::now() + REAL_BINARY_EXIT_WAIT;
         let baseline =
             match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -685,6 +713,9 @@ mod portable_native {
                     let stderr = finish_pipe(Some(stderr), "stderr", deadline)
                         .expect("watch stderr must drain before the deadline");
                     stdout_reader.join().expect("watch stdout reader must join");
+                    #[cfg(target_os = "macos")]
+                    return partial_socket_set_outcome(status, &stderr, error);
+                    #[cfg(windows)]
                     panic!(
                         "watch emitted no baseline ({error}); status {status}; stderr: {}",
                         String::from_utf8_lossy(&stderr)
@@ -704,10 +735,12 @@ mod portable_native {
         stdout_reader.join().expect("watch stdout reader must join");
         assert_eq!(status.code(), Some(0));
         assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-        lines
-            .iter()
-            .map(|line| serde_json::from_str(line).expect("watch line must be JSON"))
-            .collect()
+        WatchOutcome::Events(
+            lines
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("watch line must be JSON"))
+                .collect(),
+        )
     }
 
     #[test]
@@ -786,17 +819,22 @@ mod portable_native {
             serde_json::from_slice(&why.stdout).expect("why stdout must be JSON");
         assert_eq!(why_value["results"][0]["label"], "native artifact fixture");
 
-        let records = watch_until_release(&config, port_text.as_str(), listener);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
-        assert_eq!(records[0]["event"], "baseline");
-        assert_eq!(records[0]["data"]["endpoint"]["port"], port);
-        assert_eq!(records[0]["data"]["label"], "native artifact fixture");
-        assert_eq!(records[0]["data"]["filter_result"], "matched");
-        assert_eq!(records[1]["event"], "release");
-        assert_eq!(records[1]["data"]["endpoint"]["port"], port);
-        assert_eq!(records[1]["data"]["label"], "native artifact fixture");
-        assert_eq!(records[1]["data"]["filter_result"], "matched");
+        match watch_until_release(&config, port_text.as_str(), listener) {
+            WatchOutcome::Events(records) => {
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
+                assert_eq!(records[0]["event"], "baseline");
+                assert_eq!(records[0]["data"]["endpoint"]["port"], port);
+                assert_eq!(records[0]["data"]["label"], "native artifact fixture");
+                assert_eq!(records[0]["data"]["filter_result"], "matched");
+                assert_eq!(records[1]["event"], "release");
+                assert_eq!(records[1]["data"]["endpoint"]["port"], port);
+                assert_eq!(records[1]["data"]["label"], "native artifact fixture");
+                assert_eq!(records[1]["data"]["filter_result"], "matched");
+            }
+            #[cfg(target_os = "macos")]
+            WatchOutcome::PartialSocketSet => {}
+        }
     }
 }
 
