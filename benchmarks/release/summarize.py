@@ -175,7 +175,7 @@ def validate_manifest(plan: dict[str, Any], manifest: dict[str, Any]) -> None:
         raise EvidenceError("manifest harness commit differs from the plan")
     for key in ("plan_sha256", "raw_sha256"):
         _sha(manifest[key], key)
-    _integer(manifest["duration_ns"], "duration_ns", 2 * 60 * 60 * 1_000_000_000)
+    _integer(manifest["duration_ns"], "duration_ns", plan["bounds"]["run_timeout_seconds"] * 1_000_000_000)
     try:
         started = dt.datetime.fromisoformat(manifest["started_utc"])
     except (TypeError, ValueError) as error:
