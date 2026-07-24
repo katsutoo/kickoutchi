@@ -7,6 +7,7 @@
 
 use std::io::{self, Read};
 use std::net::IpAddr;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -16,7 +17,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::model::{DockerContainerPort, DockerPortContext, PermissionStatus, PortEntry, Protocol};
+use crate::model::{
+    DockerContainerPort, DockerPortContext, PermissionStatus, PortEntryView, Protocol,
+};
 
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 // How long to wait for a drain worker after the child is gone. Killing the
@@ -114,7 +117,7 @@ struct PublishedPort {
     protocol: Protocol,
 }
 
-pub(crate) fn enrich_port(entry: &PortEntry) -> Option<DockerPortContext> {
+pub(crate) fn enrich_port(entry: PortEntryView<'_>) -> Option<DockerPortContext> {
     if !should_try_docker_enrichment(entry) {
         return None;
     }
@@ -778,7 +781,10 @@ fn terminate_and_reap(child: &mut impl ReapChild) -> ReapOutcome {
     }
 }
 
-fn docker_context_from_ps_output(entry: &PortEntry, output: &str) -> Option<DockerPortContext> {
+fn docker_context_from_ps_output(
+    entry: PortEntryView<'_>,
+    output: &str,
+) -> Option<DockerPortContext> {
     let mut containers = Vec::new();
     let mut truncated = false;
 
@@ -832,7 +838,7 @@ fn docker_context_from_ps_output(entry: &PortEntry, output: &str) -> Option<Dock
 fn contains_container_match(
     containers: &[DockerContainerPort],
     container_id: &str,
-    entry: &PortEntry,
+    entry: PortEntryView<'_>,
     container_port: u16,
 ) -> bool {
     containers.iter().any(|container| {
@@ -843,20 +849,16 @@ fn contains_container_match(
     })
 }
 
-fn should_try_docker_enrichment(entry: &PortEntry) -> bool {
+fn should_try_docker_enrichment(entry: PortEntryView<'_>) -> bool {
     looks_like_docker_owner(entry)
         || (entry.permission == PermissionStatus::Partial && entry.process_name.is_none())
 }
 
-fn looks_like_docker_owner(entry: &PortEntry) -> bool {
-    entry
-        .process_name
-        .as_deref()
-        .is_some_and(is_docker_process_name)
+fn looks_like_docker_owner(entry: PortEntryView<'_>) -> bool {
+    entry.process_name.is_some_and(is_docker_process_name)
         || entry
             .executable_path
-            .as_ref()
-            .and_then(|path| path.file_name())
+            .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .is_some_and(is_docker_process_name)
 }
@@ -1019,7 +1021,7 @@ fn parse_protocol(protocol: &str) -> Option<Protocol> {
     }
 }
 
-fn matched_container_port(entry: &PortEntry, published_port: PublishedPort) -> Option<u16> {
+fn matched_container_port(entry: PortEntryView<'_>, published_port: PublishedPort) -> Option<u16> {
     if entry.protocol != published_port.protocol {
         return None;
     }
@@ -1080,7 +1082,9 @@ mod tests {
         run_command_bounded_with_capacity, should_try_docker_enrichment, spawn_child_cleanup,
         spawn_output_drain, terminate_and_reap,
     };
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
+    };
 
     #[cfg(target_os = "linux")]
     use super::{
@@ -1645,7 +1649,7 @@ mod tests {
             "postgres",
         );
 
-        assert!(!should_try_docker_enrichment(&row));
+        assert!(!should_try_docker_enrichment(PortEntryView::from(&row)));
     }
 
     #[test]
@@ -1661,7 +1665,7 @@ mod tests {
         row.executable_path = None;
         row.permission = PermissionStatus::Partial;
 
-        assert!(should_try_docker_enrichment(&row));
+        assert!(should_try_docker_enrichment(PortEntryView::from(&row)));
     }
 
     #[test]
@@ -1673,7 +1677,7 @@ mod tests {
             "Docker-Proxy",
         );
 
-        assert!(looks_like_docker_owner(&row));
+        assert!(looks_like_docker_owner(PortEntryView::from(&row)));
     }
 
     #[test]
@@ -1720,12 +1724,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let exact = docker_context_from_ps_output(&row, &output[..DOCKER_MATCHES_MAX].join("\n"))
-            .expect("eight matches are retained");
+        let exact = docker_context_from_ps_output(
+            PortEntryView::from(&row),
+            &output[..DOCKER_MATCHES_MAX].join("\n"),
+        )
+        .expect("eight matches are retained");
         assert_eq!(exact.containers.len(), DOCKER_MATCHES_MAX);
         assert!(!exact.truncated);
 
-        let over = docker_context_from_ps_output(&row, &output.join("\n"))
+        let over = docker_context_from_ps_output(PortEntryView::from(&row), &output.join("\n"))
             .expect("the first eight matches remain available");
         assert_eq!(over.containers.len(), DOCKER_MATCHES_MAX);
         assert!(over.truncated);
@@ -1741,7 +1748,8 @@ mod tests {
         );
         let output = r#"{"ID":"abc123","Names":"web","Ports":"0.0.0.0:8000-8002->9000-9002/tcp","Labels":""}"#;
 
-        let context = docker_context_from_ps_output(&row, output).expect("range matches");
+        let context = docker_context_from_ps_output(PortEntryView::from(&row), output)
+            .expect("range matches");
         let container = context.single_container().expect("one container");
 
         assert_eq!(container.host_port, 8001);
@@ -1758,7 +1766,8 @@ mod tests {
         );
         let output = r#"{"ID":"a762a2b37a1d","Names":"postgres-dev","Ports":"0.0.0.0:5432->5432/tcp","Labels":"com.docker.compose.project=swamp,com.docker.compose.service=db"}"#;
 
-        let context = docker_context_from_ps_output(&row, output).expect("container matches");
+        let context = docker_context_from_ps_output(PortEntryView::from(&row), output)
+            .expect("container matches");
         let container = context.single_container().expect("one container");
 
         assert_eq!(container.name, "postgres-dev");
@@ -1779,7 +1788,7 @@ mod tests {
         let output =
             r#"{"ID":"abc123","Names":"dns","Ports":"0.0.0.0:5353->5353/tcp","Labels":""}"#;
 
-        assert!(docker_context_from_ps_output(&row, output).is_none());
+        assert!(docker_context_from_ps_output(PortEntryView::from(&row), output).is_none());
     }
 
     #[test]
@@ -1792,7 +1801,8 @@ mod tests {
         );
         let output = r#"{"ID":"abc123","Names":"web","Ports":"0.0.0.0:8080->80/tcp, [::]:8080->80/tcp","Labels":""}"#;
 
-        let context = docker_context_from_ps_output(&row, output).expect("container matches");
+        let context = docker_context_from_ps_output(PortEntryView::from(&row), output)
+            .expect("container matches");
 
         assert_eq!(context.containers.len(), 1);
         assert_eq!(context.containers[0].name, "web");
@@ -1808,7 +1818,7 @@ mod tests {
         );
         let output = r#"{"ID":"abc123","Names":"web","Ports":"[::]:8080->80/tcp","Labels":""}"#;
 
-        assert!(docker_context_from_ps_output(&row, output).is_none());
+        assert!(docker_context_from_ps_output(PortEntryView::from(&row), output).is_none());
     }
 
     #[test]
@@ -1821,7 +1831,7 @@ mod tests {
         );
         let output = r#"{"ID":"abc123","Names":"web","Ports":"0.0.0.0:8080->80/tcp","Labels":""}"#;
 
-        assert!(docker_context_from_ps_output(&row, output).is_none());
+        assert!(docker_context_from_ps_output(PortEntryView::from(&row), output).is_none());
     }
 
     #[test]
@@ -1837,7 +1847,8 @@ mod tests {
             r#"{"ID":"abc123","Names":"api","Ports":"127.0.0.1:8080->80/tcp","Labels":""}"#,
         );
 
-        let context = docker_context_from_ps_output(&row, output).expect("valid row matches");
+        let context = docker_context_from_ps_output(PortEntryView::from(&row), output)
+            .expect("valid row matches");
 
         assert_eq!(context.containers.len(), 1);
         assert_eq!(context.containers[0].container_port, 80);

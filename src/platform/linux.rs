@@ -1949,6 +1949,7 @@ fn decode_cmdline(bytes: &[u8], max_bytes: usize) -> (Option<String>, bool) {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::PortEntryView;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::ErrorKind;
@@ -3091,7 +3092,7 @@ mod tests {
         assert_eq!(entries[0].parent_pid, Some(1));
         assert_eq!(entries[0].parent_process_name.as_deref(), Some("systemd"));
         assert_eq!(entries[0].permission, PermissionStatus::Full);
-        assert!(entries[0].is_system_process());
+        assert!(PortEntryView::from(&entries[0]).is_system_process());
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 

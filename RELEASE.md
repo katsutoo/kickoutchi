@@ -81,7 +81,7 @@ is deployed last.
 
 ## 1.3.0 Status
 
-Released from `931948d` on 2026-07-24. Steps 1 through 7 above are complete and
+Released from `931948d` on 2026-07-24. Steps 1 through 8 above are complete and
 verified:
 
 | Channel | State | Verified |
@@ -91,6 +91,7 @@ verified:
 | Scoop `nuggocto/scoop-bucket` | `1.3.0` | Excavator run succeeded, manifest reports the version |
 | AUR `kickoutchi-bin` | `1.3.0-1` | rebuilt from a clean public clone; binary reports `1.3.0` |
 | AUR `kickoutchi` | `1.3.0-1` | compiled from the release source archive; binary reports `1.3.0` |
+| `kickoutchi.com` | `1.3.0` | live pages report the version, advertise AUR as available, and serve the new command docs |
 
 Remaining before the release is fully closed:
 
@@ -100,4 +101,8 @@ Remaining before the release is fully closed:
   and the Windows archive have not been executed by anyone.
 - `brew install` and `scoop install` smoke tests. Formula and manifest contents
   were verified, but neither install has been run.
-- Step 8, the `../kickoutchi-front` update.
+
+Both remaining items need a macOS or Windows host. They are verification gaps in
+what was published, not defects found in it, and no later release closes them on
+their behalf: the same two checks are owed for every version until a host exists
+to run them.

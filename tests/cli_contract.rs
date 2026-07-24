@@ -3988,6 +3988,17 @@ mod linux {
 
         assert_eq!(output.status.code(), Some(6));
         assert!(stderr(&output).contains("protected"));
+        // The refusal lands before the target banner, which proves protection was
+        // resolved while the rows were projected rather than only at delivery.
+        // Delivery re-checks protection independently, so without this the whole
+        // projection-time policy could be unwired and the exit code would still
+        // be 6 — the only symptom would be a banner announcing a kill that never
+        // runs.
+        assert!(
+            !stderr(&output).contains("Command: kill"),
+            "a protected target must be refused before its banner is printed: {}",
+            stderr(&output),
+        );
         assert!(
             helper
                 .child

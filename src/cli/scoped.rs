@@ -10,7 +10,9 @@ use std::io::Write;
 use crate::collector;
 use crate::config::Config;
 use crate::display::sanitize;
-use crate::model::{PermissionStatus, Platform, PortEntry, ProcessContext, SystemProcessCheck};
+use crate::model::{
+    PermissionStatus, Platform, PortEntry, PortEntryView, ProcessContext, SystemProcessCheck,
+};
 use crate::observation::MetadataProfile;
 use crate::platform;
 use crate::process::{
@@ -84,7 +86,11 @@ struct TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+pub(super) fn run_tree_kill(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntryView<'_>],
+) -> ExitReason {
     let mode = if args.force {
         KillMode::Force
     } else {
@@ -110,7 +116,11 @@ pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEnt
 }
 
 #[cfg(windows)]
-pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+pub(super) fn run_tree_kill(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntryView<'_>],
+) -> ExitReason {
     let mode = if args.force {
         KillMode::Force
     } else {
@@ -123,7 +133,7 @@ pub(super) fn run_tree_kill(args: &KillArgs, config: &Config, entries: &[PortEnt
 fn run_tree_kill_with<Ops, CollectContext, Prompt, CollectKillPorts, CollectPorts>(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mode: KillMode,
     ops: &mut Ops,
     mut seams: TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts>,
@@ -221,7 +231,7 @@ where
 fn run_windows_tree_kill(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mode: KillMode,
 ) -> ExitReason {
     run_windows_tree_kill_with(
@@ -273,7 +283,7 @@ fn run_windows_tree_kill_with<
 >(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mode: KillMode,
     mut seams: WindowsTreeKillSeams<
         CollectTree,
@@ -538,7 +548,7 @@ where
 fn resolve_scoped_kill_root<CollectContext>(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     snapshot: &[tree::TreeProcessInfo],
     collect_context: &mut CollectContext,
 ) -> Result<KillTarget, ExitReason>
@@ -1481,7 +1491,7 @@ use crate::tree::GROUP_YES_SKIP_MAX_PROCESSES;
 pub(super) fn run_group_kill(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
 ) -> ExitReason {
     let mode = if args.force {
         KillMode::Force
@@ -1511,7 +1521,7 @@ pub(super) fn run_group_kill(
 fn run_group_kill_with<Ops, CollectContext, Prompt, CollectKillPorts, CollectPorts>(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mode: KillMode,
     ops: &mut Ops,
     mut seams: TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts>,
@@ -1936,6 +1946,11 @@ fn fresh_group_gates(
 
 #[cfg(test)]
 mod tests {
+    // Only the freeze-first Unix tests build a target from a single row; the
+    // Windows tree tests go through `entry_views` instead.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::model::PortEntryView;
+    use crate::model::entry_views;
     use std::cell::RefCell;
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use std::io::Write;
@@ -2047,7 +2062,7 @@ mod tests {
                 tree: true,
             },
             &Config::default(),
-            &[entry(3000)],
+            &entry_views(&[entry(3000)]),
             crate::process::KillMode::Terminate,
             super::WindowsTreeKillSeams {
                 collect_tree: || Ok(process_snapshot.clone()),
@@ -2103,7 +2118,7 @@ mod tests {
                 tree: true,
             },
             &Config::default(),
-            &[entry(3000)],
+            &entry_views(&[entry(3000)]),
             crate::process::KillMode::Terminate,
             super::WindowsTreeKillSeams {
                 collect_tree: || Ok(process_snapshot.clone()),
@@ -2691,7 +2706,7 @@ mod tests {
             },
             ..ProcessContext::default()
         };
-        let target = KillTarget::from_entries(18_422, [&row], Some(&context));
+        let target = KillTarget::from_entries(18_422, [PortEntryView::from(&row)], Some(&context));
         let warning = target
             .warning_lines()
             .into_iter()
@@ -2728,7 +2743,7 @@ mod tests {
                 group: false,
             },
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -2802,7 +2817,7 @@ mod tests {
                 group: false,
             },
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -2838,7 +2853,7 @@ mod tests {
         let reason = run_tree_kill_with(
             &kill_pid_tree(18_422),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -2884,7 +2899,7 @@ mod tests {
                 group: false,
             },
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -2987,7 +3002,7 @@ mod tests {
                 group: false,
             },
             &config,
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut PreviewOnlyTreeOps(snapshot),
             TreeKillSeams {
@@ -3063,7 +3078,7 @@ mod tests {
                 group: false,
             },
             &config,
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -3122,7 +3137,7 @@ mod tests {
                 group: false,
             },
             &config,
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -3391,7 +3406,7 @@ mod tests {
                 group: true,
             },
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -3427,7 +3442,7 @@ mod tests {
         let reason = run_group_kill_with(
             &kill_pid_group(18_422, false),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {
@@ -3498,7 +3513,7 @@ mod tests {
         let reason = run_group_kill_with(
             &kill_port_group(3000),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillMode::Terminate,
             &mut ops,
             TreeKillSeams {

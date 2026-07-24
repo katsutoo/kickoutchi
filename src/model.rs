@@ -1,10 +1,13 @@
 //! The shared vocabulary: the types the CLI, TUI, collectors, filters, and the
 //! kill flow all pass around.
 //!
-//! Platform collectors produce one authoritative `NetworkSnapshot`; existing
-//! CLI and TUI surfaces borrow or materialize this legacy [`PortEntry`] view.
-//! [`PortEntryView`] owns the stable `list --json` serialization contract while
+//! Platform collectors produce one authoritative `NetworkSnapshot`, and
+//! [`PortEntryView`] borrows a row out of it. Every read-only surface — list,
+//! kill, scoped kill, inspect, Docker enrichment, the TUI table — speaks that
+//! view, and it also owns the stable `list --json` serialization contract while
 //! internal identity evidence remains outside that wire shape.
+//! [`PortEntry`] is the owned mirror, kept only where a row must outlive the
+//! snapshot it came from.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -114,16 +117,22 @@ impl BindScope {
 /// This is an owned *projection* of [`crate::observation::NetworkSnapshot`],
 /// not a source of truth. Every field is derived by `project_legacy*`, and the
 /// snapshot is authoritative for anything a destructive decision rests on.
-/// Prefer [`PortEntryView`], which borrows the same facts without copying the
-/// shared process metadata; reach for the owned form only where a value has to
-/// outlive its snapshot.
 ///
-/// The type is still passed between internal modules — the kill, scoped-kill,
-/// TUI, and inspect paths all speak it — which is a historical shape rather
-/// than a designed one. The intended direction is to keep narrowing it toward
-/// the `list --json` serializer boundary, which is the one consumer that
-/// genuinely needs an owned legacy row. Do not add fields here to serve an
-/// internal caller: add them to the snapshot and project what is needed.
+/// No function signature takes this type any more: list, kill, scoped kill,
+/// inspect, Docker enrichment, and the TUI all pass [`PortEntryView`], which
+/// borrows the same facts from a live snapshot without copying the shared
+/// process metadata. What is left are the three places a row genuinely has to
+/// outlive the snapshot that produced it:
+///
+/// - the TUI's stored table, which keeps rows across frames while snapshots
+///   come and go, and hands one to a details worker on another thread;
+/// - the `collect_*_ports` seams, whose closures own a snapshot internally and
+///   must return something after it drops;
+/// - test fixtures, which are clearer written out than assembled into a whole
+///   `NetworkSnapshot` (see `entry_views`).
+///
+/// Each of those converts to a view at the first read. Do not add fields here
+/// to serve a caller: add them to the snapshot and project what is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortEntry {
     pub(crate) protocol: Protocol,
@@ -215,6 +224,18 @@ impl<'a> PortEntryView<'a> {
     }
 }
 
+/// Borrow a slice of owned fixture rows as the views production code speaks.
+///
+/// Production builds views from a live snapshot, but a test that only needs a
+/// handful of rows is clearer writing them out than assembling a whole
+/// `NetworkSnapshot`. This is the one bridge between those two worlds, so
+/// `PortEntry` stays a fixture convenience instead of leaking back into a
+/// signature.
+#[cfg(test)]
+pub(crate) fn entry_views(rows: &[PortEntry]) -> Vec<PortEntryView<'_>> {
+    rows.iter().map(PortEntryView::from).collect()
+}
+
 /// Extra context we gather lazily for the selected process.
 ///
 /// This lives outside [`PortEntry`] on purpose: it keeps the rule that table rows
@@ -297,25 +318,6 @@ impl DockerContainerPort {
 
     pub(crate) fn stop_command(&self) -> String {
         format!("docker stop {}", self.stop_target())
-    }
-}
-
-impl PortEntry {
-    /// Exact port match, used by `list --port` and `kill --port`.
-    pub(crate) fn matches_port(&self, port: u16) -> bool {
-        self.local_port == port
-    }
-
-    /// Best-effort "is this a system/service process?" check, used for optional
-    /// hiding.
-    ///
-    /// Deliberately cautious: PID 0/1, direct children of PID 1, and a short list
-    /// of well-known OS names. We don't collect per-row owner UID (that's resolved
-    /// lazily for the selected row only), so this table-wide check can't lean on
-    /// it. And a protected app like `postgres` doesn't count as a system process
-    /// just because it's protected — those are two different ideas.
-    pub(crate) fn is_system_process(&self) -> bool {
-        PortEntryView::from(self).is_system_process()
     }
 }
 
@@ -497,8 +499,9 @@ mod tests {
     #[test]
     fn port_filter_is_exact() {
         let row = entry(3000, Some(1), Some("node"));
-        assert!(row.matches_port(3000));
-        assert!(!row.matches_port(300));
+        let view = PortEntryView::from(&row);
+        assert_eq!(view.local_port, 3000);
+        assert_ne!(view.local_port, 300);
     }
 
     #[test]
@@ -517,32 +520,32 @@ mod tests {
     #[test]
     fn system_process_classification_is_conservative() {
         let mut row = entry(5432, Some(1201), Some("postgres"));
-        assert!(!row.is_system_process());
+        assert!(!PortEntryView::from(&row).is_system_process());
 
         row.parent_pid = Some(1);
-        assert!(row.is_system_process());
+        assert!(PortEntryView::from(&row).is_system_process());
 
         row.parent_pid = None;
         row.process_name = Some(Arc::from("systemd"));
-        assert!(row.is_system_process());
+        assert!(PortEntryView::from(&row).is_system_process());
     }
 
     #[test]
     fn windows_system_process_classification_covers_core_services() {
         let mut row = entry(445, Some(4), Some("System"));
         row.platform = Platform::Windows;
-        assert!(row.is_system_process());
+        assert!(PortEntryView::from(&row).is_system_process());
 
         row.pid = Some(20_000);
         row.process_name = Some(Arc::from("SVCHOST.EXE"));
-        assert!(row.is_system_process());
+        assert!(PortEntryView::from(&row).is_system_process());
 
         row.process_name = Some(Arc::from("vendor-service.exe"));
         row.parent_process_name = Some(Arc::from("services.exe"));
-        assert!(row.is_system_process());
+        assert!(PortEntryView::from(&row).is_system_process());
 
         row.parent_process_name = Some(Arc::from("explorer.exe"));
-        assert!(!row.is_system_process());
+        assert!(!PortEntryView::from(&row).is_system_process());
     }
 
     #[test]

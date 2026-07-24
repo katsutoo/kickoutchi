@@ -18,7 +18,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::display::sanitize;
-use crate::model::{Platform, PortEntry};
+use crate::model::{Platform, PortEntryView};
 use crate::observation::ProcessIdentity;
 use crate::protection::is_protected_process_name;
 use crate::tree::{
@@ -174,7 +174,7 @@ pub(crate) fn build_scope(
 pub(crate) fn render_family_report<CommandLine>(
     target_pid: u32,
     snapshot: &[TreeProcessInfo],
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     protected_names: &[String],
     platform: Platform,
     command_line: CommandLine,
@@ -197,7 +197,7 @@ where
 pub(crate) fn render_family_report_with_scope<CommandLine>(
     target_pid: u32,
     snapshot: &[TreeProcessInfo],
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     protected_names: &[String],
     platform: Platform,
     scope: &InspectScope,
@@ -535,7 +535,10 @@ fn ancestor_chain<'snapshot>(
     chain
 }
 
-fn ports_by_pid(entries: &[PortEntry], snapshot: &[TreeProcessInfo]) -> HashMap<u32, Vec<String>> {
+fn ports_by_pid(
+    entries: &[PortEntryView<'_>],
+    snapshot: &[TreeProcessInfo],
+) -> HashMap<u32, Vec<String>> {
     let identities = snapshot
         .iter()
         .filter_map(process_identity)
@@ -596,7 +599,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{InspectError, render_family_report};
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, entry_views};
     use crate::tree::TreeProcessInfo;
 
     fn info(pid: u32, parent: Option<u32>, name: &str, group: u32) -> TreeProcessInfo {
@@ -655,7 +658,7 @@ mod tests {
         render_family_report(
             target,
             &family_snapshot(),
-            &[port_entry(400, 3000)],
+            &entry_views(&[port_entry(400, 3000)]),
             &["postgres".to_owned()],
             Platform::Linux,
             |pid| (pid == 300).then(|| "npm run dev".to_owned()),
@@ -674,12 +677,24 @@ mod tests {
                 .expect("test marker is nonzero"),
         });
 
-        let matching_report =
-            render_family_report(400, &snapshot, &[matching], &[], Platform::Linux, |_| None)
-                .expect("target is present");
-        let recycled_report =
-            render_family_report(400, &snapshot, &[recycled], &[], Platform::Linux, |_| None)
-                .expect("target is present");
+        let matching_report = render_family_report(
+            400,
+            &snapshot,
+            &entry_views(&[matching]),
+            &[],
+            Platform::Linux,
+            |_| None,
+        )
+        .expect("target is present");
+        let recycled_report = render_family_report(
+            400,
+            &snapshot,
+            &entry_views(&[recycled]),
+            &[],
+            Platform::Linux,
+            |_| None,
+        )
+        .expect("target is present");
 
         assert!(matching_report.contains("Ports: TCP 127.0.0.1:3000"));
         assert!(recycled_report.contains("Ports: none visible"));
@@ -770,7 +785,7 @@ mod tests {
         let report = render_family_report(
             400,
             &family_snapshot(),
-            &[port_entry(400, 3000)],
+            &entry_views(&[port_entry(400, 3000)]),
             &[],
             Platform::Windows,
             |_| None,

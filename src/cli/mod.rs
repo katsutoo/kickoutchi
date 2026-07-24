@@ -29,9 +29,8 @@ use crate::display::sanitize;
 use crate::inspect;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::model::Platform;
-use crate::model::{PortEntry, SortMode};
+use crate::model::{PortEntryView, SortMode};
 use crate::platform;
-use crate::protection::mark_protected;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::tree;
 
@@ -313,15 +312,23 @@ pub(crate) fn run(
     match command {
         Command::List(args) => run_list_snapshot(args, config, &snapshot),
         Command::Kill(args) => {
-            let mut entries =
-                match crate::observation::project_legacy_target(&snapshot, args.pid, args.port) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        eprintln!("error: projecting collected ports failed: {error}");
-                        return ExitReason::Failure;
-                    }
-                };
-            mark_protected(&mut entries, &config.protected_processes);
+            // Descriptors resolve protection during construction, so this is the
+            // whole projection: no owned legacy rows, no second marking pass.
+            let descriptors = match snapshot.port_entry_descriptors_matching(
+                args.pid,
+                args.port,
+                &config.protected_processes,
+            ) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    eprintln!("error: projecting collected ports failed: {error}");
+                    return ExitReason::Failure;
+                }
+            };
+            let entries = descriptors
+                .iter()
+                .map(|descriptor| snapshot.port_entry_view(descriptor))
+                .collect::<Vec<_>>();
             run_kill(args, config, &entries)
         }
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -350,7 +357,7 @@ fn write_stdout_with(
     }
 }
 
-fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntry]) {
+fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntryView<'_>]) {
     let Some(port) = diagnostic_port_without_confirmed_socket(diagnostic_port, entries) else {
         return;
     };
@@ -362,7 +369,7 @@ fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[Port
 
 fn diagnostic_port_without_confirmed_socket(
     diagnostic_port: Option<u16>,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
 ) -> Option<u16> {
     let port = diagnostic_port?;
     if entries.iter().any(|entry| entry.local_port == port) {
@@ -387,14 +394,21 @@ fn run_inspect(
     config: &Config,
     network_snapshot: &crate::observation::NetworkSnapshot,
 ) -> ExitReason {
-    let initial_entries =
-        match crate::observation::project_legacy_target(network_snapshot, args.pid, args.port) {
-            Ok(entries) => entries,
-            Err(error) => {
-                eprintln!("error: projecting inspect target failed: {error}");
-                return ExitReason::Failure;
-            }
-        };
+    let initial_descriptors = match network_snapshot.port_entry_descriptors_matching(
+        args.pid,
+        args.port,
+        &config.protected_processes,
+    ) {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            eprintln!("error: projecting inspect target failed: {error}");
+            return ExitReason::Failure;
+        }
+    };
+    let initial_entries = initial_descriptors
+        .iter()
+        .map(|descriptor| network_snapshot.port_entry_view(descriptor))
+        .collect::<Vec<_>>();
     let target_pid = match resolve_inspect_target(args, &initial_entries) {
         Ok(pid) => pid,
         Err(KillTargetError::NoMatch) => {
@@ -449,7 +463,7 @@ fn run_inspect(
         TREE_HOST_PLATFORM,
         &config.protected_processes,
     );
-    let entries = match crate::observation::project_legacy_identities(
+    let report_rows = match crate::observation::project_legacy_identities(
         network_snapshot,
         report_scope.port_identities(),
     ) {
@@ -459,6 +473,10 @@ fn run_inspect(
             return ExitReason::Failure;
         }
     };
+    let entries = report_rows
+        .iter()
+        .map(PortEntryView::from)
+        .collect::<Vec<_>>();
     let command_line_identities = inspect::command_line_scope_identities(target_pid, &snapshot);
     let command_line = platform::inspect_command_line_reader(&command_line_identities);
     match inspect::render_family_report_with_scope(
@@ -488,7 +506,7 @@ fn run_inspect(
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn resolve_inspect_target(
     args: &InspectArgs,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
 ) -> Result<u32, KillTargetError> {
     match (args.pid, args.port) {
         (Some(pid), None) => Ok(pid),
@@ -506,7 +524,7 @@ fn resolve_inspect_target(
 fn inspect_port_owner_matches_snapshot(
     args: &InspectArgs,
     target_pid: u32,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     snapshot: &[crate::tree::TreeProcessInfo],
 ) -> bool {
     if args.port.is_none() {
@@ -599,6 +617,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::entry_views;
     use clap::{Parser, error::ErrorKind};
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -869,15 +888,18 @@ mod tests {
         assert_eq!(resolve_inspect_target(&by_pid(1), &[]), Ok(1));
 
         let rows = vec![entry(3000)];
-        assert_eq!(resolve_inspect_target(&by_port(3000), &rows), Ok(18_422));
         assert_eq!(
-            resolve_inspect_target(&by_port(4000), &rows),
+            resolve_inspect_target(&by_port(3000), &entry_views(&rows)),
+            Ok(18_422)
+        );
+        assert_eq!(
+            resolve_inspect_target(&by_port(4000), &entry_views(&rows)),
             Err(KillTargetError::NoMatch),
         );
 
         let hidden = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
         assert_eq!(
-            resolve_inspect_target(&by_port(3000), &hidden),
+            resolve_inspect_target(&by_port(3000), &entry_views(&hidden)),
             Err(KillTargetError::MissingPid { port: 3000 }),
         );
 
@@ -886,7 +908,7 @@ mod tests {
             entry_with_pid(3000, Some(200), Protocol::Udp, "worker"),
         ];
         assert!(matches!(
-            resolve_inspect_target(&by_port(3000), &shared),
+            resolve_inspect_target(&by_port(3000), &entry_views(&shared)),
             Err(KillTargetError::AmbiguousPort { port: 3000, .. }),
         ));
     }
@@ -921,25 +943,25 @@ mod tests {
         assert!(inspect_port_owner_matches_snapshot(
             &by_port,
             18_422,
-            &rows,
+            &entry_views(&rows),
             &[process(matching)]
         ));
         assert!(!inspect_port_owner_matches_snapshot(
             &by_port,
             18_422,
-            &rows,
+            &entry_views(&rows),
             &[process(recycled)]
         ));
         assert!(!inspect_port_owner_matches_snapshot(
             &by_port,
             18_422,
-            &rows,
+            &entry_views(&rows),
             &[process(None)]
         ));
         assert!(inspect_port_owner_matches_snapshot(
             &by_pid,
             18_422,
-            &rows,
+            &entry_views(&rows),
             &[process(recycled)]
         ));
 
@@ -948,7 +970,7 @@ mod tests {
         assert!(!inspect_port_owner_matches_snapshot(
             &by_port,
             18_422,
-            &unverified,
+            &entry_views(&unverified),
             &[process(matching)]
         ));
     }
@@ -993,7 +1015,7 @@ mod tests {
             Some(3000)
         );
         assert_eq!(
-            diagnostic_port_without_confirmed_socket(Some(3000), &[entry(3000)]),
+            diagnostic_port_without_confirmed_socket(Some(3000), &entry_views(&[entry(3000)])),
             None
         );
         assert_eq!(diagnostic_port_without_confirmed_socket(None, &[]), None);

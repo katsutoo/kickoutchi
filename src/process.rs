@@ -23,9 +23,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::display::sanitize;
-use crate::model::{
-    PermissionStatus, Platform, PortEntry, PortEntryView, ProcessContext, Protocol,
-};
+use crate::model::{PermissionStatus, Platform, PortEntryView, ProcessContext, Protocol};
 use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
@@ -250,7 +248,7 @@ impl KillTarget {
 
     pub(crate) fn from_entries<'a>(
         pid: u32,
-        entries: impl IntoIterator<Item = &'a PortEntry>,
+        entries: impl IntoIterator<Item = PortEntryView<'a>>,
         context: Option<&ProcessContext>,
     ) -> Self {
         let mut process_name = None;
@@ -271,7 +269,7 @@ impl KillTarget {
                 "kill target row PID must match target PID",
             );
             if process_name.is_none() {
-                process_name = entry.process_name.as_deref().map(str::to_owned);
+                process_name = entry.process_name.map(str::to_owned);
             }
             platform = entry.platform;
             if entry.permission == PermissionStatus::Partial {
@@ -525,8 +523,8 @@ pub(crate) fn kill_target_has_port(ports: &[KillTargetPort], port: &KillTargetPo
     ports.binary_search(port).is_ok()
 }
 
-impl From<&PortEntry> for KillTargetPort {
-    fn from(entry: &PortEntry) -> Self {
+impl From<PortEntryView<'_>> for KillTargetPort {
+    fn from(entry: PortEntryView<'_>) -> Self {
         Self {
             protocol: entry.protocol,
             local_addr: entry.local_addr,
@@ -628,16 +626,16 @@ pub(crate) fn target_still_matches_confirmation(
 /// shared check keeps those surfaces from drifting apart on this safety line.
 pub(crate) fn confirmed_port_owner_unavailable(
     confirmed: &KillTarget,
-    fresh_entries: &[PortEntry],
+    fresh_entries: &[PortEntryView<'_>],
 ) -> bool {
     fresh_entries.iter().any(|entry| {
-        entry.pid.is_none() && kill_target_has_port(&confirmed.ports, &KillTargetPort::from(entry))
+        entry.pid.is_none() && kill_target_has_port(&confirmed.ports, &KillTargetPort::from(*entry))
     })
 }
 
 pub(crate) fn revalidate_confirmed_target(
     confirmed: &KillTarget,
-    fresh_entries: &[PortEntry],
+    fresh_entries: &[PortEntryView<'_>],
     fresh_context: Option<&ProcessContext>,
 ) -> Result<KillTarget, TerminationOutcome> {
     if confirmed_port_owner_unavailable(confirmed, fresh_entries) {
@@ -646,6 +644,7 @@ pub(crate) fn revalidate_confirmed_target(
 
     let rows = fresh_entries
         .iter()
+        .copied()
         .filter(|entry| entry.pid == Some(confirmed.pid))
         .filter(|entry| kill_target_has_port(&confirmed.ports, &KillTargetPort::from(*entry)))
         .collect::<Vec<_>>();
@@ -1536,6 +1535,8 @@ fn terminate_handle_checked_platform(
 
 #[cfg(test)]
 mod tests {
+    use crate::model::PortEntryView;
+    use crate::model::entry_views;
     use std::net::{IpAddr, Ipv4Addr};
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1787,7 +1788,8 @@ mod tests {
             docker: None,
         };
 
-        let target = KillTarget::from_entries(18422, rows.iter(), Some(&context));
+        let target =
+            KillTarget::from_entries(18422, rows.iter().map(PortEntryView::from), Some(&context));
 
         assert_eq!(target.identity(), "PID 18422 (node)");
         assert_eq!(
@@ -1810,7 +1812,8 @@ mod tests {
         let mut row = entry(3000, Protocol::Tcp);
         row.parent_pid = Some(1);
 
-        let target = KillTarget::from_entries(18422, [&row], Some(&context(55)));
+        let target =
+            KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
 
         assert!(target.system_process);
         assert!(
@@ -1827,7 +1830,7 @@ mod tests {
         let mut row = entry(3000, Protocol::Tcp);
         row.pid = Some(999);
 
-        let _ = KillTarget::from_entries(18422, [&row], Some(&context(55)));
+        let _ = KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
     }
 
     #[test]
@@ -1885,11 +1888,9 @@ mod tests {
 
     #[test]
     fn confirmation_input_is_specific_to_the_required_path() {
-        let target = KillTarget::from_entries(
-            18422,
-            [entry(3000, Protocol::Tcp)].iter(),
-            Some(&context(55)),
-        );
+        let row = entry(3000, Protocol::Tcp);
+        let target =
+            KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
 
         assert!(confirmation_input_matches(
             "yes",
@@ -1929,7 +1930,11 @@ mod tests {
 
         let mut windows_row = entry(3000, Protocol::Tcp);
         windows_row.platform = Platform::Windows;
-        let windows_target = KillTarget::from_entries(18422, [&windows_row], Some(&context(55)));
+        let windows_target = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&windows_row)],
+            Some(&context(55)),
+        );
         assert!(confirmation_input_matches(
             "NODE",
             &windows_target,
@@ -1960,11 +1965,16 @@ mod tests {
     #[test]
     fn revalidation_requires_same_pid_name_and_confirmed_ports() {
         let confirmed_rows = [entry(3000, Protocol::Tcp), entry(3000, Protocol::Udp)];
-        let confirmed = KillTarget::from_entries(18422, confirmed_rows.iter(), Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            confirmed_rows.iter().map(PortEntryView::from),
+            Some(&context(55)),
+        );
 
         let fresh_rows = [entry(3000, Protocol::Tcp), entry(3000, Protocol::Udp)];
-        let fresh = revalidate_confirmed_target(&confirmed, &fresh_rows, Some(&context(55)))
-            .expect("same PID and ports are still valid");
+        let fresh =
+            revalidate_confirmed_target(&confirmed, &entry_views(&fresh_rows), Some(&context(55)))
+                .expect("same PID and ports are still valid");
 
         assert!(target_still_matches_confirmation(&confirmed, &fresh));
     }
@@ -1972,7 +1982,11 @@ mod tests {
     #[test]
     fn revalidation_rejects_missing_or_changed_targets() {
         let confirmed_row = entry(3000, Protocol::Tcp);
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
 
         assert_eq!(
             revalidate_confirmed_target(&confirmed, &[], Some(&context(55))),
@@ -1982,20 +1996,32 @@ mod tests {
         let mut changed_name = entry(3000, Protocol::Tcp);
         changed_name.process_name = Some("other".into());
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[changed_name], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&changed_name)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::TargetChanged),
         );
 
         let mut missing_name = entry(3000, Protocol::Tcp);
         missing_name.process_name = None;
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[missing_name], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&missing_name)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::TargetChanged),
         );
 
         let changed_port = entry(4000, Protocol::Tcp);
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[changed_port], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&changed_port)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::TargetChanged),
         );
     }
@@ -2003,7 +2029,11 @@ mod tests {
     #[test]
     fn revalidation_rejects_pid_reuse_with_changed_start_time() {
         let confirmed_row = entry(3000, Protocol::Tcp);
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
         let mut fresh_row = entry(3000, Protocol::Tcp);
         fresh_row.process_identity = Some(crate::observation::ProcessIdentity {
             pid: 18422,
@@ -2012,7 +2042,11 @@ mod tests {
         });
 
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[fresh_row], Some(&context(99))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&fresh_row)],
+                Some(&context(99))
+            ),
             Err(TerminationOutcome::TargetChanged),
         );
     }
@@ -2025,7 +2059,11 @@ mod tests {
             crate::observation::Ipv6Scope::interface_index(2)
                 .expect("test interface index is valid"),
         );
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
         let mut moved = confirmed_row;
         moved.ipv6_scope = Some(
             crate::observation::Ipv6Scope::interface_index(3)
@@ -2033,7 +2071,11 @@ mod tests {
         );
 
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[moved], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&moved)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::TargetChanged),
         );
     }
@@ -2041,12 +2083,16 @@ mod tests {
     #[test]
     fn revalidation_rejects_missing_start_time_identity() {
         let confirmed_row = entry(3000, Protocol::Tcp);
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
         let mut fresh_row = entry(3000, Protocol::Tcp);
         fresh_row.process_identity = None;
 
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[fresh_row], None),
+            revalidate_confirmed_target(&confirmed, &[PortEntryView::from(&fresh_row)], None),
             Err(TerminationOutcome::TargetChanged),
         );
     }
@@ -2054,7 +2100,11 @@ mod tests {
     #[test]
     fn revalidation_reports_ownership_unavailable_when_owning_pid_becomes_unreadable() {
         let confirmed_row = entry(3000, Protocol::Tcp);
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
 
         // The confirmed port is still listening, but we can't map its owner to a
         // PID anymore: that's permission/ownership loss, not the target moving.
@@ -2063,7 +2113,11 @@ mod tests {
         unreadable.permission = PermissionStatus::Partial;
 
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[unreadable], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&unreadable)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::OwnershipUnavailable),
         );
     }
@@ -2071,7 +2125,11 @@ mod tests {
     #[test]
     fn revalidation_reports_ownership_unavailable_when_any_confirmed_port_loses_pid() {
         let confirmed_rows = [entry(3000, Protocol::Tcp), entry(3000, Protocol::Udp)];
-        let confirmed = KillTarget::from_entries(18422, confirmed_rows.iter(), Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            confirmed_rows.iter().map(PortEntryView::from),
+            Some(&context(55)),
+        );
         let mut unreadable_udp = entry(3000, Protocol::Udp);
         unreadable_udp.pid = None;
         unreadable_udp.permission = PermissionStatus::Partial;
@@ -2079,7 +2137,10 @@ mod tests {
         assert_eq!(
             revalidate_confirmed_target(
                 &confirmed,
-                &[entry(3000, Protocol::Tcp), unreadable_udp],
+                &[
+                    PortEntryView::from(&entry(3000, Protocol::Tcp)),
+                    PortEntryView::from(&unreadable_udp),
+                ],
                 Some(&context(55)),
             ),
             Err(TerminationOutcome::OwnershipUnavailable),
@@ -2089,12 +2150,20 @@ mod tests {
     #[test]
     fn revalidation_rejects_targets_that_become_protected() {
         let confirmed_row = entry(3000, Protocol::Tcp);
-        let confirmed = KillTarget::from_entries(18422, [&confirmed_row], Some(&context(55)));
+        let confirmed = KillTarget::from_entries(
+            18422,
+            [PortEntryView::from(&confirmed_row)],
+            Some(&context(55)),
+        );
         let mut protected = entry(3000, Protocol::Tcp);
         protected.protected = true;
 
         assert_eq!(
-            revalidate_confirmed_target(&confirmed, &[protected], Some(&context(55))),
+            revalidate_confirmed_target(
+                &confirmed,
+                &[PortEntryView::from(&protected)],
+                Some(&context(55))
+            ),
             Err(TerminationOutcome::ProtectedProcess),
         );
     }

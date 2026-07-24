@@ -10,7 +10,7 @@ use crate::collector;
 use crate::command;
 use crate::config::Config;
 use crate::display::sanitize;
-use crate::model::{PortEntry, ProcessContext};
+use crate::model::{PortEntry, PortEntryView, ProcessContext};
 use crate::observation::MetadataProfile;
 use crate::platform;
 use crate::process::{
@@ -35,7 +35,11 @@ pub(super) fn collect_kill_authority_ports(
     collector::collect_kill_ports(pid, port)
 }
 
-pub(super) fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) -> ExitReason {
+pub(super) fn run_kill(
+    args: &KillArgs,
+    config: &Config,
+    entries: &[PortEntryView<'_>],
+) -> ExitReason {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     if args.tree {
         return run_tree_kill(args, config, entries);
@@ -85,7 +89,7 @@ fn run_kill_with<
 >(
     args: &KillArgs,
     config: &Config,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mut collectors: KillCollectors<CollectContext, CollectKillPorts, CollectVisibilityPorts>,
     mut prompt: Prompt,
     mut prepare: Prepare,
@@ -244,7 +248,7 @@ where
             Ok(entries) => entries,
             Err(error) => return PostKillPortsStatus::RefreshFailed(error.to_string()),
         };
-        let still_visible = entries.iter().any(|entry| {
+        let still_visible = entries.iter().map(PortEntryView::from).any(|entry| {
             process::kill_target_has_port(&target.ports, &process::KillTargetPort::from(entry))
         });
         if !still_visible {
@@ -321,6 +325,12 @@ where
         }
     })?;
     mark_protected(&mut fresh_entries, &config.protected_processes);
+    // The closure owns the snapshot it collected from, so the rows arrive owned
+    // and are borrowed once here for every read below.
+    let fresh_entries = fresh_entries
+        .iter()
+        .map(PortEntryView::from)
+        .collect::<Vec<_>>();
 
     // A confirmed port that's still listening but whose owner PID is now
     // unreadable is ownership loss, not a moved target. Re-resolving a `--pid`
@@ -376,7 +386,7 @@ pub(super) enum KillTargetError {
 
 pub(super) fn resolve_kill_target<CollectContext>(
     args: &KillArgs,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     collect_context: CollectContext,
 ) -> Result<KillTarget, KillTargetError>
 where
@@ -391,7 +401,7 @@ where
 
 fn resolve_pid_target<CollectContext>(
     pid: u32,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mut collect_context: CollectContext,
 ) -> Result<KillTarget, KillTargetError>
 where
@@ -401,8 +411,9 @@ where
         return Err(KillTargetError::UnsafePid(reason));
     }
 
-    let rows: Vec<&PortEntry> = entries
+    let rows: Vec<PortEntryView<'_>> = entries
         .iter()
+        .copied()
         .filter(|entry| entry.pid == Some(pid))
         .collect();
     if rows.is_empty() {
@@ -414,7 +425,7 @@ where
 
 fn resolve_port_target<CollectContext>(
     port: u16,
-    entries: &[PortEntry],
+    entries: &[PortEntryView<'_>],
     mut collect_context: CollectContext,
 ) -> Result<KillTarget, KillTargetError>
 where
@@ -435,13 +446,14 @@ where
 /// so the two policies cannot drift; the unsafe-PID guard deliberately stays
 /// with the kill caller, because reading PID 1's family is legitimate while
 /// signalling it is not.
-pub(super) fn resolve_single_port_owner(
+pub(super) fn resolve_single_port_owner<'a>(
     port: u16,
-    entries: &[PortEntry],
-) -> Result<(u32, Vec<&PortEntry>), KillTargetError> {
-    let rows: Vec<&PortEntry> = entries
+    entries: &[PortEntryView<'a>],
+) -> Result<(u32, Vec<PortEntryView<'a>>), KillTargetError> {
+    let rows: Vec<PortEntryView<'a>> = entries
         .iter()
-        .filter(|entry| entry.matches_port(port))
+        .copied()
+        .filter(|entry| entry.local_port == port)
         .collect();
     if rows.is_empty() {
         return Err(KillTargetError::NoMatch);
@@ -465,12 +477,12 @@ pub(super) fn resolve_single_port_owner(
     Ok((*pid, rows))
 }
 
-fn candidate_labels(rows: &[&PortEntry]) -> Vec<String> {
+fn candidate_labels(rows: &[PortEntryView<'_>]) -> Vec<String> {
     let mut candidates = rows
         .iter()
         .filter_map(|entry| {
             let pid = entry.pid?;
-            let name = sanitize(entry.process_name.as_deref().unwrap_or("<unknown>"));
+            let name = sanitize(entry.process_name.unwrap_or("<unknown>"));
             Some(format!(
                 "PID {pid} ({name}) {} {}:{}",
                 entry.protocol.label(),
@@ -656,6 +668,8 @@ fn exit_reason_for_outcome(outcome: &TerminationOutcome) -> ExitReason {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::PortEntryView;
+    use crate::model::entry_views;
     use std::cell::RefCell;
 
     use super::{
@@ -753,8 +767,12 @@ mod tests {
             entry_with_pid(3000, Some(200), Protocol::Udp, "worker"),
         ];
 
-        let error = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
-            .expect_err("two PIDs on one port must be ambiguous");
+        let error = resolve_kill_target(
+            &kill_port(3000, false, true),
+            &entry_views(&rows),
+            no_context,
+        )
+        .expect_err("two PIDs on one port must be ambiguous");
 
         let KillTargetError::AmbiguousPort { port, candidates } = error else {
             panic!("expected ambiguous port error, got {error:?}");
@@ -777,8 +795,12 @@ mod tests {
     fn kill_port_resolution_refuses_rows_without_pids() {
         let rows = vec![entry_with_pid(3000, None, Protocol::Tcp, "hidden")];
 
-        let error = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
-            .expect_err("a port without a PID is not killable");
+        let error = resolve_kill_target(
+            &kill_port(3000, false, true),
+            &entry_views(&rows),
+            no_context,
+        )
+        .expect_err("a port without a PID is not killable");
 
         assert_eq!(error, KillTargetError::MissingPid { port: 3000 });
     }
@@ -791,7 +813,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(3000, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || panic!("missing PID target must fail before revalidation"),
@@ -818,8 +840,12 @@ mod tests {
             entry_with_pid(3000, Some(100), Protocol::Udp, "node"),
         ];
 
-        let target = resolve_kill_target(&kill_port(3000, false, true), &rows, no_context)
-            .expect("one PID can own multiple matching rows");
+        let target = resolve_kill_target(
+            &kill_port(3000, false, true),
+            &entry_views(&rows),
+            no_context,
+        )
+        .expect("one PID can own multiple matching rows");
 
         assert_eq!(target.pid, 100);
         assert_eq!(
@@ -839,12 +865,14 @@ mod tests {
     #[test]
     fn resolution_pins_the_snapshot_owner_marker_not_detached_context_identity() {
         let rows = vec![entry(3000)];
-        let target = resolve_kill_target(&kill_pid(18_422, false, true), &rows, |_pid| {
-            crate::model::ProcessContext {
+        let target = resolve_kill_target(
+            &kill_pid(18_422, false, true),
+            &entry_views(&rows),
+            |_pid| crate::model::ProcessContext {
                 process_start_time_marker: crate::observation::ProcessStartMarker::linux(99).ok(),
                 ..crate::model::ProcessContext::default()
-            }
-        })
+            },
+        )
         .expect("verified snapshot row resolves");
 
         assert_eq!(
@@ -860,7 +888,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(rows.clone()),
@@ -888,7 +916,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(5432, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(rows.clone()),
@@ -915,7 +943,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, true, false),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(rows.clone()),
@@ -944,7 +972,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, false),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(rows.clone()),
@@ -977,7 +1005,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(fresh_rows.clone()),
@@ -1008,7 +1036,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || {
@@ -1039,7 +1067,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(3000, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
@@ -1077,7 +1105,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(3000, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
@@ -1108,7 +1136,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || {
@@ -1140,7 +1168,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(3000, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
@@ -1176,7 +1204,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_port(3000, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || {
@@ -1210,7 +1238,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || kill_ports_from_snapshot(&snapshot, Some(18_422), None),
@@ -1239,7 +1267,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(fresh_rows.clone()),
@@ -1267,7 +1295,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(vec![fresh.clone()]),
@@ -1299,7 +1327,7 @@ mod tests {
         let reason = run_kill_with(
             &kill_pid(18_422, false, true),
             &Config::default(),
-            &rows,
+            &entry_views(&rows),
             KillCollectors {
                 collect_context: no_context,
                 collect_kill_ports: || Ok(vec![fresh.clone()]),
@@ -1374,7 +1402,7 @@ mod tests {
 
     fn settle_target() -> KillTarget {
         let row = entry(3000);
-        KillTarget::from_entries(18_422, [&row], None)
+        KillTarget::from_entries(18_422, [PortEntryView::from(&row)], None)
     }
 
     #[test]
@@ -1434,7 +1462,11 @@ mod tests {
         // any-port-remains check against a quiet flip to all-ports-remain.
         let row_a = entry(3000);
         let row_b = entry(3001);
-        let target = KillTarget::from_entries(18_422, [&row_a, &row_b], None);
+        let target = KillTarget::from_entries(
+            18_422,
+            [PortEntryView::from(&row_a), PortEntryView::from(&row_b)],
+            None,
+        );
         let mut collect_calls = 0;
         let mut sleeps = 0;
 

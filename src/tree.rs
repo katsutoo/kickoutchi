@@ -1469,6 +1469,7 @@ fn refuse_after_thaw<Ops: TreeProcessOps>(
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use crate::model::PortEntryView;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1845,7 +1846,7 @@ mod tests {
             process_start_time_marker: crate::observation::ProcessStartMarker::linux(marker).ok(),
             ..ProcessContext::default()
         };
-        KillTarget::from_entries(pid, [&entry], Some(&context))
+        KillTarget::from_entries(pid, [PortEntryView::from(&entry)], Some(&context))
     }
 
     #[test]

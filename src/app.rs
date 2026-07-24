@@ -1183,9 +1183,15 @@ impl App {
         };
         mark_protected(&mut fresh_rows, &self.protected_processes);
         let fresh_context = collect_context(confirmation.target.pid);
+        // The rows stay owned because the table keeps them after this check;
+        // revalidation only reads, so it borrows them.
+        let fresh_views = fresh_rows
+            .iter()
+            .map(PortEntryView::from)
+            .collect::<Vec<_>>();
         let fresh_root = match process::revalidate_confirmed_target(
             &confirmation.target,
-            &fresh_rows,
+            &fresh_views,
             Some(&fresh_context),
         ) {
             Ok(root) => root,
@@ -1339,9 +1345,14 @@ impl App {
         };
         mark_protected(&mut fresh_rows, &self.protected_processes);
         let fresh_context = collect_context(confirmation.target.pid);
+        // Same split as the tree path: owned for the table, borrowed for the check.
+        let fresh_views = fresh_rows
+            .iter()
+            .map(PortEntryView::from)
+            .collect::<Vec<_>>();
         let target = match process::revalidate_confirmed_target(
             &confirmation.target,
-            &fresh_rows,
+            &fresh_views,
             Some(&fresh_context),
         ) {
             Ok(target) => target,
@@ -1508,7 +1519,11 @@ impl App {
         match thread::Builder::new()
             .name("kickoutchi-details".to_owned())
             .spawn(move || {
-                let _ = sender.send(collect_selected_process_context(&entry));
+                // The worker outlives the snapshot the view borrowed, so the row
+                // is owned across the thread boundary and re-borrowed here.
+                let _ = sender.send(collect_selected_process_context(PortEntryView::from(
+                    &entry,
+                )));
             }) {
             Ok(_handle) => {
                 self.context_request_state = ContextRequestState::Idle;
@@ -1808,16 +1823,16 @@ fn tree_kill_status_line(
     }
 }
 
-fn collect_selected_process_context(entry: &PortEntry) -> ProcessContext {
+fn collect_selected_process_context(entry: PortEntryView<'_>) -> ProcessContext {
     collect_selected_process_context_with(entry, docker::enrich_port)
 }
 
 fn collect_selected_process_context_with<EnrichDocker>(
-    entry: &PortEntry,
+    entry: PortEntryView<'_>,
     enrich_docker: EnrichDocker,
 ) -> ProcessContext
 where
-    EnrichDocker: FnOnce(&PortEntry) -> Option<DockerPortContext>,
+    EnrichDocker: FnOnce(PortEntryView<'_>) -> Option<DockerPortContext>,
 {
     let mut context = entry
         .pid
@@ -2046,7 +2061,9 @@ mod tests {
         let row = entry_without_pid(5432);
 
         let context =
-            super::collect_selected_process_context_with(&row, |_| Some(docker_context()));
+            super::collect_selected_process_context_with(PortEntryView::from(&row), |_| {
+                Some(docker_context())
+            });
 
         assert_eq!(context.children.children.len(), 0);
         assert!(context.process_start_time_marker.is_none());
@@ -2220,7 +2237,7 @@ mod tests {
     #[test]
     fn unknown_failure_status_is_sanitized_for_tui() {
         let row = entry(3000, Some("node"));
-        let target = KillTarget::from_entries(3000, [&row], None);
+        let target = KillTarget::from_entries(3000, [PortEntryView::from(&row)], None);
 
         let status = termination_status_line(
             &target,

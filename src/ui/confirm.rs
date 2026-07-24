@@ -493,7 +493,9 @@ mod tests {
 
     use super::confirmation_lines;
     use crate::app::KillConfirmation;
-    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState};
+    use crate::model::{
+        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
+    };
     use crate::process::{ConfirmationRequirement, KillMode, KillTarget};
     use crate::ui::theme::Theme;
 
@@ -519,7 +521,7 @@ mod tests {
             }),
             ipv6_scope: None,
         };
-        KillTarget::from_entries(18422, [&row], None)
+        KillTarget::from_entries(18422, [PortEntryView::from(&row)], None)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -547,7 +549,7 @@ mod tests {
                 ipv6_scope: None,
             })
             .collect::<Vec<_>>();
-        KillTarget::from_entries(18422, rows.iter(), None)
+        KillTarget::from_entries(18422, rows.iter().map(PortEntryView::from), None)
     }
 
     #[test]

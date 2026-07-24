@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Every surface that only reads a port row now borrows it from the authoritative
+  snapshot instead of receiving an owned legacy copy. List, single-process kill,
+  scoped tree and group kill, inspect, Docker enrichment, and the TUI all speak
+  the borrowed row; the owned form survives only where a row genuinely outlives
+  its snapshot, which is the TUI's stored table, the collection seams whose
+  closures own a snapshot internally, and test fixtures. Kill and inspect also
+  resolve protected-process policy while projecting rows rather than marking
+  them afterwards, removing a second pass over the same data. No command
+  behavior, output, or exit code changes.
+
 ### Fixed
 
 - The macOS release-profile watch journey no longer fails when the host gives a
