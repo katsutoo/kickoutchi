@@ -6,10 +6,17 @@ import importlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
 from typing import Any
+import uuid
+
+try:
+    from qa.terminal_screen import render_terminal_screen
+except ModuleNotFoundError:
+    from terminal_screen import render_terminal_screen
 
 TIMEOUT_SECONDS = 15.0
 STREAM_BYTES_MAX = 4 * 1024 * 1024
@@ -75,14 +82,30 @@ def main() -> int:
         parser.error(f"refusing to overwrite {output}")
     winpty = importlib.import_module("winpty")
 
-    terminal = winpty.PTY(80, 25, backend=winpty.Backend.ConPTY, timeout=100)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    label = f"qa-conpty-{uuid.uuid4().hex[:10]}"
+    config.write_text(
+        "[[ports]]\n"
+        'protocol = "tcp"\n'
+        'address = "127.0.0.1"\n'
+        f"port = {listener.getsockname()[1]}\n"
+        f'label = "{label}"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    terminal = winpty.PTY(140, 30, backend=winpty.Backend.ConPTY, timeout=100)
     command_line = " " + subprocess.list2cmdline(["--config", str(config)])
     started = terminal.spawn(str(binary), cmdline=command_line, cwd=str(binary.parent))
     captured = bytearray()
     timed_out = False
     oversized = False
     diagnostic = ""
+    sent_search = False
     sent_quit = False
+    label_visible = False
+    search_applied = False
     cleanup_verified = False
     started_at = time.monotonic()
     deadline = started_at + TIMEOUT_SECONDS
@@ -96,7 +119,15 @@ def main() -> int:
                 if len(captured) > STREAM_BYTES_MAX:
                     oversized = True
                     break
-            if not sent_quit and (b"\x1b[?1049h" in captured or time.monotonic() - started_at >= 2.0):
+            screen = render_terminal_screen(bytes(captured), 30, 141)
+            entered = b"\x1b[?1049h" in captured
+            label_visible = label in screen
+            search_applied = f"filter: {label}" in screen.lower()
+            if entered and not sent_search:
+                terminal.write(f"/{label}\r")
+                terminal.set_size(141, 30)
+                sent_search = True
+            if search_applied and not sent_quit:
                 terminal.write("q")
                 sent_quit = True
             time.sleep(0.01)
@@ -124,6 +155,7 @@ def main() -> int:
         while terminal.isalive() and time.monotonic() < cleanup_deadline:
             time.sleep(0.01)
         cleanup_verified = not terminal.isalive()
+        listener.close()
 
     oversized = oversized or len(captured) > STREAM_BYTES_MAX
     entered = b"\x1b[?1049h" in captured
@@ -137,6 +169,8 @@ def main() -> int:
         and entered
         and left
         and cleanup_verified
+        and label_visible
+        and search_applied
         and not diagnostic
     )
     report = {
@@ -152,6 +186,8 @@ def main() -> int:
         "entered_alternate_screen": entered,
         "left_alternate_screen": left,
         "cleanup_verified": cleanup_verified,
+        "label_visible": label_visible,
+        "search_applied": search_applied,
         "terminal_output_bytes": len(captured),
         "terminal_output_sha256": sha256(bytes(captured)),
         "harness_diagnostic": diagnostic,

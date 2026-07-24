@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from qa import release_qa
+from qa.terminal_screen import render_terminal_screen
 
 
 class ArgumentTests(unittest.TestCase):
@@ -109,6 +110,12 @@ class ArtifactTests(unittest.TestCase):
 
 
 class StructuredParsingTests(unittest.TestCase):
+    def test_terminal_screen_reconstructs_incremental_cursor_updates(self) -> None:
+        output = b"initial\x1b[2J\x1b[1;1Hfilter: none\x1b[1;9Hlabel\x1b[2;1Hqa-exact"
+        screen = render_terminal_screen(output, 3, 20)
+        self.assertIn("filter: label", screen)
+        self.assertIn("qa-exact", screen)
+
     def test_ndjson_accepts_exact_record_and_count_bounds(self) -> None:
         line = json.dumps({"event": "baseline"}) + "\n"
         records = release_qa.parse_ndjson(
@@ -176,6 +183,8 @@ class StructuredParsingTests(unittest.TestCase):
                         "entered_alternate_screen": True,
                         "left_alternate_screen": True,
                         "cleanup_verified": True,
+                        "label_visible": True,
+                        "search_applied": True,
                         "pywinpty_version": "3.0.5",
                         "terminal_output_bytes": 1,
                         "terminal_output_sha256": "c" * 64,

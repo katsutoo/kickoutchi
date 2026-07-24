@@ -65,26 +65,46 @@ jobs:
             artifact: artifacts-build-local-x86_64-unknown-linux-gnu
             archive: kickoutchi-x86_64-unknown-linux-gnu.tar.xz
             root: kickoutchi-x86_64-unknown-linux-gnu
+            candidate_binary_sha256: 847fcf0ab12648cd0ccd3b2f30870e26a3b263b69956c5a2206d6f9c8a159855
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-x86_64-unknown-linux-gnu.tar.xz
+            baseline_archive_sha256: f855ba6c0c0e4a08096aa180de67999d918d2b883a84f201922012d47504548c
+            baseline_binary_sha256: f8a3174ec13689348def30f69801103d1640e796de4195d3acf7faba797be3cc
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
             artifact: artifacts-build-local-aarch64-unknown-linux-gnu
             archive: kickoutchi-aarch64-unknown-linux-gnu.tar.xz
             root: kickoutchi-aarch64-unknown-linux-gnu
+            candidate_binary_sha256: aabbfafa7054da8f16536062fd449219fe88462987bb7b2ace785c73085034c2
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-aarch64-unknown-linux-gnu.tar.xz
+            baseline_archive_sha256: 5f461a111998e722ed46206487efd006f50274490d95f8fc05ab43937fd290cb
+            baseline_binary_sha256: 4c62559406478dde4eaf3889c67a607a8cb762096a899a72032547bb7b16eb05
           - name: macos-x86_64
             runner: macos-15-intel
             artifact: artifacts-build-local-x86_64-apple-darwin
             archive: kickoutchi-x86_64-apple-darwin.tar.xz
             root: kickoutchi-x86_64-apple-darwin
+            candidate_binary_sha256: 5407bd94f646e71972008b11246c55ce0d34fbcdf3ec53ea983d16e2a4225774
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-x86_64-apple-darwin.tar.xz
+            baseline_archive_sha256: d49f6a6f8eceff91bb29d7a95440c20c5e37f1bf7d29fa8ce431cd7aeab5d107
+            baseline_binary_sha256: 6aae55ee92d38872ff502d9cd7b68419d1415c45046b4f174432f3b85a61ad3b
           - name: macos-aarch64
             runner: macos-14
             artifact: artifacts-build-local-aarch64-apple-darwin
             archive: kickoutchi-aarch64-apple-darwin.tar.xz
             root: kickoutchi-aarch64-apple-darwin
+            candidate_binary_sha256: 54177695affffec2a0d2f06c9d339c5138bd39973980c8d64be3a5ceef9ec72c
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-aarch64-apple-darwin.tar.xz
+            baseline_archive_sha256: 61316172860d1f0c7f51add62ada6ddbabf5db12aea12b87be561b3774fe8c6c
+            baseline_binary_sha256: 296965f58a74f75657fdb723e649f84fdb74d5c39064b411eea98c0af8ae4060
           - name: windows-x86_64
             runner: windows-2022
             artifact: artifacts-build-local-x86_64-pc-windows-msvc
             archive: kickoutchi-x86_64-pc-windows-msvc.zip
             root: .
+            candidate_binary_sha256: 431a4bec837e32f4daf7f206286e007072f4373c5a9636ab81a97c1930df897d
+            baseline_url: https://github.com/nuggocto/kickoutchi/releases/download/v1.2.0/kickoutchi-x86_64-pc-windows-msvc.zip
+            baseline_archive_sha256: 71a5004a8d503284034659e70e1d5a861e26d9f362ea0f42c097518718db8d24
+            baseline_binary_sha256: e21a7d01ed920370a85b1064908600bf0db4e38cfe73d6ddade934f90adb01bb
     name: QA (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -95,7 +115,7 @@ jobs:
           persist-credentials: false
 
       - name: Test QA harness
-        run: python3 -m unittest -v qa.test_release_qa
+        run: python3 -m unittest -v qa.test_release_qa qa.test_extended_release_qa
 
       - name: Download exact candidate archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -112,6 +132,7 @@ jobs:
         env:
           ARCHIVE: ${{ matrix.archive }}
           ROOT: ${{ matrix.root }}
+          CANDIDATE_BINARY_SHA256: ${{ matrix.candidate_binary_sha256 }}
         shell: bash
         run: |
           cd "$RUNNER_TEMP/candidate"
@@ -131,6 +152,10 @@ jobs:
             echo "candidate archive did not preserve both executable payloads" >&2
             exit 1
           }
+          [[ "$(shasum -a 256 "extracted/${ROOT}/kick" | cut -d ' ' -f 1)" == "$CANDIDATE_BINARY_SHA256" ]] || {
+            echo "candidate executable checksum mismatch" >&2
+            exit 1
+          }
           echo "canonical=${RUNNER_TEMP}/candidate/extracted/${ROOT}/kickoutchi" >> "$GITHUB_OUTPUT"
           echo "short=${RUNNER_TEMP}/candidate/extracted/${ROOT}/kick" >> "$GITHUB_OUTPUT"
           echo "archive_sha256=$actual" >> "$GITHUB_OUTPUT"
@@ -140,6 +165,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           ARCHIVE: ${{ matrix.archive }}
+          CANDIDATE_BINARY_SHA256: ${{ matrix.candidate_binary_sha256 }}
         shell: pwsh
         run: |
           $candidate = "$env:RUNNER_TEMP\candidate"
@@ -152,9 +178,63 @@ jobs:
           foreach ($binary in @('kickoutchi.exe', 'kick.exe')) {
             if (-not (Test-Path -LiteralPath "$candidate\extracted\$binary" -PathType Leaf)) { throw "candidate archive is missing $binary" }
           }
+          $shortActual = (Get-FileHash -Algorithm SHA256 -LiteralPath "$candidate\extracted\kick.exe").Hash.ToLowerInvariant()
+          if ($shortActual -ne $env:CANDIDATE_BINARY_SHA256) { throw "candidate executable checksum mismatch" }
           "canonical=$candidate\extracted\kickoutchi.exe" >> $env:GITHUB_OUTPUT
           "short=$candidate\extracted\kick.exe" >> $env:GITHUB_OUTPUT
           "archive_sha256=$actual" >> $env:GITHUB_OUTPUT
+
+      - id: baseline-unix
+        name: Download and verify Unix baseline
+        if: runner.os != 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          ROOT: ${{ matrix.root }}
+          BASELINE_URL: ${{ matrix.baseline_url }}
+          BASELINE_ARCHIVE_SHA256: ${{ matrix.baseline_archive_sha256 }}
+          BASELINE_BINARY_SHA256: ${{ matrix.baseline_binary_sha256 }}
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/baseline"
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/baseline/$ARCHIVE" "$BASELINE_URL"
+          actual="$(shasum -a 256 "$RUNNER_TEMP/baseline/$ARCHIVE" | cut -d ' ' -f 1)"
+          [[ "$actual" == "$BASELINE_ARCHIVE_SHA256" ]] || {
+            echo "baseline archive checksum mismatch" >&2
+            exit 1
+          }
+          tar -xJf "$RUNNER_TEMP/baseline/$ARCHIVE" -C "$RUNNER_TEMP/baseline"
+          binary="$RUNNER_TEMP/baseline/${ROOT}/kick"
+          [[ -x "$binary" ]] || {
+            echo "baseline archive is missing kick" >&2
+            exit 1
+          }
+          [[ "$(shasum -a 256 "$binary" | cut -d ' ' -f 1)" == "$BASELINE_BINARY_SHA256" ]] || {
+            echo "baseline executable checksum mismatch" >&2
+            exit 1
+          }
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+
+      - id: baseline-windows
+        name: Download and verify Windows baseline
+        if: runner.os == 'Windows'
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          BASELINE_URL: ${{ matrix.baseline_url }}
+          BASELINE_ARCHIVE_SHA256: ${{ matrix.baseline_archive_sha256 }}
+          BASELINE_BINARY_SHA256: ${{ matrix.baseline_binary_sha256 }}
+        shell: pwsh
+        run: |
+          $baseline = "$env:RUNNER_TEMP\baseline"
+          New-Item -ItemType Directory -Path $baseline | Out-Null
+          Invoke-WebRequest -Uri $env:BASELINE_URL -OutFile "$baseline\$env:ARCHIVE"
+          $archiveActual = (Get-FileHash -Algorithm SHA256 -LiteralPath "$baseline\$env:ARCHIVE").Hash.ToLowerInvariant()
+          if ($archiveActual -ne $env:BASELINE_ARCHIVE_SHA256) { throw "baseline archive checksum mismatch" }
+          Expand-Archive -LiteralPath "$baseline\$env:ARCHIVE" -DestinationPath "$baseline\extracted"
+          $binary = "$baseline\extracted\kick.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "baseline archive is missing kick.exe" }
+          $binaryActual = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
+          if ($binaryActual -ne $env:BASELINE_BINARY_SHA256) { throw "baseline executable checksum mismatch" }
+          "binary=$binary" >> $env:GITHUB_OUTPUT
 
       - id: windows-tui
         name: Exercise Windows pseudo-console lifecycle
@@ -209,6 +289,44 @@ jobs:
           }
           python @arguments
 
+      - id: extended-qa-unix
+        name: Run extended Unix exploratory charters
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ matrix.candidate_binary_sha256 }}
+          BASELINE_BINARY_SHA256: ${{ matrix.baseline_binary_sha256 }}
+        shell: bash
+        run: |
+          arguments=(
+            --candidate '${{ steps.unix-artifact.outputs.short }}'
+            --candidate-sha256 "$CANDIDATE_BINARY_SHA256"
+            --baseline '${{ steps.baseline-unix.outputs.binary }}'
+            --baseline-sha256 "$BASELINE_BINARY_SHA256"
+            --candidate-commit "$CANDIDATE_COMMIT"
+            --output "extended-qa-${{ matrix.name }}.json"
+          )
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo -n true
+            docker pull ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+            arguments+=(--privileged-watch)
+          fi
+          python3 -m qa.extended_release_qa "${arguments[@]}"
+
+      - id: extended-qa-windows
+        name: Run extended Windows exploratory charters
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python -m qa.extended_release_qa `
+            --candidate '${{ steps.windows-artifact.outputs.short }}' `
+            --candidate-sha256 '${{ matrix.candidate_binary_sha256 }}' `
+            --baseline '${{ steps.baseline-windows.outputs.binary }}' `
+            --baseline-sha256 '${{ matrix.baseline_binary_sha256 }}' `
+            --candidate-commit $env:CANDIDATE_COMMIT `
+            --output 'extended-qa-${{ matrix.name }}.json'
+
       - name: Upload QA evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -216,6 +334,7 @@ jobs:
           name: release-qa-${{ matrix.name }}
           path: |
             qa-${{ matrix.name }}.json
+            extended-qa-${{ matrix.name }}.json
             ${{ steps.windows-tui.outputs.evidence }}
           if-no-files-found: error
           retention-days: 90
@@ -224,16 +343,18 @@ jobs:
         if: always()
         env:
           REPORT: qa-${{ matrix.name }}.json
+          EXTENDED_REPORT: extended-qa-${{ matrix.name }}.json
         shell: bash
         run: |
-          python3 - "$REPORT" <<'PY'
+          python3 - "$REPORT" "$EXTENDED_REPORT" <<'PY'
           import json
           import pathlib
           import sys
 
-          report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-          if report.get("overall") != "PASS":
-              raise SystemExit(f"QA verdict is {report.get('overall')}")
+          for filename in sys.argv[1:]:
+              report = json.loads(pathlib.Path(filename).read_text(encoding="utf-8"))
+              if report.get("overall") != "PASS":
+                  raise SystemExit(f"{filename} verdict is {report.get('overall')}")
           PY
 
   benchmark:

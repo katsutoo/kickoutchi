@@ -31,5 +31,41 @@ stream bounds before accepting that check.
 Run focused harness tests with:
 
 ```sh
-python3 -m unittest -v qa.test_release_qa
+python3 -m unittest -v qa.test_release_qa qa.test_extended_release_qa
 ```
+
+## Extended charters
+
+Run the additional upgrade, endpoint-matrix, watch-lifecycle, input-boundary,
+termination, and platform-scope charters with an extracted v1.2 executable and
+the exact candidate executable:
+
+```sh
+python3 -m qa.extended_release_qa \
+  --candidate /absolute/path/to/v1.3/kickoutchi \
+  --candidate-sha256 64-lowercase-hex-characters \
+  --baseline /absolute/path/to/v1.2/kickoutchi \
+  --baseline-sha256 64-lowercase-hex-characters \
+  --candidate-commit 40-lowercase-hex-characters \
+  --output /absolute/path/to/extended-release-qa.json
+```
+
+The output path must not exist. Both executable hashes are mandatory and are
+checked before either artifact runs. All product commands have bounded output
+and deadlines. Configurations, sockets, listeners, process trees, process
+groups, fault state, and compiler output live in the harness-owned temporary
+tree and are cleaned up on every exit path. Cleanup uncertainty makes the report
+inconclusive.
+
+The deterministic collection-failure charter is Linux-only. It builds the
+QA-owned `watch_fault_fixture.c` interposer with `cc` inside the temporary tree
+and fails selected `/proc/net/tcp` opens; a missing compiler blocks that charter
+rather than weakening it. Tree termination runs on Linux, macOS, and Windows;
+process-group termination runs on Linux and macOS. Unsupported IPv6 is retained
+as an explicit Why result. The Windows charter asserts the native-host scope and
+`wsl_network_stack_excluded` contract; it does not claim that WSL was executed.
+
+This harness is not invoked by the current release qualification workflow. A
+workflow job must download and verify the published v1.2 artifact for each
+native target, pass both executable hashes, run this module, upload its report,
+and require `overall: PASS` before its results can satisfy the release gate.

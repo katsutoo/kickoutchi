@@ -22,6 +22,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+try:
+    from qa.terminal_screen import render_terminal_screen
+except ModuleNotFoundError:
+    from terminal_screen import render_terminal_screen
+
 
 BINARY_MAX_BYTES = 512 * 1024 * 1024
 COMMAND_OUTPUT_MAX_BYTES = 32 * 1024 * 1024
@@ -102,6 +107,8 @@ def read_windows_tui_evidence(path: Path, binary_sha256: str) -> dict[str, Any]:
         "left_alternate_screen": True,
         "cleanup_verified": True,
         "pywinpty_version": "3.0.5",
+        "label_visible": True,
+        "search_applied": True,
     }
     if not isinstance(value, dict) or any(value.get(key) != expected for key, expected in required.items()):
         raise HarnessError("Windows TUI evidence does not prove the required console lifecycle")
@@ -1009,9 +1016,13 @@ class QaSession:
 
     def _tui(self) -> dict[str, Any]:
         import errno
+        import fcntl
         import pty
+        import struct
+        import termios
 
         master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 140, 0, 0))
         command = [self.canonical, "--config", str(self.config_labels)]
         tui_env = dict(self.env)
         tui_env["TERM"] = "xterm-256color"
@@ -1029,18 +1040,38 @@ class QaSession:
         truncated = False
         cleanup: list[str] = []
         selector: Optional[selectors.BaseSelector] = None
+        screen = ""
         try:
             ready_deadline = time.monotonic() + min(self.timeout, HELPER_READY_TIMEOUT_SECONDS)
             ready_selector = selectors.DefaultSelector()
             ready_selector.register(master, selectors.EVENT_READ)
-            while time.monotonic() < ready_deadline and not output:
+            label_bytes = self.exact_label.encode("utf-8")
+            while time.monotonic() < ready_deadline and b"\x1b[?1049h" not in output:
                 if process.poll() is not None:
                     break
                 if ready_selector.select(timeout=0.05):
                     chunk = os.read(master, min(65_536, PTY_OUTPUT_MAX_BYTES + 1))
                     output.extend(chunk)
             ready_selector.close()
-            _expect(bool(output), "TUI produced no terminal output before its readiness deadline")
+            _expect(b"\x1b[?1049h" in output, "TUI did not enter the alternate screen before its readiness deadline")
+            os.write(master, b"/" + label_bytes + b"\r")
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 141, 0, 0))
+            search_bytes = b"filter: " + label_bytes
+            search_deadline = time.monotonic() + min(self.timeout, HELPER_READY_TIMEOUT_SECONDS)
+            search_selector = selectors.DefaultSelector()
+            search_selector.register(master, selectors.EVENT_READ)
+            while time.monotonic() < search_deadline:
+                screen = render_terminal_screen(bytes(output), 30, 141)
+                if search_bytes.decode("utf-8") in screen.lower() and self.exact_label in screen:
+                    break
+                if process.poll() is not None:
+                    break
+                if search_selector.select(timeout=0.05):
+                    chunk = os.read(master, min(65_536, PTY_OUTPUT_MAX_BYTES + 1 - len(output)))
+                    output.extend(chunk)
+            search_selector.close()
+            _expect(search_bytes.decode("utf-8") in screen.lower(), "TUI search did not apply the configured label")
+            _expect(self.exact_label in screen, "TUI did not render the configured label after search")
             os.write(master, b"q")
             deadline = time.monotonic() + self.timeout
             selector = selectors.DefaultSelector()
@@ -1084,6 +1115,8 @@ class QaSession:
             "pty": "stdlib pty.openpty",
             "output_bytes_captured": len(output),
             "output_truncated": truncated,
+            "label_visible": self.exact_label in screen,
+            "search_applied": search_bytes.decode("utf-8") in screen.lower(),
             "output": output.decode("utf-8", "replace"),
             "cleanup": cleanup,
         }
