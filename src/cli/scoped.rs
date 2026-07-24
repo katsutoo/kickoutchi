@@ -1015,15 +1015,6 @@ fn windows_tree_partial_report_text(
             tree::format_pid_list(&report.job_terminated_pids),
         )
     };
-    let fallback = if report.fallback_terminated_pids.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; fallback-terminated {} verified process(es) individually (PIDs: {})",
-            report.fallback_terminated_pids.len(),
-            tree::format_pid_list(&report.fallback_terminated_pids),
-        )
-    };
     let already_exited = if report.already_exited_pids.is_empty() {
         String::new()
     } else {
@@ -1042,7 +1033,7 @@ fn windows_tree_partial_report_text(
         )
     };
     let withheld = if report.job_termination_withheld {
-        "; job termination was withheld because safe termination of the contained membership could not be established"
+        "; job termination was withheld because strict tree closure could not be established for every observed descendant"
     } else {
         ""
     };
@@ -1072,7 +1063,7 @@ fn windows_tree_partial_report_text(
             format!("; cleanup issue: {}", windows_cleanup_issue_text(issue))
         });
     format!(
-        "warning: Windows tree containment was partial for {}; {job}{fallback}{already_exited}{missing}{withheld}{post_commit_issue}{secondary_post_commit_issue}{cleanup_issue}",
+        "warning: Windows tree containment was partial for {}; {job}{already_exited}{missing}{withheld}{post_commit_issue}{secondary_post_commit_issue}{cleanup_issue}",
         root.identity(),
     )
 }
@@ -2161,7 +2152,6 @@ mod tests {
         let report = crate::windows_tree::WindowsTreeKillReport {
             total: 1,
             job_terminated_pids: vec![100],
-            fallback_terminated_pids: Vec::new(),
             already_exited_pids: Vec::new(),
             not_terminated: vec![101],
             containment_partial: true,
@@ -2226,7 +2216,6 @@ mod tests {
         let report = crate::windows_tree::WindowsTreeKillReport {
             total: 1,
             job_terminated_pids: vec![100],
-            fallback_terminated_pids: Vec::new(),
             already_exited_pids: Vec::new(),
             not_terminated: Vec::new(),
             containment_partial: false,
@@ -2264,9 +2253,8 @@ mod tests {
             children_truncated: false,
         };
         let report = crate::windows_tree::WindowsTreeKillReport {
-            total: 4,
+            total: 3,
             job_terminated_pids: Vec::new(),
-            fallback_terminated_pids: vec![101],
             already_exited_pids: vec![102],
             not_terminated: vec![100, 103],
             containment_partial: true,
@@ -2291,9 +2279,7 @@ mod tests {
 
         let text = super::windows_tree_partial_report_text(&root, &report);
 
-        assert!(text.contains("job-terminated 0 of 4"), "{text}");
-        assert!(text.contains("fallback-terminated 1"), "{text}");
-        assert!(text.contains("PIDs: 101"), "{text}");
+        assert!(text.contains("job-terminated 0 of 3"), "{text}");
         assert!(text.contains("already exited (PIDs: 102)"), "{text}");
         assert!(
             text.contains("not confirmed terminated: 100, 103"),
@@ -2308,7 +2294,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("safe termination of the contained membership could not be established"),
+            text.contains("strict tree closure could not be established"),
             "{text}"
         );
         assert!(
@@ -2343,9 +2329,8 @@ mod tests {
         let outcome = crate::windows_tree::WindowsTreeKillOutcome::JobTerminateFailed {
             error: "job failed".to_owned(),
             report: Box::new(crate::windows_tree::WindowsTreeKillReport {
-                total: 3,
+                total: 2,
                 job_terminated_pids: Vec::new(),
-                fallback_terminated_pids: vec![101],
                 already_exited_pids: vec![102],
                 not_terminated: vec![100],
                 containment_partial: true,
@@ -2380,8 +2365,6 @@ mod tests {
             text.contains("TerminateJobObject failed: job failed"),
             "{text}"
         );
-        assert!(text.contains("fallback-terminated 1"), "{text}");
-        assert!(text.contains("PIDs: 101"), "{text}");
         assert!(text.contains("already exited (PIDs: 102)"), "{text}");
         assert!(text.contains("not confirmed terminated: 100"), "{text}");
         assert!(

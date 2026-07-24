@@ -71,9 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows tree kill now freezes the committed Job Object for its final bounded
   validation sweep through private information class 18, closing the
   descendant-spawn window before whole-job termination. An empty disposable job
-  proves freeze/thaw support before target assignment. Freeze or final-validation
-  failure withholds whole-job delivery, attempts thaw when required, and
-  preserves primary, secondary, cleanup, and verified fallback outcomes.
+  proves freeze/thaw support before target assignment. A live member that cannot
+  join the job now withholds all termination instead of receiving racy individual
+  fallback termination. Assignment, freeze, or final-validation failure reports
+  that strict tree closure was not established and attempts thaw when required.
 - Pinned `socket2` 0.6.5 with its empty default feature set for exact bind
   probes. Its dependency graph, license, MSRV, unsafe call surface, binary-size
   impact, and Linux, macOS, and Windows behavior were reviewed and accepted
@@ -106,6 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- macOS release-profile watch journeys retry only the exact partial-initial-socket
+  condition with a fixed three-attempt budget and now fail unless one attempt
+  proves the baseline and release event contract.
+- The public `kickoutchi::run()` entrypoint now preserves an embedding process's
+  tracing subscriber, and repeated calls no longer panic during diagnostics
+  initialization.
 - Windows replacement coverage creates the replacement listener in a distinct
   process, proving changed owner identity instead of depending on incidental
   partial ownership from the host socket table.

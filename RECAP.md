@@ -298,9 +298,11 @@ Windows tree kill now:
 - Freezes the committed job for a final bounded validation sweep.
 - Reapplies `--yes` warning authorization during committed sweeps.
 - Withholds whole-job termination when a late child needs fresh review.
-- Attempts thaw and verified fallback handling after post-commit failures.
-- Preserves delivered, already-exited, fallback, unconfirmed, and not-terminated
-  PID outcomes instead of reporting false total success.
+- Withholds all termination when a live member cannot join the job, rather than
+  reopening the descendant-spawn window through individual fallback termination.
+- Attempts thaw after post-commit failures and preserves delivered,
+  already-exited, unconfirmed, and not-terminated PID outcomes instead of
+  reporting false total success.
 
 Tree and process-group rollback now pin the identity observed immediately after
 each successful stop and use one snapshot to prove convergence and final frozen

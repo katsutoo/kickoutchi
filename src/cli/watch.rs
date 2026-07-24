@@ -2844,6 +2844,37 @@ mod tests {
     }
 
     #[test]
+    fn initial_partial_socket_set_fails_without_emitting_a_baseline() {
+        let mut partial = snapshot();
+        partial.completeness = SnapshotCompleteness::Partial;
+        partial.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::SocketSet,
+            EvidenceGapCode::NativeFieldUnavailable,
+            None,
+            None,
+            "injected partial socket set",
+        ));
+        let mut runtime = FakeRuntime::new(vec![Ok(partial)]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let result = run_watch_loop(
+            &options(Duration::from_millis(100)),
+            &Config::default(),
+            &mut runtime,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(result, ExitReason::Failure);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: initial observation has a partial socket set\n"
+        );
+    }
+
+    #[test]
     fn slow_initial_collection_failure_is_not_masked_by_duration_expiry() {
         let mut runtime =
             FakeRuntime::new(vec![Err(ObservationError::SocketTableUnavailable.into())]);

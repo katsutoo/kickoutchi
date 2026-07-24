@@ -9,6 +9,7 @@ const REAL_BINARY_EXIT_WAIT: Duration = Duration::from_secs(10);
 const COMMAND_OUTPUT_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const COMMAND_RUNNER_HELPER_ENV: &str = "KICKOUTCHI_TEST_COMMAND_RUNNER_HELPER";
 const BINARY_OVERRIDE_HELPER_ENV: &str = "KICKOUTCHI_TEST_BINARY_OVERRIDE_HELPER";
+const TRACING_HELPER_ENV: &str = "KICKOUTCHI_TEST_TRACING_HELPER";
 const RELEASE_E2E_REQUIRED_ENV: &str = "KICKOUTCHI_RELEASE_E2E_REQUIRED";
 const KICKOUTCHI_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICKOUTCHI";
 const KICK_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICK";
@@ -242,6 +243,42 @@ fn binary_override_helper_process() {
         drop(kickoutchi_binary());
         drop(kick_binary());
     }
+}
+
+#[test]
+#[ignore = "subprocess fixture; invoked explicitly by contract tests"]
+fn tracing_helper_process() {
+    if std::env::var_os(TRACING_HELPER_ENV).is_some() {
+        tracing_subscriber::fmt()
+            .with_writer(io::sink)
+            .try_init()
+            .expect("helper tracing subscriber must install");
+        assert_eq!(kickoutchi::run(), std::process::ExitCode::from(2));
+        assert_eq!(kickoutchi::run(), std::process::ExitCode::from(2));
+    }
+}
+
+#[test]
+fn public_run_tracing_preserves_an_existing_subscriber_across_repeated_calls() {
+    let output = run_command_with_deadline(
+        Command::new(std::env::current_exe().expect("test binary path resolves"))
+            .args([
+                "--exact",
+                "tracing_helper_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(TRACING_HELPER_ENV, "1"),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("tracing helper must exit before its deadline");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -614,6 +651,15 @@ mod portable_native {
     }
 
     #[cfg(target_os = "macos")]
+    const WATCH_RELEASE_ATTEMPTS: usize = 3;
+
+    fn endpoint_config(port: u16) -> ConfigGuard {
+        ConfigGuard::new(&format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard fixture\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"native artifact fixture\"\n"
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     fn partial_socket_set_outcome(
         status: std::process::ExitStatus,
         stderr: &[u8],
@@ -765,6 +811,36 @@ mod portable_native {
         )
     }
 
+    fn watch_release_attempt() -> (u16, WatchOutcome) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
+        let port = listener.local_addr().expect("TCP address is known").port();
+        let port_text = port.to_string();
+        let config = endpoint_config(port);
+        (port, watch_until_release(&config, &port_text, listener))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn required_watch_release_journey() -> (u16, Vec<serde_json::Value>) {
+        let mut partial_attempts = 0;
+        for _attempt in 1..=WATCH_RELEASE_ATTEMPTS {
+            let (port, outcome) = watch_release_attempt();
+            match outcome {
+                WatchOutcome::Events(records) => return (port, records),
+                WatchOutcome::PartialSocketSet => partial_attempts += 1,
+            }
+        }
+
+        panic!(
+            "native watch produced a partial initial socket set in all {partial_attempts} attempts"
+        );
+    }
+
+    #[cfg(windows)]
+    fn required_watch_release_journey() -> (u16, Vec<serde_json::Value>) {
+        let (port, WatchOutcome::Events(records)) = watch_release_attempt();
+        (port, records)
+    }
+
     #[test]
     fn labels_and_watch_run_through_the_native_binary() {
         #[cfg(target_os = "macos")]
@@ -773,9 +849,7 @@ mod portable_native {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
         let port = listener.local_addr().expect("TCP address is known").port();
         let port_text = port.to_string();
-        let config = ConfigGuard::new(&format!(
-            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard fixture\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"native artifact fixture\"\n"
-        ));
+        let config = endpoint_config(port);
 
         let list = run_with_config(
             &config,
@@ -840,23 +914,19 @@ mod portable_native {
         let why_value: serde_json::Value =
             serde_json::from_slice(&why.stdout).expect("why stdout must be JSON");
         assert_eq!(why_value["results"][0]["label"], "native artifact fixture");
+        drop(listener);
 
-        match watch_until_release(&config, port_text.as_str(), listener) {
-            WatchOutcome::Events(records) => {
-                assert_eq!(records.len(), 2);
-                assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
-                assert_eq!(records[0]["event"], "baseline");
-                assert_eq!(records[0]["data"]["endpoint"]["port"], port);
-                assert_eq!(records[0]["data"]["label"], "native artifact fixture");
-                assert_eq!(records[0]["data"]["filter_result"], "matched");
-                assert_eq!(records[1]["event"], "release");
-                assert_eq!(records[1]["data"]["endpoint"]["port"], port);
-                assert_eq!(records[1]["data"]["label"], "native artifact fixture");
-                assert_eq!(records[1]["data"]["filter_result"], "matched");
-            }
-            #[cfg(target_os = "macos")]
-            WatchOutcome::PartialSocketSet => {}
-        }
+        let (watch_port, records) = required_watch_release_journey();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
+        assert_eq!(records[0]["event"], "baseline");
+        assert_eq!(records[0]["data"]["endpoint"]["port"], watch_port);
+        assert_eq!(records[0]["data"]["label"], "native artifact fixture");
+        assert_eq!(records[0]["data"]["filter_result"], "matched");
+        assert_eq!(records[1]["event"], "release");
+        assert_eq!(records[1]["data"]["endpoint"]["port"], watch_port);
+        assert_eq!(records[1]["data"]["label"], "native artifact fixture");
+        assert_eq!(records[1]["data"]["filter_result"], "matched");
     }
 }
 

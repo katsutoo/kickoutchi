@@ -137,8 +137,9 @@ fn run_tui(config: &Config) -> ExitCode {
 /// when we're outside the alternate screen anyway: startup, shutdown, panic, and
 /// fatal-error time. So they can never scribble over a rendered frame.
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    // Embedders own the process-global subscriber; an existing one is valid.
+    let _ = tracing_subscriber::fmt()
         .with_writer(io::stderr)
         .with_max_level(tracing::Level::WARN)
-        .init();
+        .try_init();
 }
