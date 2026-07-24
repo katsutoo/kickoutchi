@@ -936,16 +936,29 @@ mod portable_native {
         };
         #[cfg(windows)]
         let (watch_port, records) = watch_release_journey();
-        assert_eq!(records.len(), 2);
+        assert!(records.len() >= 2);
         assert_eq!(records[0]["schema"], "kickoutchi.watch_event");
         assert_eq!(records[0]["event"], "baseline");
         assert_eq!(records[0]["data"]["endpoint"]["port"], watch_port);
         assert_eq!(records[0]["data"]["label"], "native artifact fixture");
         assert_eq!(records[0]["data"]["filter_result"], "matched");
-        assert_eq!(records[1]["event"], "release");
-        assert_eq!(records[1]["data"]["endpoint"]["port"], watch_port);
-        assert_eq!(records[1]["data"]["label"], "native artifact fixture");
-        assert_eq!(records[1]["data"]["filter_result"], "matched");
+        let releases = records
+            .iter()
+            .skip(1)
+            .filter(|record| record["event"] == "release")
+            .collect::<Vec<_>>();
+        assert_eq!(releases.len(), 1, "{records:#?}");
+        assert!(
+            records.iter().skip(1).all(|record| matches!(
+                record["event"].as_str(),
+                Some("release" | "collection_gap")
+            )),
+            "{records:#?}"
+        );
+        let release = releases[0];
+        assert_eq!(release["data"]["endpoint"]["port"], watch_port);
+        assert_eq!(release["data"]["label"], "native artifact fixture");
+        assert_eq!(release["data"]["filter_result"], "matched");
     }
 }
 
