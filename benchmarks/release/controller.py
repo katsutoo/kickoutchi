@@ -398,11 +398,14 @@ def verify_protocol_identity(plan: dict[str, Any]) -> None:
     lines = rustc.stdout.splitlines()
     rustc_version = lines[0] if rustc.returncode == 0 and lines else None
     rust_target = next((line.removeprefix("host: ") for line in lines if line.startswith("host: ")), None)
+    platform_key = f"{platform.system().lower()}-{platform.machine().lower()}"
     actual = {"harness_tree_sha256":harness_hash,"included_product_sources_sha256":product_hash,
-              "diff_helper_source_sha256":helper_source_hash,"diff_helper_lock_sha256":lock_hash,"rust_target":rust_target,"rustc_version":rustc_version}
+              "diff_helper_source_sha256":helper_source_hash,"diff_helper_lock_sha256":lock_hash,"rustc_version":rustc_version}
     for key, value in actual.items():
         if identity[key] != value:
             raise EvidenceError(f"protocol identity differs for {key}")
+    if identity["rust_target_by_platform"].get(platform_key) != rust_target:
+        raise EvidenceError("protocol identity differs for rust target")
     reviewed_commit = identity["harness_commit"]
     reviewed = {"harness_tree_sha256":_commit_tree_hash(reviewed_commit, harness_sources, root),
                 "included_product_sources_sha256":_commit_tree_hash(reviewed_commit, product_sources, root),
@@ -411,6 +414,9 @@ def verify_protocol_identity(plan: dict[str, Any]) -> None:
     for key, value in reviewed.items():
         if identity[key] != value:
             raise EvidenceError(f"reviewed source commit differs for {key}")
+    candidate_product_hash = _commit_tree_hash(plan["artifacts"]["candidate"]["source_commit"], product_sources, root)
+    if identity["included_product_sources_sha256"] != candidate_product_hash:
+        raise EvidenceError("included product sources differ from the candidate commit")
 
 
 def smoke_workload(workload: dict[str, Any]) -> dict[str, Any]:

@@ -278,7 +278,7 @@ def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, An
     if top["immutable"] is not True or top["gate_mode"] != "final" or not isinstance(top["gate_ready"], bool):
         raise EvidenceError("plan immutable, gate mode, or readiness is invalid")
     _integer(top["ordering_seed"], "ordering_seed", 0, (1 << 63) - 1)
-    identity = _exact_keys(top["protocol_identity"], {"harness_commit", "harness_tree_sha256", "included_product_sources_sha256", "diff_helper_source_sha256", "diff_helper_lock_sha256", "diff_helper_sha256_by_platform", "rust_target", "rustc_version"}, "protocol_identity")
+    identity = _exact_keys(top["protocol_identity"], {"harness_commit", "harness_tree_sha256", "included_product_sources_sha256", "diff_helper_source_sha256", "diff_helper_lock_sha256", "diff_helper_sha256_by_platform", "rust_target_by_platform", "rustc_version"}, "protocol_identity")
     for key in ("harness_tree_sha256", "included_product_sources_sha256", "diff_helper_source_sha256", "diff_helper_lock_sha256"):
         _sha(identity[key], f"protocol_identity.{key}", required=False)
     helper_hashes = identity["diff_helper_sha256_by_platform"]
@@ -289,7 +289,10 @@ def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, An
             if not isinstance(platform_key, str):
                 raise EvidenceError("diff helper platform key is invalid")
             _sha(digest, f"diff_helper.{platform_key}")
-    for key in ("harness_commit", "rust_target", "rustc_version"):
+    targets = identity["rust_target_by_platform"]
+    if targets is not None and (not isinstance(targets, dict) or not targets or not all(isinstance(key, str) and isinstance(value, str) and value for key, value in targets.items())):
+        raise EvidenceError("protocol_identity.rust_target_by_platform is invalid")
+    for key in ("harness_commit", "rustc_version"):
         if identity[key] is not None and (not isinstance(identity[key], str) or not identity[key]):
             raise EvidenceError(f"protocol_identity.{key} is invalid")
     if identity["harness_commit"] is not None and len(identity["harness_commit"]) != 40:

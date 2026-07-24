@@ -41,14 +41,14 @@ class PlanValidationTests(unittest.TestCase):
     def test_gate_ready_refuses_any_unimplemented_workload(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["gate_ready"] = True
-        changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target":"x86_64-unknown-linux-gnu","rustc_version":"rustc test"}
+        changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target_by_platform":{"linux-x86_64":"x86_64-unknown-linux-gnu"},"rustc_version":"rustc test"}
         with self.assertRaisesRegex(EvidenceError, "unimplemented"):
             validate_plan(changed)
 
     def test_declared_implemented_flag_cannot_bypass_an_unavailable_driver(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["gate_ready"] = True
-        changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target":"x86_64-unknown-linux-gnu","rustc_version":"rustc test"}
+        changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target_by_platform":{"linux-x86_64":"x86_64-unknown-linux-gnu"},"rustc_version":"rustc test"}
         for item in changed["workloads"]:
             item["implemented"] = True
         with self.assertRaisesRegex(EvidenceError, "unavailable workload driver"):

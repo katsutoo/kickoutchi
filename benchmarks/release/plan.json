@@ -13,7 +13,7 @@
     "diff_helper_source_sha256": null,
     "diff_helper_lock_sha256": null,
     "diff_helper_sha256_by_platform": null,
-    "rust_target": null,
+    "rust_target_by_platform": null,
     "rustc_version": null
   },
   "artifacts": {
