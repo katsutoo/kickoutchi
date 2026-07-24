@@ -221,6 +221,20 @@ class ProcessAndEvidenceTests(unittest.TestCase):
         self.assertEqual(report["candidate"]["failures"], 1)
         self.assertEqual(report["verdict"], "FAIL")
 
+    def test_smoke_summary_does_not_treat_four_samples_as_a_relative_gate(self) -> None:
+        plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
+        plan["workloads"] = [workload(plan, "list_typical")]
+        manifest = {"skipped_workloads":[],"not_applicable_workloads":[],"artifacts":{"baseline":{"bytes":10},"candidate":{"bytes":10}},"gate_eligible":False,"mode":"smoke","plan_sha256":"p","raw_sha256":"r"}
+        rows = [
+            self.observation(workload="list_typical", artifact_role="baseline", executor_role="baseline", executor_sha256="b" * 64, lane="calibration", lane_side="left", latency_ns=100),
+            self.observation(workload="list_typical", artifact_role="baseline", executor_role="baseline", executor_sha256="b" * 64, lane="calibration", lane_side="right", latency_ns=100),
+            self.observation(workload="list_typical", artifact_role="baseline", executor_role="baseline", executor_sha256="b" * 64, lane="comparison", lane_side="left", latency_ns=100),
+            self.observation(workload="list_typical", lane="comparison", lane_side="right", latency_ns=300),
+        ]
+        report = summarize(plan, manifest, rows)
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        self.assertNotEqual(report["workloads"][0]["verdict"], "FAIL")
+
     def test_every_row_artifact_identity_is_checked_by_driver(self) -> None:
         plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
         manifest = {"artifacts":{"baseline":{"sha256":"b" * 64,"bytes":10},"candidate":{"sha256":"c" * 64,"bytes":20}},

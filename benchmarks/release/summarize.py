@@ -327,7 +327,10 @@ def summarize(plan: dict[str, Any], manifest: dict[str, Any], rows: list[dict[st
         else:
             baseline = None
             candidate = distribution([row for row in selected if row["lane"] == "calibration"], polls)
-        verdict, reasons, deltas = classify(workload["budgets"], baseline, candidate, noise, workload["calibration"])
+        classification_budgets = workload["budgets"]
+        if not manifest["gate_eligible"]:
+            classification_budgets = dict(workload["budgets"], relative_delta_percent_max={})
+        verdict, reasons, deltas = classify(classification_budgets, baseline, candidate, noise, workload["calibration"])
         report = {"name":workload["name"],"scenario":workload["scenario"],"comparison_supported":baseline is not None,"verdict":verdict,"reasons":reasons,
                   "executor_role":"source_helper" if workload["driver"] in {"diff_helper", "watch_fixture"} else "release_artifact","calibration":{"left":calibration_left,"right":calibration_right,"metric_absolute_delta_percent":noise},"candidate":candidate,"budgets":workload["budgets"],"deltas_percent":deltas}
         if baseline is not None:

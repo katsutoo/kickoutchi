@@ -499,9 +499,12 @@ jobs:
           )
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             parent_netns="$(readlink /proc/self/ns/net)"
+            runner_home="$HOME"
             sudo --preserve-env=PATH,RUSTUP_TOOLCHAIN unshare --net -- \
               bash -c 'ulimit -n 8192 && ip link set lo up && exec "$@"' bash \
-              env KICKOUTCHI_PARENT_NETNS="$parent_netns" "${controller[@]}"
+              env KICKOUTCHI_PARENT_NETNS="$parent_netns" \
+              RUSTUP_HOME="$runner_home/.rustup" CARGO_HOME="$runner_home/.cargo" \
+              "${controller[@]}"
           else
             "${controller[@]}"
           fi
