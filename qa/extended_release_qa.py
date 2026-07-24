@@ -398,16 +398,37 @@ class Session:
         replacement = FixedListener("tcp", "127.0.0.1", port); self.owned_sockets.append(replacement)
         controlled.wait_for_event("bind", self.timeout)
         replacement.close(); self.owned_sockets.remove(replacement)
-        replacement = FixedListener("tcp", "127.0.0.1", port); self.owned_sockets.append(replacement)
-        controlled.wait_for_event("replacement", self.timeout)
-        replacement.close(); self.owned_sockets.remove(replacement)
+        replacement_process = None
+        replacement_limitation = None
+        if platform.system() == "Linux":
+            transient = FixedListener("tcp", "127.0.0.1", port)
+            transient.close()
+            replacement_process = self._start_fixed_listener_process("tcp", "127.0.0.1", port)
+        else:
+            replacement = FixedListener("tcp", "127.0.0.1", port); self.owned_sockets.append(replacement)
+        try:
+            controlled.wait_for_event("replacement", self.timeout)
+        except release_qa.ProductFailure:
+            if platform.system() != "Windows":
+                raise
+            snapshot = self.command(["list", "--snapshot-json"])
+            snapshot_value = _result_json(snapshot, {0})
+            _expect(snapshot_value.get("owner_completeness") == "partial", "Windows suppressed replacement without reporting partial ownership")
+            replacement_limitation = {"reason": "incomplete_global_ownership_disables_replacement", "snapshot": snapshot}
+        finally:
+            if replacement_process is not None:
+                release_qa._terminate_process(replacement_process)
+                self.owned_processes.remove(replacement_process)
+            for owned in list(self.owned_sockets):
+                owned.close(); self.owned_sockets.remove(owned)
         controlled.interrupt()
         result = controlled.finish(self.timeout)
         self.controlled_commands.remove(controlled)
         release_qa._expect_exit(result, {0})
         records = release_qa.parse_ndjson(result["stdout"])
         events = [record.get("event") for record in records]
-        for expected in ("baseline", "release", "bind", "replacement"):
+        expected_events = ("baseline", "release", "bind") if replacement_limitation else ("baseline", "release", "bind", "replacement")
+        for expected in expected_events:
             _expect(expected in events, f"watch omitted {expected} event")
         duration = self.command(["watch", "--json", "--tcp", "--port", str(port), "--interval", "100ms", "--duration", "200ms"])
         release_qa._expect_exit(duration, {0})
@@ -426,7 +447,7 @@ class Session:
         _expect(len(samples) >= MEMORY_SAMPLES // 2, "could not collect a finite memory trend")
         split = max(1, len(samples) // 4)
         _expect(max(samples[-split:]) <= max(samples[:split]) + MEMORY_GROWTH_LIMIT_BYTES, "finite no-duration watch memory trend exceeded 8 MiB")
-        return {"lifecycle": result, "events": events, "duration": duration, "interrupted": interrupted, "rss_bytes": samples, "growth_limit_bytes": MEMORY_GROWTH_LIMIT_BYTES}
+        return {"lifecycle": result, "events": events, "replacement_limitation": replacement_limitation, "duration": duration, "interrupted": interrupted, "rss_bytes": samples, "growth_limit_bytes": MEMORY_GROWTH_LIMIT_BYTES}
 
     def _fault_capability(self) -> tuple[bool, str]:
         if platform.system() != "Linux":
