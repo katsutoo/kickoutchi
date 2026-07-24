@@ -395,7 +395,13 @@ jobs:
           persist-credentials: false
 
       - name: Test benchmark harness
-        run: python3 -m unittest -v benchmarks.release.test_release_benchmark
+        shell: bash
+        run: |
+          if [[ '${{ inputs.run_benchmarks }}' == 'true' && '${{ inputs.benchmark_smoke }}' == 'true' ]]; then
+            echo "full and smoke benchmark modes are mutually exclusive" >&2
+            exit 1
+          fi
+          python3 -m unittest -v benchmarks.release.test_release_benchmark
 
       - id: diff-helper
         name: Build exact-source diff helper
@@ -413,6 +419,9 @@ jobs:
           }
           echo "path=$(pwd)/$helper" >> "$GITHUB_OUTPUT"
           echo "sha256=$(sha256sum "$helper" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          for scenario in empty typical large maximum_same maximum_replacement snapshot_large snapshot_maximum watch_high_churn watch_transient_recovery watch_failure_exhaustion; do
+            "$helper" "$scenario" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["scenario"] == sys.argv[1]' "$scenario"
+          done
 
       - name: Download exact candidate archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -478,14 +487,23 @@ jobs:
           if [[ '${{ inputs.benchmark_smoke }}' == 'true' ]]; then
             mode+=(--smoke)
           fi
-          python3 benchmarks/release/controller.py \
-            --plan benchmarks/release/plan.json \
-            --baseline '${{ steps.prepare-unix.outputs.baseline || steps.prepare-windows.outputs.baseline }}' \
-            --candidate '${{ steps.prepare-unix.outputs.candidate || steps.prepare-windows.outputs.candidate }}' \
-            --diff-helper '${{ steps.diff-helper.outputs.path }}' \
-            --output release-raw.jsonl \
-            --manifest release-manifest.json \
+          controller=(
+            python3 benchmarks/release/controller.py
+            --plan benchmarks/release/plan.json
+            --baseline '${{ steps.prepare-unix.outputs.baseline || steps.prepare-windows.outputs.baseline }}'
+            --candidate '${{ steps.prepare-unix.outputs.candidate || steps.prepare-windows.outputs.candidate }}'
+            --diff-helper '${{ steps.diff-helper.outputs.path }}'
+            --output release-raw.jsonl
+            --manifest release-manifest.json
             "${mode[@]}"
+          )
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            parent_netns="$(readlink /proc/self/ns/net)"
+            sudo --preserve-env=PATH,RUSTUP_TOOLCHAIN unshare --net -- \
+              env KICKOUTCHI_PARENT_NETNS="$parent_netns" "${controller[@]}"
+          else
+            "${controller[@]}"
+          fi
           python3 benchmarks/release/summarize.py \
             --plan benchmarks/release/plan.json \
             --raw release-raw.jsonl \

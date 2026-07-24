@@ -68,7 +68,7 @@ BUDGET_METRICS = {
     "cpu_p50_ns", "peak_memory_bytes", "throughput_events_per_second",
     "throughput_rows_per_second", "poll_cpu_ns", "artifact_bytes",
 }
-IMPLEMENTED_DRIVERS = {"native_cli", "diff_helper"}
+IMPLEMENTED_DRIVERS = {"native_cli", "namespace_fixture", "diff_helper", "watch_fixture"}
 ABSOLUTE_MAX_METRICS = BUDGET_METRICS - {"throughput_events_per_second", "throughput_rows_per_second"}
 ABSOLUTE_MIN_METRICS = {"throughput_events_per_second", "throughput_rows_per_second"}
 
@@ -246,10 +246,11 @@ def _validate_workload(workload: Any, total_rows: int) -> int:
         raise EvidenceError(f"{name}.expected.statuses is invalid")
     if expected["stderr_empty"] is not True:
         raise EvidenceError(f"{name} must require empty stderr on valid output")
-    if item["kind"] in {"list", "startup"} and (expected["rows"] is not None or expected["events"] != 0 or expected["statuses"] != [0]):
+    list_rows = 0 if item["driver"] == "namespace_fixture" else None
+    if item["kind"] in {"list", "startup"} and (expected["rows"] != list_rows or expected["events"] != 0 or expected["statuses"] != [0]):
         raise EvidenceError(f"{name} expected list result is invalid")
     if item["kind"] == "snapshot":
-        required_rows = socket_count if item["driver"] == "watch_fixture" else None
+        required_rows = socket_count if item["driver"] in {"namespace_fixture", "watch_fixture"} else None
         if expected["rows"] != required_rows or expected["events"] != 0 or expected["statuses"] != [0]:
             raise EvidenceError(f"{name} expected snapshot result is invalid")
     if item["kind"] == "diff" and (expected["rows"] != socket_count or expected["events"] != item["fixture"]["churn_events"] or expected["statuses"] != [0]):
@@ -257,8 +258,8 @@ def _validate_workload(workload: Any, total_rows: int) -> int:
     if item["kind"] == "why" and (expected["rows"] != 8 or expected["events"] != 0 or expected["statuses"] != [0, 3]):
         raise EvidenceError(f"{name} expected Why matrix is invalid")
     if item["kind"] == "watch":
-        watch_events = {"watch_stable":1, "watch_high_churn":2048, "watch_transient_recovery":2, "watch_failure_exhaustion":4}[name]
-        watch_statuses = [1] if name == "watch_failure_exhaustion" else [0]
+        watch_events = {"watch_stable":1, "watch_high_churn":3072, "watch_transient_recovery":2, "watch_failure_exhaustion":4}[name]
+        watch_statuses = [0]
         if expected["rows"] != 0 or expected["events"] != watch_events or expected["statuses"] != watch_statuses:
             raise EvidenceError(f"{name} expected watch result is invalid")
     _validate_calibration(item["calibration"], comparison, f"{name}.calibration")

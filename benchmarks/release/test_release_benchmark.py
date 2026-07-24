@@ -42,17 +42,17 @@ class PlanValidationTests(unittest.TestCase):
         changed = copy.deepcopy(self.plan)
         changed["gate_ready"] = True
         changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target_by_platform":{"linux-x86_64":"x86_64-unknown-linux-gnu"},"rustc_version":"rustc test"}
+        changed["workloads"][0]["implemented"] = False
         with self.assertRaisesRegex(EvidenceError, "unimplemented"):
             validate_plan(changed)
 
-    def test_declared_implemented_flag_cannot_bypass_an_unavailable_driver(self) -> None:
+    def test_gate_ready_accepts_only_the_integrated_driver_matrix(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["gate_ready"] = True
         changed["protocol_identity"] = {"harness_commit":"a" * 40,"harness_tree_sha256":"b" * 64,"included_product_sources_sha256":"f" * 64,"diff_helper_source_sha256":"c" * 64,"diff_helper_lock_sha256":"d" * 64,"diff_helper_sha256_by_platform":{"linux-x86_64":"e" * 64},"rust_target_by_platform":{"linux-x86_64":"x86_64-unknown-linux-gnu"},"rustc_version":"rustc test"}
         for item in changed["workloads"]:
             item["implemented"] = True
-        with self.assertRaisesRegex(EvidenceError, "unavailable workload driver"):
-            validate_plan(changed)
+        validate_plan(changed)
 
     def test_unknown_plan_and_workload_keys_are_rejected(self) -> None:
         for changed, message in ((copy.deepcopy(self.plan), "plan keys"), (copy.deepcopy(self.plan), "workload keys")):
@@ -174,13 +174,31 @@ class OutputValidationTests(unittest.TestCase):
         result = self.result(b"{}"); result["stdout_bytes"] = 100
         self.assertEqual(validate_output(item, result, set())[3], "output_not_retained_for_validation")
 
+    def test_fixture_helper_requires_exact_scenario_counts_and_candidate_exit(self) -> None:
+        item = workload(self.plan, "watch_failure_exhaustion")
+        document = {"schema":"kickoutchi.release_fixture_helper","version":1,"scenario":"watch_failure_exhaustion","socket_count":1,"record_count":4,"change_event_count":0,"event_counts":{"baseline":1,"collection_gap":3},"collection_attempts":4,"serialized_bytes":100,"checksum":1,"operation_duration_ns":250,"candidate_exit_code":1,"assertions_passed":True}
+        validated = validate_output(item, self.result(json.dumps(document).encode()), set())
+        self.assertEqual(validated, (True, 0, 0, None, 250, None))
+        document["candidate_exit_code"] = 0
+        self.assertEqual(validate_output(item, self.result(json.dumps(document).encode()), set())[3], "invalid_fixture_helper_output")
+
+    def test_empty_namespace_requires_exact_zero_rows(self) -> None:
+        list_item = workload(self.plan, "list_empty")
+        self.assertTrue(validate_output(list_item, self.result(b"[]"), set())[0])
+        self.assertEqual(validate_output(list_item, self.result(b"[{}]"), set())[3], "invalid_list_contract")
+        snapshot_item = workload(self.plan, "snapshot_empty")
+        document = {"schema":"kickoutchi.snapshot","version":1,"capture":{},"scope":{},"completeness":"complete","owner_completeness":"complete","evidence_gaps":[],"omitted_evidence_gap_count":0,"sockets":[],"processes":[]}
+        self.assertTrue(validate_output(snapshot_item, self.result(json.dumps(document).encode()), set())[0])
+        document["sockets"] = [{"endpoint":{}}]
+        self.assertEqual(validate_output(snapshot_item, self.result(json.dumps(document).encode()), set())[3], "unexpected_row_count")
+
 
 class ProcessAndEvidenceTests(unittest.TestCase):
     @staticmethod
     def observation(**changes: object) -> dict:
         row = {"outcome":"valid","error":None,"status":0,"latency_ns":1_000,"operation_duration_ns":None,"scanned_count":None,
                "user_cpu_ns":100,"system_cpu_ns":100,"peak_memory_bytes":1000,"block":1,"row_count":10,"event_count":5,
-               "workload":"list_typical","artifact_role":"candidate","artifact_sha256":"c" * 64,"artifact_bytes":20}
+               "workload":"list_typical","artifact_role":"candidate","executor_role":"candidate","executor_sha256":"c" * 64,"executor_bytes":20}
         row.update(changes)
         return row
 
@@ -195,7 +213,7 @@ class ProcessAndEvidenceTests(unittest.TestCase):
     def test_candidate_only_summary_combines_calibration_sides_and_failures(self) -> None:
         plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
         plan["workloads"] = [workload(plan, "snapshot_typical")]
-        manifest = {"skipped_workloads":[],"artifacts":{"baseline":{"bytes":10},"candidate":{"bytes":20}},"gate_eligible":True,"mode":"final","plan_sha256":"p","raw_sha256":"r"}
+        manifest = {"skipped_workloads":[],"not_applicable_workloads":[],"artifacts":{"baseline":{"bytes":10},"candidate":{"bytes":20}},"gate_eligible":True,"mode":"final","plan_sha256":"p","raw_sha256":"r"}
         rows = [self.observation(workload="snapshot_typical", lane="calibration", lane_side="left", latency_ns=100),
                 self.observation(workload="snapshot_typical", lane="calibration", lane_side="right", latency_ns=200, outcome="error", error="bad")]
         report = summarize(plan, manifest, rows)["workloads"][0]
@@ -208,9 +226,9 @@ class ProcessAndEvidenceTests(unittest.TestCase):
         manifest = {"artifacts":{"baseline":{"sha256":"b" * 64,"bytes":10},"candidate":{"sha256":"c" * 64,"bytes":20}},
                     "diff_helper_sha256":"d" * 64,"diff_helper_bytes":30}
         native = self.observation()
-        helper = self.observation(workload="diff_typical", artifact_sha256="d" * 64, artifact_bytes=30)
+        helper = self.observation(workload="diff_typical", executor_role="source_helper", executor_sha256="d" * 64, executor_bytes=30)
         validate_row_artifacts(plan, manifest, [native, helper])
-        for changed in (dict(native, artifact_bytes=21), dict(helper, artifact_sha256="e" * 64)):
+        for changed in (dict(native, executor_bytes=21), dict(helper, executor_sha256="e" * 64), dict(helper, executor_role="candidate")):
             with self.subTest(row=changed["workload"]), self.assertRaisesRegex(EvidenceError, "artifact identity"):
                 validate_row_artifacts(plan, manifest, [changed])
 
@@ -228,9 +246,14 @@ class ProcessAndEvidenceTests(unittest.TestCase):
                     "source_commit":plan["artifacts"]["candidate"]["source_commit"],"harness_commit":None,"checkout_commit":"c" * 40,
                     "platform_key":platform_key,"environment":{"compiler":"x","target":"x","cpu":"x","cpu_count":1,"ram_bytes":1,"os":"x","kernel":"x","power":{},"thermal":{},"concurrent_load":None,"python":"x"},
                     "commands":{},"versions":{"baseline":"kickoutchi 1.2.0","candidate":"kickoutchi 1.3.0"},"diff_helper_sha256":None,"diff_helper_bytes":None,
+                    "fixture_scope":{"kind":"linux_network_namespace","method":"unshare","parent_identifier":"net:[1]","identifier":"net:[2]","initial_rows":{"tcp":0,"tcp6":0,"udp":0,"udp6":0}},"not_applicable_workloads":[],
                     "artifacts":{"baseline":{"sha256":plan["artifacts"]["baseline"]["sha256_by_platform"][platform_key],"bytes":1},"candidate":{"sha256":plan["artifacts"]["candidate"]["sha256_by_platform"][platform_key],"bytes":1}},
                     "row_count":0,"failure_count":0,"skipped_workloads":[item["name"] for item in plan["workloads"]],"notes":[]}
         validate_manifest(plan, manifest)
+        malformed_scope = copy.deepcopy(manifest)
+        malformed_scope["fixture_scope"]["identifier"] = "not-a-namespace"
+        with self.assertRaisesRegex(EvidenceError, "verified empty namespace"):
+            validate_manifest(plan, malformed_scope)
         for changed in ({key:value for key, value in manifest.items() if key != "checkout_commit"}, dict(manifest, surprise=True)):
             with self.subTest(keys=set(changed)), self.assertRaisesRegex(EvidenceError, "exact keys"):
                 validate_manifest(plan, changed)

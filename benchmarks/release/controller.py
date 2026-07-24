@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import stat
@@ -241,6 +242,21 @@ def validate_output(workload: dict[str, Any], result: dict[str, Any], expected_e
     if result["stdout_bytes"] != len(result["stdout"]):
         return False, 0, 0, "output_not_retained_for_validation", None, None
     try:
+        if workload["driver"] == "watch_fixture":
+            document = json.loads(result["stdout"])
+            keys = {"schema", "version", "scenario", "socket_count", "record_count", "change_event_count", "event_counts", "collection_attempts", "serialized_bytes", "checksum", "operation_duration_ns", "candidate_exit_code", "assertions_passed"}
+            if not isinstance(document, dict) or set(document) != keys:
+                return False, 0, 0, "invalid_fixture_helper_output", None, None
+            integer_fields = ("socket_count", "record_count", "change_event_count", "collection_attempts", "serialized_bytes", "checksum", "operation_duration_ns", "candidate_exit_code")
+            if any(not isinstance(document.get(field), int) or isinstance(document.get(field), bool) or document[field] < 0 for field in integer_fields):
+                return False, 0, 0, "invalid_fixture_helper_output", None, None
+            expected_exit = 1 if workload["name"] == "watch_failure_exhaustion" else 0
+            attempts = {"snapshot_large":0, "snapshot_maximum":0, "watch_high_churn":2, "watch_transient_recovery":3, "watch_failure_exhaustion":4}[workload["name"]]
+            event_counts = {"snapshot_large":{}, "snapshot_maximum":{}, "watch_high_churn":{"baseline":1024,"release":1024,"bind":1024}, "watch_transient_recovery":{"baseline":1,"collection_gap":1}, "watch_failure_exhaustion":{"baseline":1,"collection_gap":3}}[workload["name"]]
+            valid = document["schema"] == "kickoutchi.release_fixture_helper" and document["version"] == 1 and document["scenario"] == workload["command"][0] and document["socket_count"] == workload["fixture"]["socket_count"] and document["record_count"] == (expected["rows"] if workload["kind"] == "snapshot" else expected["events"]) and document["change_event_count"] == workload["fixture"]["churn_events"] and document["event_counts"] == event_counts and document["collection_attempts"] == attempts and document["serialized_bytes"] > 0 and document["checksum"] > 0 and 0 < document["operation_duration_ns"] <= 120_000_000_000 and document["candidate_exit_code"] == expected_exit and document["assertions_passed"] is True
+            rows = document["record_count"] if workload["kind"] == "snapshot" else 0
+            events = document["change_event_count"] if workload["kind"] == "watch" else 0
+            return (True, rows, events, None, document["operation_duration_ns"], None) if valid else (False, 0, 0, "invalid_fixture_helper_output", None, None)
         if workload["kind"] == "watch":
             documents = [json.loads(line) for line in result["stdout"].splitlines() if line]
             if len(documents) != expected["events"] or any(not isinstance(item, dict) or item.get("schema") != "kickoutchi.watch_event" or item.get("version") != 1 or item.get("sequence") != index for index, item in enumerate(documents)):
@@ -258,12 +274,16 @@ def validate_output(workload: dict[str, Any], result: dict[str, Any], expected_e
         if not isinstance(document, list) or any(not isinstance(row, dict) or set(row) != required or row.get("protocol") not in {"tcp", "udp"} or row.get("state") not in {"listen", "bound"} for row in document):
             return False, 0, 0, "invalid_list_contract", None, None
         observed = {(row["protocol"], row["local_addr"], row["local_port"]) for row in document}
+        if expected["rows"] is not None and len(document) != expected["rows"]:
+            return False, len(document), 0, "unexpected_row_count", None, None
         return (True, len(document), 0, None, None, None) if expected_endpoints <= observed else (False, len(document), 0, "helper_endpoints_missing", None, None)
     if workload["kind"] == "snapshot":
         keys = {"schema", "version", "capture", "scope", "completeness", "owner_completeness", "evidence_gaps", "omitted_evidence_gap_count", "sockets", "processes"}
         if not isinstance(document, dict) or set(document) != keys or document.get("schema") != "kickoutchi.snapshot" or document.get("version") != 1 or not isinstance(document.get("sockets"), list) or not isinstance(document.get("processes"), list) or not isinstance(document.get("evidence_gaps"), list) or not isinstance(document.get("omitted_evidence_gap_count"), int):
             return False, 0, 0, "invalid_snapshot_contract", None, None
         observed = {_endpoint(row.get("endpoint")) for row in document["sockets"] if isinstance(row, dict)}
+        if expected["rows"] is not None and len(document["sockets"]) != expected["rows"]:
+            return False, len(document["sockets"]), 0, "unexpected_row_count", None, None
         return (True, len(document["sockets"]), 0, None, None, None) if expected_endpoints <= observed else (False, len(document["sockets"]), 0, "snapshot_helper_endpoints_missing", None, None)
     if workload["kind"] == "why":
         results = document.get("results") if isinstance(document, dict) else None
@@ -305,6 +325,29 @@ def helper_sockets(total: int) -> tuple[list[socket.socket], set[tuple[str, str,
         for item in owned:
             item.close()
         raise EvidenceError(f"could not create controlled socket fixture: {error}") from error
+
+
+def verify_empty_linux_namespace() -> dict[str, Any]:
+    parent = os.environ.get("KICKOUTCHI_PARENT_NETNS")
+    try:
+        current = os.readlink("/proc/self/ns/net")
+    except OSError as error:
+        raise EvidenceError(f"could not identify the benchmark network namespace: {error}") from error
+    pattern = re.compile(r"net:\[[1-9][0-9]*\]")
+    if parent is None or pattern.fullmatch(parent) is None or pattern.fullmatch(current) is None or parent == current:
+        raise EvidenceError("benchmark process is not in a verified child network namespace")
+    tables: dict[str, int] = {}
+    for name in ("tcp", "tcp6", "udp", "udp6"):
+        path = Path("/proc/net") / name
+        try:
+            lines = [line for line in path.read_text(encoding="ascii").splitlines() if line.strip()]
+        except (OSError, UnicodeError) as error:
+            raise EvidenceError(f"could not verify empty namespace table {name}: {error}") from error
+        rows = max(len(lines) - 1, 0)
+        tables[name] = rows
+        if rows != 0:
+            raise EvidenceError(f"isolated network namespace {name} table is not empty")
+    return {"kind":"linux_network_namespace","method":"unshare","parent_identifier":parent,"identifier":current,"initial_rows":tables}
 
 
 def environment_metadata() -> dict[str, Any]:
@@ -387,8 +430,8 @@ def verify_protocol_identity(plan: dict[str, Any]) -> None:
     release_dir = Path(__file__).resolve().parent
     root = release_dir.parent.parent
     harness_sources = [release_dir / "common.py", release_dir / "controller.py", release_dir / "summarize.py"]
-    helper_sources = [release_dir / "diff_helper" / "Cargo.toml", release_dir / "diff_helper" / "src" / "main.rs"]
-    product_sources = [root / "src" / name for name in ("model.rs", "observation.rs", "protection.rs", "watch.rs")]
+    helper_sources = [release_dir / "diff_helper" / "Cargo.toml", release_dir / "diff_helper" / "src" / "main.rs", release_dir / "diff_helper" / "src" / "fixture_adapter.rs"]
+    product_sources = [root / "src" / name for name in ("cli/watch.rs", "display.rs", "labels.rs", "model.rs", "observation.rs", "protection.rs", "public_output.rs", "query.rs", "watch.rs")]
     lock_path = release_dir / "diff_helper" / "Cargo.lock"
     harness_hash = _tree_hash(harness_sources, root)
     helper_source_hash = _tree_hash(helper_sources, root)
@@ -475,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
             temp_raw = Path(evidence_name) / "raw.jsonl"
             commands: dict[str, list[str]] = {}
             skipped: list[str] = []
+            not_applicable: list[str] = []
+            fixture_scope: dict[str, Any] = {"kind":"native_host_stack","method":"none","parent_identifier":None,"identifier":None,"initial_rows":{}}
             row_count = failures = 0
             with temp_raw.open("xb") as raw:
                 for declared in plan["workloads"]:
@@ -484,8 +529,9 @@ def main(argv: list[str] | None = None) -> int:
                             continue
                         raise EvidenceError(f"unimplemented workload reached collection: {declared['name']}")
                     workload = smoke_workload(declared) if args.smoke else declared
-                    if workload["driver"] in {"namespace_fixture", "watch_fixture"}:
-                        raise EvidenceError(f"workload driver is not integrated: {workload['driver']}")
+                    if workload["driver"] == "namespace_fixture" and not sys.platform.startswith("linux"):
+                        not_applicable.append(workload["name"])
+                        continue
                     if workload["driver"] == "diff_helper" and helper is None:
                         if args.smoke:
                             skipped.append(workload["name"])
@@ -494,6 +540,8 @@ def main(argv: list[str] | None = None) -> int:
                     owned: list[socket.socket] = []
                     endpoints: set[tuple[str, str, int]] = set()
                     try:
+                        if workload["driver"] == "namespace_fixture":
+                            fixture_scope = verify_empty_linux_namespace()
                         if workload["driver"] == "native_cli":
                             owned, endpoints = helper_sockets(workload["fixture"]["socket_count"])
                         replacements: dict[str, int] = {}
@@ -506,10 +554,10 @@ def main(argv: list[str] | None = None) -> int:
                             replacements["{watch_port}"] = next(iter(endpoints))[2]
                         command = [str(replacements.get(value, value)) for value in workload["command"]]
                         commands[workload["name"]] = command
-                        executable = helper if workload["driver"] == "diff_helper" else candidate
+                        executable = helper if workload["driver"] in {"diff_helper", "watch_fixture"} else candidate
                         if executable is None:
                             raise EvidenceError(f"{workload['name']} has no executable driver")
-                        if workload["driver"] == "diff_helper" and helper_size is None:
+                        if workload["driver"] in {"diff_helper", "watch_fixture"} and helper_size is None:
                             raise EvidenceError("diff helper size is unavailable")
                         applicable = [("candidate", executable)] if workload["comparison"] == "candidate_only" else [("baseline", baseline), ("candidate", candidate)]
                         for role, binary in applicable:
@@ -534,8 +582,8 @@ def main(argv: list[str] | None = None) -> int:
                             key = (lane, role, side)
                             sample_counts[key] = sample_counts.get(key, 0) + 1
                             row = {"schema":"kickoutchi.release_observation","version":2,"plan_sha256":sha256_bytes(plan_bytes),"mode":"smoke" if args.smoke else "final","gate_eligible":not args.smoke,
-                                   "workload":workload["name"],"lane":lane,"artifact_role":role,"lane_side":side,"artifact_sha256":helper_hash if workload["driver"] == "diff_helper" else (baseline_hash if role == "baseline" else candidate_hash),
-                                   "artifact_bytes":helper_size if workload["driver"] == "diff_helper" else (baseline_size if role == "baseline" else candidate_size),"block":block,"pair":pair,"order":order,"sample":sample_counts[key],"command":command,
+                                   "workload":workload["name"],"lane":lane,"artifact_role":role,"lane_side":side,"executor_role":"source_helper" if workload["driver"] in {"diff_helper", "watch_fixture"} else role,"executor_sha256":helper_hash if workload["driver"] in {"diff_helper", "watch_fixture"} else (baseline_hash if role == "baseline" else candidate_hash),
+                                    "executor_bytes":helper_size if workload["driver"] in {"diff_helper", "watch_fixture"} else (baseline_size if role == "baseline" else candidate_size),"block":block,"pair":pair,"order":order,"sample":sample_counts[key],"command":command,
                                    "latency_ns":result["latency_ns"],"user_cpu_ns":result["user_cpu_ns"],"system_cpu_ns":result["system_cpu_ns"],"peak_memory_bytes":result["peak_memory_bytes"],
                                     "status":result["status"],"outcome":"valid" if valid else "error","error":error,"stdout_bytes":result["stdout_bytes"],"stderr_bytes":result["stderr_bytes"],
                                     "stdout_sha256":result["stdout_sha256"],"stderr_sha256":result["stderr_sha256"],"row_count":rows,"event_count":events,
@@ -573,6 +621,7 @@ def main(argv: list[str] | None = None) -> int:
                         "duration_ns":int((time.monotonic()-started_mono)*1e9),"source_commit":plan["artifacts"]["candidate"]["source_commit"],
                         "harness_commit":plan["protocol_identity"]["harness_commit"],"checkout_commit":_git_commit(),
                         "platform_key":platform_key,"environment":environment_metadata(),"commands":commands,"versions":versions,"diff_helper_sha256":helper_hash,"diff_helper_bytes":helper_size,
+                        "fixture_scope":fixture_scope,"not_applicable_workloads":not_applicable,
                         "artifacts":{"baseline":{"sha256":baseline_hash,"bytes":baseline_size},"candidate":{"sha256":candidate_hash,"bytes":candidate_size}},
                         "row_count":row_count,"failure_count":failures,"skipped_workloads":skipped,"notes":["Smoke mode is non-gate evidence and may skip unavailable integration drivers."] if args.smoke else []}
             temp_manifest = Path(evidence_name) / "manifest.json"

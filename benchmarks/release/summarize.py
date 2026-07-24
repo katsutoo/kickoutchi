@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     from benchmarks.release.common import MANIFEST_BYTES_MAX, MAX_TOTAL_ROWS, PLAN_BYTES_MAX, RAW_BYTES_MAX, EvidenceError, balanced_orders, canonical_json, nearest_rank, read_json, read_regular, require_absent, sha256_bytes, validate_plan
 
-ROW_KEYS = {"schema", "version", "plan_sha256", "mode", "gate_eligible", "workload", "lane", "artifact_role", "lane_side", "artifact_sha256", "artifact_bytes", "block", "pair", "order", "sample", "command", "latency_ns", "operation_duration_ns", "scanned_count", "user_cpu_ns", "system_cpu_ns", "peak_memory_bytes", "status", "outcome", "error", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "row_count", "event_count"}
-MANIFEST_KEYS = {"schema", "version", "plan_sha256", "raw_sha256", "mode", "gate_eligible", "complete", "started_utc", "duration_ns", "source_commit", "harness_commit", "checkout_commit", "platform_key", "environment", "commands", "versions", "diff_helper_sha256", "diff_helper_bytes", "artifacts", "row_count", "failure_count", "skipped_workloads", "notes"}
+ROW_KEYS = {"schema", "version", "plan_sha256", "mode", "gate_eligible", "workload", "lane", "artifact_role", "lane_side", "executor_role", "executor_sha256", "executor_bytes", "block", "pair", "order", "sample", "command", "latency_ns", "operation_duration_ns", "scanned_count", "user_cpu_ns", "system_cpu_ns", "peak_memory_bytes", "status", "outcome", "error", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256", "row_count", "event_count"}
+MANIFEST_KEYS = {"schema", "version", "plan_sha256", "raw_sha256", "mode", "gate_eligible", "complete", "started_utc", "duration_ns", "source_commit", "harness_commit", "checkout_commit", "platform_key", "environment", "commands", "versions", "diff_helper_sha256", "diff_helper_bytes", "fixture_scope", "not_applicable_workloads", "artifacts", "row_count", "failure_count", "skipped_workloads", "notes"}
 
 
 def delta_percent(baseline: int | float, candidate: int | float) -> float:
@@ -138,20 +139,20 @@ def parse_rows(raw: bytes, plan_hash: str) -> list[dict[str, Any]]:
             raise EvidenceError(f"invalid observation schema or keys at line {line_number}")
         if row["plan_sha256"] != plan_hash or row["mode"] not in {"final", "smoke"} or row["gate_eligible"] is not (row["mode"] == "final"):
             raise EvidenceError(f"observation identity mismatch at line {line_number}")
-        for key, maximum in (("latency_ns", 120_000_000_000), ("status", 255), ("stdout_bytes", 1 << 40), ("stderr_bytes", 1 << 40), ("row_count", 262_144), ("event_count", 524_288), ("artifact_bytes", 256 * 1024 * 1024)):
+        for key, maximum in (("latency_ns", 120_000_000_000), ("status", 255), ("stdout_bytes", 1 << 40), ("stderr_bytes", 1 << 40), ("row_count", 262_144), ("event_count", 524_288), ("executor_bytes", 256 * 1024 * 1024)):
             _integer(row[key], key, maximum)
         for key, maximum in (("block", 100), ("pair", 10_000), ("order", 2), ("sample", 500_000)):
             _integer(row[key], key, maximum, positive=True)
         for key in ("operation_duration_ns", "scanned_count", "user_cpu_ns", "system_cpu_ns", "peak_memory_bytes"):
             if row[key] is not None:
                 _integer(row[key], key, 1 << 50)
-        if row["outcome"] not in {"valid", "error"} or row["artifact_role"] not in {"baseline", "candidate"} or row["lane"] not in {"calibration", "comparison"} or row["lane_side"] not in {"left", "right"}:
+        if row["outcome"] not in {"valid", "error"} or row["artifact_role"] not in {"baseline", "candidate"} or row["executor_role"] not in {"baseline", "candidate", "source_helper"} or row["lane"] not in {"calibration", "comparison"} or row["lane_side"] not in {"left", "right"}:
             raise EvidenceError(f"invalid observation classification at line {line_number}")
         if row["error"] is not None and not isinstance(row["error"], str):
             raise EvidenceError(f"invalid observation error at line {line_number}")
         if not isinstance(row["command"], list) or not all(isinstance(value, str) for value in row["command"]):
             raise EvidenceError(f"invalid observation command at line {line_number}")
-        for key in ("artifact_sha256", "stdout_sha256", "stderr_sha256"):
+        for key in ("executor_sha256", "stdout_sha256", "stderr_sha256"):
             _sha(row[key], key)
         if row["outcome"] == "valid" and row["stderr_bytes"] != 0:
             raise EvidenceError(f"valid observation has stderr at line {line_number}")
@@ -185,6 +186,19 @@ def validate_manifest(plan: dict[str, Any], manifest: dict[str, Any]) -> None:
         raise EvidenceError("manifest versions are invalid")
     if not isinstance(manifest["skipped_workloads"], list) or (mode == "final" and manifest["skipped_workloads"]):
         raise EvidenceError("final manifest cannot skip workloads")
+    not_applicable = manifest["not_applicable_workloads"]
+    expected_not_applicable = ["list_empty", "snapshot_empty"] if manifest["platform_key"] == "windows-amd64" else []
+    if not_applicable != expected_not_applicable:
+        raise EvidenceError("manifest platform applicability differs from the protocol")
+    fixture_scope = manifest["fixture_scope"]
+    if not isinstance(fixture_scope, dict) or set(fixture_scope) != {"kind", "method", "parent_identifier", "identifier", "initial_rows"}:
+        raise EvidenceError("manifest fixture scope is invalid")
+    if manifest["platform_key"] == "linux-x86_64":
+        namespace_pattern = re.compile(r"net:\[[1-9][0-9]*\]")
+        if fixture_scope["kind"] != "linux_network_namespace" or fixture_scope["method"] != "unshare" or not isinstance(fixture_scope["parent_identifier"], str) or not isinstance(fixture_scope["identifier"], str) or namespace_pattern.fullmatch(fixture_scope["parent_identifier"]) is None or namespace_pattern.fullmatch(fixture_scope["identifier"]) is None or fixture_scope["parent_identifier"] == fixture_scope["identifier"] or fixture_scope["initial_rows"] != {"tcp":0,"tcp6":0,"udp":0,"udp6":0}:
+            raise EvidenceError("Linux fixture scope is not a verified empty namespace")
+    elif fixture_scope != {"kind":"native_host_stack","method":"none","parent_identifier":None,"identifier":None,"initial_rows":{}}:
+        raise EvidenceError("non-Linux fixture scope is invalid")
     environment = manifest["environment"]
     required_environment = {"compiler", "target", "cpu", "cpu_count", "ram_bytes", "os", "kernel", "power", "thermal", "concurrent_load", "python"}
     if not isinstance(environment, dict) or set(environment) != required_environment:
@@ -210,7 +224,7 @@ def validate_manifest(plan: dict[str, Any], manifest: dict[str, Any]) -> None:
     if not isinstance(commands, dict):
         raise EvidenceError("manifest commands are invalid")
     for workload in plan["workloads"]:
-        if workload["name"] in manifest["skipped_workloads"]:
+        if workload["name"] in manifest["skipped_workloads"] or workload["name"] in not_applicable:
             continue
         command = commands.get(workload["name"])
         if not isinstance(command, list) or len(command) != len(workload["command"]):
@@ -226,7 +240,7 @@ def validate_manifest(plan: dict[str, Any], manifest: dict[str, Any]) -> None:
 def validate_order(plan: dict[str, Any], manifest: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     cursor = 0
     counts: dict[tuple[str, str, str, str], int] = {}
-    skipped = set(manifest["skipped_workloads"])
+    skipped = set(manifest["skipped_workloads"]) | set(manifest["not_applicable_workloads"])
     for declared in plan["workloads"]:
         if declared["name"] in skipped:
             continue
@@ -258,9 +272,13 @@ def validate_order(plan: dict[str, Any], manifest: dict[str, Any], rows: list[di
                     counts[key] = counts.get(key, 0) + 1
                     if row["sample"] != counts[key] or row["command"] != manifest["commands"][workload["name"]]:
                         raise EvidenceError(f"sample sequence or command mismatch at row {cursor + 1}")
-                    if workload["driver"] == "diff_helper":
-                        if row["outcome"] == "valid" and (row["operation_duration_ns"] is None or row["scanned_count"] != workload["fixture"]["socket_count"] * 2):
-                            raise EvidenceError(f"diff operation metrics are invalid at row {cursor + 1}")
+                    if workload["driver"] in {"diff_helper", "watch_fixture"}:
+                        if row["outcome"] == "valid" and row["operation_duration_ns"] is None:
+                            raise EvidenceError(f"helper operation metrics are invalid at row {cursor + 1}")
+                        if workload["driver"] == "diff_helper" and row["outcome"] == "valid" and row["scanned_count"] != workload["fixture"]["socket_count"] * 2:
+                            raise EvidenceError(f"diff scan metrics are invalid at row {cursor + 1}")
+                        if workload["driver"] == "watch_fixture" and row["scanned_count"] is not None:
+                            raise EvidenceError(f"fixture scan metrics are invalid at row {cursor + 1}")
                     elif row["operation_duration_ns"] is not None or row["scanned_count"] is not None:
                         raise EvidenceError(f"non-diff operation metrics are present at row {cursor + 1}")
                     cursor += 1
@@ -274,12 +292,14 @@ def validate_row_artifacts(plan: dict[str, Any], manifest: dict[str, Any], rows:
         driver = workload_drivers.get(row["workload"])
         if driver is None:
             raise EvidenceError(f"unknown observation workload at row {index}")
-        if driver == "diff_helper":
+        if driver in {"diff_helper", "watch_fixture"}:
             expected_hash, expected_bytes = manifest["diff_helper_sha256"], manifest["diff_helper_bytes"]
+            expected_role = "source_helper"
         else:
             identity = manifest["artifacts"][row["artifact_role"]]
             expected_hash, expected_bytes = identity["sha256"], identity["bytes"]
-        if row["artifact_sha256"] != expected_hash or row["artifact_bytes"] != expected_bytes:
+            expected_role = row["artifact_role"]
+        if row["executor_role"] != expected_role or row["executor_sha256"] != expected_hash or row["executor_bytes"] != expected_bytes:
             raise EvidenceError(f"observation artifact identity mismatch at row {index}")
 
 
@@ -287,13 +307,17 @@ def summarize(plan: dict[str, Any], manifest: dict[str, Any], rows: list[dict[st
     reports = []
     overall = "PASS"
     skipped = set(manifest["skipped_workloads"])
+    not_applicable = set(manifest["not_applicable_workloads"])
     for workload in plan["workloads"]:
+        if workload["name"] in not_applicable:
+            reports.append({"name":workload["name"],"verdict":"NOT_APPLICABLE","reasons":["no verified empty Windows network compartment"]})
+            continue
         if workload["name"] in skipped:
             reports.append({"name":workload["name"],"verdict":"INCONCLUSIVE","reasons":["workload unavailable in smoke mode"]})
             overall = "INCONCLUSIVE"
             continue
         selected = [row for row in rows if row["workload"] == workload["name"]]
-        polls = len(workload["fixture"]["failure_pattern"]) or (5 if workload["kind"] == "watch" else None)
+        polls = {"watch_stable":5,"watch_high_churn":2,"watch_transient_recovery":3,"watch_failure_exhaustion":4}.get(workload["name"])
         calibration_left = distribution([row for row in selected if row["lane"] == "calibration" and row["lane_side"] == "left"], polls)
         calibration_right = distribution([row for row in selected if row["lane"] == "calibration" and row["lane_side"] == "right"], polls)
         noise = metric_noise(calibration_left, calibration_right, workload["calibration"]["metric_noise_limit_percent"])
@@ -305,7 +329,7 @@ def summarize(plan: dict[str, Any], manifest: dict[str, Any], rows: list[dict[st
             candidate = distribution([row for row in selected if row["lane"] == "calibration"], polls)
         verdict, reasons, deltas = classify(workload["budgets"], baseline, candidate, noise, workload["calibration"])
         report = {"name":workload["name"],"scenario":workload["scenario"],"comparison_supported":baseline is not None,"verdict":verdict,"reasons":reasons,
-                  "calibration":{"left":calibration_left,"right":calibration_right,"metric_absolute_delta_percent":noise},"candidate":candidate,"budgets":workload["budgets"],"deltas_percent":deltas}
+                  "executor_role":"source_helper" if workload["driver"] in {"diff_helper", "watch_fixture"} else "release_artifact","calibration":{"left":calibration_left,"right":calibration_right,"metric_absolute_delta_percent":noise},"candidate":candidate,"budgets":workload["budgets"],"deltas_percent":deltas}
         if baseline is not None:
             report["baseline"] = baseline
         reports.append(report)
