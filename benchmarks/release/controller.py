@@ -228,7 +228,7 @@ def _endpoint(document: Any) -> tuple[str, str, int] | None:
     return (protocol, address, port) if protocol in {"tcp", "udp"} and isinstance(address, str) and isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535 else None
 
 
-def validate_output(workload: dict[str, Any], result: dict[str, Any], expected_endpoints: set[tuple[str, str, int]]) -> tuple[bool, int, int, str | None, int | None, int | None]:
+def validate_output(workload: dict[str, Any], result: dict[str, Any], expected_endpoints: set[tuple[str, str, int]], artifact_role: str = "candidate") -> tuple[bool, int, int, str | None, int | None, int | None]:
     expected = workload["expected"]
     if result["stream_exceeded"]:
         return False, 0, 0, "stream_bound_exceeded", None, None
@@ -253,6 +253,8 @@ def validate_output(workload: dict[str, Any], result: dict[str, Any], expected_e
         return False, 0, 0, f"invalid_json:{error}", None, None
     if workload["kind"] in {"list", "startup"}:
         required = {"protocol", "local_addr", "local_port", "state", "pid", "process_name", "executable_path", "command_line", "parent_pid", "parent_process_name", "child_pids", "protected", "platform", "permission", "label"}
+        if artifact_role == "baseline":
+            required.remove("label")
         if not isinstance(document, list) or any(not isinstance(row, dict) or set(row) != required or row.get("protocol") not in {"tcp", "udp"} or row.get("state") not in {"listen", "bound"} for row in document):
             return False, 0, 0, "invalid_list_contract", None, None
         observed = {(row["protocol"], row["local_addr"], row["local_port"]) for row in document}
@@ -506,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
                         applicable = [("candidate", executable)] if workload["comparison"] == "candidate_only" else [("baseline", baseline), ("candidate", candidate)]
                         for role, binary in applicable:
                             preflight = invoke(binary, command, base_environment, bounds["child_timeout_seconds"], bounds["retained_output_bytes_max"], bounds["stream_bytes_max"])
-                            valid, _, _, error, _, _ = validate_output(workload, preflight, endpoints)
+                            valid, _, _, error, _, _ = validate_output(workload, preflight, endpoints, role)
                             if not valid:
                                 raise EvidenceError(f"{workload['name']} {role} preflight failed: {error}")
                         sample_counts: dict[tuple[str, str, str], int] = {}
@@ -522,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
                             finally:
                                 if cold_dir:
                                     cold_dir.cleanup()
-                            valid, rows, events, error, operation_duration_ns, scanned_count = validate_output(workload, result, endpoints)
+                            valid, rows, events, error, operation_duration_ns, scanned_count = validate_output(workload, result, endpoints, role)
                             key = (lane, role, side)
                             sample_counts[key] = sample_counts.get(key, 0) + 1
                             row = {"schema":"kickoutchi.release_observation","version":2,"plan_sha256":sha256_bytes(plan_bytes),"mode":"smoke" if args.smoke else "final","gate_eligible":not args.smoke,
@@ -540,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                             for role, binary in applicable:
                                 for _ in range(sampling["warmups"]):
                                     warmup = invoke(binary, command, base_environment, bounds["child_timeout_seconds"], bounds["retained_output_bytes_max"], bounds["stream_bytes_max"])
-                                    if not validate_output(workload, warmup, endpoints)[0]:
+                                    if not validate_output(workload, warmup, endpoints, role)[0]:
                                         raise EvidenceError(f"{workload['name']} warmup failed")
                             pair_count = sampling["samples_per_block"] if workload["comparison"] == "baseline_candidate" else sampling["samples_per_block"] // 2
                             orders = balanced_orders(plan["ordering_seed"], workload["name"], block, pair_count)

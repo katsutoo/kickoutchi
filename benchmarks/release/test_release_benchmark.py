@@ -143,6 +143,13 @@ class OutputValidationTests(unittest.TestCase):
         row["unknown"] = 1
         self.assertEqual(validate_output(item, self.result(json.dumps([row]).encode()), set())[3], "invalid_list_contract")
 
+    def test_list_baseline_accepts_only_the_pre_label_contract(self) -> None:
+        item = workload(self.plan, "list_typical")
+        row = {"protocol":"tcp","local_addr":"127.0.0.1","local_port":32001,"state":"listen","pid":1,"process_name":"p","executable_path":None,"command_line":None,"parent_pid":None,"parent_process_name":None,"child_pids":[],"protected":False,"platform":"linux","permission":"full"}
+        result = self.result(json.dumps([row]).encode())
+        self.assertTrue(validate_output(item, result, {("tcp","127.0.0.1",32001)}, "baseline")[0])
+        self.assertEqual(validate_output(item, result, set(), "candidate")[3], "invalid_list_contract")
+
     def test_success_with_stderr_is_rejected(self) -> None:
         item = workload(self.plan, "list_empty")
         self.assertEqual(validate_output(item, self.result(b"[]", stderr=b"warning"), set())[3], "nonempty_stderr")
