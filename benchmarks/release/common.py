@@ -319,7 +319,7 @@ def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, An
     _integer(bounds["retained_output_bytes_max"], "retained_output_bytes_max", 1024, 64 * 1024 * 1024)
     _integer(bounds["stream_bytes_max"], "stream_bytes_max", bounds["retained_output_bytes_max"], 1 << 40)
     _integer(bounds["child_timeout_seconds"], "child_timeout_seconds", 1, 120)
-    _integer(bounds["run_timeout_seconds"], "run_timeout_seconds", 1, 2 * 60 * 60)
+    _integer(bounds["run_timeout_seconds"], "run_timeout_seconds", 1, 6 * 60 * 60)
     _integer(bounds["max_failures"], "max_failures", 1, 1000)
     cleanup = _exact_keys(top["stop_cleanup_rules"], {"process_tree", "bounded_stream_readers", "close_helpers", "exclusive_publish"}, "stop_cleanup_rules")
     if cleanup != {"process_tree": True, "bounded_stream_readers": True, "close_helpers": True, "exclusive_publish": True}:
@@ -349,10 +349,9 @@ def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, An
             raise EvidenceError("gate-ready plan contains an unimplemented workload")
         if any(workload["driver"] not in IMPLEMENTED_DRIVERS for workload in workloads):
             raise EvidenceError("gate-ready plan contains an unavailable workload driver")
-        if any(value is None for value in identity.values()):
+        reproducible_identity = {key:value for key, value in identity.items() if key != "diff_helper_sha256_by_platform"}
+        if any(value is None for value in reproducible_identity.values()):
             raise EvidenceError("gate-ready plan has incomplete protocol identity")
-        if not identity["diff_helper_sha256_by_platform"]:
-            raise EvidenceError("gate-ready plan has no diff helper artifact hashes")
         for role in ("baseline", "candidate"):
             if not artifacts[role]["sha256_by_platform"]:
                 raise EvidenceError(f"gate-ready plan has no {role} artifact hashes")

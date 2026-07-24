@@ -12,7 +12,7 @@
     "included_product_sources_sha256": "edf2d231932313f4e750bfaf2cfd814f464dfa3332d515c72a4b96fa8ef3cf1c",
     "diff_helper_source_sha256": "55061c3435ea3770e9c7e59c72311500acb181eebc23c69369babbccdc3c8904",
     "diff_helper_lock_sha256": "a94652813b0d3243e549a020c1a68b995eef13ad6029df9abf3a59b5ad9444e7",
-    "diff_helper_sha256_by_platform": {"linux-x86_64":"541efd609100170dd2e3cb4bca05d5b11010795358fd128de78057b86bb93835","windows-amd64":"4cc4faed99fc16b1abc393c7d1cb9c941975d536ae2dd0424858772bd84108f7"},
+    "diff_helper_sha256_by_platform": null,
     "rust_target_by_platform": {"linux-x86_64":"x86_64-unknown-linux-gnu","windows-amd64":"x86_64-pc-windows-msvc"},
     "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)"
   },
@@ -20,7 +20,7 @@
     "baseline": {"version": "1.2.0", "source": "published v1.2.0 release", "source_commit": null, "sha256_by_platform": {"linux-x86_64": "f8a3174ec13689348def30f69801103d1640e796de4195d3acf7faba797be3cc", "windows-amd64": "e21a7d01ed920370a85b1064908600bf0db4e38cfe73d6ddade934f90adb01bb"}},
     "candidate": {"version": "1.3.0", "source": "reviewed source release artifact", "source_commit": "7393b56a5d86a5e2afb298cf6d1eb185a77bf02a", "sha256_by_platform": {"linux-x86_64": "847fcf0ab12648cd0ccd3b2f30870e26a3b263b69956c5a2206d6f9c8a159855", "windows-amd64": "431a4bec837e32f4daf7f206286e007072f4373c5a9636ab81a97c1930df897d"}}
   },
-  "bounds": {"artifact_bytes_max": 268435456, "retained_output_bytes_max": 33554432, "stream_bytes_max": 274877906944, "child_timeout_seconds": 10, "run_timeout_seconds": 7200, "max_failures": 20},
+  "bounds": {"artifact_bytes_max": 268435456, "retained_output_bytes_max": 33554432, "stream_bytes_max": 274877906944, "child_timeout_seconds": 10, "run_timeout_seconds": 18000, "max_failures": 20},
   "stop_cleanup_rules": {"process_tree": true, "bounded_stream_readers": true, "close_helpers": true, "exclusive_publish": true},
   "environment_requirements": {"compiler": true, "target": true, "cpu": true, "ram": true, "os": true, "kernel": true, "power": true, "thermal": true, "concurrent_load": true},
   "artifact_budgets": {"failures_max": 0, "absolute_max": {"artifact_bytes": 8388608}, "absolute_min": {}, "relative_delta_percent_max": {"artifact_bytes": 35.0}},

@@ -37,6 +37,11 @@ class PlanValidationTests(unittest.TestCase):
     def test_gate_collection_accepts_the_frozen_plan(self) -> None:
         validate_plan(self.plan)
 
+    def test_gate_identity_uses_reproducible_helper_inputs(self) -> None:
+        changed = copy.deepcopy(self.plan)
+        changed["protocol_identity"]["diff_helper_sha256_by_platform"] = None
+        validate_plan(changed)
+
     def test_gate_ready_refuses_any_unimplemented_workload(self) -> None:
         changed = copy.deepcopy(self.plan)
         changed["gate_ready"] = True
@@ -261,6 +266,20 @@ class ProcessAndEvidenceTests(unittest.TestCase):
         self.assertIn('"checkout_commit":_git_commit()', source)
         self.assertIn('f"safe.directory={base}"', source)
         self.assertLess(source.index("started_utc ="), source.index("snapshot_executable(args.baseline"))
+
+    def test_final_manifest_requires_recorded_helper_artifact(self) -> None:
+        plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
+        platform_key = "linux-x86_64"
+        manifest = {"schema":"kickoutchi.release_benchmark_manifest","version":2,"plan_sha256":"a" * 64,"raw_sha256":"b" * 64,
+                    "mode":"final","gate_eligible":True,"complete":True,"started_utc":"2026-07-24T12:00:00+00:00","duration_ns":1,
+                    "source_commit":plan["artifacts"]["candidate"]["source_commit"],"harness_commit":plan["protocol_identity"]["harness_commit"],"checkout_commit":"c" * 40,
+                    "platform_key":platform_key,"environment":{"compiler":"x","target":"x","cpu":"x","cpu_count":1,"ram_bytes":1,"os":"x","kernel":"x","power":{},"thermal":{},"concurrent_load":None,"python":"x"},
+                    "commands":{},"versions":{"baseline":"kickoutchi 1.2.0","candidate":"kickoutchi 1.3.0"},"diff_helper_sha256":None,"diff_helper_bytes":None,
+                    "fixture_scope":{"kind":"linux_network_namespace","method":"unshare","parent_identifier":"net:[1]","identifier":"net:[2]","initial_rows":{"tcp":0,"tcp6":0,"udp":0,"udp6":0}},"not_applicable_workloads":[],
+                    "artifacts":{"baseline":{"sha256":plan["artifacts"]["baseline"]["sha256_by_platform"][platform_key],"bytes":1},"candidate":{"sha256":plan["artifacts"]["candidate"]["sha256_by_platform"][platform_key],"bytes":1}},
+                    "row_count":0,"failure_count":0,"skipped_workloads":[],"notes":[]}
+        with self.assertRaisesRegex(EvidenceError, "exact-source diff helper"):
+            validate_manifest(plan, manifest)
 
     def test_tree_identity_canonicalizes_checkout_line_endings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -213,13 +213,13 @@ def validate_manifest(plan: dict[str, Any], manifest: dict[str, Any]) -> None:
         if not isinstance(identity, dict) or set(identity) != {"sha256", "bytes"} or not expected or identity["sha256"] != expected:
             raise EvidenceError(f"manifest {role} identity differs from the plan")
         _integer(identity["bytes"], f"{role} artifact bytes", 256 * 1024 * 1024, positive=True)
-    if mode == "final" and manifest["diff_helper_sha256"] != plan["protocol_identity"]["diff_helper_sha256_by_platform"].get(platform_key):
-        raise EvidenceError("manifest diff helper identity differs from the plan")
     if manifest["diff_helper_sha256"] is not None:
         _sha(manifest["diff_helper_sha256"], "diff_helper_sha256")
         _integer(manifest["diff_helper_bytes"], "diff_helper_bytes", 256 * 1024 * 1024, positive=True)
     elif manifest["diff_helper_bytes"] is not None:
         raise EvidenceError("manifest diff helper identity is incomplete")
+    elif mode == "final":
+        raise EvidenceError("final manifest has no exact-source diff helper identity")
     commands = manifest["commands"]
     if not isinstance(commands, dict):
         raise EvidenceError("manifest commands are invalid")

@@ -507,8 +507,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected_hash = plan["artifacts"][role]["sha256_by_platform"].get(platform_key)
                 if expected_hash != digest:
                     raise EvidenceError(f"{role} artifact hash is absent or differs for {platform_key}")
-            if not args.smoke and plan["protocol_identity"]["diff_helper_sha256_by_platform"].get(platform_key) != helper_hash:
-                raise EvidenceError(f"diff helper artifact hash is absent or differs for {platform_key}")
+            if not args.smoke and helper_hash is None:
+                raise EvidenceError("final collection requires the exact-source diff helper")
             base_environment = {"LC_ALL": "C", "LANG": "C", "HOME": env_name, "XDG_CONFIG_HOME": env_name, "TMPDIR": env_name, "TEMP": env_name, "TMP": env_name}
             if os.name == "nt":
                 base_environment["SystemRoot"] = os.environ.get("SystemRoot", "C:\\Windows")

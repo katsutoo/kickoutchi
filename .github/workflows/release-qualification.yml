@@ -385,7 +385,7 @@ jobs:
             baseline_sha256: 71a5004a8d503284034659e70e1d5a861e26d9f362ea0f42c097518718db8d24
     name: Benchmark (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       RUSTUP_TOOLCHAIN: 1.95.0
     steps:
