@@ -34,9 +34,8 @@ class PlanValidationTests(unittest.TestCase):
         self.assertTrue(all((item["sampling"]["blocks"], item["sampling"]["samples_per_block"]) == (10, 1000) for item in fast))
         self.assertTrue(all(item["sampling"]["blocks"] * item["sampling"]["samples_per_block"] == 2000 for item in long))
 
-    def test_gate_collection_refuses_the_unfrozen_plan(self) -> None:
-        with self.assertRaisesRegex(EvidenceError, "not ready"):
-            validate_plan(self.plan)
+    def test_gate_collection_accepts_the_frozen_plan(self) -> None:
+        validate_plan(self.plan)
 
     def test_gate_ready_refuses_any_unimplemented_workload(self) -> None:
         changed = copy.deepcopy(self.plan)
@@ -277,7 +276,7 @@ class ProcessAndEvidenceTests(unittest.TestCase):
         platform_key = "linux-x86_64"
         manifest = {"schema":"kickoutchi.release_benchmark_manifest","version":2,"plan_sha256":"a" * 64,"raw_sha256":"b" * 64,
                     "mode":"smoke","gate_eligible":False,"complete":True,"started_utc":"2026-07-24T12:00:00+00:00","duration_ns":1,
-                    "source_commit":plan["artifacts"]["candidate"]["source_commit"],"harness_commit":None,"checkout_commit":"c" * 40,
+                    "source_commit":plan["artifacts"]["candidate"]["source_commit"],"harness_commit":plan["protocol_identity"]["harness_commit"],"checkout_commit":"c" * 40,
                     "platform_key":platform_key,"environment":{"compiler":"x","target":"x","cpu":"x","cpu_count":1,"ram_bytes":1,"os":"x","kernel":"x","power":{},"thermal":{},"concurrent_load":None,"python":"x"},
                     "commands":{},"versions":{"baseline":"kickoutchi 1.2.0","candidate":"kickoutchi 1.3.0"},"diff_helper_sha256":None,"diff_helper_bytes":None,
                     "fixture_scope":{"kind":"linux_network_namespace","method":"unshare","parent_identifier":"net:[1]","identifier":"net:[2]","initial_rows":{"tcp":0,"tcp6":0,"udp":0,"udp6":0}},"not_applicable_workloads":[],
