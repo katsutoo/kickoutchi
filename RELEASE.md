@@ -30,9 +30,13 @@ to one exact SHA and does not carry forward to a later commit.
 
 | Candidate SHA | Native CI | Non-publishing Release | Notes |
 | --- | --- | --- | --- |
-| `7eeb7bf` | passed | passed | Superseded: post-audit cleanup landed after it. Requalify the new head. |
+| `7eeb7bf` | passed | passed | Superseded before publication. |
+| `931948d` | [30121177391](https://github.com/nuggocto/kickoutchi/actions/runs/30121177391) | [30121707294](https://github.com/nuggocto/kickoutchi/actions/runs/30121707294) | **Released as `v1.3.0`.** One macOS archive upload needed a re-run for a transient `ENOTFOUND`; build and archive validation passed first time. |
 
 ## Publish After Approval
+
+Tag the qualified SHA explicitly (`git tag vX.Y.Z <sha>`), never `HEAD`. Anything
+committed after qualification moves `HEAD` off the commit that was verified.
 
 1. Tag the approved commit as `v1.3.0` and push only that tag. The tag-triggered
    Release workflow must repeat same-commit verification before publication.
@@ -74,3 +78,26 @@ documentation must not claim otherwise.
 Order matters for public claims: publish every package channel before the
 website advertises it. The site is the surface that promises availability, so it
 is deployed last.
+
+## 1.3.0 Status
+
+Released from `931948d` on 2026-07-24. Steps 1 through 7 above are complete and
+verified:
+
+| Channel | State | Verified |
+| --- | --- | --- |
+| GitHub Release `v1.3.0` | live, 22 assets | target commit, asset set, checksums against sidecars and `sha256.sum` |
+| Homebrew `nuggocto/homebrew-tap` | `1.3.0` | formula hashes byte-match independently downloaded archives |
+| Scoop `nuggocto/scoop-bucket` | `1.3.0` | Excavator run succeeded, manifest reports the version |
+| AUR `kickoutchi-bin` | `1.3.0-1` | rebuilt from a clean public clone; binary reports `1.3.0` |
+| AUR `kickoutchi` | `1.3.0-1` | compiled from the release source archive; binary reports `1.3.0` |
+
+Remaining before the release is fully closed:
+
+- Step 3 on macOS and Windows. Linux `x86_64` was verified end to end, including
+  checksum, both binary names, the exit-code contract, and a real port kill.
+  `aarch64` Linux was checksum and layout verified only. The two Darwin archives
+  and the Windows archive have not been executed by anyone.
+- `brew install` and `scoop install` smoke tests. Formula and manifest contents
+  were verified, but neither install has been run.
+- Step 8, the `../kickoutchi-front` update.

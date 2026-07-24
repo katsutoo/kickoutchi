@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The macOS release-profile watch journey no longer fails when the host gives a
+  partial observation for every attempt. That journey has two correct outcomes
+  and the host decides which one: process-first `libproc` collection sees a
+  partial machine-wide socket set whenever a protected process holds a socket,
+  and watch then refuses to publish a baseline it cannot vouch for. Both paths
+  are asserted — a complete observation must prove the baseline and release
+  contract, a partial one must prove exit code 1, the exact refusal message, and
+  zero emitted records — so the journey stops depending on which processes a
+  shared runner happens to be running.
+
 ## [1.3.0] - 2026-07-24
 
 ### Added
