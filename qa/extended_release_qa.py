@@ -400,9 +400,10 @@ class Session:
         replacement.close(); self.owned_sockets.remove(replacement)
         replacement_process = None
         replacement_limitation = None
-        if platform.system() == "Linux":
-            transient = FixedListener("tcp", "127.0.0.1", port)
-            transient.close()
+        if platform.system() in {"Linux", "Windows"}:
+            if platform.system() == "Linux":
+                transient = FixedListener("tcp", "127.0.0.1", port)
+                transient.close()
             replacement_process = self._start_fixed_listener_process("tcp", "127.0.0.1", port)
         else:
             replacement = FixedListener("tcp", "127.0.0.1", port); self.owned_sockets.append(replacement)
