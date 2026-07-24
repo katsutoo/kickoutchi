@@ -398,7 +398,7 @@ def _tree_hash(paths: list[Path], base: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths):
         relative = path.relative_to(base).as_posix().encode("utf-8")
-        contents = path.read_bytes()
+        contents = path.read_bytes().replace(b"\r\n", b"\n")
         digest.update(len(relative).to_bytes(4, "big")); digest.update(relative)
         digest.update(len(contents).to_bytes(8, "big")); digest.update(contents)
     return digest.hexdigest()
@@ -408,7 +408,7 @@ def _commit_tree_hash(commit: str, paths: list[Path], base: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths):
         relative = path.relative_to(base).as_posix()
-        result = subprocess.run(["git", "show", f"{commit}:{relative}"], cwd=base, capture_output=True, timeout=10, check=False)
+        result = subprocess.run(["git", "-c", f"safe.directory={base}", "show", f"{commit}:{relative}"], cwd=base, capture_output=True, timeout=10, check=False)
         if result.returncode:
             raise EvidenceError(f"could not read reviewed harness source {relative}")
         encoded = relative.encode("utf-8")
@@ -419,7 +419,7 @@ def _commit_tree_hash(commit: str, paths: list[Path], base: Path) -> str:
 
 def _commit_file_hash(commit: str, path: Path, base: Path) -> str:
     relative = path.relative_to(base).as_posix()
-    result = subprocess.run(["git", "show", f"{commit}:{relative}"], cwd=base, capture_output=True, timeout=10, check=False)
+    result = subprocess.run(["git", "-c", f"safe.directory={base}", "show", f"{commit}:{relative}"], cwd=base, capture_output=True, timeout=10, check=False)
     if result.returncode:
         raise EvidenceError(f"could not read reviewed harness source {relative}")
     return sha256_bytes(result.stdout)

@@ -3,18 +3,18 @@
   "version": 2,
   "immutable": true,
   "gate_mode": "final",
-  "gate_ready": true,
+  "gate_ready": false,
   "decision": "Fail absolute safety and correctness budgets first; classify practical regressions with metric-specific same-artifact calibration; otherwise withhold on excessive noise.",
   "ordering_seed": 731294887,
   "protocol_identity": {
-    "harness_commit": "7eb4375a037086e393660262b216bed992ca3124",
-    "harness_tree_sha256": "1bfc93e5716bbe84a637ed4d8d6c94779c767832bdf29ed62b0605de6b160b65",
-    "included_product_sources_sha256": "edf2d231932313f4e750bfaf2cfd814f464dfa3332d515c72a4b96fa8ef3cf1c",
-    "diff_helper_source_sha256": "55061c3435ea3770e9c7e59c72311500acb181eebc23c69369babbccdc3c8904",
-    "diff_helper_lock_sha256": "a94652813b0d3243e549a020c1a68b995eef13ad6029df9abf3a59b5ad9444e7",
-    "diff_helper_sha256_by_platform": {"linux-x86_64":"541efd609100170dd2e3cb4bca05d5b11010795358fd128de78057b86bb93835","windows-amd64":"4cc4faed99fc16b1abc393c7d1cb9c941975d536ae2dd0424858772bd84108f7"},
-    "rust_target_by_platform": {"linux-x86_64":"x86_64-unknown-linux-gnu","windows-amd64":"x86_64-pc-windows-msvc"},
-    "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14)"
+    "harness_commit": null,
+    "harness_tree_sha256": null,
+    "included_product_sources_sha256": null,
+    "diff_helper_source_sha256": null,
+    "diff_helper_lock_sha256": null,
+    "diff_helper_sha256_by_platform": null,
+    "rust_target_by_platform": null,
+    "rustc_version": null
   },
   "artifacts": {
     "baseline": {"version": "1.2.0", "source": "published v1.2.0 release", "source_commit": null, "sha256_by_platform": {"linux-x86_64": "f8a3174ec13689348def30f69801103d1640e796de4195d3acf7faba797be3cc", "windows-amd64": "e21a7d01ed920370a85b1064908600bf0db4e38cfe73d6ddade934f90adb01bb"}},
