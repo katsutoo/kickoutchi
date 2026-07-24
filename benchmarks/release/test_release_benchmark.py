@@ -88,6 +88,10 @@ class PlanValidationTests(unittest.TestCase):
         self.assertIn("fresh", cold["scenario"]); self.assertIn("reused", warm["scenario"])
         self.assertEqual(smoke_workload(cold)["sampling"], {"profile":"fast_process","blocks":1,"samples_per_block":4,"warmups":1})
 
+    def test_stable_watch_cpu_budgets_cover_all_five_collections(self) -> None:
+        budgets = workload(self.plan, "watch_stable")["budgets"]["absolute_max"]
+        self.assertEqual(budgets["cpu_p50_ns"], budgets["poll_cpu_ns"] * 5)
+
 
 class OrderingAndPercentileTests(unittest.TestCase):
     def test_seeded_order_is_repeatable_and_balanced(self) -> None:
