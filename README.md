@@ -54,7 +54,7 @@ an independent signature.
 ### Package Managers
 
 ```sh
-# Homebrew
+# Homebrew (Linux and macOS)
 brew install nuggocto/tap/kickoutchi
 
 # Cargo from Git
@@ -80,6 +80,41 @@ only a bootstrap reference.
 
 Arch package templates live in `packaging/arch/`; the AUR package is not
 published yet.
+
+### Updating
+
+Installer-based installs update through the generated updater:
+
+```sh
+kickoutchi-update
+```
+
+Package-manager installs should use the same manager that installed Kickoutchi:
+
+```sh
+# Homebrew
+brew update
+brew upgrade nuggocto/tap/kickoutchi
+
+# Nix profile installed from the repository flake
+nix profile upgrade kickoutchi
+
+# Cargo from Git
+cargo install --force --locked --git https://github.com/nuggocto/kickoutchi
+```
+
+```powershell
+# Scoop
+scoop update
+scoop update kickoutchi
+```
+
+An unqualified Git or Nix GitHub source follows the repository's default branch,
+which can contain changes newer than the latest stable release. For a
+reproducible stable source install, select an explicit tag such as `v1.3.0` and
+replace that tag deliberately when upgrading. Direct-archive installs must be
+replaced manually after verifying the new archive. AUR updates will use the
+normal Arch package-manager flow once the packages are published.
 
 ## Quick Start
 

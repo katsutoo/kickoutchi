@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-24
+
 ### Added
 
 - Native Linux, macOS, and Windows release gates now run formatting, strict
@@ -60,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replaced the Python release-archive validator and its tests with a test-only
+  Rust target. CI and cargo-dist retain bounded checksum, path, archive-layout,
+  member-type, expanded-size, permission, version, dual-entrypoint, timeout, and
+  extracted-binary journey checks without requiring Python in the repository.
+- Expanded installation, update, and security documentation to distinguish
+  GitHub installers and archives, Homebrew, Scoop, Nix, Cargo Git installs, and
+  future AUR packages, including their independent trust and update boundaries.
+- Added a durable release runbook for exact-candidate qualification,
+  publication approval, package synchronization, AUR preparation, and website
+  deployment; the completed one-off feature checklist was removed.
 - Reworked collection behind the existing list, TUI, inspect, and kill surfaces
   around one bounded, consistency-checked snapshot. Unprivileged `kill --port`
   remains supported when the selected endpoint has one verified owner; unrelated
@@ -1003,7 +1015,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/nuggocto/kickoutchi/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/nuggocto/kickoutchi/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/nuggocto/kickoutchi/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/nuggocto/kickoutchi/compare/v1.1.0...v1.1.1

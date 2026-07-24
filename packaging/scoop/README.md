@@ -17,6 +17,10 @@ same bucket can hold multiple apps.
 ```powershell
 scoop bucket add nuggocto https://github.com/nuggocto/scoop-bucket
 scoop install kickoutchi
+
+# Later updates
+scoop update
+scoop update kickoutchi
 ```
 
 Installs both `kickoutchi.exe` and `kick.exe` from the release's

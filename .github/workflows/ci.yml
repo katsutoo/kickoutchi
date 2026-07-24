@@ -41,7 +41,7 @@ jobs:
         run: cargo install --locked cargo-deny --version 0.19.4
 
       - name: Test release artifact validator
-        run: python3 .github/scripts/test_validate_release_artifact.py
+        run: cargo test --locked --test release_artifact_validator
 
       - name: Run cargo-deny
         run: cargo deny check

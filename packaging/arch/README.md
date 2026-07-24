@@ -30,6 +30,11 @@ kick --version
 kick list
 ```
 
+Once published, update either package through the normal full-system upgrade or
+by asking the configured AUR helper to rebuild that package. Until publication,
+the commands above are examples of the intended package names rather than an
+available registry install.
+
 ## Maintainer notes
 
 When a new tag ships, update `pkgver` and the checksums in `PKGBUILD` only after the `cargo-dist` GitHub Release assets exist. Do not use placeholder checksums or `SKIP` for the AUR package metadata.

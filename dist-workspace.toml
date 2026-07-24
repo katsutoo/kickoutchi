@@ -10,15 +10,17 @@ ci = "github"
 # Build and upload packages on pull requests so release packaging is exercised
 # before a tag can publish the same artifact graph.
 pr-run-mode = "upload"
-# release.yml is cargo-dist-generated but intentionally hardened in-repo with
-# pinned action SHAs and narrower job permissions.
+# release.yml began as cargo-dist output but is intentionally maintained in-repo
+# with pinned actions, narrow permissions, same-run native gates, bounded archive
+# validation, and scoped publication credentials. Review generated changes by
+# hand instead of overwriting those controls.
 allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
 # Homebrew tap that receives the generated formula. The publish-homebrew-formula
 # job in release.yml pushes to it with HOMEBREW_TAP_TOKEN. release.yml is
-# hand-hardened (pinned SHAs, narrowed permissions), so that job is kept in sync
-# with `dist generate` by hand rather than regenerated.
+# hand-hardened, so that job is kept in sync with cargo-dist changes by review
+# rather than blindly regenerated.
 tap = "nuggocto/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program

@@ -1,20 +1,19 @@
 # Kickoutchi 1.3.0 Recap
 
 This is the product-facing recap for updating the Kickoutchi landing page. It
-summarizes the completed work from the previous feature plan and the current
-`[Unreleased]` changelog section.
+summarizes the completed work shipped by the `1.3.0` source and changelog.
 
-Status: implemented locally for the unreleased `1.3.0` release. Native CI,
-artifact generation, publication, and published-archive smoke tests remain
-release-time checks.
+Status: release-candidate source. Publication, package-repository synchronization,
+and published-archive smoke tests remain separate release-time checks. This file
+describes product behavior, not the live version in an external package registry.
 
 ## Short Landing-Page Summary
 
 Kickoutchi 1.3.0 adds names, history, and explanations to local ports:
 
 - Name expected TCP and UDP endpoints with validated labels.
-- Export a complete, versioned native socket snapshot.
-- Watch sockets bind, release, or change owners in real time.
+- Export a full-state, bounded, scope-qualified native socket snapshot.
+- Watch sockets bind, release, or change owners through bounded polling.
 - Ask why an exact endpoint is or is not bindable right now.
 - Filter by address, family, scope, state, label, owner, and process metadata.
 - Keep destructive actions tied to verified process identity and explicit
@@ -54,9 +53,10 @@ process metadata, completeness, evidence gaps, scope, and configured labels.
 
 ### Safer Process Cleanup
 
-Single-process, tree, and process-group termination revalidate ownership,
-process-start identity, protection policy, and scope immediately before action.
-Uncertainty refuses the kill instead of guessing.
+Single-process and tree termination on every platform, plus process-group
+termination on Linux and macOS, revalidate ownership, process-start identity,
+protection policy, and scope immediately before action. Uncertainty refuses the
+kill instead of guessing.
 
 ## Endpoint Labels
 
@@ -380,7 +380,7 @@ Implemented changes:
 `complete` always means complete within that declared native scope. It does not
 mean every socket in every container, namespace, VM, or subsystem.
 
-Published targets remain:
+Configured `1.3.0` release targets are:
 
 - Linux `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
 - macOS `x86_64-apple-darwin` and `aarch64-apple-darwin`.
@@ -410,11 +410,35 @@ For multi-endpoint `why`, aggregate precedence is `1`, then `4`, then `3`, then
   persisted.
 - Release publication is tag-only and waits for verification and artifact jobs.
 - Cargo-dist is installed at exact locked version `0.32.0`.
+- Native release archives are parsed by a test-only Rust validator with bounded
+  checksum, layout, path, type, size, permission, version, and execution checks.
 - Repository and Homebrew credentials are introduced only in the specific steps
   that require them.
 - A private vulnerability-reporting policy is available in `SECURITY.md`.
 - One-off Stage reviews, qualification automation, QA harnesses, and benchmark
   artifacts were removed before release.
+
+## Installation And Updates
+
+- Generated Linux, macOS, and Windows installers include `kickoutchi-update`.
+- Homebrew serves Linux and macOS through `nuggocto/homebrew-tap`; users update
+  with `brew update` followed by `brew upgrade nuggocto/tap/kickoutchi`.
+- Scoop serves x64 Windows through `nuggocto/scoop-bucket`; users run
+  `scoop update` and `scoop update kickoutchi`.
+- Nix supports `nix run` and `nix profile install`; an installed mutable profile
+  updates with `nix profile upgrade kickoutchi`.
+- Cargo Git installs update by repeating `cargo install --force --locked --git`
+  for the desired branch, tag, or revision.
+- Direct archives require manual download, checksum verification, and
+  replacement.
+- AUR metadata is maintained under `packaging/arch`, but the packages remain
+  unavailable until an AUR maintainer account can publish them.
+
+Unqualified Cargo Git and Nix GitHub references follow the repository's default
+branch and can be newer than the latest stable release. Tag- or commit-qualified
+references are the reproducible source-install path. Homebrew, Scoop, and future
+AUR repositories are independent publisher boundaries and can update after the
+GitHub Release rather than atomically with it.
 
 ## Landing-Page Command Set
 

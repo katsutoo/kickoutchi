@@ -63,6 +63,15 @@ unicode-width = "0.2.2"
 # in particular, do not enable its broad `all` API surface.
 socket2 = "=0.6.5"
 
+[dev-dependencies]
+# Release-only archive verification. These stay out of the shipped binaries and
+# replace the former Python validator with bounded native Rust parsers.
+sha2 = { version = "=0.10.9", default-features = false }
+tar = { version = "=0.4.46", default-features = false }
+lzma-rust2 = { version = "=0.15.5", default-features = false, features = ["encoder", "std", "xz"] }
+xz4rust = { version = "=0.2.2", default-features = false, features = ["bcj", "crc64", "delta", "no_unsafe", "sha256", "std"] }
+zip = { version = "=8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
 [target.'cfg(unix)'.dependencies]
 # Unix termination uses the OS signal API directly for SIGTERM/SIGKILL instead
 # of shelling out to `kill`; the unsafe boundary is kept inside process.rs.

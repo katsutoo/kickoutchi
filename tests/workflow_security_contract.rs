@@ -347,8 +347,9 @@ fn tag_and_ref_values_are_passed_to_shells_through_environment_variables() {
             .find_map(|(candidate, value)| (candidate == key).then_some(value))
             .unwrap_or_else(|| panic!("release plan must expose {key}"));
         assert!(
-            value.contains("startsWith(github.ref, 'refs/tags/')"),
-            "release plan output {key} must be derived only from a tag ref"
+            value.contains("github.event_name == 'push'")
+                && value.contains("startsWith(github.ref, 'refs/tags/')"),
+            "release plan output {key} must require a pushed tag"
         );
     }
 
@@ -357,6 +358,13 @@ fn tag_and_ref_values_are_passed_to_shells_through_environment_variables() {
         .find(|step| step_env(step, "PLAN_ARGS").is_some())
         .expect("release plan must pass its arguments through the environment");
     assert!(plan_step.contains("dist $PLAN_ARGS"));
+    assert!(
+        step_env(&plan_step, "PLAN_ARGS").is_some_and(|value| {
+            value.contains("github.event_name == 'push'")
+                && value.contains("startsWith(github.ref, 'refs/tags/')")
+        }),
+        "manual dispatches, including tag-ref dispatches, must remain non-publishing"
+    );
 
     for job_name in ["build-local-artifacts", "build-global-artifacts", "host"] {
         let job = workflow_job(RELEASE_WORKFLOW, job_name);
@@ -432,14 +440,10 @@ fn native_archives_are_validated_before_upload_and_publication() {
         .iter()
         .position(|step| step.contains("dist build"))
         .expect("local artifacts must be built");
-    let unix = steps
+    let validation = steps
         .iter()
-        .position(|step| step.contains("python3 .github/scripts/validate-release-artifact.py"))
-        .expect("Unix archives must be validated");
-    let windows = steps
-        .iter()
-        .position(|step| step.contains("python .github/scripts/validate-release-artifact.py"))
-        .expect("Windows archives must be validated");
+        .position(|step| step.contains("cargo test --locked --test release_artifact_validator"))
+        .expect("native archives must be validated");
     let upload = steps
         .iter()
         .position(|step| {
@@ -449,43 +453,34 @@ fn native_archives_are_validated_before_upload_and_publication() {
         .expect("local artifacts must be uploaded");
 
     assert!(
-        build < unix && unix < upload && build < windows && windows < upload,
+        build < validation && validation < upload,
         "every native archive must be validated after build and before upload"
     );
-    for (step, condition, python, targets_argument) in [
-        (
-            &steps[unix],
-            "runner.os != 'Windows'",
-            "python3",
-            "--targets-json \"$TARGETS_JSON\"",
-        ),
-        (
-            &steps[windows],
-            "runner.os == 'Windows'",
-            "python",
-            "--targets-json $env:TARGETS_JSON",
-        ),
-    ] {
-        assert_eq!(yaml_scalar(step, "if", 8).as_deref(), Some(condition));
-        assert_eq!(
-            step_env(step, "TARGETS_JSON").as_deref(),
-            Some("${{ toJSON(matrix.targets) }}")
-        );
-        assert!(step.contains(&format!(
-            "{python} .github/scripts/validate-release-artifact.py"
-        )));
-        assert!(step.contains("--distrib target/distrib"));
-        assert!(step.contains(targets_argument));
-        assert!(step.contains("--runner-os \"${{ runner.os }}\""));
-        assert!(step.contains("--runner-arch \"${{ runner.arch }}\""));
-        assert!(
-            !step
-                .lines()
-                .filter_map(active_line)
-                .any(|line| line.starts_with("continue-on-error:") || line.contains("|| true")),
-            "archive validation must fail closed"
-        );
-    }
+    let step = &steps[validation];
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_RELEASE_DISTRIB").as_deref(),
+        Some("target/distrib")
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_RELEASE_TARGETS_JSON").as_deref(),
+        Some("${{ toJSON(matrix.targets) }}")
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_RELEASE_RUNNER_OS").as_deref(),
+        Some("${{ runner.os }}")
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_RELEASE_RUNNER_ARCH").as_deref(),
+        Some("${{ runner.arch }}")
+    );
+    assert!(step.contains("validate_generated_native_archive -- --exact --ignored --nocapture"));
+    assert!(
+        !step
+            .lines()
+            .filter_map(active_line)
+            .any(|line| line.starts_with("continue-on-error:") || line.contains("|| true")),
+        "archive validation must fail closed"
+    );
 
     let host = workflow_job(RELEASE_WORKFLOW, "host");
     assert!(

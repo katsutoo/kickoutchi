@@ -107,8 +107,9 @@ The relevant attacker is a local unprivileged user or process able to influence
 configuration, CLI arguments, process metadata, socket churn, child-process
 output, or a downstream output consumer. Kernel and native APIs provide
 authority but are not trusted for stable sizes or timing. Docker output,
-downloaded build tools, GitHub Actions, package registries, release hosting, the
-Homebrew tap, and the Scoop bucket cross separate trust boundaries.
+downloaded build tools, GitHub Actions, package registries, release hosting,
+installer and updater execution, the Homebrew tap, the Scoop bucket, Git and Nix
+source installs, and future AUR maintainers cross distinct trust boundaries.
 
 Security objectives are correct process identity and signal delivery, truthful
 scope and certainty claims, memory safety at native boundaries, bounded resource
@@ -120,29 +121,57 @@ protection evidence; retries and retained event state have fixed limits; watch
 and Why never invoke Docker.
 
 Release workflows pin actions by full commit SHA and install the exact
-`cargo-dist 0.32.0` crate with Cargo's locked dependency resolution. Release
-planning has read-only repository permission; checkout never persists GitHub
-credentials, and no write-scoped token is exported to release-tool installation.
-Explicit repository `GH_TOKEN` values exist only on the dist planning, hosting,
-GitHub Release, and Homebrew push steps that require them. GitHub permissions
-remain job-scoped, so pinned actions in the host job still execute where
-`contents: write` is available.
+`cargo-dist 0.32.0` crate with Cargo's locked dependency resolution. A test-only
+Rust target parses generated native archives with explicit member, compressed,
+expanded, binary, output, and execution-time bounds. It rejects unsafe paths,
+links, special files, encryption, unexpected layouts, mismatched checksums,
+wrong executable permissions, wrong versions, and missing binary entry points,
+then runs the real CLI journeys against the extracted binaries.
+
+Release planning has read-only repository permission; checkout never persists
+GitHub credentials, and no write-scoped token is exported to release-tool
+installation. Explicit repository `GH_TOKEN` values exist only on the dist
+planning, hosting, and GitHub Release steps that require them. The Homebrew token
+exists only on the final tap push step. GitHub permissions remain job-scoped, so
+pinned actions in the host job still execute where `contents: write` is
+available. A manual workflow dispatch exercises the artifact graph without tag
+publication; tag runs repeat verification on their exact commit before any
+release is created.
 
 The Homebrew publisher downloads the generated formula, runs `brew update` and
-`brew style`, stages only formula files, and receives the tap-scoped
-`HOMEBREW_TAP_TOKEN` only for the final push. Stable GitHub Releases are then
-observed independently by the public Scoop bucket's scheduled Excavator
-workflow, which regenerates and commits its manifest URL and hash; Kickoutchi's
-release workflow does not hold a Scoop write token. Package-manager repositories
-can therefore lag a new release or fail independently.
+`brew style --fix`, stages only formula files, and receives the tap-scoped
+`HOMEBREW_TAP_TOKEN` only for the final push. This is formatting validation, not
+a `brew audit`, installation test, or post-push smoke test. Stable GitHub
+Releases are observed independently by the public Scoop bucket's scheduled
+Excavator workflow, which regenerates and commits its manifest URL and hash;
+Kickoutchi's release workflow does not hold a Scoop write token. Either package
+repository can lag a new release or fail independently.
+
+The documented Unix and PowerShell installer commands execute content from the
+mutable GitHub Release `latest` URL. TLS and the GitHub repository are therefore
+part of the trust decision before the installer can be inspected locally.
+`kickoutchi-update` uses the same release authority. An unqualified
+`cargo install --git` or `github:nuggocto/kickoutchi` Nix flake reference follows
+the repository's default branch and can select unreleased code; `--locked` pins
+the selected checkout's Cargo dependency graph, not that checkout. Select an
+explicit tag or commit when reproducibility matters. The committed Nix lock pins
+the flake's `nixpkgs` input, not Kickoutchi's own source revision.
+
+AUR packages are not published at the time of this policy. If they are
+published, the AUR account and package maintainer become another independent
+publisher boundary. Arch metadata is updated only from real public release URLs
+and checksums, never placeholder hashes.
 
 Release checksums are published through the same repository authority as their
 artifacts. They detect accidental corruption but are not an independent
 signature or provenance channel. Release verification builds the native binaries
-for the exact workflow commit, then validates each generated archive's checksum,
-layout, executable permissions, and both binary entry points before upload.
-Users must still decide whether they trust the GitHub repository and
-package-manager publisher boundaries.
+for the exact workflow commit, then validates each native binary archive's
+checksum, layout, executable permissions where applicable, both binary entry
+points, and runtime version before upload. Source archives, installers, updater
+artifacts, and the final public download path do not receive that same executable
+archive journey; post-publication smoke tests remain a separate release step.
+Users must still decide whether they trust the GitHub repository and each
+package-manager publisher boundary.
 
 Read-only inspect reports join socket owners, process-table rows, and optional
 command lines only when PID and process start identity agree. A port owner that
