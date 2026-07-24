@@ -360,11 +360,14 @@ def validate_plan(plan: Any, *, require_gate_ready: bool = True) -> dict[str, An
 
 
 def balanced_orders(seed: int, workload: str, block: int, pairs: int) -> list[tuple[str, str]]:
-    if pairs < 2 or pairs % 2:
-        raise EvidenceError("balanced pair count must be positive and even")
+    if pairs < 1:
+        raise EvidenceError("balanced pair count must be positive")
     material = f"{seed}:{workload}:{block}".encode()
     ranked = sorted(range(pairs), key=lambda item: hashlib.sha256(material + b":" + str(item).encode()).digest())
-    reversed_pairs = set(ranked[: pairs // 2])
+    reversed_count = pairs // 2
+    if pairs % 2 and hashlib.sha256(material).digest()[0] & 1:
+        reversed_count += 1
+    reversed_pairs = set(ranked[:reversed_count])
     return [("right", "left") if item in reversed_pairs else ("left", "right") for item in range(pairs)]
 
 
