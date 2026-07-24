@@ -61,7 +61,10 @@ impl Theme {
         self.fg(Color::Green).add_modifier(Modifier::BOLD)
     }
 
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "every Theme accessor takes self so callers stay uniform when a style becomes palette-dependent"
+    )]
     pub(crate) fn status(self) -> Style {
         Style::default()
             .add_modifier(Modifier::REVERSED)

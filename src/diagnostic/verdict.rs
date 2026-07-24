@@ -177,7 +177,7 @@ pub(crate) fn analyze(
     let verdict = select_verdict(endpoint, ipv6_mode, snapshot, probe.outcome);
     let mut evidence = BoundedEvidence::default();
 
-    append_owner_evidence(&mut evidence, endpoint, ipv6_mode, snapshot, source);
+    append_owner_evidence(&mut evidence, endpoint, ipv6_mode, snapshot);
     append_kernel_evidence(&mut evidence, endpoint, ipv6_mode, snapshot, source);
     append_probe_evidence(&mut evidence, probe.outcome);
     append_timer_evidence(&mut evidence, endpoint, ipv6_mode, snapshot, source);
@@ -366,12 +366,15 @@ impl BoundedEvidence {
     }
 }
 
+/// Owner evidence names [`owner_source`], not the caller's native source: on
+/// Windows the socket table comes from IP Helper while owner identity comes
+/// from the process API, and attributing the owner fact to the wrong source
+/// would misreport where the evidence came from.
 fn append_owner_evidence(
     evidence: &mut BoundedEvidence,
     endpoint: &EndpointIdentity,
     ipv6_mode: Ipv6Mode,
     snapshot: &NetworkSnapshot,
-    _source: EvidenceSource,
 ) {
     let source = owner_source(snapshot);
     for socket in

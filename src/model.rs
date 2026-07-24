@@ -110,6 +110,20 @@ impl BindScope {
 /// `Option` fields are `None` when the OS wouldn't tell us; `permission` records
 /// that it happened, so consumers can tell "there's no value" apart from "we
 /// weren't allowed to look".
+///
+/// This is an owned *projection* of [`crate::observation::NetworkSnapshot`],
+/// not a source of truth. Every field is derived by `project_legacy*`, and the
+/// snapshot is authoritative for anything a destructive decision rests on.
+/// Prefer [`PortEntryView`], which borrows the same facts without copying the
+/// shared process metadata; reach for the owned form only where a value has to
+/// outlive its snapshot.
+///
+/// The type is still passed between internal modules — the kill, scoped-kill,
+/// TUI, and inspect paths all speak it — which is a historical shape rather
+/// than a designed one. The intended direction is to keep narrowing it toward
+/// the `list --json` serializer boundary, which is the one consumer that
+/// genuinely needs an owned legacy row. Do not add fields here to serve an
+/// internal caller: add them to the snapshot and project what is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortEntry {
     pub(crate) protocol: Protocol,
@@ -122,13 +136,6 @@ pub(crate) struct PortEntry {
     pub(crate) command_line: Option<Arc<str>>,
     pub(crate) parent_pid: Option<u32>,
     pub(crate) parent_process_name: Option<Arc<str>>,
-    /// Reserved, and effectively always empty on real rows: the Linux collector
-    /// never populates this. Per-row child enumeration would mean walking the whole
-    /// process table on every refresh, so the selected row's children are resolved
-    /// lazily into the [`ProcessContext`] `children` field instead. The field stays
-    /// only because it's part of the
-    /// stable `list --json` shape; real child data does not flow through here.
-    pub(crate) child_pids: Vec<u32>,
     pub(crate) protected: bool,
     pub(crate) platform: Platform,
     pub(crate) permission: PermissionStatus,
@@ -479,7 +486,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
@@ -549,7 +555,6 @@ mod tests {
         row.command_line = Some(Arc::from("node server.js"));
         row.parent_pid = Some(18001);
         row.parent_process_name = Some(Arc::from("cursor-agent"));
-        row.child_pids = vec![18430];
 
         let view = PortEntryView::from(&row).with_label(Some("web dev"));
         let value = serde_json::to_value(crate::public_output::LegacyListRecord::from(&view))
@@ -567,6 +572,9 @@ mod tests {
                 "command_line": "node server.js",
                 "parent_pid": 18001,
                 "parent_process_name": "cursor-agent",
+                // `child_pids` is a frozen 1.x compatibility field with no
+                // backing data: the serializer emits an empty array for every
+                // row. Scripts still parse the key, so it must keep appearing.
                 "child_pids": [],
                 "protected": false,
                 "platform": "linux",

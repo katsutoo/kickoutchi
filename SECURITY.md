@@ -109,7 +109,7 @@ output, or a downstream output consumer. Kernel and native APIs provide
 authority but are not trusted for stable sizes or timing. Docker output,
 downloaded build tools, GitHub Actions, package registries, release hosting,
 installer and updater execution, the Homebrew tap, the Scoop bucket, Git and Nix
-source installs, and future AUR maintainers cross distinct trust boundaries.
+source installs, and AUR maintainers cross distinct trust boundaries.
 
 Security objectives are correct process identity and signal delivery, truthful
 scope and certainty claims, memory safety at native boundaries, bounded resource
@@ -157,10 +157,11 @@ the selected checkout's Cargo dependency graph, not that checkout. Select an
 explicit tag or commit when reproducibility matters. The committed Nix lock pins
 the flake's `nixpkgs` input, not Kickoutchi's own source revision.
 
-AUR packages are not published at the time of this policy. If they are
-published, the AUR account and package maintainer become another independent
-publisher boundary. Arch metadata is updated only from real public release URLs
-and checksums, never placeholder hashes.
+The AUR account and package maintainer are another independent publisher
+boundary, on the same footing as the Homebrew tap and the Scoop bucket. Arch
+metadata is updated only from real public release URLs and checksums, never
+placeholder hashes, and is pushed only after the corresponding GitHub Release
+assets exist.
 
 Release checksums are published through the same repository authority as their
 artifacts. They detect accidental corruption but are not an independent

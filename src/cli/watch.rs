@@ -32,7 +32,10 @@ use crate::watch::{
 
 use super::ExitReason;
 
-const WATCH_INTERVAL_DEFAULT: Duration = Duration::from_secs(1);
+/// The default poll interval, spelled as the duration token the parser accepts
+/// so clap and `parse_duration_token` share one source of truth. Its resolved
+/// value is pinned by `default_interval_is_one_second_and_scope_requires_ipv6_address`.
+const WATCH_INTERVAL_DEFAULT_TOKEN: &str = "1s";
 const WATCH_INTERVAL_MIN: Duration = Duration::from_millis(100);
 const WATCH_INTERVAL_MAX: Duration = Duration::from_mins(1);
 const WATCH_DURATION_MIN: Duration = Duration::from_millis(100);
@@ -66,7 +69,7 @@ pub(crate) struct WatchArgs {
     #[arg(long, value_name = "TEXT")]
     filter: Option<String>,
     /// Poll every 100ms..=60s (default 1s), for example 500ms or 2s.
-    #[arg(long, value_name = "DURATION", default_value = "1s")]
+    #[arg(long, value_name = "DURATION", default_value = WATCH_INTERVAL_DEFAULT_TOKEN)]
     interval: String,
     /// Stop after 100ms..=7d instead of waiting for Ctrl-C.
     #[arg(long, value_name = "DURATION")]
@@ -77,7 +80,7 @@ pub(crate) struct WatchArgs {
 }
 
 #[derive(Debug)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "independent CLI selectors and output mode remain explicit after validation"
 )]
@@ -96,12 +99,11 @@ struct WatchOptions {
 
 impl WatchOptions {
     fn parse(args: &WatchArgs) -> Result<Self, String> {
-        let interval = if args.interval == "1s" {
-            WATCH_INTERVAL_DEFAULT
-        } else {
-            parse_duration_token(&args.interval, WATCH_INTERVAL_MIN, WATCH_INTERVAL_MAX)
-                .map_err(|error| format!("invalid --interval: {error}"))?
-        };
+        // The clap default is a duration token like any other, so it parses
+        // through the same path as a user-supplied value. No separate default
+        // branch means nothing to drift out of sync with the declared default.
+        let interval = parse_duration_token(&args.interval, WATCH_INTERVAL_MIN, WATCH_INTERVAL_MAX)
+            .map_err(|error| format!("invalid --interval: {error}"))?;
         let duration = args
             .duration
             .as_deref()
@@ -224,7 +226,7 @@ impl WatchRuntime for ProductionRuntime {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::single_match_else,
     reason = "the polling state machine keeps each failure and flush transition in execution order"
@@ -494,7 +496,7 @@ fn run_watch_loop(
     }
 }
 
-#[allow(
+#[expect(
     clippy::unnecessary_wraps,
     reason = "adapts baseline events to the fallible diff-event stream"
 )]
@@ -502,7 +504,7 @@ const fn baseline_event_result(event: WatchEvent<'_>) -> Result<WatchEvent<'_>, 
     Ok(event)
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "ordered streaming keeps runtime, output, caches, gaps, and sequence ownership explicit"
@@ -572,7 +574,14 @@ where
         }
         events = group_end;
 
-        for rank in 0..u16::BITS {
+        // One emission pass per rank present in the group, re-scanning the
+        // group from `group_start` each time. Collecting the group once and
+        // sorting it would be fewer passes, but a group is bounded only by
+        // WATCH_EVENTS_PER_POLL_MAX, so buffering it would trade a fixed-memory
+        // stream for an allocation that grows with the poll. Passes are capped
+        // at EVENT_ORDER_RANK_COUNT and groups are one event in the common
+        // case, so the re-scan is the cheaper bound to keep.
+        for rank in 0..EVENT_ORDER_RANK_COUNT {
             if rank_mask & (1 << rank) == 0 {
                 continue;
             }
@@ -638,6 +647,12 @@ where
         }
     }
 }
+
+/// Distinct values [`event_order_rank`] can return: three filter results times
+/// four certainties. The emission loop iterates exactly this many passes, and
+/// `rank_mask` must be wide enough to hold one bit per rank.
+const EVENT_ORDER_RANK_COUNT: u32 = 12;
+const _: () = assert!(EVENT_ORDER_RANK_COUNT <= u16::BITS);
 
 const fn event_order_rank(filter_result: FilterResult, certainty: Certainty) -> u32 {
     let filter_rank = match filter_result {
@@ -955,7 +970,7 @@ fn evaluate_side(
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "event-side filtering keeps snapshot, socket, owner, parsed terms, policy, and cache explicit"
 )]
@@ -992,7 +1007,7 @@ fn evaluate_terms_for_owner(
     if unknown { Truth::Unknown } else { Truth::True }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "term evaluation keeps endpoint facts and one conceptual owner row explicit"
 )]
@@ -1296,7 +1311,7 @@ fn state_matches(state: SocketState, filter: StateFilter) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-#[allow(
+#[expect(
     clippy::struct_field_names,
     reason = "field names are the versioned JSON contract"
 )]
@@ -1350,7 +1365,7 @@ struct PublicError {
     message: String,
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "the streaming boundary keeps event, schema, filter, and bounded gap context explicit"
 )]
@@ -2090,9 +2105,10 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        BoundedRecord, FilterCache, FilterResult, GapIndex, ObservationTimes, OwnerPidConstraint,
-        Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN, WATCH_INTERVAL_DEFAULT, WATCH_INTERVAL_MAX,
-        WATCH_INTERVAL_MIN, WatchArgs, WatchOptions, WatchRuntime, evaluate_event, evaluate_side,
+        BoundedRecord, EVENT_ORDER_RANK_COUNT, FilterCache, FilterResult, GapIndex,
+        ObservationTimes, OwnerPidConstraint, Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN,
+        WATCH_INTERVAL_DEFAULT_TOKEN, WATCH_INTERVAL_MAX, WATCH_INTERVAL_MIN, WatchArgs,
+        WatchOptions, WatchRuntime, evaluate_event, evaluate_side, event_order_rank,
         human_endpoint_text, parse_duration_token, run_watch_loop, write_human_event,
         write_ordered_events,
     };
@@ -2137,6 +2153,42 @@ mod tests {
         }
     }
 
+    /// The emission loop runs exactly `EVENT_ORDER_RANK_COUNT` passes, so a
+    /// rank outside that range would silently drop every event carrying it.
+    /// Enumerating the full product keeps the constant tied to the function
+    /// rather than to a remembered arithmetic.
+    #[test]
+    fn event_order_ranks_are_distinct_and_fit_the_emission_passes() {
+        let mut seen = Vec::new();
+        for filter_result in [
+            FilterResult::NotApplied,
+            FilterResult::Matched,
+            FilterResult::Indeterminate,
+        ] {
+            for certainty in [
+                Certainty::Proven,
+                Certainty::Estimated,
+                Certainty::Heuristic,
+                Certainty::Unknown,
+            ] {
+                let rank = event_order_rank(filter_result, certainty);
+                assert!(
+                    rank < EVENT_ORDER_RANK_COUNT,
+                    "rank {rank} for {filter_result:?}/{certainty:?} is outside the emission passes",
+                );
+                seen.push(rank);
+            }
+        }
+        seen.sort_unstable();
+        let distinct = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), distinct, "ordering ranks must not collide");
+        assert_eq!(
+            distinct, EVENT_ORDER_RANK_COUNT as usize,
+            "EVENT_ORDER_RANK_COUNT must match the rank domain exactly",
+        );
+    }
+
     #[test]
     fn default_interval_is_one_second_and_scope_requires_ipv6_address() {
         let args = WatchArgs {
@@ -2146,14 +2198,29 @@ mod tests {
             scope_id: None,
             port: None,
             filter: None,
-            interval: "1s".to_owned(),
+            interval: WATCH_INTERVAL_DEFAULT_TOKEN.to_owned(),
             duration: Some("100ms".to_owned()),
             json: true,
         };
+        // The declared default reaches the parser as a plain token, so resolve
+        // it through a real clap parse rather than trusting a hand-written
+        // string to still match the attribute.
+        let parsed = <crate::cli::Cli as clap::Parser>::try_parse_from(["kickoutchi", "watch"])
+            .expect("bare watch invocation parses");
+        let Some(crate::cli::Command::Watch(declared)) = parsed.command else {
+            panic!("expected a watch command");
+        };
+        assert_eq!(declared.interval, WATCH_INTERVAL_DEFAULT_TOKEN);
+        assert_eq!(
+            WatchOptions::parse(&declared).unwrap().interval,
+            Duration::from_secs(1),
+            "the documented one-second default must survive token parsing",
+        );
         assert_eq!(
             WatchOptions::parse(&args).unwrap().interval,
-            WATCH_INTERVAL_DEFAULT
+            Duration::from_secs(1)
         );
+
         let invalid = WatchArgs {
             scope_id: Some(1),
             ..args
@@ -3802,7 +3869,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "the complete schema contract keeps every field and event-side rule explicit"
     )]
@@ -4031,7 +4098,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "the maximum schema fixture keeps every bounded field visible"
     )]

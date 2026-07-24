@@ -38,37 +38,35 @@ use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
 
 const PROC_ROOT: &str = "/proc";
-// `/proc/net/{tcp,udp}{,6}` is one row per socket and read on every refresh, so
-// it's bounded like every other /proc read here. The cap is deliberately generous
-// (~100k sockets), but a socket table is the one /proc file we must not silently
-// truncate: dropping bytes drops whole socket rows, i.e. real open ports. So
-// `read_bounded_text` fails closed past this cap — the scan surfaces a clear
-// error instead of a short, misleading table.
+
+// Shared limits and their rationale live in `observation.rs`; the constants
+// below are the ones only this adapter has an opinion about.
+
+/// `/proc/<pid>/cmdline` bytes. Degrades to `None` plus partial metadata — a
+/// command line is optional enrichment, so an over-cap read is representable.
 const MAX_CMDLINE_BYTES: usize = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
-// `/proc/<pid>/status` and `/proc/<pid>/stat` are kernel-generated and read
-// on every refresh, so they are bounded like every other /proc read here —
-// and the reads fail closed past the cap rather than silently truncating,
-// because a truncated stat line could parse a *prefix* of the start-time
-// marker as a valid but wrong number: a wrong identity check on a kill path,
-// not an error. The caps leave real files no way to trip the failure: stat is
-// a fixed ~52-field line with comm capped at 16 bytes (a few hundred bytes),
-// and status stays small except for `Groups:`, which can legitimately list up
-// to NGROUPS_MAX (65536) GIDs — roughly 450 KiB — so its cap clears that with
-// room to spare. `take()` reads only what exists, so the generous cap costs
-// nothing on the ~1 KiB common case.
+
+/// `/proc/<pid>/status` and `/proc/<pid>/stat` bytes.
+///
+/// Both fail closed past the cap rather than truncating, because a short `stat`
+/// line could parse a *prefix* of the start-time marker as a valid but wrong
+/// number — a silently wrong identity check on a kill path, not an error.
+///
+/// Real files cannot reach either cap: `stat` is a fixed ~52-field line whose
+/// `comm` is capped at 16 bytes, and `status` stays small except for `Groups:`,
+/// which can legitimately list `NGROUPS_MAX` (65536) GIDs at roughly 450 KiB.
+/// `take()` reads only what exists, so the headroom costs nothing on the ~1 KiB
+/// common case.
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
 const MAX_STAT_BYTES: usize = 4 * 1024;
+
+/// Display and traversal bounds for the optional selected-row and diagnostic
+/// views. All three degrade — these are hints, never authority.
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const MAX_PROCESS_ANCESTORS: usize = 64;
-// The kernel's own pid_max (4 M) already bounds the /proc PID scan, but the
-// bound deserves to be explicit and symmetric with the macOS collector's cap.
-// Truncating would silently drop processes — potentially real port owners —
-// so the scan fails closed past it, like the socket table above.
-// Aggregate bounds for the two multiplicative parts of collection. One million
-// fd entries covers ordinary high-density hosts while bounding procfs traversal;
-// 262k rows allows substantial shared-socket fanout above the socket-table size.
-// Both limits fail closed because a partial owner map or row set is misleading.
+
+/// The `/proc/<pid>/fd` symlink shape that identifies a socket descriptor.
 const SOCKET_LINK_PREFIX: &str = "socket:[";
 const SOCKET_LINK_SUFFIX: &str = "]";
 
@@ -1261,7 +1259,7 @@ fn read_process_metadata_bounded(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "deterministic metadata field order and one aggregate budget stay together"
 )]

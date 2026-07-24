@@ -128,10 +128,13 @@ pub(crate) fn collect_target_ports(
     crate::observation::project_legacy_target(&snapshot, pid, port).map_err(CollectorError::from)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "destructive authority checks stay in one ordered fail-closed decision"
-)]
+/// Project the rows a destructive command is allowed to act on, or refuse.
+///
+/// The whole function is a fail-closed gate: it answers "may we signal based on
+/// this snapshot?" before it answers "which rows?". Authority is accumulated
+/// from two independent sources — the matched sockets themselves, and the
+/// snapshot's evidence gaps — and only then converted into a refusal, so no
+/// early return can skip a reason that a later source would have raised.
 pub(crate) fn kill_ports_from_snapshot(
     snapshot: &NetworkSnapshot,
     pid: Option<u32>,
@@ -142,111 +145,215 @@ pub(crate) fn kill_ports_from_snapshot(
         (None, Some(port)) => DestructiveTargetMode::Port(port),
         _ => return Err(ObservationError::NativeDataMalformed.into()),
     };
+
+    // An omitted gap is evidence we never got to inspect, so it is partial
+    // before any socket is examined.
+    let mut authority = Authority::complete();
+    authority.partial |= snapshot.omitted_evidence_gap_count != 0;
+
     let mut matched_endpoints = std::collections::BTreeSet::new();
-    let mut has_permission_refusal = false;
-    let mut has_partial_refusal = snapshot.omitted_evidence_gap_count != 0;
     for socket in &snapshot.sockets {
-        if !matches!(
-            (socket.local_endpoint.protocol, socket.state),
-            (Protocol::Tcp, ObservationSocketState::Listen)
-                | (Protocol::Udp, ObservationSocketState::Bound)
-        ) {
+        let Some(target_match) = destructive_socket_match(socket, target_mode) else {
             continue;
-        }
-        let matches_port = port.is_some_and(|port| socket.local_endpoint.port.get() == port);
-        let matches_pid = pid.is_some_and(|pid| {
-            socket.owners.iter().any(|owner| {
-                matches!(
-                    owner,
-                    crate::observation::OwnerObservation::Verified(identity)
-                        if identity.pid == pid
-                )
-            })
-        });
-        let unverified_target_reason = pid.and_then(|pid| {
-            socket.owners.iter().find_map(|owner| match owner {
-                crate::observation::OwnerObservation::UnverifiedPid {
-                    pid: owner_pid,
-                    reason,
-                } if *owner_pid == pid => Some(*reason),
-                _ => None,
-            })
-        });
-        let matches_unverified_pid = unverified_target_reason.is_some();
-        if !matches_port && !matches_pid && !matches_unverified_pid {
-            continue;
-        }
-        matched_endpoints.insert(socket.local_endpoint.clone());
-        let has_socket_local_permission_gap = matches!(
-            &socket.owner_completeness,
-            OwnerCompleteness::Partial { reasons }
-                if reasons.contains(&EvidenceGapCode::OwnerPermissionDenied)
-        );
-        has_permission_refusal |= has_socket_local_permission_gap
-            || unverified_target_reason
-                == Some(crate::observation::UnverifiedOwnerReason::PermissionDenied);
-        has_partial_refusal |= matches_unverified_pid || !socket.owner_completeness.is_complete();
-        if matches!(target_mode, DestructiveTargetMode::Port(_)) {
-            if socket.owners.is_empty() {
-                has_partial_refusal = true;
-            }
-            has_permission_refusal |= socket.owners.iter().any(|owner| {
-                matches!(
-                    owner,
-                    crate::observation::OwnerObservation::UnverifiedPid {
-                        reason: crate::observation::UnverifiedOwnerReason::PermissionDenied,
-                        ..
-                    }
-                )
-            });
-            has_partial_refusal |= socket
-                .owners
-                .iter()
-                .any(|owner| !matches!(owner, crate::observation::OwnerObservation::Verified(_)));
-        }
-    }
-    for gap in &snapshot.evidence_gaps {
-        if gap.code == EvidenceGapCode::ObservationRaced {
-            has_partial_refusal = true;
-        }
-        let applicable = match (target_mode, gap.impact) {
-            (DestructiveTargetMode::Pid(target_pid), EvidenceImpact::SocketSet) => {
-                gap.pid == Some(target_pid)
-                    || gap
-                        .endpoint
-                        .as_ref()
-                        .is_some_and(|endpoint| matched_endpoints.contains(endpoint))
-                    || (gap.endpoint.is_none() && gap.pid.is_none())
-            }
-            (DestructiveTargetMode::Pid(target_pid), EvidenceImpact::Ownership) => {
-                gap.endpoint
-                    .as_ref()
-                    .is_some_and(|endpoint| matched_endpoints.contains(endpoint))
-                    || (gap.endpoint.is_none() && gap.pid == Some(target_pid))
-            }
-            (DestructiveTargetMode::Port(target_port), EvidenceImpact::SocketSet) => gap
-                .endpoint
-                .as_ref()
-                .is_none_or(|endpoint| endpoint.port.get() == target_port),
-            (DestructiveTargetMode::Port(target_port), EvidenceImpact::Ownership) => gap
-                .endpoint
-                .as_ref()
-                .is_some_and(|endpoint| endpoint.port.get() == target_port),
-            (_, EvidenceImpact::Metadata | EvidenceImpact::Scope) => false,
         };
-        has_permission_refusal |= applicable && gap.code == EvidenceGapCode::OwnerPermissionDenied;
-        has_partial_refusal |= applicable;
+        matched_endpoints.insert(socket.local_endpoint.clone());
+        authority.merge(socket_authority(socket, target_mode, target_match));
     }
-    if has_permission_refusal {
+
+    for gap in &snapshot.evidence_gaps {
+        // A raced observation invalidates the whole snapshot regardless of
+        // which endpoint or PID the gap names.
+        authority.partial |= gap.code == EvidenceGapCode::ObservationRaced;
+        if !gap_applies_to_target(gap, target_mode, &matched_endpoints) {
+            continue;
+        }
+        authority.permission_denied |= gap.code == EvidenceGapCode::OwnerPermissionDenied;
+        authority.partial = true;
+    }
+
+    // Permission denial outranks partiality: it is the more specific and more
+    // actionable refusal, and it maps to a distinct exit code.
+    if authority.permission_denied {
         return Err(CollectorError::OwnershipPermissionDenied);
     }
-    if has_partial_refusal {
+    if authority.partial {
         return Err(ObservationError::PartialSocketSet.into());
     }
     if snapshot.completeness == SnapshotCompleteness::Raced {
         return Err(ObservationError::ObservationRaced.into());
     }
     project_legacy_target(snapshot, pid, port).map_err(CollectorError::from)
+}
+
+/// Why a destructive command may not act on a snapshot, if it may not.
+///
+/// Two independent reasons rather than one flag, because they map to different
+/// exit codes and different user advice. Both are monotonic: once raised, no
+/// later evidence can lower them.
+#[derive(Debug, Clone, Copy)]
+struct Authority {
+    permission_denied: bool,
+    partial: bool,
+}
+
+impl Authority {
+    const fn complete() -> Self {
+        Self {
+            permission_denied: false,
+            partial: false,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.permission_denied |= other.permission_denied;
+        self.partial |= other.partial;
+    }
+}
+
+/// How a candidate socket matched the destructive target, if it matched.
+#[derive(Debug, Clone, Copy)]
+struct DestructiveSocketMatch {
+    /// The reason the target PID's owner edge could not be verified, when the
+    /// socket matched through an unverified owner rather than a verified one.
+    unverified_target_reason: Option<crate::observation::UnverifiedOwnerReason>,
+}
+
+/// Match one socket against the destructive target.
+///
+/// Only listening TCP and bound UDP sockets carry destructive authority; a
+/// snapshot's established and transitional connections are real observations
+/// but are not something a kill can target.
+fn destructive_socket_match(
+    socket: &crate::observation::SocketObservation,
+    target_mode: DestructiveTargetMode,
+) -> Option<DestructiveSocketMatch> {
+    if !matches!(
+        (socket.local_endpoint.protocol, socket.state),
+        (Protocol::Tcp, ObservationSocketState::Listen)
+            | (Protocol::Udp, ObservationSocketState::Bound)
+    ) {
+        return None;
+    }
+    match target_mode {
+        DestructiveTargetMode::Port(target_port) => {
+            (socket.local_endpoint.port.get() == target_port).then_some(DestructiveSocketMatch {
+                unverified_target_reason: None,
+            })
+        }
+        DestructiveTargetMode::Pid(target_pid) => {
+            let verified = socket.owners.iter().any(|owner| {
+                matches!(
+                    owner,
+                    crate::observation::OwnerObservation::Verified(identity)
+                        if identity.pid == target_pid
+                )
+            });
+            let unverified_target_reason = socket.owners.iter().find_map(|owner| match owner {
+                crate::observation::OwnerObservation::UnverifiedPid {
+                    pid: owner_pid,
+                    reason,
+                } if *owner_pid == target_pid => Some(*reason),
+                _ => None,
+            });
+            (verified || unverified_target_reason.is_some()).then_some(DestructiveSocketMatch {
+                unverified_target_reason,
+            })
+        }
+    }
+}
+
+/// The authority one matched socket contributes.
+///
+/// Port targets are held to a stricter rule than PID targets: a PID target has
+/// already been resolved to one verified identity, but a port target must prove
+/// that *every* holder of that endpoint is accounted for — otherwise the signal
+/// frees a port someone else is still holding.
+fn socket_authority(
+    socket: &crate::observation::SocketObservation,
+    target_mode: DestructiveTargetMode,
+    target_match: DestructiveSocketMatch,
+) -> Authority {
+    let socket_local_permission_gap = matches!(
+        &socket.owner_completeness,
+        OwnerCompleteness::Partial { reasons }
+            if reasons.contains(&EvidenceGapCode::OwnerPermissionDenied)
+    );
+    let target_owner_permission_denied = target_match.unverified_target_reason
+        == Some(crate::observation::UnverifiedOwnerReason::PermissionDenied);
+
+    let mut authority = Authority {
+        permission_denied: socket_local_permission_gap || target_owner_permission_denied,
+        partial: target_match.unverified_target_reason.is_some()
+            || !socket.owner_completeness.is_complete(),
+    };
+
+    if matches!(target_mode, DestructiveTargetMode::Port(_)) {
+        // No owner at all, or any owner we could not tie to a start identity,
+        // means the port's holder set is unproven.
+        authority.partial |= socket.owners.is_empty()
+            || socket
+                .owners
+                .iter()
+                .any(|owner| !matches!(owner, crate::observation::OwnerObservation::Verified(_)));
+        authority.permission_denied |= socket.owners.iter().any(|owner| {
+            matches!(
+                owner,
+                crate::observation::OwnerObservation::UnverifiedPid {
+                    reason: crate::observation::UnverifiedOwnerReason::PermissionDenied,
+                    ..
+                }
+            )
+        });
+    }
+
+    authority
+}
+
+/// Whether an evidence gap can affect this target's authority.
+///
+/// Provenance is the whole point: an unrelated process losing its owner
+/// attribution must not make an unprivileged `kill --port` impossible, while a
+/// gap that could plausibly hide part of *this* target must refuse. The two
+/// target modes need different rules because they are asking different
+/// questions — "is this PID's evidence intact?" versus "is this port's holder
+/// set complete?" — so a socket-set gap with no endpoint is fatal to a port
+/// target but only to an unattributed PID target.
+fn gap_applies_to_target(
+    gap: &crate::observation::EvidenceGap,
+    target_mode: DestructiveTargetMode,
+    matched_endpoints: &std::collections::BTreeSet<crate::observation::EndpointIdentity>,
+) -> bool {
+    let names_matched_endpoint = || {
+        gap.endpoint
+            .as_ref()
+            .is_some_and(|endpoint| matched_endpoints.contains(endpoint))
+    };
+    match (target_mode, gap.impact) {
+        // Metadata and scope gaps never remove destructive authority: they
+        // describe optional enrichment and declared observation boundaries,
+        // neither of which changes who holds the endpoint.
+        (_, EvidenceImpact::Metadata | EvidenceImpact::Scope) => false,
+        (DestructiveTargetMode::Pid(target_pid), EvidenceImpact::SocketSet) => {
+            gap.pid == Some(target_pid)
+                || names_matched_endpoint()
+                // An unattributed socket-set loss could have hidden a socket
+                // belonging to this PID.
+                || (gap.endpoint.is_none() && gap.pid.is_none())
+        }
+        (DestructiveTargetMode::Pid(target_pid), EvidenceImpact::Ownership) => {
+            names_matched_endpoint() || (gap.endpoint.is_none() && gap.pid == Some(target_pid))
+        }
+        // Any socket-set loss that is not provably about another port could
+        // have hidden a co-holder of this one.
+        (DestructiveTargetMode::Port(target_port), EvidenceImpact::SocketSet) => gap
+            .endpoint
+            .as_ref()
+            .is_none_or(|endpoint| endpoint.port.get() == target_port),
+        (DestructiveTargetMode::Port(target_port), EvidenceImpact::Ownership) => gap
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.port.get() == target_port),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,7 +478,7 @@ where
 /// Deterministic authoritative fixture. It is built in snapshot form so tests
 /// exercise the same borrowed projection as native collectors.
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the five-row authoritative fixture keeps all snapshot facts together"
 )]
@@ -570,7 +677,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "function pointer must match the fallible native adapter seam"
     )]
@@ -586,7 +693,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "function pointer must match the fallible native adapter seam"
     )]

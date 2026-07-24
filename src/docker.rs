@@ -1225,7 +1225,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

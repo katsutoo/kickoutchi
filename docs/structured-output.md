@@ -373,7 +373,7 @@ Each array element has exactly these fields:
 | `command_line` | `string \| null` | Complete decoded command line, or `null` when unavailable or over 1 MiB. It is never silently truncated. |
 | `parent_pid` | `u32 \| null` | Parent PID when available. |
 | `parent_process_name` | `string \| null` | Parent process name when available. |
-| `child_pids` | array of `u32` | Reserved legacy field; current real rows serialize `[]`. |
+| `child_pids` | array of `u32` | Frozen `1.x` compatibility field with no backing data. It is always `[]`, on every row and every platform. Child processes are not part of this contract; use `inspect` for process relationships. |
 | `protected` | boolean | Whether configured and built-in protection rules classify the process as protected. |
 | `platform` | `"linux" \| "macos" \| "windows"` | Host collector platform. |
 | `permission` | `"full" \| "partial"` | Whether all legacy process metadata was available. Use this to distinguish unavailable metadata from known values. |

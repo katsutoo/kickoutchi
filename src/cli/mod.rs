@@ -224,10 +224,10 @@ pub(crate) struct ListArgs {
 /// `kill` requires exactly one target: a PID or a port. Requiring one stops
 /// a bare `kickoutchi kill` from meaning "kill something"; forbidding both
 /// stops a contradictory selection.
-// Each bool is one independent CLI flag; clap's derive needs them as bools,
-// and the contradictory combination (`--tree --group`) is already rejected at
-// parse time via `conflicts_with`.
-#[allow(clippy::struct_excessive_bools)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent CLI flag; clap's derive requires bools, and `--tree --group` is already rejected at parse time. `allow`, not `expect`: only Linux and macOS have `--group`, so Windows stays under the threshold"
+)]
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
 pub(crate) struct KillArgs {
@@ -577,7 +577,6 @@ pub(crate) mod test_support {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

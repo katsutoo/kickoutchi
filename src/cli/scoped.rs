@@ -1338,7 +1338,7 @@ fn scoped_delivery_summary(
 /// different codes depending on how the same processes were targeted;
 /// `scope_noun` and `scope_of_target` only shape the wording.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the exhaustive typed scoped-outcome mapping is intentionally centralized"
 )]
@@ -3016,7 +3016,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Partial,

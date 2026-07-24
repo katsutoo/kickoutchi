@@ -27,6 +27,18 @@ const LABELED_HEADERS: [&str; LABELED_COLUMN_COUNT] = [
 /// Stand-in for metadata the OS wouldn't give us. A visible dash keeps the
 /// columns lined up and says "unknown" out loud instead of leaving a gap.
 const MISSING: &str = "-";
+
+/// Spaces used to pad every column, sized to the widest cell any column can
+/// hold. `write_cells` clamps against this length rather than relying on the
+/// argument, so an unforeseen column can never index past the end.
+///
+/// The widest cell is a process name: addresses, ports, PIDs, states and
+/// protocols are short, and labels are clipped to
+/// [`crate::labels::LABEL_DISPLAY_MAX_COLUMNS`]. Process names are capped at
+/// [`crate::observation::PROCESS_NAME_MAX_BYTES`] by the metadata budget, and a
+/// sanitized string's terminal width never exceeds its byte length — every
+/// width-2 scalar starts at U+1100, which needs three UTF-8 bytes — so this
+/// length is an upper bound on any padding request.
 const PADDING: [u8; crate::observation::PROCESS_NAME_MAX_BYTES] =
     [b' '; crate::observation::PROCESS_NAME_MAX_BYTES];
 
@@ -199,8 +211,10 @@ fn write_cells<const N: usize>(
         // Pad every column but the last — trailing spaces are just invisible
         // noise for diffs and shells.
         if index < N - 1 {
-            let remaining = width.saturating_sub(cell.width());
-            debug_assert!(remaining <= PADDING.len());
+            // Clamped, not asserted: the bound documented on PADDING holds, but
+            // a misaligned column is a cosmetic bug while an out-of-range slice
+            // is a panic in the middle of writing a row.
+            let remaining = width.saturating_sub(cell.width()).min(PADDING.len());
             writer.write_all(&PADDING[..remaining])?;
         }
     }
@@ -230,7 +244,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

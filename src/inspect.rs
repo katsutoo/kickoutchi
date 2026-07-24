@@ -47,16 +47,35 @@ pub(crate) enum InspectError {
     TargetMissing,
 }
 
+/// PID lookup over one process-table snapshot.
+///
+/// A report resolves the same table many times — the ancestor walk, the scope
+/// PID set, the tree and group sections — and a linear scan per lookup makes a
+/// bounded report cost `lookups x table size` on a host with many processes.
+/// Built once per entry point and passed down instead.
+type PidIndex<'a> = HashMap<u32, &'a TreeProcessInfo>;
+
+fn index_by_pid(snapshot: &[TreeProcessInfo]) -> PidIndex<'_> {
+    let mut index = HashMap::with_capacity(snapshot.len());
+    for info in snapshot {
+        // First entry wins, matching the `find` this replaced, so a table that
+        // ever repeated a PID resolves the same way it always did.
+        index.entry(info.pid).or_insert(info);
+    }
+    index
+}
+
 pub(crate) fn command_line_scope_identities(
     target_pid: u32,
     snapshot: &[TreeProcessInfo],
 ) -> Vec<ProcessIdentity> {
-    let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
+    let index = index_by_pid(snapshot);
+    let Some(target) = index.get(&target_pid).copied() else {
         return Vec::new();
     };
     let mut processes = vec![target];
     processes.extend(
-        ancestor_chain(target, snapshot)
+        ancestor_chain(target, &index)
             .into_iter()
             .take(ANCESTORS_DISPLAY_MAX),
     );
@@ -86,7 +105,8 @@ pub(crate) fn build_scope(
     platform: Platform,
     protected_names: &[String],
 ) -> InspectScope {
-    let Some(target) = snapshot.iter().find(|info| info.pid == target_pid) else {
+    let index = index_by_pid(snapshot);
+    let Some(target) = index.get(&target_pid).copied() else {
         return InspectScope {
             port_identities: BTreeSet::new(),
             tree: Err(TreePlanError::RootMissing),
@@ -94,7 +114,7 @@ pub(crate) fn build_scope(
     };
     let mut pids = BTreeSet::from([target_pid]);
     pids.extend(
-        ancestor_chain(target, snapshot)
+        ancestor_chain(target, &index)
             .into_iter()
             .take(ANCESTORS_DISPLAY_MAX)
             .map(|info| info.pid),
@@ -135,7 +155,7 @@ pub(crate) fn build_scope(
     }
     let port_identities = pids
         .into_iter()
-        .filter_map(|pid| snapshot.iter().find(|info| info.pid == pid))
+        .filter_map(|pid| index.get(&pid).copied())
         .filter_map(process_identity)
         .collect();
     InspectScope {
@@ -186,9 +206,10 @@ pub(crate) fn render_family_report_with_scope<CommandLine>(
 where
     CommandLine: FnMut(u32) -> Option<String>,
 {
-    let target = snapshot
-        .iter()
-        .find(|info| info.pid == target_pid)
+    let index = index_by_pid(snapshot);
+    let target = index
+        .get(&target_pid)
+        .copied()
         .ok_or(InspectError::TargetMissing)?;
 
     let ports_by_pid = ports_by_pid(entries, snapshot);
@@ -205,7 +226,7 @@ where
     render_ancestors(
         &mut out,
         target,
-        snapshot,
+        &index,
         protected_names,
         platform,
         &mut command_line,
@@ -282,14 +303,14 @@ fn render_target<CommandLine>(
 fn render_ancestors<CommandLine>(
     out: &mut String,
     target: &TreeProcessInfo,
-    snapshot: &[TreeProcessInfo],
+    index: &PidIndex<'_>,
     protected_names: &[String],
     platform: Platform,
     command_line: &mut CommandLine,
 ) where
     CommandLine: FnMut(u32) -> Option<String>,
 {
-    let ancestors = ancestor_chain(target, snapshot);
+    let ancestors = ancestor_chain(target, index);
     if ancestors.is_empty() {
         out.push_str("Ancestors: none visible\n");
         return;
@@ -492,7 +513,7 @@ fn render_group(
 /// set makes a cyclic or corrupt parent map terminate instead of looping.
 fn ancestor_chain<'snapshot>(
     target: &TreeProcessInfo,
-    snapshot: &'snapshot [TreeProcessInfo],
+    index: &PidIndex<'snapshot>,
 ) -> Vec<&'snapshot TreeProcessInfo> {
     let mut chain = Vec::new();
     let mut seen = HashSet::from([target.pid]);
@@ -505,7 +526,7 @@ fn ancestor_chain<'snapshot>(
         if !seen.insert(pid) {
             break;
         }
-        let Some(info) = snapshot.iter().find(|info| info.pid == pid) else {
+        let Some(info) = index.get(&pid).copied() else {
             break;
         };
         chain.push(info);
@@ -603,7 +624,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

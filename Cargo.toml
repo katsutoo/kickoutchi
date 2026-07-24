@@ -85,6 +85,14 @@ windows-sys = { version = "0.61.2", features = ["Wdk_System_Threading", "Win32_F
 
 [lints.clippy]
 pedantic = "warn"
+# Every lint suppression must say why it exists. A silenced lint with no stated
+# reason is indistinguishable from one that stopped being needed, which is
+# exactly how a stale `allow` survives review. Prefer `expect` over `allow`
+# where the lint is guaranteed to fire on every target: `expect` warns once the
+# suppression becomes unnecessary, so it cleans itself up. `allow` remains
+# correct for suppressions that only apply on some targets, where `expect`
+# would fire `unfulfilled_lint_expectations` on the others.
+allow_attributes_without_reason = "warn"
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -370,7 +370,6 @@ mod tests {
             command_line: Some("node server.js".into()),
             parent_pid: Some(18_001),
             parent_process_name: Some("cursor-agent".into()),
-            child_pids: vec![18_430, 18_431],
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

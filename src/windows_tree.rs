@@ -224,7 +224,7 @@ pub(crate) fn execute_tree_kill(
     )
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "the Windows commit boundary and post-commit handling stay visibly ordered"
 )]
@@ -694,7 +694,7 @@ fn assign_initial_members<Api: WindowsTreeApi>(
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the post-commit convergence keeps all safety-critical state and ordering explicit"
@@ -894,7 +894,7 @@ fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "post-commit refusal keeps the job, pinned child, evidence, and report explicit"
 )]
@@ -1391,7 +1391,10 @@ mod tests {
     }
 
     #[derive(Default)]
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "each bool scripts one independent fake-API failure mode"
+    )]
     struct FakeApi {
         snapshots: Vec<Vec<TreeProcessInfo>>,
         snapshot_errors: HashMap<usize, String>,

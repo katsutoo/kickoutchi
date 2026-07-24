@@ -250,7 +250,7 @@ impl MacosCollector {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "bounded socket, owner, token-conflict, and evidence stores are updated atomically"
 )]
@@ -1331,10 +1331,6 @@ where
     Ok((records, losses))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "ordered native metadata reads share one aggregate byte budget"
-)]
 fn read_process_metadata_bounded(
     pid: u32,
     profile: MetadataProfile,

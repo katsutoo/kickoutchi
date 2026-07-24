@@ -3205,7 +3205,7 @@ mod linux {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "the real-binary schema contract asserts every field and nested shape"
     )]

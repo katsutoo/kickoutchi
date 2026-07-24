@@ -655,7 +655,6 @@ mod tests {
             command_line: Some(format!("{name} --port {port}").into()),
             parent_pid: Some(10),
             parent_process_name: Some("agent".into()),
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,

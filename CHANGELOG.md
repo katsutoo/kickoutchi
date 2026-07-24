@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented `child_pids` in `list --json` as what it has always been: a frozen
+  `1.x` compatibility field that is `[]` on every row and every platform, with
+  no backing data. The wire output is unchanged; the field it mirrored is gone,
+  so the empty array can no longer drift from a value behind it.
+- Every lint suppression now states a reason, enforced by
+  `clippy::allow_attributes_without_reason`. Suppressions that always apply use
+  `expect`, which reports itself once it is no longer needed; `allow` is kept
+  only where a suppression is target-specific. Adopting this removed three
+  suppressions that no longer applied to the code they guarded.
 - Replaced the Python release-archive validator and its tests with a test-only
   Rust target. CI and cargo-dist retain bounded checksum, path, archive-layout,
   member-type, expanded-size, permission, version, dual-entrypoint, timeout, and
@@ -119,6 +128,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tree and group cleanup no longer reports a member that exited under the freeze
+  as a thaw failure. Only a refused `SIGCONT` leaves a process that may still be
+  stopped, so only refusals are named; a member the kernel reports as gone is
+  not something the user can resume. This matches the classification the
+  delivery paths and single-process termination already used, so a refusal such
+  as a root that exits mid-freeze no longer prints a cleanup error naming a PID
+  that no longer exists.
 - macOS normal termination now distinguishes a process that exits between
   `SIGTERM` delivery and the guarded `SIGCONT` identity check from an unreadable
   or recycled PID, avoiding a false cleanup failure without signaling a new

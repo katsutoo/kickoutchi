@@ -26,7 +26,10 @@ use super::ExitReason;
 
 const PUBLIC_MESSAGE_MAX_BYTES: usize = 512;
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent CLI flag; clap's derive requires bools, and the contradictory combinations are rejected at parse time"
+)]
 #[derive(Debug, Args)]
 pub(crate) struct WhyArgs {
     /// Port to diagnose (1..=65535).
@@ -210,12 +213,18 @@ impl WhyOptions {
             .ok()
             .filter(|port| *port != 0)
             .ok_or_else(|| "port must be in 1..=65535".to_owned())?;
+        // `--tcp` is read here rather than left to fall through the `else`.
+        // Both mean TCP today, but a flag that works only because it matches
+        // the default is a flag that breaks silently when the default moves.
+        // Same shape as watch's `protocol_selected`. clap rejects any two
+        // protocol flags together, so at most one is set.
+        let tcp_selected = args.tcp || !(args.udp || args.all_protocols);
         let protocols = if args.all_protocols {
             vec![Protocol::Tcp, Protocol::Udp]
-        } else if args.udp {
-            vec![Protocol::Udp]
-        } else {
+        } else if tcp_selected {
             vec![Protocol::Tcp]
+        } else {
+            vec![Protocol::Udp]
         };
         let addresses = parse_addresses(args)?;
         let scope_id = args.scope_id.and_then(NonZeroU32::new);
@@ -911,6 +920,40 @@ mod tests {
         assert_eq!(options.endpoints.len(), 2);
     }
 
+    /// `--tcp` names the same protocol the bare query defaults to, so a version
+    /// that ignored the flag would still pass the test above. Asserting each
+    /// selector on its own is what catches a `--tcp` that stopped being read.
+    #[test]
+    fn every_protocol_selector_is_read_independently_of_the_default() {
+        for (input, expected) in [
+            (
+                WhyArgs {
+                    tcp: true,
+                    ..args()
+                },
+                vec![Protocol::Tcp],
+            ),
+            (
+                WhyArgs {
+                    udp: true,
+                    ..args()
+                },
+                vec![Protocol::Udp],
+            ),
+            (
+                WhyArgs {
+                    all_protocols: true,
+                    ..args()
+                },
+                vec![Protocol::Tcp, Protocol::Udp],
+            ),
+            (args(), vec![Protocol::Tcp]),
+        ] {
+            let options = WhyOptions::parse(&input).expect("protocol selector is valid");
+            assert_eq!(options.protocols, expected);
+        }
+    }
+
     #[test]
     fn expanded_query_is_the_canonical_eight_endpoint_matrix() {
         let mut input = args();
@@ -1342,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "the schema contract asserts every envelope and nested result field"
     )]
@@ -1487,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "human and JSON output are compared across every result fact"
     )]

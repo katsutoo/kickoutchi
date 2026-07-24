@@ -64,7 +64,10 @@ pub(super) fn run_kill(args: &KillArgs, config: &Config, entries: &[PortEntry]) 
     )
 }
 
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the shared collect_ prefix names the seam each field injects"
+)]
 struct KillCollectors<CollectContext, CollectKillPorts, CollectVisibilityPorts> {
     collect_context: CollectContext,
     collect_kill_ports: CollectKillPorts,

@@ -310,10 +310,6 @@ impl ProcessApi for RealProcessApi {
 }
 
 impl ProcessSnapshot {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "creation-handle bracketing and deterministic metadata budgeting are one safety transaction"
-    )]
     fn collect(
         profile: MetadataProfile,
         selection: ProcessSelection<'_>,
@@ -321,10 +317,6 @@ impl ProcessSnapshot {
         Self::collect_with_budget(profile, selection, OPTIONAL_METADATA_MAX_BYTES)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "creation-handle bracketing and deterministic metadata budgeting are one safety transaction"
-    )]
     fn collect_with_budget(
         profile: MetadataProfile,
         selection: ProcessSelection<'_>,
@@ -338,7 +330,7 @@ impl ProcessSnapshot {
         )
     }
 
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "creation-handle bracketing and deterministic metadata budgeting are one safety transaction"
     )]
@@ -1754,7 +1746,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         clippy::unnecessary_wraps,
         reason = "four typed collector seams stay visible in one production-wiring test"

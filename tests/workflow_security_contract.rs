@@ -6,10 +6,18 @@ fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
+/// One workflow line with indentation, blank lines, and comments removed.
+///
+/// The result is trimmed again after the comment is stripped. Several
+/// assertions below compare the whole line (`== "permissions: read-all"`) or
+/// its suffix (`ends_with(": write")`), and leaving the space that separated
+/// the comment would quietly exempt any line carrying one — exactly the lines
+/// a reviewer is most likely to annotate.
 fn active_line(line: &str) -> Option<&str> {
     let line = line.trim();
     (!line.is_empty() && !line.starts_with('#'))
         .then(|| line.split(" #").next().expect("active line must exist"))
+        .map(str::trim_end)
 }
 
 fn yaml_block(source: &str, key: &str, indent: usize) -> String {
@@ -495,4 +503,158 @@ fn native_archives_are_validated_before_upload_and_publication() {
         }),
         "publication must require validated local artifacts to succeed"
     );
+}
+
+/// The helpers above are a hand-rolled YAML reader, kept instead of a parser
+/// dependency because these tests read one repository-controlled file. That
+/// trade is only safe while the reader is itself pinned: a helper that silently
+/// returned nothing would make every security assertion in this file pass
+/// vacuously. These tests exercise the reader against a fixture with the shapes
+/// the real workflows use — nesting, comments, inline comments, blank lines,
+/// multi-line steps — plus the failure modes that must stay loud.
+#[cfg(test)]
+mod yaml_reader {
+    use super::{
+        action_reference, active_line, indentation, job_steps, sequence_items, step_env,
+        workflow_job, workflow_job_names, workflow_steps, yaml_block, yaml_mapping, yaml_scalar,
+        yaml_sequence,
+    };
+
+    const FIXTURE: &str = r#"# leading comment
+name: Fixture
+permissions:
+  contents: read
+
+env:
+  PINNED: "1.2.3"
+
+jobs:
+  first:
+    runs-on: ubuntu-latest  # inline comment
+    permissions:
+      contents: read
+    needs:
+      - zeroth
+      - other
+    if: ${{ needs.zeroth.result == 'success' }}
+    steps:
+      - uses: actions/checkout@1111111111111111111111111111111111111111 # v1
+        with:
+          persist-credentials: false
+
+      - name: Multi line step
+        env:
+          TOKEN: ${{ secrets.EXAMPLE }}
+        run: |
+          echo one
+          echo two
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only step
+        run: echo done
+"#;
+
+    #[test]
+    fn active_line_strips_comments_and_blanks() {
+        assert_eq!(active_line("  key: value"), Some("key: value"));
+        assert_eq!(active_line("  key: value  # trailing"), Some("key: value"));
+        assert_eq!(active_line("   # whole line"), None);
+        assert_eq!(active_line("    "), None);
+        // A `#` that is not comment-separated stays part of the value.
+        assert_eq!(
+            active_line("url: http://x/#frag"),
+            Some("url: http://x/#frag")
+        );
+        assert_eq!(indentation("    key:"), 4);
+    }
+
+    #[test]
+    fn scalars_mappings_and_sequences_read_the_requested_depth() {
+        assert_eq!(yaml_scalar(FIXTURE, "name", 0).as_deref(), Some("Fixture"));
+        // A key at another indentation must not be picked up.
+        assert_eq!(yaml_scalar(FIXTURE, "contents", 0), None);
+        assert_eq!(
+            yaml_mapping(FIXTURE, "permissions", 0),
+            [("contents".to_owned(), "read".to_owned())]
+        );
+        assert_eq!(
+            yaml_mapping(FIXTURE, "env", 0),
+            [("PINNED".to_owned(), "\"1.2.3\"".to_owned())]
+        );
+
+        let first = workflow_job(FIXTURE, "first");
+        assert_eq!(yaml_sequence(&first, "needs", 4), ["zeroth", "other"]);
+        assert_eq!(
+            yaml_scalar(&first, "if", 4).as_deref(),
+            Some("${{ needs.zeroth.result == 'success' }}")
+        );
+    }
+
+    #[test]
+    fn blocks_end_at_the_next_key_of_equal_or_lower_indentation() {
+        let permissions = yaml_block(FIXTURE, "permissions", 0);
+        assert!(permissions.contains("contents: read"));
+        assert!(!permissions.contains("PINNED"), "{permissions}");
+
+        // The first job's block must not bleed into the second job.
+        let first = workflow_job(FIXTURE, "first");
+        assert!(first.contains("Multi line step"));
+        assert!(!first.contains("Only step"), "{first}");
+    }
+
+    #[test]
+    fn missing_blocks_fail_loudly_rather_than_returning_nothing() {
+        // A silent empty block is what would make the real assertions vacuous.
+        let missing = std::panic::catch_unwind(|| yaml_block(FIXTURE, "absent", 0));
+        assert!(
+            missing.is_err(),
+            "a missing block must panic, not return empty"
+        );
+    }
+
+    #[test]
+    fn jobs_and_steps_are_enumerated_completely() {
+        assert_eq!(workflow_job_names(FIXTURE), ["first", "second"]);
+
+        let first = workflow_job(FIXTURE, "first");
+        let steps = job_steps(&first);
+        assert_eq!(steps.len(), 2, "{steps:#?}");
+        // A blank line inside a step must not split it into two items.
+        assert!(steps[0].contains("persist-credentials: false"));
+        assert!(steps[1].contains("echo one") && steps[1].contains("echo two"));
+
+        // Every step across the file is found, so an un-scanned step cannot
+        // hide an unpinned action.
+        assert_eq!(workflow_steps(FIXTURE).len(), 3);
+        assert_eq!(sequence_items(&yaml_block(&first, "steps", 4), 6).len(), 2);
+    }
+
+    #[test]
+    fn step_details_are_read_from_the_right_step() {
+        let steps = job_steps(&workflow_job(FIXTURE, "first"));
+        assert_eq!(
+            action_reference(&steps[0]).as_deref(),
+            Some("actions/checkout@1111111111111111111111111111111111111111")
+        );
+        assert_eq!(action_reference(&steps[1]), None);
+        assert_eq!(
+            step_env(&steps[1], "TOKEN").as_deref(),
+            Some("${{ secrets.EXAMPLE }}")
+        );
+        // A step with no env block must report none rather than borrowing one.
+        assert_eq!(step_env(&steps[0], "TOKEN"), None);
+        assert_eq!(step_env(&steps[1], "ABSENT"), None);
+    }
+}
+
+/// Regression for the inline-comment blind spot: a permission line annotated
+/// with a comment must still be seen as a write permission, or the read-only
+/// assertion above would exempt exactly the lines reviewers annotate.
+#[test]
+fn commented_write_permissions_are_still_detected() {
+    let annotated = "        contents: write  # needed for the release";
+    let line = active_line(annotated).expect("annotated line is active");
+    assert_eq!(line, "contents: write");
+    assert!(line.ends_with(": write"));
 }

@@ -11,8 +11,6 @@ Both ship the `kickoutchi` binary and the `kick` shortcut. The `-bin` package is
 
 ## Install from the AUR
 
-Once the packages are live:
-
 ```sh
 yay -S kickoutchi-bin
 ```
@@ -30,16 +28,14 @@ kick --version
 kick list
 ```
 
-Once published, update either package through the normal full-system upgrade or
-by asking the configured AUR helper to rebuild that package. Until publication,
-the commands above are examples of the intended package names rather than an
-available registry install.
+Update either package through a normal full-system upgrade, or by asking the
+configured AUR helper to rebuild that package.
 
 ## Maintainer notes
 
 When a new tag ships, update `pkgver` and the checksums in `PKGBUILD` only after the `cargo-dist` GitHub Release assets exist. Do not use placeholder checksums or `SKIP` for the AUR package metadata.
 
-For a new release, keep the package metadata pinned to the latest published assets until the new GitHub Release assets and checksums exist. Initial AUR publication remains pending until package maintenance is assigned.
+For a new release, keep the package metadata pinned to the latest published assets until the new GitHub Release assets and checksums exist. A version bump pushed before its assets exist gives Arch users a package that cannot build.
 
 The required update order is: run/publish the release with `cargo-dist`, download or read the generated checksums from the release assets, update `pkgver`/`source`/`provides`/`sha256sums`, regenerate `.SRCINFO`, then build locally.
 

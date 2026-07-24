@@ -431,14 +431,15 @@ For multi-endpoint `why`, aggregate precedence is `1`, then `4`, then `3`, then
   for the desired branch, tag, or revision.
 - Direct archives require manual download, checksum verification, and
   replacement.
-- AUR metadata is maintained under `packaging/arch`, but the packages remain
-  unavailable until an AUR maintainer account can publish them.
+- Arch users install `kickoutchi-bin` or `kickoutchi` from the AUR. Both are
+  maintained under `packaging/arch` and pushed after the GitHub Release, because
+  their version and checksums come from the real published assets.
 
 Unqualified Cargo Git and Nix GitHub references follow the repository's default
 branch and can be newer than the latest stable release. Tag- or commit-qualified
-references are the reproducible source-install path. Homebrew, Scoop, and future
-AUR repositories are independent publisher boundaries and can update after the
-GitHub Release rather than atomically with it.
+references are the reproducible source-install path. Homebrew, Scoop, and AUR
+are independent publisher boundaries and can update after the GitHub Release
+rather than atomically with it.
 
 ## Landing-Page Command Set
 

@@ -178,8 +178,12 @@ pub(crate) trait TreeProcessOps {
     ) -> Option<ProcessStartMarker> {
         prior_marker
     }
-    /// `SIGCONT` a process. `NotFound` leaves no stopped survivor; `Denied`
-    /// must be reported as a cleanup failure.
+    /// `SIGCONT` a process.
+    ///
+    /// `NotFound` leaves no stopped survivor — the process is gone, so there is
+    /// nothing to resume and nothing to report. Only `Denied` is a cleanup
+    /// failure: the process is still there and may still be stopped. Every
+    /// caller classifies on `Denied` alone; see [`thaw_all`].
     fn cont(&mut self, pid: u32) -> TreeSignalResult;
     /// Retain the verified identity needed to make a raw-PID thaw safe.
     fn prepare_thaw(&mut self, _pid: u32, _marker: Option<ProcessStartMarker>) {}
@@ -1425,12 +1429,20 @@ fn signal_group<Ops: TreeProcessOps>(
     }
 }
 
+/// Thaw every frozen member and report the ones that may still be stopped.
+///
+/// Only `Denied` counts as a cleanup failure, matching `signal_tree`,
+/// `signal_group`, and the single-process `outcome_after_thaw`. `NotFound`
+/// means the member is gone — an external `SIGKILL` removed it, or macOS
+/// observed a changed start marker — so there is no stopped survivor to
+/// report, and naming it would send the user hunting for a process that no
+/// longer exists.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) -> Vec<u32> {
     let mut failed = Vec::new();
     for node in frozen.iter().rev() {
         ops.prepare_thaw(node.pid, node.rollback_start_time_marker);
-        if ops.cont(node.pid) != TreeSignalResult::Delivered {
+        if ops.cont(node.pid) == TreeSignalResult::Denied {
             failed.push(node.pid);
         }
     }
@@ -1642,11 +1654,16 @@ mod tests {
         assert_eq!(ops.events, [Event::Cont(42)]);
     }
 
+    /// A member that vanished under the freeze leaves nothing stopped, so it
+    /// must not be named as a thaw failure — that would send the user chasing
+    /// a PID that no longer exists. Only a refused `SIGCONT` is a real failure.
+    /// This pins the same `Denied`-only rule the delivery paths and the
+    /// single-process `outcome_after_thaw` already use.
     #[test]
-    fn refusal_reports_not_found_continuation_as_thaw_failure() {
+    fn refusal_reports_only_denied_continuations_as_thaw_failures() {
         let marker = crate::observation::ProcessStartMarker::linux(55).ok();
-        let frozen = [FrozenNode {
-            pid: 42,
+        let node = |pid| FrozenNode {
+            pid,
             parent_pid: None,
             parent_process_name: None,
             process_name: Some("node".to_owned()),
@@ -1654,13 +1671,18 @@ mod tests {
             start_time_marker: marker,
             rollback_start_time_marker: marker,
             depth: 0,
-        }];
+        };
+        let frozen = [node(42), node(43)];
         let mut ops = FakeOps::new(Vec::new());
         ops.missing_cont.push(42);
+        ops.deny_cont.push(43);
 
-        assert_eq!(super::thaw_all(&frozen, &mut ops), [42]);
+        assert_eq!(super::thaw_all(&frozen, &mut ops), [43]);
         assert_eq!(ops.prepared_thaws.get(&42), Some(&marker));
-        assert_eq!(ops.events, [Event::Cont(42)]);
+        assert_eq!(ops.prepared_thaws.get(&43), Some(&marker));
+        // Both members are still attempted, deepest-first, even though only one
+        // is reported.
+        assert_eq!(ops.events, [Event::Cont(43), Event::Cont(42)]);
     }
 
     #[test]
@@ -1809,7 +1831,6 @@ mod tests {
             command_line: None,
             parent_pid: None,
             parent_process_name: None,
-            child_pids: Vec::new(),
             protected: false,
             platform: Platform::Linux,
             permission: PermissionStatus::Full,
