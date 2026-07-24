@@ -2437,10 +2437,10 @@ Preserve the first intermittent failure. Do not retry until green.
 
 ### Stage 11 gate
 
-- [ ] QA tested the exact release artifacts on all three platforms.
-- [ ] QA verdict is PASS.
-- [ ] QA release recommendation is `ship`.
-- [ ] Cleanup was verified and residual risk is documented.
+- [x] QA tested the exact release artifacts on all three platforms.
+- [x] QA verdict is PASS.
+- [x] QA release recommendation is `ship`.
+- [x] Cleanup was verified and residual risk is documented.
 
 ## Stage 12: Release Benchmark
 

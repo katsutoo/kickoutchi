@@ -4,35 +4,33 @@ Date: 2026-07-24
 
 ## Verdict
 
-QA verdict: BLOCKED.
+QA verdict: PASS.
 
-Release recommendation from this gate: `hold`.
+Release recommendation from this gate: `ship`.
 
-The exact artifacts passed twelve bounded native charters on all five targets,
-but those charters do not cover the complete mandatory exploratory matrix. The
-passing run is retained as partial evidence and is not promoted to a gate pass.
+The complete bounded exploratory matrix passed against the exact candidate
+artifacts on five native targets. Benchmarking may proceed without changing the
+candidate identity.
 
-## Candidate And Harness Identity
+## Candidate And Evidence Identity
 
 - Candidate source commit:
   `7393b56a5d86a5e2afb298cf6d1eb185a77bf02a`.
 - Candidate Release run:
   https://github.com/nuggocto/kickoutchi/actions/runs/30046834702
 - Qualification harness commit:
-  `4fa553c8fcb55d7c3387be8db704b5446660150a`.
+  `f5c6ad590eddc33b36d5c17c41f777e697a427b9`.
 - Passing qualification run:
-  https://github.com/nuggocto/kickoutchi/actions/runs/30052379065
-- The harness checkout was clean on every target.
-- The workflow used read-only repository and Actions permissions, did not use
-  persisted checkout credentials, and downloaded the immutable candidate run by
-  explicit run ID.
+  https://github.com/nuggocto/kickoutchi/actions/runs/30057691151
+- Earlier incomplete/failing runs `30052379065`, `30057283200`, and
+  `30057577754` remain preserved and are not cited as passing evidence.
 
-The qualification harness was added after the candidate was built. Its separate
-commit does not alter the candidate archives or executables; every report binds
-the executed binaries to the candidate commit, archive checksum, and executable
-checksums.
+The workflow had read-only repository and Actions permissions, persisted no
+checkout credentials, and downloaded the immutable candidate run by explicit
+run ID. The qualification-only commits do not alter the candidate executables.
+Every report verifies the candidate and v1.2.0 baseline executable hashes.
 
-## Native Artifact Evidence
+## Native Artifacts
 
 | Native target | Archive SHA-256 | `kickoutchi` SHA-256 | `kick` SHA-256 |
 | --- | --- | --- | --- |
@@ -42,116 +40,59 @@ checksums.
 | macOS ARM64 | `b2570c73f94b9114ad875abad6efed37d4ff70507ce6b177d5e4efdc8d5f12da` | `7b89f7d7ee71298259032d18514f05d18ff5d0bf449fbd2fabf9f9e17dc0228c` | `54177695affffec2a0d2f06c9d339c5138bd39973980c8d64be3a5ceef9ec72c` |
 | Windows x86_64 | `e31eb5709a7f7385f18306b92cec6c47a7341e75558f4dea74875dfdf3874f15` | `4e2cc692d2e5a828e51aa6d5b10ce05ff79af9de39173e19c5e7d8ff7b7d774b` | `431a4bec837e32f4daf7f206286e007072f4373c5a9636ab81a97c1930df897d` |
 
-All five native reports recorded `overall: PASS`, no first failure, and twelve
-unique passing charters. That report verdict describes the implemented harness,
-not the broader gate in `FEATURE.md`.
+All ten base and extended reports recorded `overall: PASS`. The reports preserve
+exact commands, bounded stream byte counts and digests, environment metadata,
+and cleanup results while redacting private stream contents.
 
-## Evidence Collected
+## Coverage
 
-The bounded user-level harness exercised:
+The native charters established:
 
-- canonical and short-binary version parity;
-- no-label table output and the legacy JSON array;
-- exact and wildcard labels in list and search;
-- snapshot schema, labels, and privacy;
-- TCP and UDP IPv4-loopback Why schema, labels, and privacy;
-- bounded watch duration, baseline NDJSON, labels, and privacy;
-- short-binary functional parity;
-- configuration and filter boundaries;
-- early-closing JSON and NDJSON consumers;
-- read-only inspect behavior;
-- a safe test-owned kill with verified process cleanup;
-- native TUI alternate-screen startup and restoration.
+- canonical and short-binary parity, legacy list compatibility, structured
+  snapshot privacy, inspect, and safe test-owned termination;
+- exact and wildcard labels in list and TUI presentation/search;
+- v1.2.0-to-v1.3.0 upgrades with absent and existing configuration;
+- bindable and occupied TCP/UDP, IPv4/IPv6, loopback, and wildcard Why matrices;
+- watch baseline, bind, release, replacement, bounded duration, Ctrl-C, finite
+  memory trend, transient recovery, and three-failure exhaustion;
+- malformed, empty, legal-maximum, and maximum-plus-one public inputs;
+- protected-process refusal and safe PID, tree, and process-group termination;
+- real permission-limited process metadata, isolated network namespaces,
+  hash-pinned Docker isolation, and an actual Windows WSL capability probe;
+- early-closing JSON/NDJSON consumers and complete helper/resource cleanup.
 
-Every product invocation had a deadline and bounded output capture. The harness
-used isolated home, configuration, and temporary directories. It retained exact
-commands and stream metadata while redacting stream contents and the unique
-privacy marker. No privacy marker occurred in the published evidence.
+Windows TUI evidence used ConPTY through hash-pinned `pywinpty 3.0.5`. It proved
+alternate-screen entry/exit, label rendering, applied search, status 0, bounded
+12,150-byte terminal output with SHA-256
+`a161d58870dd00da90f943427e2e03a1f18cd33561ec693c335c380c98baead2`,
+and verified process cleanup.
 
-The legacy list JSON compatibility interface still exposes its documented
-command-line field. Each report identifies the two affected legacy rows and does
-not misrepresent that compatibility exception as new structured-output privacy.
+## Platform Limits And Residual Risk
 
-## Windows TUI Evidence
+- macOS retained its exact fail-closed `partial_socket_set` watch behavior and
+  process-first port-kill refusal. Tree and process-group termination still
+  passed against owned fixtures.
+- Windows retained `wsl_network_stack_excluded`. The hosted machine's actual WSL
+  status/list probes were recorded, without claiming execution inside WSL.
+- Windows correctly suppressed replacement certainty when global ownership was
+  partial; Linux exact artifacts proved replacement under complete ownership.
+- GitHub Linux denied direct unprivileged namespace creation. The failed attempt
+  was preserved and the charter used a second hash-pinned Docker network
+  namespace rather than claiming host namespace access.
+- Hosted runners cannot represent every local policy, container topology,
+  permission model, thermal condition, or short-lived race. Product output
+  reports those boundaries rather than asserting machine-wide certainty.
 
-Windows used the native ConPTY backend through hash-pinned `pywinpty 3.0.5`.
-The evidence binds to canonical executable SHA-256
-`4e2cc692d2e5a828e51aa6d5b10ce05ff79af9de39173e19c5e7d8ff7b7d774b`
-and records:
-
-- alternate-screen entry: true;
-- alternate-screen exit: true;
-- process exit status: 0;
-- timeout: false;
-- oversized output: false;
-- combined terminal output: 3,722 bytes, SHA-256
-  `a63ca309dac16623d0fd8bb1f6138f729bef4de75500298dd77b160455a952ca`.
-
-ConPTY exposes one combined terminal stream, so the retained report's legacy
-`stdout` and `stderr` field names must not be interpreted as independently
-captured process handles.
-
-This replaced the initial WinPTY approach after preserved failures proved that
-the hosted PowerShell runner supplied no terminal dimensions. The first failure
-was not retried unchanged or hidden.
-
-## Missing Mandatory Coverage
-
-The native run did not establish all required user-level behavior. In
-particular, it did not independently exercise:
-
-- upgrade from the previous release with existing and absent configuration;
-- watch bind, release, replacement, transient failure, recovery, three-failure
-  exhaustion, no-duration memory behavior, and Ctrl-C as exploratory journeys;
-- the complete TCP/UDP, IPv4/IPv6, wildcard, and dual-stack Why matrix under
-  controlled occupied and bindable states;
-- real permission-denied and partial-metadata environments on every applicable
-  platform;
-- actual Docker, WSL, and isolated namespace environments rather than only the
-  documented limitation text;
-- malformed, empty, legal maximum, and maximum-plus-one user inputs;
-- protected-process confirmation and tree/group kill regressions.
-
-Prior automated suites cover many of these behaviors, but this gate explicitly
-requires exploratory user-level coverage and cannot pass by referring back to
-the automated gate.
-
-## Platform Limits And Cleanup
-
-- Both macOS hosts reported the exact fail-closed `partial_socket_set`
-  limitation during watch collection. No partial baseline was accepted.
-- Linux and Windows reported no qualification-harness platform limitation.
-- The retained run reports successful cleanup for every helper and socket. No timeout,
-  oversized stream, failed reap, dirty worktree, or residual test resource was
-  reported.
-- Docker, WSL, namespace, process-visibility, bind-race, and polling limitations
-  were checked through their user-visible contracts without accessing production
-  or third-party systems.
-
-Residual risk remains that hosted runners cannot reproduce every local policy,
-container topology, WSL network stack, permission model, or short-lived socket
-race. The product reports those boundaries rather than claiming machine-wide
-certainty. The macOS process-first limitation remains an accepted known platform
-constraint.
-
-## Preserved Failure History
-
-Qualification runs `30050990781`, `30051209003`, `30051346961`,
-`30051485961`, `30051615417`, `30051752121`, and `30052095190` preserve the
-progression from harness defects and missing Windows pseudo-console evidence to
-the final native ConPTY solution. None is cited as passing evidence.
+Every harness-owned process, socket, container, pseudo-console, and temporary
+tree was closed or reaped. No timeout, oversized stream, failed cleanup, or
+privacy-marker disclosure occurred in the passing run.
 
 ## Formal Gate Status
 
-- [ ] QA tested the complete required matrix against exact Linux, macOS, and Windows artifacts.
-- [ ] QA verdict is PASS.
-- [ ] QA release recommendation is `ship`.
-- [ ] Cleanup and residual risk are complete for the full matrix.
+- [x] QA tested the complete required matrix against exact Linux, macOS, and Windows artifacts.
+- [x] QA verdict is PASS.
+- [x] QA release recommendation is `ship`.
+- [x] Cleanup and residual risk are complete for the full matrix.
 
-The corresponding `FEATURE.md` gate remains open.
-
-## Required Follow-up
-
-Extend the exploratory harness or conduct equivalent bounded manual charters for
-the missing matrix, rerun all native targets against the same artifact identity,
-and retain a new report. Benchmarking remains gated on a complete QA pass.
+The corresponding `FEATURE.md` gate may be closed. Release benchmarking is the
+next gate.

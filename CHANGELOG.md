@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifacts by run identity, executes bounded user-level charters on Linux,
   macOS, and Windows, records the Windows TUI lifecycle with native ConPTY, and
   preserves redacted machine-readable evidence with exact artifact checksums and
-  cleanup results.
+  cleanup results. Extended qualification covers previous-release upgrades,
+  complete bind diagnostics, watch recovery and exhaustion, input limits,
+  permission-restricted metadata, namespace and Docker scope, WSL capability,
+  tree/group termination, and label-aware TUI search.
 - Deterministic unit, contract, and real-binary coverage for observation
   completeness, metadata budgets, labels and filters, watch recovery and event
   ordering, bind diagnostics, output schemas, configuration boundaries, safe

@@ -63,9 +63,9 @@ and fails selected `/proc/net/tcp` opens; a missing compiler blocks that charter
 rather than weakening it. Tree termination runs on Linux, macOS, and Windows;
 process-group termination runs on Linux and macOS. Unsupported IPv6 is retained
 as an explicit Why result. The Windows charter asserts the native-host scope and
-`wsl_network_stack_excluded` contract; it does not claim that WSL was executed.
+`wsl_network_stack_excluded` contract and records actual WSL capability probes;
+it does not claim that the Windows artifact executed inside WSL.
 
-This harness is not invoked by the current release qualification workflow. A
-workflow job must download and verify the published v1.2 artifact for each
-native target, pass both executable hashes, run this module, upload its report,
-and require `overall: PASS` before its results can satisfy the release gate.
+The release qualification workflow downloads and verifies the published v1.2
+artifact for each native target, passes both executable hashes, runs this module,
+uploads its report, and requires `overall: PASS`.
