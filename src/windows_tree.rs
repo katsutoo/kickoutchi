@@ -18,7 +18,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE,
-    WaitForSingleObject,
+    PROCESS_TERMINATE, WaitForSingleObject,
 };
 
 use crate::model::Platform;
@@ -1172,8 +1172,12 @@ impl WindowsTreeApi for RealWindowsTreeApi {
     }
 
     fn open_process(&mut self, pid: u32) -> Result<Self::ProcessHandle, WindowsApiError> {
-        let desired_access =
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_SET_QUOTA;
+        // AssignProcessToJobObject requires both SET_QUOTA and TERMINATE access,
+        // even though tree kill never terminates this handle individually.
+        let desired_access = PROCESS_TERMINATE
+            | PROCESS_QUERY_LIMITED_INFORMATION
+            | PROCESS_SYNCHRONIZE
+            | PROCESS_SET_QUOTA;
         let handle = unsafe {
             // SAFETY: OpenProcess takes only value arguments here. The returned
             // handle is checked before it is wrapped for owned close-on-drop.

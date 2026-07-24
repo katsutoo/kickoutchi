@@ -108,8 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - macOS release-profile watch journeys retry only the exact partial-initial-socket
-  condition with a fixed three-attempt budget and now fail unless one attempt
-  proves the baseline and release event contract.
+  condition with a fixed three-attempt budget. The shared runner uses
+  noninteractive elevation for that fixture-owned journey and now fails unless
+  one attempt proves the baseline and release event contract.
 - The public `kickoutchi::run()` entrypoint now preserves an embedding process's
   tracing subscriber, and repeated calls no longer panic during diagnostics
   initialization.
