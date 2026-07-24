@@ -500,7 +500,7 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             parent_netns="$(readlink /proc/self/ns/net)"
             sudo --preserve-env=PATH,RUSTUP_TOOLCHAIN unshare --net -- \
-              bash -c 'ip link set lo up && exec "$@"' bash \
+              bash -c 'ulimit -n 8192 && ip link set lo up && exec "$@"' bash \
               env KICKOUTCHI_PARENT_NETNS="$parent_netns" "${controller[@]}"
           else
             "${controller[@]}"

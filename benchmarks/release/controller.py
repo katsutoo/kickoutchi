@@ -550,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
                             reservation.set_inheritable(False)
                             reservation.bind(("127.0.0.1", 0)); reservation.listen(1); owned.append(reservation)
                             replacements["{reserved_port}"] = reservation.getsockname()[1]
-                        if workload["kind"] == "watch":
+                        if workload["kind"] == "watch" and workload["driver"] == "native_cli":
                             replacements["{watch_port}"] = next(iter(endpoints))[2]
                         command = [str(replacements.get(value, value)) for value in workload["command"]]
                         commands[workload["name"]] = command
