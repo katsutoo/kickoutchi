@@ -355,18 +355,18 @@ class Session:
         for result in bindable_results:
             if ":" not in result["endpoint"]["address"] or ipv6:
                 _expect(result["probe"]["outcome"] == "bindable_now", "supported free endpoint was not bindable")
-        holders = []
-        try:
-            for protocol in ("tcp", "udp"):
-                for address in (["127.0.0.1", "::1"] if ipv6 else ["127.0.0.1"]):
-                    holders.append(FixedListener(protocol, address, port))
-            occupied = self.command(["why", str(port), "--all-protocols", "--all-addresses", "--json"])
-            occupied_results = validate_why_document(_result_json(occupied, {3}), port=port, protocols=["tcp", "udp"], addresses=addresses)
-            for result in occupied_results:
-                if ":" not in result["endpoint"]["address"] or ipv6:
-                    _expect(result["probe"]["outcome"] == "address_in_use", "controlled occupied endpoint was not address-in-use")
-        finally:
-            for holder in holders: holder.close()
+        occupied = []
+        occupied_addresses = ["127.0.0.1", "0.0.0.0", "::1", "::"] if ipv6 else ["127.0.0.1", "0.0.0.0"]
+        for protocol in ("tcp", "udp"):
+            for address in occupied_addresses:
+                holder = FixedListener(protocol, address, 0)
+                try:
+                    occupied_result = self.command(["why", str(holder.port), f"--{protocol}", "--address", address, "--json"])
+                    occupied_results = validate_why_document(_result_json(occupied_result, {3}), port=holder.port, protocols=[protocol], addresses=[address])
+                    _expect(occupied_results[0]["probe"]["outcome"] == "address_in_use", "controlled occupied endpoint was not address-in-use")
+                    occupied.append(occupied_result)
+                finally:
+                    holder.close()
         return {"ipv6_supported": ipv6, "bare": bare, "bindable": bindable, "occupied": occupied}
 
     def watch_lifecycle(self) -> dict[str, Any]:
@@ -399,14 +399,11 @@ class Session:
         controlled.wait_for_event("bind", self.timeout)
         replacement.close(); self.owned_sockets.remove(replacement)
         replacement = FixedListener("tcp", "127.0.0.1", port); self.owned_sockets.append(replacement)
-        replacement.close(); self.owned_sockets.remove(replacement)
-        replacement_process = self._start_fixed_listener_process("tcp", "127.0.0.1", port)
         controlled.wait_for_event("replacement", self.timeout)
+        replacement.close(); self.owned_sockets.remove(replacement)
         controlled.interrupt()
         result = controlled.finish(self.timeout)
         self.controlled_commands.remove(controlled)
-        release_qa._terminate_process(replacement_process)
-        self.owned_processes.remove(replacement_process)
         release_qa._expect_exit(result, {0})
         records = release_qa.parse_ndjson(result["stdout"])
         events = [record.get("event") for record in records]
@@ -488,13 +485,15 @@ class Session:
             "why_max_port": (self.command(["why", "65535", "--address", "127.0.0.1", "--json"]), {0, 3}),
             "why_max_plus_one_port": (self.command(["why", "65536", "--json"]), {2}),
             "why_zone_rejected": (self.command(["why", "1", "--address", "fe80::1%1", "--json"]), {2}),
-            "watch_minimums": (self.command(["watch", "--json", "--interval", "100ms", "--duration", "100ms", "--filter", "port:65535"]), {0}),
+            "watch_minimums": (self.command(["watch", "--json", "--interval", "100ms", "--duration", "100ms", "--filter", "port:65535"]), {0, 1} if platform.system() == "Darwin" else {0}),
             "watch_interval_below_min": (self.command(["watch", "--interval", "99ms", "--duration", "100ms"]), {2}),
             "watch_duration_below_min": (self.command(["watch", "--duration", "99ms"]), {2}),
         }
         for name, (result, exits) in cases.items():
             try: release_qa._expect_exit(result, exits)
             except release_qa.ProductFailure as error: raise release_qa.ProductFailure(f"{name}: {error}") from error
+        if platform.system() == "Darwin" and cases["watch_minimums"][0]["exit_code"] == 1:
+            _expect(release_qa._macos_watch_limitation(cases["watch_minimums"][0]) is not None, "minimum watch failed for an unrecognized reason")
         return {name: result for name, (result, _) in cases.items()}
 
     def _start_release_listener(self) -> tuple[release_qa.Listener, dict[str, Any]]:
@@ -510,6 +509,9 @@ class Session:
         listener, metadata = self._start_release_listener()
         try:
             by_port = self.command(["kill", "--port", str(metadata["port"]), "--yes"])
+            if platform.system() == "Darwin" and by_port["exit_code"] == 4:
+                _expect(listener.process is not None and listener.process.poll() is None, "macOS partial-visibility refusal signalled the helper")
+                return {"by_port": by_port, "accepted_platform_limitation": "process_first_socket_visibility_limited"}
             release_qa._expect_exit(by_port, {0})
             assert listener.process is not None
             listener.process.wait(timeout=release_qa.HELPER_STOP_TIMEOUT_SECONDS)
@@ -630,6 +632,8 @@ class Session:
             cwd=self.root,
             timeout=self.timeout,
         )
+        if result["exit_code"] == 1 and "operation not permitted" in result["stderr"].lower():
+            return {"unshare": result, "host_limit": "unprivileged_namespace_creation_denied", "docker_fallback": self.linux_docker()}
         value = _result_json(result, {0})
         _expect(value.get("scope", {}).get("kind") == "current_network_namespace", "isolated namespace scope differed")
         return {"command": result, "scope": value.get("scope"), "socket_count": len(value.get("sockets", []))}
