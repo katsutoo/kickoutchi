@@ -1198,7 +1198,9 @@ fn qualification_workflow_is_read_only_and_bound_to_exact_artifacts() {
             .count(),
         2
     );
-    assert!(workflow.contains("needs: qa\n    if: inputs.run_benchmarks"));
+    assert!(workflow.contains(
+        "needs: qa\n    if: inputs.run_benchmarks || inputs.benchmark_smoke"
+    ));
     assert!(workflow.contains("if report.get(\"overall\") != \"PASS\":"));
     assert!(
         workflow.contains(

@@ -125,32 +125,47 @@ benchmarks\windows-native-validation.ps1 -Mode benchmark `
 
 ## Native Release Controller
 
-The standard-library-only controller in `benchmarks/release/` is the final
-native release comparison harness. Its immutable JSON plan identifies the
-published v1.2.0 baseline and the v1.3.0 candidate source, fixes the ordering
-seed, workload semantics, practical budgets, A/A noise policy, warmups, blocks,
-sample counts, timeouts, output limits, helper-socket limits, and cleanup rules.
-Do not edit a plan after collection; a plan hash is carried by every raw row and
-the manifest. Create and review a new plan instead.
+The standard-library-only controller and summarizer in `benchmarks/release/`
+implement protocol version 2. The plan uses exact-key validation: unknown plan,
+workload, sampling, fixture, expected-output, calibration, or budget fields are
+errors. It declares the complete matrix, final sample shapes, metric-specific
+calibration limits, absolute and relative budgets, output bounds, process-tree
+cleanup, and required environment evidence. Every raw row carries the immutable
+plan hash. Never edit a plan after collection.
 
-The checked-in plan currently declares `gate_ready=false` because its workload
-matrix is incomplete. It may be used only with `--smoke`; the controller refuses
-gate-eligible collection until a replacement plan covers every required
-workload and passes review.
+The checked-in plan deliberately remains `gate_ready=false`. Isolated empty
+namespace collection, large/maximum snapshot serialization, and synchronized
+high-churn and collection-failure drivers are declared but marked unimplemented.
+Protocol identity fields also remain unset until the exact reviewed source, lock
+file, target, compiler, and harness tree are frozen. Gate collection rejects any
+unavailable driver or identity; smoke mode skips those workloads and records
+them as inconclusive.
 
-Use extracted native release binaries, not Cargo wrappers. The candidate must
-come from the source commit declared by the plan. The reviewed native executable
-checksums in `sha256_by_platform` are mandatory; the controller refuses a
-platform without both artifact identities and refuses a private snapshot that
-does not match.
+The private diff helper is not part of either shipped binary. It includes the
+candidate's real private `model`, `observation`, and `watch` modules by source
+path, consumes the real diff iterator to exhaustion, and validates exact event
+counts for empty, typical, large, maximum no-change, and maximum replacement
+fixtures. Build it with the retained lock file and release settings:
 
-Exact final collection and summary commands are:
+```sh
+cargo build --locked --release \
+  --manifest-path benchmarks/release/diff_helper/Cargo.toml
+```
+
+Retain the helper source, `Cargo.lock`, build command, source commit, compiler
+target, and helper binary SHA-256 beside the raw evidence. Source inclusion means
+the helper cannot silently benchmark a copied algorithm and does not change the
+shipping artifact.
+
+Use extracted native release binaries, not Cargo wrappers. Both executable
+hashes must match the platform entry in the plan. A collection command is:
 
 ```sh
 python3 benchmarks/release/controller.py \
   --plan benchmarks/release/plan.json \
   --baseline /absolute/path/to/extracted/v1.2.0/kick \
   --candidate /absolute/path/to/extracted/v1.3.0/kick \
+  --diff-helper /absolute/path/to/kickoutchi-release-diff-helper \
   --output /absolute/new/path/release-raw.jsonl \
   --manifest /absolute/new/path/release-manifest.json
 python3 benchmarks/release/summarize.py \
@@ -160,39 +175,46 @@ python3 benchmarks/release/summarize.py \
   --output /absolute/new/path/release-summary.json
 ```
 
-Run the same controller command with `--smoke` for a two-to-four sample local
-check. Smoke output is marked `gate_eligible=false`; its summary is always
-`INCONCLUSIVE` and is never release evidence.
+Add `--smoke` for four retained observations per available workload. Smoke
+evidence is always non-gate and its summary is always `INCONCLUSIVE` unless an
+absolute failure makes it `FAIL`.
 
-The controller privately copies and hashes both binaries, validates exact
-`--version` output, validates every workload before warmup and timing, and
-publishes only to absent paths. It records per-process latency, status, output
-count and digest, user/system CPU when the host exposes it, Linux peak RSS, and
-Windows peak working set when the native API is available. The manifest records
-the exact arguments as executed, the deliberately minimal environment,
-artifact identities and sizes, platform, interpreter, source commit, counts,
-and evidence hashes. A child timeout kills the owned child. Helper TCP and UDP
-sockets are bounded, non-inheritable, IPv4/IPv6 loopback sockets and are closed
-on every exit path.
+The controller privately copies and hashes every executable, validates versions
+and workload output before timing, reserves the Why TCP port for the complete
+workload, and publishes only complete absent paths. Reader threads retain a
+bounded prefix while hashing and counting the complete bounded stdout/stderr
+streams. Timeout or overflow terminates the POSIX process group or Windows Job
+Object. Windows process-time and memory APIs use explicit `ctypes` argument and
+result signatures. Every valid invocation requires empty stderr and the exact
+structured-output contract.
 
-Only `list --json` is compared with v1.2.0. Snapshot, Why, and the stable 500 ms
-watch are candidate-only absolute-budget checks because v1.2.0 does not support
-those commands. Reports explicitly set `comparison_supported=false` for them;
-they must not be described as baseline improvements or regressions.
+Cold startup receives a fresh home/config directory for each retained process.
+Warm startup reuses one directory and performs block warmups. List typical/high
+are interleaved baseline/candidate comparisons with baseline A/A calibration.
+Snapshots, the full eight-endpoint Why matrix, watches, and diffs are
+candidate-only and use paired same-artifact calibration. Candidate-only declared
+sample counts are split evenly across calibration sides, not doubled.
 
-The final list, snapshot, and Why workloads retain at least ten blocks of 1,000
-process samples. Each block receives 12 or 16 unmeasured warmups and comparison
-blocks are exactly balanced from the recorded seed. The stable watch uses 2,000
-process-level samples in ten bounded blocks.
-The summarizer validates schema, all declared bounds and counts, deterministic
-order, plan/raw/artifact hash consistency, and complete manifests before merging
-raw observations. It computes nearest-rank p50/p95/p99/max and block-p99 range
-from raw values, never averages percentiles, and reports latency, CPU, memory,
-size, failures, thresholds, A/A noise, deltas, and `PASS`, `FAIL`, or
-`INCONCLUSIVE`.
+The classifier checks correctness and absolute maxima/minima before noise.
+Relative regressions use only the matching metric's calibration delta; one noisy
+latency metric cannot excuse CPU or memory. Missing required metrics and noisy
+threshold crossings are `INCONCLUSIVE`. The summarizer recomputes nearest-rank
+p50/p95/p99/max and block-p99 ranges from raw observations and validates exact
+ordering, counts, commands, hashes, and manifest environment fields.
+
+The final declared protocol retains ten 1,000-observation blocks with 10 to 20
+warmups for fast process workloads, 2,000 process observations in ten blocks for
+each 500 ms watch workload, and ten bounded blocks for expensive large/maximum
+operations. On the historical 20-35 ms one-shot range, the complete matrix is
+expected to take roughly 3.5 to 5.5 hours per native machine, dominated by watch
+duration and 270,000-plus one-shot process invocations. The current two-hour
+single-run bound therefore requires reviewed workload sharding and aggregate
+manifest support before the plan can become gate-ready.
 
 Run the unit tests with:
 
 ```sh
 python3 -m unittest benchmarks.release.test_release_benchmark
+cargo check --locked --release \
+  --manifest-path benchmarks/release/diff_helper/Cargo.toml
 ```

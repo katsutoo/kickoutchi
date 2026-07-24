@@ -13,6 +13,11 @@ on:
         required: true
         default: false
         type: boolean
+      benchmark_smoke:
+        description: Run bounded non-gate Linux and Windows benchmark preflights
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -359,7 +364,7 @@ jobs:
 
   benchmark:
     needs: qa
-    if: inputs.run_benchmarks
+    if: inputs.run_benchmarks || inputs.benchmark_smoke
     strategy:
       fail-fast: false
       matrix:
@@ -389,6 +394,22 @@ jobs:
 
       - name: Test benchmark harness
         run: python3 -m unittest -v benchmarks.release.test_release_benchmark
+
+      - id: diff-helper
+        name: Build exact-source diff helper
+        shell: bash
+        run: |
+          cargo build --locked --release --manifest-path benchmarks/release/diff_helper/Cargo.toml
+          helper="benchmarks/release/diff_helper/target/release/kickoutchi-release-diff-helper"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            helper="${helper}.exe"
+          fi
+          [[ -f "$helper" ]] || {
+            echo "diff helper was not built" >&2
+            exit 1
+          }
+          echo "path=$(pwd)/$helper" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$helper" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - name: Download exact candidate archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -446,16 +467,22 @@ jobs:
           "baseline=$baseline\extracted\kick.exe" >> $env:GITHUB_OUTPUT
 
       - id: collect
-        name: Collect full native benchmark
+        name: Collect native benchmark evidence
         continue-on-error: true
         shell: bash
         run: |
+          mode=()
+          if [[ '${{ inputs.benchmark_smoke }}' == 'true' ]]; then
+            mode+=(--smoke)
+          fi
           python3 benchmarks/release/controller.py \
             --plan benchmarks/release/plan.json \
             --baseline '${{ steps.prepare-unix.outputs.baseline || steps.prepare-windows.outputs.baseline }}' \
             --candidate '${{ steps.prepare-unix.outputs.candidate || steps.prepare-windows.outputs.candidate }}' \
+            --diff-helper '${{ steps.diff-helper.outputs.path }}' \
             --output release-raw.jsonl \
-            --manifest release-manifest.json
+            --manifest release-manifest.json \
+            "${mode[@]}"
           python3 benchmarks/release/summarize.py \
             --plan benchmarks/release/plan.json \
             --raw release-raw.jsonl \
@@ -474,7 +501,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Require a passing benchmark verdict
+      - name: Require the declared benchmark verdict
         if: always()
         shell: bash
         run: |
@@ -483,6 +510,10 @@ jobs:
           import pathlib
 
           report = json.loads(pathlib.Path("release-summary.json").read_text(encoding="utf-8"))
-          if report.get("verdict") != "PASS" or not report.get("gate_eligible"):
+          smoke = "${{ inputs.benchmark_smoke }}" == "true"
+          if smoke:
+              if report.get("verdict") not in {"PASS", "INCONCLUSIVE"} or report.get("gate_eligible"):
+                  raise SystemExit(f"smoke benchmark verdict is {report.get('verdict')}")
+          elif report.get("verdict") != "PASS" or not report.get("gate_eligible"):
               raise SystemExit(f"benchmark verdict is {report.get('verdict')}")
           PY
