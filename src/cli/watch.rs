@@ -613,6 +613,7 @@ where
                     observation,
                     event,
                     filter_result,
+                    &options.terms,
                     config,
                     previous_gap_index,
                     current_gap_index,
@@ -745,6 +746,13 @@ enum Truth {
     False,
     Unknown,
     True,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerPidConstraint {
+    Any,
+    Exact(u32),
+    Impossible,
 }
 
 #[derive(Debug, Default)]
@@ -896,8 +904,18 @@ fn evaluate_side(
             _ => false,
         })
         .collect::<Vec<_>>();
+    let owner_terms_present = options.terms.iter().any(|term| !owner_independent(term));
+    let owner_pid_constraint = owner_pid_constraint(&options.terms);
+    let endpointless_ownership_unknown = owner_terms_present
+        && (snapshot.evidence_gaps.iter().any(|gap| {
+            gap.impact == crate::observation::EvidenceImpact::Ownership
+                && gap.endpoint.is_none()
+                && endpointless_ownership_gap_is_relevant(gap.pid, owner_pid_constraint)
+        }) || (snapshot.omitted_evidence_gap_count != 0
+            && !snapshot.owner_completeness.is_complete()
+            && endpointless_ownership_gap_is_relevant(None, owner_pid_constraint)));
     if socket.owners.is_empty() {
-        return evaluate_terms_for_owner(
+        let result = evaluate_terms_for_owner(
             snapshot,
             socket,
             None,
@@ -907,6 +925,11 @@ fn evaluate_side(
             config,
             cache,
         );
+        return if result == Truth::False && endpointless_ownership_unknown {
+            Truth::Unknown
+        } else {
+            result
+        };
     }
     let mut unknown = false;
     for owner in &socket.owners {
@@ -925,7 +948,7 @@ fn evaluate_side(
             Truth::False => {}
         }
     }
-    if unknown || !socket.owner_completeness.is_complete() {
+    if unknown || !socket.owner_completeness.is_complete() || endpointless_ownership_unknown {
         Truth::Unknown
     } else {
         Truth::False
@@ -1208,6 +1231,31 @@ const fn owner_independent(term: &FilterTerm) -> bool {
     )
 }
 
+fn owner_pid_constraint(terms: &[FilterTerm]) -> OwnerPidConstraint {
+    let mut required = None;
+    for term in terms {
+        let FilterTerm::Pid(pid) = term else {
+            continue;
+        };
+        if required.is_some_and(|required| required != *pid) {
+            return OwnerPidConstraint::Impossible;
+        }
+        required = Some(*pid);
+    }
+    required.map_or(OwnerPidConstraint::Any, OwnerPidConstraint::Exact)
+}
+
+const fn endpointless_ownership_gap_is_relevant(
+    gap_pid: Option<u32>,
+    constraint: OwnerPidConstraint,
+) -> bool {
+    match (gap_pid, constraint) {
+        (_, OwnerPidConstraint::Impossible) => false,
+        (None, _) | (Some(_), OwnerPidConstraint::Any) => true,
+        (Some(gap_pid), OwnerPidConstraint::Exact(required)) => gap_pid == required,
+    }
+}
+
 fn lowered_contains(value: &str, lowered_needle: &str) -> bool {
     value.to_lowercase().contains(lowered_needle)
 }
@@ -1313,6 +1361,7 @@ fn write_endpoint_event(
     observation: ObservationTimes,
     event: WatchEvent<'_>,
     filter_result: FilterResult,
+    filter_terms: &[FilterTerm],
     config: &Config,
     previous_gap_index: Option<&GapIndex>,
     current_gap_index: Option<&GapIndex>,
@@ -1322,7 +1371,7 @@ fn write_endpoint_event(
     }
     let socket = event.event_socket();
     let (evidence_gaps, omitted_gap_count) = if filter_result == FilterResult::Indeterminate {
-        event_gap_dtos(event, previous_gap_index, current_gap_index)
+        event_gap_dtos(event, filter_terms, previous_gap_index, current_gap_index)
     } else {
         (Vec::new(), 0)
     };
@@ -1405,13 +1454,23 @@ impl GapBucket {
 #[derive(Debug, Default)]
 struct GapIndex {
     global: GapBucket,
+    endpointless_ownership: GapBucket,
+    ownership_by_pid: HashMap<u32, GapBucket>,
     by_endpoint: HashMap<EndpointIdentity, GapBucket>,
     by_pid: HashMap<u32, GapBucket>,
+    omitted_endpointless_ownership: u64,
 }
 
 impl GapIndex {
     fn new(snapshot: &NetworkSnapshot) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            omitted_endpointless_ownership: if snapshot.owner_completeness.is_complete() {
+                0
+            } else {
+                snapshot.omitted_evidence_gap_count
+            },
+            ..Self::default()
+        };
         for (gap_index, gap) in snapshot.evidence_gaps.iter().enumerate() {
             match (&gap.endpoint, gap.pid) {
                 (Some(endpoint), _) => index
@@ -1419,6 +1478,16 @@ impl GapIndex {
                     .entry(endpoint.clone())
                     .or_default()
                     .add(gap_index),
+                (None, Some(pid))
+                    if gap.impact == crate::observation::EvidenceImpact::Ownership =>
+                {
+                    index.endpointless_ownership.add(gap_index);
+                    index
+                        .ownership_by_pid
+                        .entry(pid)
+                        .or_default()
+                        .add(gap_index);
+                }
                 (None, Some(pid)) => index.by_pid.entry(pid).or_default().add(gap_index),
                 (None, None) => index.global.add(gap_index),
             }
@@ -1430,10 +1499,25 @@ impl GapIndex {
         &self,
         snapshot: &'a NetworkSnapshot,
         socket: &SocketObservation,
+        owner_pid_constraint: OwnerPidConstraint,
         gaps: &mut Vec<&'a EvidenceGap>,
         total: &mut u64,
     ) {
         append_gap_bucket(&self.global, snapshot, gaps, total);
+        match owner_pid_constraint {
+            OwnerPidConstraint::Any => {
+                append_gap_bucket(&self.endpointless_ownership, snapshot, gaps, total);
+            }
+            OwnerPidConstraint::Exact(pid) => {
+                if let Some(bucket) = self.ownership_by_pid.get(&pid) {
+                    append_gap_bucket(bucket, snapshot, gaps, total);
+                }
+            }
+            OwnerPidConstraint::Impossible => {}
+        }
+        if owner_pid_constraint != OwnerPidConstraint::Impossible {
+            *total = total.saturating_add(self.omitted_endpointless_ownership);
+        }
         if let Some(bucket) = self.by_endpoint.get(&socket.local_endpoint) {
             append_gap_bucket(bucket, snapshot, gaps, total);
         }
@@ -1469,22 +1553,36 @@ fn retain_bounded_gap<'a>(gaps: &mut Vec<&'a EvidenceGap>, gap: &'a EvidenceGap)
 
 fn event_gap_dtos<'a>(
     event: WatchEvent<'a>,
+    filter_terms: &[FilterTerm],
     previous_index: Option<&GapIndex>,
     current_index: Option<&GapIndex>,
 ) -> (Vec<EvidenceGapDto<'a>>, u64) {
     let mut gaps = Vec::with_capacity(WATCH_EVENT_GAPS_MAX);
     let mut total = 0u64;
+    let owner_pid_constraint = owner_pid_constraint(filter_terms);
     if let (Some(snapshot), Some(socket), Some(index)) = (
         event.previous_snapshot,
         event.previous_socket,
         previous_index,
     ) {
-        index.append(snapshot, socket, &mut gaps, &mut total);
+        index.append(
+            snapshot,
+            socket,
+            owner_pid_constraint,
+            &mut gaps,
+            &mut total,
+        );
     }
     if let (Some(snapshot), Some(socket), Some(index)) =
         (event.current_snapshot, event.current_socket, current_index)
     {
-        index.append(snapshot, socket, &mut gaps, &mut total);
+        index.append(
+            snapshot,
+            socket,
+            owner_pid_constraint,
+            &mut gaps,
+            &mut total,
+        );
     }
     let retained = gaps.len();
     let omitted = total.saturating_sub(u64::try_from(retained).unwrap_or(u64::MAX));
@@ -1992,8 +2090,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        BoundedRecord, FilterCache, FilterResult, GapIndex, ObservationTimes, Truth,
-        WATCH_DURATION_MAX, WATCH_DURATION_MIN, WATCH_INTERVAL_DEFAULT, WATCH_INTERVAL_MAX,
+        BoundedRecord, FilterCache, FilterResult, GapIndex, ObservationTimes, OwnerPidConstraint,
+        Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN, WATCH_INTERVAL_DEFAULT, WATCH_INTERVAL_MAX,
         WATCH_INTERVAL_MIN, WatchArgs, WatchOptions, WatchRuntime, evaluate_event, evaluate_side,
         human_endpoint_text, parse_duration_token, run_watch_loop, write_human_event,
         write_ordered_events,
@@ -3161,6 +3259,195 @@ mod tests {
     }
 
     #[test]
+    fn global_ownership_gap_makes_owner_dependent_miss_indeterminate() {
+        let mut snapshot = snapshot();
+        snapshot.sockets.truncate(1);
+        snapshot.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete]).unwrap();
+        snapshot.completeness = SnapshotCompleteness::Partial;
+        snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerAttributionIncomplete,
+            None,
+            None,
+            "an owner could not be attributed to an endpoint",
+        ));
+        let mut filter = options(Duration::from_millis(100));
+        filter.port = None;
+        filter.terms =
+            crate::query::parse_filter_text("pid:4294967295", QueryCapabilities::WATCH).unwrap();
+
+        assert_eq!(
+            evaluate_side(
+                &snapshot,
+                &snapshot.sockets[0],
+                &filter,
+                &Config::default(),
+                &mut FilterCache::default(),
+            ),
+            Truth::Unknown
+        );
+
+        filter.terms = crate::query::parse_filter_text(
+            &format!("port:{}", snapshot.sockets[0].local_endpoint.port),
+            QueryCapabilities::WATCH,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_side(
+                &snapshot,
+                &snapshot.sockets[0],
+                &filter,
+                &Config::default(),
+                &mut FilterCache::default(),
+            ),
+            Truth::True,
+            "global owner uncertainty must not weaken endpoint-only filters"
+        );
+    }
+
+    #[test]
+    fn pid_scoped_ownership_gap_is_indeterminate_and_emitted_for_hidden_owner() {
+        let mut snapshot = snapshot();
+        snapshot.sockets.truncate(1);
+        snapshot.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap();
+        snapshot.completeness = SnapshotCompleteness::Partial;
+        snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerPermissionDenied,
+            None,
+            Some(4_242),
+            "permission denied before the PID's socket ownership could be attributed",
+        ));
+        let filter = filtered_options("pid:4242");
+        let event = WatchEvent {
+            kind: EventKind::Baseline,
+            previous_snapshot: None,
+            current_snapshot: Some(&snapshot),
+            previous_socket: None,
+            current_socket: Some(&snapshot.sockets[0]),
+            multiplicity: 1,
+            certainty: Certainty::Proven,
+        };
+
+        assert_eq!(
+            evaluate_event(
+                event,
+                &filter,
+                &Config::default(),
+                None,
+                Some(&mut FilterCache::default()),
+            ),
+            Some(FilterResult::Indeterminate)
+        );
+        assert_eq!(
+            evaluate_event(
+                event,
+                &filtered_options("pid:9999"),
+                &Config::default(),
+                None,
+                Some(&mut FilterCache::default()),
+            ),
+            None,
+            "a PID-scoped gap must not weaken a filter for a different PID"
+        );
+
+        let gap_index = GapIndex::new(&snapshot);
+        let mut output = Vec::new();
+        super::write_endpoint_event(
+            &mut output,
+            true,
+            0,
+            ObservationTimes {
+                previous_completed_unix_ms: None,
+                attempt_started_unix_ms: 1,
+                attempt_completed_unix_ms: 2,
+            },
+            event,
+            FilterResult::Indeterminate,
+            &filter.terms,
+            &Config::default(),
+            None,
+            Some(&gap_index),
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["data"]["filter_result"], "indeterminate");
+        assert_eq!(value["data"]["evidence_gaps"].as_array().unwrap().len(), 1);
+        assert_eq!(value["data"]["evidence_gaps"][0]["impact"], "ownership");
+        assert_eq!(
+            value["data"]["evidence_gaps"][0]["code"],
+            "owner_permission_denied"
+        );
+        assert_eq!(value["data"]["evidence_gaps"][0]["pid"], 4_242);
+    }
+
+    #[test]
+    fn omitted_ownership_gap_keeps_pid_filter_indeterminate_and_counts_the_gap() {
+        let mut snapshot = snapshot();
+        snapshot.sockets.truncate(1);
+        snapshot.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap();
+        snapshot.completeness = SnapshotCompleteness::Partial;
+        snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerPermissionDenied,
+            None,
+            Some(9_999),
+            "an unrelated retained PID could not be scanned",
+        ));
+        snapshot.omitted_evidence_gap_count = 1;
+        let filter = filtered_options("pid:4242");
+        let event = WatchEvent {
+            kind: EventKind::Baseline,
+            previous_snapshot: None,
+            current_snapshot: Some(&snapshot),
+            previous_socket: None,
+            current_socket: Some(&snapshot.sockets[0]),
+            multiplicity: 1,
+            certainty: Certainty::Proven,
+        };
+
+        assert_eq!(
+            evaluate_event(
+                event,
+                &filter,
+                &Config::default(),
+                None,
+                Some(&mut FilterCache::default()),
+            ),
+            Some(FilterResult::Indeterminate)
+        );
+
+        let gap_index = GapIndex::new(&snapshot);
+        let mut output = Vec::new();
+        super::write_endpoint_event(
+            &mut output,
+            true,
+            0,
+            ObservationTimes {
+                previous_completed_unix_ms: None,
+                attempt_started_unix_ms: 1,
+                attempt_completed_unix_ms: 2,
+            },
+            event,
+            FilterResult::Indeterminate,
+            &filter.terms,
+            &Config::default(),
+            None,
+            Some(&gap_index),
+        )
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["data"]["filter_result"], "indeterminate");
+        assert_eq!(value["data"]["evidence_gaps"], serde_json::json!([]));
+        assert_eq!(value["data"]["omitted_evidence_gap_count"], 1);
+    }
+
+    #[test]
     fn complete_ownerless_socket_matches_protected_false() {
         let mut snapshot = snapshot();
         snapshot.sockets.truncate(1);
@@ -3607,6 +3894,7 @@ mod tests {
                 observation,
                 event,
                 FilterResult::Matched,
+                &[],
                 &Config::default(),
                 Some(&GapIndex::new(&previous)),
                 Some(&GapIndex::new(&current)),
@@ -3868,6 +4156,7 @@ mod tests {
         index.append(
             &snapshot,
             &snapshot.sockets[0],
+            OwnerPidConstraint::Any,
             &mut applicable,
             &mut applicable_total,
         );
@@ -3893,7 +4182,6 @@ mod tests {
             super::retain_bounded_gap(&mut retained, gap);
         }
         assert_eq!(retained.len(), 8);
-        assert_eq!(retained.capacity(), 8);
         assert_eq!(retained[0].pid, Some(42));
         assert_eq!(retained[7].pid, Some(49));
 

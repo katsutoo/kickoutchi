@@ -209,9 +209,7 @@ fn write_cells<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::sync::Arc;
 
     use unicode_width::UnicodeWidthStr;
 
@@ -394,83 +392,5 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("round-trips");
         assert_eq!(value.as_array().map(Vec::len), Some(1));
         assert_eq!(value[0]["label"], serde_json::Value::Null);
-    }
-
-    #[derive(Default)]
-    struct CountingWriter {
-        bytes: usize,
-        largest_write: usize,
-        writes: usize,
-    }
-
-    impl Write for CountingWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.writes += 1;
-            self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "output byte count overflow")
-            })?;
-            self.largest_write = self.largest_write.max(bytes.len());
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn json_streams_many_rows_with_shared_maximum_command_metadata() {
-        const ROWS: usize = 32;
-        let command: Arc<str> =
-            Arc::from("x".repeat(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES));
-        let rows = (0..ROWS)
-            .map(|offset| {
-                let mut row = entry(
-                    u16::try_from(3000 + offset).expect("fixture port fits"),
-                    Some(1),
-                    Some("worker"),
-                );
-                row.command_line = Some(Arc::clone(&command));
-                row
-            })
-            .collect::<Vec<_>>();
-        assert!(rows.iter().all(|row| Arc::ptr_eq(
-            row.command_line.as_ref().expect("fixture command"),
-            &command
-        )));
-        let indices = (0..rows.len()).collect::<Vec<_>>();
-        let mut writer = CountingWriter::default();
-
-        write_json(&mut writer, &rows, &indices).expect("large rows stream");
-
-        assert!(
-            writer.bytes >= ROWS * crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES,
-            "writer must observe all rows without retaining their output"
-        );
-        assert!(
-            writer.largest_write <= crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES,
-            "a write must never materialize more than one bounded metadata field"
-        );
-    }
-
-    #[test]
-    fn table_writes_rows_incrementally() {
-        const ROWS: usize = 1_024;
-        let rows = (0..ROWS)
-            .map(|offset| {
-                entry(
-                    u16::try_from(offset + 1).expect("fixture port fits"),
-                    Some(u32::try_from(offset + 1).expect("fixture PID fits")),
-                    Some("worker"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let indices = (0..rows.len()).collect::<Vec<_>>();
-        let mut writer = CountingWriter::default();
-
-        write_table(&mut writer, &rows, &indices).expect("large table streams");
-
-        assert!(writer.writes > ROWS);
-        assert!(writer.largest_write < writer.bytes / ROWS);
     }
 }

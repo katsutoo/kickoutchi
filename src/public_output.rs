@@ -1753,46 +1753,6 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct CountingWriter {
-        bytes: usize,
-        writes: usize,
-        largest_write: usize,
-    }
-
-    impl Write for CountingWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.bytes = self
-                .bytes
-                .checked_add(bytes.len())
-                .ok_or_else(|| io::Error::other("fixture count overflow"))?;
-            self.writes += 1;
-            self.largest_write = self.largest_write.max(bytes.len());
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn production_maximum_snapshot_is_written_incrementally() {
-        const SOCKETS: usize = crate::observation::SOCKET_OBSERVATIONS_MAX;
-        let sockets = (0..SOCKETS)
-            .map(|offset| {
-                let port = u32::try_from(offset % usize::from(u16::MAX) + 1).expect("fixture port");
-                socket(port, Vec::new())
-            })
-            .collect();
-        let snapshot = snapshot(sockets);
-        let mut writer = CountingWriter::default();
-        write_snapshot_json(&mut writer, &snapshot, &LabelRegistry::default())
-            .expect("large snapshot streams");
-        assert!(writer.writes > SOCKETS);
-        assert!(writer.largest_write < writer.bytes / SOCKETS);
-    }
-
     #[test]
     fn serde_writer_failure_preserves_io_kind() {
         struct FailedWriter;

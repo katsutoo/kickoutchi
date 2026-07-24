@@ -1119,14 +1119,6 @@ fn freeze_sweep<Ops: TreeProcessOps>(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unfrozen_children(index: &ProcessTreeIndex<'_>, frozen: &[FrozenNode]) -> Vec<FrozenNode> {
-    unfrozen_children_with_operation_count(index, frozen).0
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn unfrozen_children_with_operation_count(
-    index: &ProcessTreeIndex<'_>,
-    frozen: &[FrozenNode],
-) -> (Vec<FrozenNode>, usize) {
     let frozen_depths: HashMap<u32, usize> =
         frozen.iter().map(|node| (node.pid, node.depth)).collect();
     let mut discovered = Vec::new();
@@ -1135,11 +1127,8 @@ fn unfrozen_children_with_operation_count(
         .iter()
         .map(|node| (node.pid, node.depth))
         .collect::<Vec<_>>();
-    let mut operations = 0usize;
     while let Some((parent_pid, parent_depth)) = frontier.pop() {
-        operations += 1;
         for &info in index.children(parent_pid) {
-            operations += 1;
             if !seen.insert(info.pid) {
                 continue;
             }
@@ -1149,7 +1138,7 @@ fn unfrozen_children_with_operation_count(
         }
     }
     discovered.sort_by_key(|node| node.pid);
-    (discovered, operations)
+    discovered
 }
 
 /// Group members are a flat filter on the group ID; depth 1 keeps them grouped
@@ -1476,7 +1465,7 @@ mod tests {
         MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ScopeAuthorization,
         TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
         execute_group_kill, execute_tree_kill, plan_process_group, plan_process_tree,
-        unfrozen_children_with_operation_count, verify_frozen_identities,
+        verify_frozen_identities,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
@@ -1746,29 +1735,6 @@ mod tests {
 
         let error = ProcessTreeIndex::new(&exact, 2).expect_err("max plus one is rejected");
         assert_eq!(error, TreePlanError::SnapshotLimitExceeded { limit: 2 });
-    }
-
-    #[test]
-    fn deep_discovery_operations_scale_with_tree_depth_not_snapshot_size() {
-        const DEPTH: u32 = 256;
-        const SNAPSHOT_SIZE: usize = 131_072;
-        let mut snapshot = Vec::with_capacity(SNAPSHOT_SIZE);
-        snapshot.push(info(2, None, "root", 2));
-        for pid in 3..=DEPTH + 2 {
-            snapshot.push(info(pid, Some(pid - 1), "chain", u64::from(pid)));
-        }
-        for offset in snapshot.len()..SNAPSHOT_SIZE {
-            let pid = u32::try_from(offset + 10_000).expect("fixture PID fits u32");
-            snapshot.push(info(pid, None, "unrelated", u64::from(pid)));
-        }
-        let index = ProcessTreeIndex::new(&snapshot, SNAPSHOT_SIZE).expect("index builds");
-        let frozen = [FrozenNode::from_info(&snapshot[0], 0)];
-
-        let (discovered, operations) = unfrozen_children_with_operation_count(&index, &frozen);
-
-        assert_eq!(discovered.len(), usize::try_from(DEPTH).unwrap());
-        assert_eq!(operations, usize::try_from(DEPTH * 2 + 1).unwrap());
-        assert!(operations < SNAPSHOT_SIZE / 100);
     }
 
     #[test]

@@ -951,3 +951,10 @@ The versioned contracts identify themselves with exact `schema` and integer `ver
 - A future incompatible shape or semantic change requires a new integer version and documentation for the new schema/version pair.
 
 Resource-bound safety behavior is part of compatibility: values over their documented limits become explicit null/partial evidence where specified, increment omitted counts where specified, or fail operationally. They are never silently truncated into a value that appears complete.
+
+## Related documentation
+
+- [Documentation index](README.md)
+- [Security policy](../SECURITY.md)
+- [Configuration and filters](configuration.md)
+- [Platform support and observation limits](platform-support.md)

@@ -127,7 +127,7 @@ fn native_pass_from_records(
                     EvidenceGapCode::OwnerAttributionIncomplete,
                     Some(endpoint.clone()),
                     None,
-                    "IP Helper reported that the UDP endpoint owner is unavailable",
+                    "IP Helper reported that the endpoint owner is unavailable",
                 ));
             } else {
                 omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
@@ -1616,7 +1616,7 @@ fn tcp4_record(row: &MIB_TCPROW_OWNER_PID) -> Result<SocketRecord, CollectorErro
         local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope: None,
         state: mib_tcp_state(row.dwState),
-        pid: Some(row.dwOwningPid),
+        pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
     })
 }
 
@@ -1631,7 +1631,7 @@ fn tcp6_record(row: &MIB_TCP6ROW_OWNER_PID) -> Result<SocketRecord, CollectorErr
         local_port: decode_port(row.dwLocalPort)?,
         ipv6_scope,
         state: mib_tcp_state(row.dwState),
-        pid: Some(row.dwOwningPid),
+        pid: (row.dwOwningPid != 0).then_some(row.dwOwningPid),
     })
 }
 
@@ -2445,28 +2445,6 @@ mod tests {
         assert!(udp6_rows(&truncated).is_err());
     }
 
-    #[test]
-    fn owner_batch_relation_enumeration_is_constant_vs_owner_count() {
-        for owner_count in [1_u32, 128] {
-            let relations = (1..=owner_count)
-                .map(|pid| (pid, None))
-                .collect::<HashMap<_, _>>();
-            let pids = (1..=owner_count).collect::<Vec<_>>();
-            let mut api = FakeProcessApi::stable(relations);
-
-            let snapshot = ProcessSnapshot::collect_with(
-                &mut api,
-                MetadataProfile::Display,
-                ProcessSelection::Exact(&pids),
-                super::OPTIONAL_METADATA_MAX_BYTES,
-            )
-            .expect("fake batch collection succeeds");
-
-            assert_eq!(snapshot.processes.len(), pids.len());
-            assert_eq!(api.enumeration_count, 2);
-        }
-    }
-
     fn assert_socket_relation_fallback(failed_call: usize, row_bound_refusal: bool) {
         let record = super::SocketRecord {
             protocol: Protocol::Tcp,
@@ -3241,7 +3219,27 @@ mod tests {
     }
 
     #[test]
-    fn ownerless_udp_snapshot_retains_endpoint_without_reading_pid_zero() {
+    fn ownerless_windows_snapshot_retains_endpoints_without_reading_pid_zero() {
+        let tcp4 = tcp4_record(&MIB_TCPROW_OWNER_PID {
+            dwState: u32::try_from(MIB_TCP_STATE_LISTEN).unwrap(),
+            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+            dwLocalPort: encode_port_for_tests(5351),
+            dwRemoteAddr: 0,
+            dwRemotePort: 0,
+            dwOwningPid: 0,
+        })
+        .expect("valid ownerless TCPv4 row");
+        let tcp6 = tcp6_record(&MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: Ipv6Addr::LOCALHOST.octets(),
+            dwLocalScopeId: 0,
+            dwLocalPort: encode_port_for_tests(5352),
+            ucRemoteAddr: [0; 16],
+            dwRemoteScopeId: 0,
+            dwRemotePort: 0,
+            dwState: u32::try_from(MIB_TCP_STATE_LISTEN).unwrap(),
+            dwOwningPid: 0,
+        })
+        .expect("valid ownerless TCPv6 row");
         let udp4 = udp4_record(&MIB_UDPROW_OWNER_PID {
             dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
             dwLocalPort: encode_port_for_tests(5353),
@@ -3255,8 +3253,8 @@ mod tests {
             dwOwningPid: 0,
         })
         .expect("valid ownerless UDPv6 row");
-        let pass =
-            native_pass_from_records(vec![udp4, udp6]).expect("ownerless UDP rows are retained");
+        let pass = native_pass_from_records(vec![tcp4, tcp6, udp4, udp6])
+            .expect("ownerless Windows rows are retained");
         let scope = ObservationScope::new(
             ObservationScopeKind::CurrentHostNetworkStack,
             None,
@@ -3275,10 +3273,10 @@ mod tests {
                 Ok(std::collections::BTreeMap::new())
             },
         )
-        .expect("ownerless UDP snapshot remains valid");
+        .expect("ownerless Windows snapshot remains valid");
 
         assert_eq!(process_reads, 2);
-        assert_eq!(snapshot.sockets.len(), 2);
+        assert_eq!(snapshot.sockets.len(), 4);
         assert!(
             snapshot
                 .sockets

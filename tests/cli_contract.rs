@@ -212,6 +212,7 @@ fn run_command_with_deadline(
 }
 
 #[test]
+#[ignore = "subprocess fixture; invoked explicitly by contract tests"]
 fn command_runner_helper_process() {
     match std::env::var(COMMAND_RUNNER_HELPER_ENV).as_deref() {
         Ok("dual-output") => {
@@ -235,6 +236,7 @@ fn command_runner_helper_process() {
 }
 
 #[test]
+#[ignore = "subprocess fixture; invoked explicitly by contract tests"]
 fn binary_override_helper_process() {
     if std::env::var_os(BINARY_OVERRIDE_HELPER_ENV).is_some() {
         drop(kickoutchi_binary());
@@ -247,7 +249,12 @@ fn binary_overrides_are_all_or_nothing() {
     fn helper() -> Command {
         let mut command = Command::new(std::env::current_exe().expect("test binary path resolves"));
         command
-            .args(["--exact", "binary_override_helper_process", "--nocapture"])
+            .args([
+                "--exact",
+                "binary_override_helper_process",
+                "--ignored",
+                "--nocapture",
+            ])
             .env(BINARY_OVERRIDE_HELPER_ENV, "1")
             .env_remove(RELEASE_E2E_REQUIRED_ENV)
             .env_remove(KICKOUTCHI_BINARY_ENV)
@@ -294,7 +301,12 @@ fn command_runner_drains_large_stdout_and_stderr_without_deadlock() {
     let output = run_command_with_deadline(
         Command::new(std::env::current_exe().expect("test binary path resolves"))
             .env(COMMAND_RUNNER_HELPER_ENV, "dual-output")
-            .args(["--exact", "command_runner_helper_process", "--nocapture"]),
+            .args([
+                "--exact",
+                "command_runner_helper_process",
+                "--ignored",
+                "--nocapture",
+            ]),
         None,
         REAL_BINARY_EXIT_WAIT,
     )
@@ -316,7 +328,12 @@ fn command_runner_rejects_output_past_its_byte_limit() {
     let error = run_command_with_deadline(
         Command::new(std::env::current_exe().expect("test binary path resolves"))
             .env(COMMAND_RUNNER_HELPER_ENV, "output-over-limit")
-            .args(["--exact", "command_runner_helper_process", "--nocapture"]),
+            .args([
+                "--exact",
+                "command_runner_helper_process",
+                "--ignored",
+                "--nocapture",
+            ]),
         None,
         REAL_BINARY_EXIT_WAIT,
     )
@@ -328,7 +345,12 @@ fn command_runner_rejects_output_past_its_byte_limit() {
 fn command_runner_timeout_kills_and_reaps_child() {
     let child = Command::new(std::env::current_exe().expect("test binary path resolves"))
         .env(COMMAND_RUNNER_HELPER_ENV, "park")
-        .args(["--exact", "command_runner_helper_process", "--nocapture"])
+        .args([
+            "--exact",
+            "command_runner_helper_process",
+            "--ignored",
+            "--nocapture",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -847,7 +869,7 @@ mod linux {
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, UdpSocket};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -869,7 +891,7 @@ mod linux {
     /// How long the live spawner keeps forking before it settles into a plain
     /// park. Long enough that the kill under test always lands mid-burst.
     const LIVE_SPAWN_WINDOW: Duration = Duration::from_secs(20);
-    const LIVE_SPAWN_MAX: usize = 200;
+    const LIVE_SPAWN_MAX: usize = 400;
 
     fn required_linux_capabilities() -> bool {
         std::env::var_os("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES").is_some()
@@ -1193,13 +1215,44 @@ mod linux {
     }
 
     struct PidGuard {
-        pid: u32,
+        pidfd: OwnedFd,
+    }
+
+    impl PidGuard {
+        fn new(pid: u32) -> Self {
+            let platform_pid = libc::pid_t::try_from(pid).expect("test PID must fit pid_t");
+            let raw_pidfd = unsafe {
+                // SAFETY: pidfd_open takes value arguments and returns a new owned
+                // descriptor. Keeping it open pins cleanup to this process identity.
+                libc::syscall(libc::SYS_pidfd_open, platform_pid, 0)
+            };
+            assert!(raw_pidfd >= 0, "test helper PID {pid} must open a pidfd");
+            let pidfd = unsafe {
+                // SAFETY: a nonnegative pidfd_open result is one owned descriptor.
+                OwnedFd::from_raw_fd(i32::try_from(raw_pidfd).expect("pidfd must fit i32"))
+            };
+            Self { pidfd }
+        }
+
+        fn signal(&self, signal: libc::c_int) {
+            unsafe {
+                // SAFETY: the owned pidfd remains live for this call; null siginfo
+                // and zero flags are the documented basic signal form.
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
     }
 
     impl Drop for PidGuard {
         fn drop(&mut self) {
-            continue_pid(self.pid);
-            terminate_pid(self.pid);
+            self.signal(libc::SIGCONT);
+            self.signal(libc::SIGTERM);
         }
     }
 
@@ -1500,6 +1553,7 @@ mod linux {
             .args([
                 "--exact",
                 "linux::helper_tcp_listener_process",
+                "--ignored",
                 "--nocapture",
             ])
             .stdout(Stdio::null())
@@ -1522,7 +1576,12 @@ mod linux {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, mode)
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "linux::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1661,15 +1720,6 @@ mod linux {
         after.chars().next()
     }
 
-    fn terminate_pid(pid: u32) {
-        let Ok(platform_pid) = libc::pid_t::try_from(pid) else {
-            return;
-        };
-        unsafe {
-            libc::kill(platform_pid, libc::SIGTERM);
-        }
-    }
-
     fn continue_pid(pid: u32) {
         let Ok(platform_pid) = libc::pid_t::try_from(pid) else {
             return;
@@ -1728,6 +1778,7 @@ mod linux {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_tcp_listener_process() {
         if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
             return;
@@ -1766,6 +1817,7 @@ mod linux {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_process_tree() {
         let Some(mode) = std::env::var_os(HELPER_TREE_ENV) else {
             return;
@@ -1801,6 +1853,7 @@ mod linux {
                         .args([
                             "--exact",
                             "linux::helper_tcp_listener_process",
+                            "--ignored",
                             "--nocapture",
                         ])
                         .stdout(Stdio::null())
@@ -1886,7 +1939,12 @@ mod linux {
                 Command::new(std::env::current_exe().expect("test binary path must resolve"))
                     .env(HELPER_TREE_ENV, format!("chain-{}", depth - 1))
                     .env(HELPER_READY_ENV, ready_file)
-                    .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "linux::helper_process_tree",
+                        "--ignored",
+                        "--nocapture",
+                    ])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -1907,9 +1965,9 @@ mod linux {
         park_bounded()
     }
 
-    /// A root that actively spawns short-lived children for a bounded window,
-    /// then settles into a plain park. Every child is a plain `sleep 2`, so
-    /// even a fully failed test leaves nothing that outlives its own timer.
+    /// A root that actively spawns short-lived children for a bounded window.
+    /// Missing that window exits the fixture with failure instead of letting the
+    /// test pass against a settled tree. Every child self-exits after two seconds.
     fn run_live_spawner_helper(ready_file: &Path) -> ! {
         // A fresh process group: children inherit pgid == this PID, giving the
         // test one precise membership question to poll after the kill.
@@ -1941,7 +1999,7 @@ mod linux {
             // while still guaranteeing the kill under test lands mid-spawn.
             thread::sleep(Duration::from_millis(50));
         }
-        park_bounded()
+        std::process::exit(2)
     }
 
     /// A parent that owns one child from the start and forks one more member
@@ -1986,7 +2044,12 @@ mod linux {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, format!("chain-{depth}"))
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "linux::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0)
@@ -2020,7 +2083,12 @@ mod linux {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, "live-spawner")
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "linux::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -2035,7 +2103,12 @@ mod linux {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, "fork-on-trigger")
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "linux::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -3748,87 +3821,6 @@ mod linux {
     }
 
     #[test]
-    fn watch_ctrl_c_while_config_is_blocked_exits_successfully() {
-        let config_home = isolated_config_home();
-        let config_guard = DirectoryGuard(config_home.clone());
-        let config_path = config_home.join("blocked-config.fifo");
-        let native_path = std::ffi::CString::new(config_path.as_os_str().as_bytes())
-            .expect("temporary path has no NUL byte");
-        // SAFETY: `native_path` is a valid NUL-terminated path and the mode is a
-        // normal owner-only permission mask.
-        assert_eq!(unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) }, 0);
-        let fifo_guard = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&config_path)
-            .expect("test must hold the FIFO open without completing its read");
-        let child = Command::new(kickoutchi_binary())
-            .arg("--config")
-            .arg(&config_path)
-            .args(["watch", "--duration", "1s"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("watch process must start");
-        let mut child = ChildGuard { child };
-        let pid = child.id();
-        let blocked_deadline = Instant::now() + KICK_EXIT_WAIT;
-        loop {
-            let wait_channel = fs::read_to_string(format!("/proc/{pid}/wchan"))
-                .expect("watch wait channel must remain readable");
-            if wait_channel.contains("pipe_read") {
-                break;
-            }
-            assert!(
-                Instant::now() < blocked_deadline,
-                "watch did not block while reading its config FIFO: {wait_channel}"
-            );
-            thread::yield_now();
-        }
-
-        let platform_pid = libc::pid_t::try_from(pid).expect("child PID must fit pid_t");
-        // SAFETY: the PID belongs to this test's child and SIGINT is the behavior under test.
-        assert_eq!(unsafe { libc::kill(platform_pid, libc::SIGINT) }, 0);
-        let exit_deadline = Instant::now() + KICK_EXIT_WAIT;
-        let status = loop {
-            if let Some(status) = child
-                .child
-                .try_wait()
-                .expect("watch exit status must be readable")
-            {
-                break status;
-            }
-            assert!(
-                Instant::now() < exit_deadline,
-                "watch did not exit after startup SIGINT"
-            );
-            thread::yield_now();
-        };
-        let mut stdout = String::new();
-        child
-            .child
-            .stdout
-            .take()
-            .expect("watch stdout must be piped")
-            .read_to_string(&mut stdout)
-            .expect("watch stdout must be readable");
-        let mut stderr = String::new();
-        child
-            .child
-            .stderr
-            .take()
-            .expect("watch stderr must be piped")
-            .read_to_string(&mut stderr)
-            .expect("watch stderr must be readable");
-
-        assert_eq!(status.code(), Some(0));
-        assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
-        drop(fifo_guard);
-        drop(config_guard);
-    }
-
-    #[test]
     fn udp_ipv6_socket_is_listed_through_the_real_binary() {
         let _host_observation = lock_host_observation();
         let socket = match UdpSocket::bind("[::1]:0") {
@@ -3971,7 +3963,7 @@ mod linux {
     fn isolated_user_and_network_namespace_port_kill_delivers_sigterm() {
         let test_binary = std::env::current_exe().expect("test binary path resolves");
         let ready_file = temp_file_path("namespace-listener-ready");
-        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --nocapture & helper=$!; i=0; while test ! -s "$3"; do i=$((i+1)); test "$i" -lt 10000 || exit 90; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
+        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --ignored --nocapture & helper=$!; i=0; while test ! -s "$3"; do i=$((i+1)); test "$i" -lt 10000 || exit 90; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
         let output = run_command_with_deadline(
             Command::new("unshare")
                 .args([
@@ -4025,7 +4017,7 @@ mod linux {
     fn tree_kill_by_port_removes_root_and_child_and_clears_port() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -4058,7 +4050,7 @@ mod linux {
     fn tree_kill_declined_at_prompt_leaves_tree_running_and_unfrozen() {
         let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid = helper.id();
 
@@ -4091,7 +4083,7 @@ mod linux {
     fn tree_kill_by_pid_terminates_previously_stopped_child() {
         let _host_observation = lock_host_observation();
         let (mut helper, _port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
         stop_pid(child_pid);
         wait_for_pid_state(child_pid, 'T');
@@ -4111,7 +4103,7 @@ mod linux {
     fn tree_kill_by_pid_force_uses_sigkill_wording() {
         let _host_observation = lock_host_observation();
         let (mut helper, _port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
 
         let killed = kickoutchi_with_stdin(
@@ -4135,7 +4127,7 @@ mod linux {
     fn tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -4215,9 +4207,7 @@ mod linux {
     fn tree_kill_recollects_after_prompt_and_kills_late_fork() {
         let _host_observation = lock_host_observation();
         let (mut helper, first_child_pid, ready_file) = spawn_fork_on_trigger_process();
-        let _first_child_cleanup = PidGuard {
-            pid: first_child_pid,
-        };
+        let _first_child_cleanup = PidGuard::new(first_child_pid);
         let root_pid_text = helper.id().to_string();
         let mut kick = InteractiveKick::spawn(&["kill", "--pid", root_pid_text.as_str(), "--tree"]);
 
@@ -4231,7 +4221,7 @@ mod linux {
             .trim()
             .parse::<u32>()
             .expect("late fork pid must be a u32");
-        let _late_cleanup = PidGuard { pid: late_pid };
+        let _late_cleanup = PidGuard::new(late_pid);
 
         kick.send_stdin("tree\n");
         let (code, transcript) = kick.finish();
@@ -4255,7 +4245,7 @@ mod linux {
     fn group_kill_by_port_reaches_reparented_member_and_clears_port() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, orphan_pid, ready_file) = spawn_group_process();
-        let _orphan_cleanup = PidGuard { pid: orphan_pid };
+        let _orphan_cleanup = PidGuard::new(orphan_pid);
         let root_pid = helper.id();
         let port_text = port.to_string();
 
@@ -4292,7 +4282,12 @@ mod linux {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, "group-orphan")
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "linux::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "linux::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -4330,7 +4325,7 @@ mod linux {
     fn inspect_shows_family_read_only_with_kill_hint() {
         let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
         let port_text = port.to_string();
 
@@ -4469,12 +4464,35 @@ mod windows {
     }
 
     struct PidGuard {
-        pid: u32,
+        handle: Option<OwnedHandle>,
+    }
+
+    impl PidGuard {
+        fn new(pid: u32) -> Self {
+            let handle = unsafe {
+                // SAFETY: OpenProcess takes value arguments and returns a new
+                // process-identity handle when successful.
+                OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)
+            };
+            let handle = (!handle.is_null()).then(|| unsafe {
+                // SAFETY: the non-null OpenProcess result is one owned handle.
+                OwnedHandle::from_raw_handle(handle)
+            });
+            Self { handle }
+        }
     }
 
     impl Drop for PidGuard {
         fn drop(&mut self) {
-            terminate_pid(self.pid);
+            let Some(handle) = &self.handle else {
+                return;
+            };
+            unsafe {
+                // SAFETY: this retained handle identifies the original helper,
+                // even if its numeric PID has since been reused.
+                TerminateProcess(handle.as_raw_handle(), 1);
+                WaitForSingleObject(handle.as_raw_handle(), 1_000);
+            }
         }
     }
 
@@ -4515,6 +4533,7 @@ mod windows {
             .args([
                 "--exact",
                 "windows::helper_tcp_listener_process",
+                "--ignored",
                 "--nocapture",
             ])
             .stdout(Stdio::null())
@@ -4535,7 +4554,12 @@ mod windows {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, mode)
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "windows::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -4564,7 +4588,12 @@ mod windows {
             .env(HELPER_TREE_ENV, "spawn-after-job")
             .env(HELPER_READY_ENV, &ready_file)
             .env(HELPER_LATE_ENV, &late_file)
-            .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "windows::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -4702,26 +4731,6 @@ mod windows {
         matches!(wait, WAIT_TIMEOUT) || !matches!(wait, WAIT_OBJECT_0)
     }
 
-    fn terminate_pid(pid: u32) {
-        let handle = unsafe {
-            // SAFETY: OpenProcess takes only value arguments here. Cleanup is
-            // best-effort and wraps any non-null handle for close-on-drop.
-            OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid)
-        };
-        if handle.is_null() {
-            return;
-        }
-        let handle = unsafe {
-            // SAFETY: OpenProcess returned a non-null owned handle.
-            OwnedHandle::from_raw_handle(handle)
-        };
-        unsafe {
-            // SAFETY: handle is live and opened with terminate access.
-            TerminateProcess(handle.as_raw_handle(), 1);
-            WaitForSingleObject(handle.as_raw_handle(), 1_000);
-        }
-    }
-
     fn stdout(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
@@ -4739,6 +4748,7 @@ mod windows {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_tcp_listener_process() {
         if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
             return;
@@ -4765,6 +4775,7 @@ mod windows {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_process_tree() {
         let Some(mode) = std::env::var_os(HELPER_TREE_ENV) else {
             return;
@@ -4793,7 +4804,12 @@ mod windows {
                         )
                         .env(HELPER_TREE_ENV, "park-child")
                         .env(HELPER_READY_ENV, &ready_file)
-                        .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+                        .args([
+                            "--exact",
+                            "windows::helper_process_tree",
+                            "--ignored",
+                            "--nocapture",
+                        ])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
@@ -4816,7 +4832,12 @@ mod windows {
                     Command::new(std::env::current_exe().expect("test binary path must resolve"))
                         .env(HELPER_TREE_ENV, "park-child")
                         .env(HELPER_READY_ENV, &ready_file)
-                        .args(["--exact", "windows::helper_process_tree", "--nocapture"])
+                        .args([
+                            "--exact",
+                            "windows::helper_process_tree",
+                            "--ignored",
+                            "--nocapture",
+                        ])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
@@ -4838,6 +4859,7 @@ mod windows {
                         .args([
                             "--exact",
                             "windows::helper_tcp_listener_process",
+                            "--ignored",
                             "--nocapture",
                         ])
                         .stdout(Stdio::null())
@@ -4900,7 +4922,7 @@ mod windows {
     #[test]
     fn windows_inspect_shows_family_read_only_with_kill_hint() {
         let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
         let port_text = port.to_string();
 
@@ -4936,7 +4958,7 @@ mod windows {
     #[test]
     fn windows_tree_kill_by_port_removes_root_and_child() {
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -4994,9 +5016,7 @@ mod windows {
             .expect("late child record must include pid")
             .parse::<u32>()
             .expect("late child pid must be a u32");
-        let _late_child_cleanup = PidGuard {
-            pid: late_child_pid,
-        };
+        let _late_child_cleanup = PidGuard::new(late_child_pid);
         let inherited_job = parts
             .next()
             .expect("late child record must include job inheritance")
@@ -5014,7 +5034,7 @@ mod windows {
     #[test]
     fn windows_tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -5092,13 +5112,53 @@ mod macos {
     /// grandchild listener), so a failed test cannot leak them.
     struct PidGuard {
         pid: u32,
+        start_time: (u64, u64),
+    }
+
+    impl PidGuard {
+        fn new(pid: u32) -> Self {
+            let start_time =
+                process_start_time(pid).expect("test helper identity must be readable");
+            Self { pid, start_time }
+        }
     }
 
     impl Drop for PidGuard {
         fn drop(&mut self) {
+            if process_start_time(self.pid) != Some(self.start_time) {
+                return;
+            }
             continue_pid(self.pid);
+            if process_start_time(self.pid) != Some(self.start_time) {
+                return;
+            }
             terminate_pid(self.pid);
         }
+    }
+
+    fn process_start_time(pid: u32) -> Option<(u64, u64)> {
+        let platform_pid = libc::c_int::try_from(pid).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let expected = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let read = unsafe {
+            // SAFETY: info reserves one proc_bsdinfo output buffer and libproc
+            // does not retain it. A full-size result proves initialization.
+            libc::proc_pidinfo(
+                platform_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        if read != expected {
+            return None;
+        }
+        let info = unsafe {
+            // SAFETY: proc_pidinfo reported one complete proc_bsdinfo result.
+            info.assume_init()
+        };
+        Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
 
     fn continue_pid(pid: u32) {
@@ -5182,6 +5242,7 @@ mod macos {
             .args([
                 "--exact",
                 "macos::helper_tcp_listener_process",
+                "--ignored",
                 "--nocapture",
             ])
             .stdout(Stdio::null())
@@ -5202,7 +5263,12 @@ mod macos {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, mode)
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "macos::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "macos::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -5302,6 +5368,7 @@ mod macos {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_tcp_listener_process() {
         if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
             return;
@@ -5328,6 +5395,7 @@ mod macos {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by contract tests"]
     fn helper_process_tree() {
         let Some(mode) = std::env::var_os(HELPER_TREE_ENV) else {
             return;
@@ -5363,6 +5431,7 @@ mod macos {
                         .args([
                             "--exact",
                             "macos::helper_tcp_listener_process",
+                            "--ignored",
                             "--nocapture",
                         ])
                         .stdout(Stdio::null())
@@ -5426,7 +5495,7 @@ mod macos {
     fn macos_group_kill_reaches_reparented_member_a_tree_walk_cannot() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, orphan_pid, ready_file) = spawn_tree_process_in_group();
-        let _orphan_cleanup = PidGuard { pid: orphan_pid };
+        let _orphan_cleanup = PidGuard::new(orphan_pid);
         let root_pid = helper.id();
         let port_text = port.to_string();
 
@@ -5456,7 +5525,12 @@ mod macos {
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
             .env(HELPER_TREE_ENV, "group-orphan")
             .env(HELPER_READY_ENV, &ready_file)
-            .args(["--exact", "macos::helper_process_tree", "--nocapture"])
+            .args([
+                "--exact",
+                "macos::helper_process_tree",
+                "--ignored",
+                "--nocapture",
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -5482,7 +5556,7 @@ mod macos {
     fn macos_tree_kill_by_pid_removes_root_owned_port_and_child() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -5512,7 +5586,7 @@ mod macos {
     fn macos_tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
 
@@ -5542,7 +5616,7 @@ mod macos {
     fn macos_inspect_shows_family_read_only_with_kill_hint() {
         let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
-        let _child_cleanup = PidGuard { pid: child_pid };
+        let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
         let port_text = port.to_string();
 

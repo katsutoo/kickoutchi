@@ -9,19 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Native Linux, macOS, and Windows release-candidate gates now run formatting,
-  strict lints, tests, doctests, dual-binary optimized builds, and real-binary
-  journeys. Release packaging additionally verifies checksums, archive safety,
-  exact binary membership and versions, and executes native cargo-dist payloads
-  before upload or publication.
-- A read-only release qualification workflow now downloads immutable candidate
-  artifacts by run identity, executes bounded user-level charters on Linux,
-  macOS, and Windows, records the Windows TUI lifecycle with native ConPTY, and
-  preserves redacted machine-readable evidence with exact artifact checksums and
-  cleanup results. Extended qualification covers previous-release upgrades,
-  complete bind diagnostics, watch recovery and exhaustion, input limits,
-  permission-restricted metadata, namespace and Docker scope, WSL capability,
-  tree/group termination, and label-aware TUI search.
+- Native Linux, macOS, and Windows release gates now run formatting, strict
+  lints, tests, doctests, dual-binary optimized builds, and real-binary journeys
+  on the exact release commit before cargo-dist packaging or publication.
 - Deterministic unit, contract, and real-binary coverage for observation
   completeness, metadata budgets, labels and filters, watch recovery and event
   ordering, bind diagnostics, output schemas, configuration boundaries, safe
@@ -102,10 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made process-first enumeration loss explicit socket-set evidence, and added
   complete raw IP Helper table fixtures for every Windows address-family and
   protocol combination.
-- Replaced the unreproducible historical README timing table with a checked-in
-  release-artifact sampling protocol and documented the exact shipped target
-  matrix, configuration, exit codes, checksum limits, and structured-output
-  privacy.
+- Documented the exact shipped target matrix, configuration, exit codes,
+  checksum limits, and structured-output privacy.
 - Endpoint selector matching now canonicalizes IPv4-mapped IPv6 addresses,
   preserves numeric IPv6 scope identity, applies exact matches before wildcard
   matches, and rejects unsafe Unicode before any terminal rendering.
@@ -118,23 +106,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Release qualification now records exact-source benchmark helper identities
-  without requiring nondeterministic Windows linker output to match an arbitrary
-  prior build, gives the full frozen sample plan sufficient bounded execution
-  time, and validates retained manifest duration against that declared bound.
-- Windows replacement QA now creates the replacement listener in a distinct
-  process, so the charter proves changed owner identity instead of depending on
-  incidental partial ownership from the host socket table.
+- Windows replacement coverage creates the replacement listener in a distinct
+  process, proving changed owner identity instead of depending on incidental
+  partial ownership from the host socket table.
 - Confirmation input now applies its 128-byte limit to the entered UTF-8 payload
   rather than counting the terminal line ending, keeping CLI and TUI boundaries
   consistent while still rejecting the first excess payload byte.
 - Real-binary test helpers now use bounded process and reader cleanup, own and
   verify every member of deep process-chain fixtures, and require broken-output
   watch tests to terminate through the closed consumer rather than duration.
-- Release workflow contracts now require credential-free checkout explicitly,
-  validate each cargo-dist archive-to-checksum association and Windows
-  executable uniqueness guard, and reject alternate repository-token aliases or
-  scopes through mutation-sensitive tests.
+- Release workflow contracts now require pinned Actions, credential-free
+  checkout, exact-commit native gates, tag-only publication, and step-scoped
+  repository and Homebrew credentials.
 - macOS single-process termination now records the identity observed after
   `SIGSTOP` and uses that identity for guarded rollback, so a detected PID-reuse
   replacement is resumed without receiving the unauthorized terminating signal.
@@ -168,9 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker enrichment no longer associates explicit IPv4 and IPv6 publications
   across address families, and oversized Linux privilege status is detected with
   a limit-plus-one read before any Docker command can run.
-- Real-binary contract runners now enforce process and pipe-drain deadlines, and
-  benchmark producers reject ambiguous workloads and existing evidence paths
-  instead of replacing retained measurements.
+- Real-binary contract runners now enforce process and pipe-drain deadlines.
 - Windows tree kills now reapply `--yes` warning authorization during every
   committed containment sweep and withhold all termination when a late child
   requires fresh review. Windows custom protected names and protected-name
@@ -195,8 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining an unsupported interface index, and classifies bounded parent-name
   omissions without exceeding the metadata allowance.
 - Windows socket collection now converts IPv6 scope IDs from network byte order,
-  normalizes IPv4-mapped IPv6 endpoints, and retains ownerless UDP endpoints as
-  partial rather than treating PID zero as a process. Authoritative socket rows
+  normalizes IPv4-mapped IPv6 endpoints, and retains ownerless TCP and UDP
+  endpoints as partial rather than treating PID zero as a process. Authoritative socket rows
   also survive Toolhelp metadata-enumeration failures through bounded direct
   owner-identity reads, while destructive tree collection remains fail closed.
 - Linux process identity now parses the bounded ASCII tail of `/proc/<pid>/stat`
@@ -218,24 +199,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Release jobs now download cargo-dist executables from versioned archives,
-  verify platform-specific SHA-256 pins before extraction, and refuse execution
-  when verification fails. Homebrew validation runs without tap credentials;
-  validation failures stop before formula staging, and the tap token is
-  introduced only for the final authenticated push. Release planning is
-  read-only, and explicit repository-token environment values exist only on the
-  three commands that plan or publish a release.
+- Release jobs install an exact locked cargo-dist version. Homebrew validation
+  runs without tap credentials; validation failures stop before formula staging,
+  and the tap token is introduced only for the final authenticated push. Release
+  planning is read-only, and explicit repository-token environment values exist
+  only on the three commands that plan or publish a release.
 - Added a private vulnerability-reporting policy and documented the sensitivity
   of command lines exposed by the legacy JSON compatibility interface.
 
 ## [1.2.0] - 2026-07-11
-
-### Added
-
-- A clearly labeled single-machine performance reference in the README based
-  on 2,000 local runs of the v1.2.0 release candidate. The benchmark harness and
-  Python tooling remain local development artifacts and are not shipped in the
-  repository.
 
 ### Changed
 

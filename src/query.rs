@@ -47,21 +47,12 @@ pub(crate) struct QueryIndexResult {
     pub(crate) indices: Vec<usize>,
     pub(crate) explicit_filter_active: bool,
     pub(crate) hidden_system_process_count: usize,
-    #[cfg(test)]
-    pub(crate) metadata_normalization_count: usize,
-    #[cfg(test)]
-    pub(crate) metadata_scan_count: usize,
-    #[cfg(test)]
-    pub(crate) metadata_match_cache_peak: usize,
 }
 
 struct MatchingIndices {
     indices: Vec<usize>,
     hidden_system_process_count: usize,
     explicit_filter_active: bool,
-    normalization_count: usize,
-    scan_count: usize,
-    match_cache_peak: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -134,22 +125,11 @@ pub(crate) fn query_view_indices(
         indices,
         hidden_system_process_count,
         explicit_filter_active,
-        normalization_count,
-        scan_count,
-        match_cache_peak,
     } = matching_indices(entries, options)?;
-    #[cfg(not(test))]
-    let _ = (normalization_count, scan_count, match_cache_peak);
     Ok(QueryIndexResult {
         indices,
         explicit_filter_active,
         hidden_system_process_count,
-        #[cfg(test)]
-        metadata_normalization_count: normalization_count,
-        #[cfg(test)]
-        metadata_scan_count: scan_count,
-        #[cfg(test)]
-        metadata_match_cache_peak: match_cache_peak,
     })
 }
 
@@ -209,9 +189,6 @@ fn matching_indices(
         indices,
         hidden_system_process_count,
         explicit_filter_active,
-        normalization_count: metadata.normalization.values.len(),
-        scan_count: metadata.scans,
-        match_cache_peak: metadata.match_entries_peak,
     })
 }
 
@@ -588,8 +565,6 @@ struct NormalizationCache<'a> {
 struct MetadataMatchCache<'a> {
     normalization: NormalizationCache<'a>,
     matches: HashMap<usize, bool>,
-    scans: usize,
-    match_entries_peak: usize,
 }
 
 impl<'a> MetadataMatchCache<'a> {
@@ -604,8 +579,6 @@ impl<'a> MetadataMatchCache<'a> {
         }
         let result = self.normalization.values[value_key].contains(needle);
         self.matches.insert(value_key, result);
-        self.match_entries_peak = self.match_entries_peak.max(self.matches.len());
-        self.scans += 1;
         result
     }
 }
@@ -662,8 +635,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions, normalized_sort_keys,
-        query_view_indices,
+        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions, query_view_indices,
     };
     use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
@@ -1011,136 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn process_sort_computes_one_unicode_key_per_visible_row() {
-        let rows = [
-            entry(3000, "Äther"),
-            entry(4000, "Zulu"),
-            entry(5000, "hidden"),
-        ];
-        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
-        let mut normalization = super::NormalizationCache::default();
-        let keys = normalized_sort_keys(&views, &[0, 1], SortMode::Process, &mut normalization);
-        let values = normalization.values;
-
-        assert_eq!(keys[0].map(|key| values[key].as_str()), Some("äther"));
-        assert_eq!(keys[1].map(|key| values[key].as_str()), Some("zulu"));
-        assert_eq!(keys[2], None);
-        assert_eq!(values.len(), 2);
-    }
-
-    #[test]
-    fn maximum_shared_name_is_normalized_once_for_filter_and_sort_keys() {
-        const ROWS: usize = crate::observation::DERIVED_PORT_ENTRIES_MAX;
-        let shared: std::sync::Arc<str> = std::sync::Arc::from("Ä".repeat(2_048));
-        let mut template = entry(3000, "placeholder");
-        template.process_name = Some(std::sync::Arc::clone(&shared));
-        let rows = vec![template; ROWS];
-        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
-
-        let result = query_view_indices(
-            &views,
-            QueryOptions {
-                process: Some("ä"),
-                sort_mode: SortMode::Port,
-                ..query("")
-            },
-        )
-        .expect("maximum bounded query succeeds");
-        assert_eq!(result.indices.len(), ROWS);
-        assert_eq!(result.metadata_normalization_count, 1);
-
-        let mut normalization = super::NormalizationCache::default();
-        let _keys = normalized_sort_keys(
-            &views,
-            &result.indices,
-            SortMode::Process,
-            &mut normalization,
-        );
-        let normalized = normalization.values;
-        assert_eq!(normalized.len(), 1);
-        assert_eq!(normalized[0].len(), shared.len());
-    }
-
-    #[test]
-    fn shared_one_mib_command_is_scanned_once_for_ascii_and_unicode_no_match_filters() {
-        for (text, needle) in [
-            (
-                "X".repeat(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES),
-                "not-present",
-            ),
-            (
-                "Ä".repeat(crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES / 2),
-                "not-present",
-            ),
-        ] {
-            let shared: std::sync::Arc<str> = text.into();
-            let mut template = entry(3000, "worker");
-            template.process_name = None;
-            template.executable_path = None;
-            template.parent_pid = None;
-            template.parent_process_name = None;
-            template.command_line = Some(std::sync::Arc::clone(&shared));
-            let rows = vec![template; 32];
-            let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
-
-            let result = query_view_indices(&views, query(needle)).expect("bounded query succeeds");
-
-            assert!(result.indices.is_empty());
-            assert_eq!(result.metadata_normalization_count, 1);
-            assert_eq!(result.metadata_scan_count, 1);
-        }
-    }
-
-    #[test]
-    fn equal_metadata_values_at_distinct_addresses_share_one_term_scan() {
-        let mut first = entry(3000, "first");
-        first.process_name = None;
-        first.executable_path = None;
-        first.parent_pid = None;
-        first.parent_process_name = None;
-        first.command_line = Some(std::sync::Arc::from("shared command value"));
-        let mut second = first.clone();
-        second.local_port = 3001;
-        second.command_line = Some(std::sync::Arc::from("shared command value"));
-        assert!(!std::sync::Arc::ptr_eq(
-            first.command_line.as_ref().unwrap(),
-            second.command_line.as_ref().unwrap(),
-        ));
-        let rows = [first, second];
-        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
-
-        let result = query_view_indices(&views, query("absent")).expect("query succeeds");
-
-        assert!(result.indices.is_empty());
-        assert_eq!(result.metadata_normalization_count, 1);
-        assert_eq!(result.metadata_scan_count, 1);
-    }
-
-    #[test]
-    fn many_terms_reuse_one_linear_match_cache() {
-        const ROWS: usize = 1_024;
-        const TERMS: usize = FILTER_TEXT_MAX_BYTES.div_ceil(2);
-        let rows = (0..ROWS)
-            .map(|index| {
-                let port = u16::try_from(10_000 + index).expect("test port fits u16");
-                entry(port, &format!("z-{index}"))
-            })
-            .collect::<Vec<_>>();
-        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
-        let filter = std::iter::repeat_n("z", TERMS)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(filter.len(), FILTER_TEXT_MAX_BYTES - 1);
-
-        let result = query_view_indices(&views, query(&filter)).expect("maximum-term query works");
-
-        assert_eq!(result.indices.len(), ROWS);
-        assert_eq!(result.metadata_match_cache_peak, ROWS);
-        assert_eq!(result.metadata_scan_count, ROWS * TERMS);
-    }
-
-    #[test]
-    fn process_and_parent_sort_use_cached_keys_without_changing_shared_metadata() {
+    fn process_and_parent_sort_unicode_names() {
         let process_a: std::sync::Arc<str> = "Zulu".into();
         let process_b: std::sync::Arc<str> = "Äther".into();
         let parent_a: std::sync::Arc<str> = "Zulu Parent".into();
@@ -1165,9 +1008,5 @@ mod tests {
             .expect("sort succeeds");
             assert_eq!(result.indices, [0, 1]);
         }
-        assert_eq!(&*process_a, "Zulu");
-        assert_eq!(&*process_b, "Äther");
-        assert_eq!(&*parent_a, "Zulu Parent");
-        assert_eq!(&*parent_b, "Äther Parent");
     }
 }

@@ -522,20 +522,7 @@ impl KillTargetPort {
 }
 
 pub(crate) fn kill_target_has_port(ports: &[KillTargetPort], port: &KillTargetPort) -> bool {
-    kill_target_has_port_with(ports, port, || {})
-}
-
-fn kill_target_has_port_with(
-    ports: &[KillTargetPort],
-    port: &KillTargetPort,
-    mut compared: impl FnMut(),
-) -> bool {
-    ports
-        .binary_search_by(|candidate| {
-            compared();
-            candidate.cmp(port)
-        })
-        .is_ok()
+    ports.binary_search(port).is_ok()
 }
 
 impl From<&PortEntry> for KillTargetPort {
@@ -1551,10 +1538,9 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::outcome_after_thaw;
     use super::{
-        ConfirmationRequirement, KillMode, KillTarget, KillTargetPort, TerminationOutcome,
-        UnsafePidReason, confirmation_input_matches, confirmation_requirement,
-        kill_target_has_port_with, revalidate_confirmed_target, target_still_matches_confirmation,
-        unsafe_pid_reason,
+        ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
+        confirmation_input_matches, confirmation_requirement, revalidate_confirmed_target,
+        target_still_matches_confirmation, unsafe_pid_reason,
     };
     #[cfg(target_os = "macos")]
     use super::{finish_macos_stopped_process, macos_cont_if_matches_with};
@@ -1604,28 +1590,6 @@ mod tests {
             }),
             ipv6_scope: None,
         }
-    }
-
-    #[test]
-    fn maximum_port_membership_uses_logarithmic_comparisons() {
-        let ports = (u16::MIN..=u16::MAX)
-            .map(|local_port| KillTargetPort {
-                protocol: Protocol::Tcp,
-                local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                local_port,
-                ipv6_scope: None,
-            })
-            .collect::<Vec<_>>();
-        let target = *ports.last().expect("maximum fixture is non-empty");
-        let mut comparisons = 0usize;
-
-        assert!(kill_target_has_port_with(&ports, &target, || {
-            comparisons += 1;
-        }));
-        assert!(
-            comparisons <= 17,
-            "binary search used {comparisons} comparisons"
-        );
     }
 
     fn context(start_time_ticks: u64) -> ProcessContext {

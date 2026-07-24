@@ -239,3 +239,10 @@ scope, completeness, owner completeness, evidence gaps, and capture/probe times.
 Never promote a complete in-scope snapshot to a machine-wide claim, a verified
 socket to verified ownership, an estimated interval to an exact event time, or a
 successful bind probe to a reservation.
+
+## Related documentation
+
+- [Documentation index](README.md)
+- [Security policy](../SECURITY.md)
+- [Configuration and filters](configuration.md)
+- [Structured output](structured-output.md)

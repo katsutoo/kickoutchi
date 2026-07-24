@@ -285,18 +285,26 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
     read_config_from(file, path)
 }
 
-fn read_config_from(reader: impl Read, path: &Path) -> Result<String, ConfigError> {
-    let limit = u64::try_from(CONFIG_FILE_MAX_BYTES + 1)
-        .expect("config byte limit plus sentinel must fit in u64");
-    let mut bytes = Vec::with_capacity(CONFIG_FILE_MAX_BYTES + 1);
+fn read_config_from(mut reader: impl Read, path: &Path) -> Result<String, ConfigError> {
+    let limit = u64::try_from(CONFIG_FILE_MAX_BYTES).expect("config byte limit must fit in u64");
+    let mut bytes = Vec::with_capacity(CONFIG_FILE_MAX_BYTES);
     reader
+        .by_ref()
         .take(limit)
         .read_to_end(&mut bytes)
         .map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-    if bytes.len() > CONFIG_FILE_MAX_BYTES {
+    let mut sentinel = [0_u8; 1];
+    let has_excess = reader
+        .read(&mut sentinel)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?
+        != 0;
+    if has_excess {
         return Err(ConfigError::Invalid {
             path: path.to_path_buf(),
             detail: format!("file exceeds the {CONFIG_FILE_MAX_BYTES}-byte limit"),

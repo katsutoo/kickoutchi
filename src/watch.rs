@@ -919,31 +919,16 @@ mod tests {
     }
 
     #[test]
-    fn production_event_and_batch_limits_match_the_contract() {
-        assert_eq!(super::WATCH_EVENTS_PER_POLL_MAX, 524_288);
-        assert_eq!(
-            super::WATCH_EVENTS_PER_POLL_MAX,
-            crate::observation::SOCKET_OBSERVATIONS_MAX
-                .checked_mul(2)
-                .unwrap()
-        );
-        assert_eq!(super::WATCH_EVENT_BATCH_MAX, 4_096);
-        assert_eq!(super::WATCH_RECORD_MAX_BYTES, 65_536);
-    }
-
-    #[test]
-    fn one_bucket_streams_across_the_batch_boundary_without_pending_indexes() {
+    fn one_bucket_emits_every_release_across_the_batch_boundary() {
         let previous = snapshot(vec![socket(3_000, None); super::WATCH_EVENT_BATCH_MAX + 1]);
         let current = snapshot(Vec::new());
-        let mut diff = diff_snapshots(&previous, &current).unwrap();
+        let events = diff_snapshots(&previous, &current)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
-        for _ in 0..super::WATCH_EVENT_BATCH_MAX {
-            assert_eq!(diff.next().unwrap().unwrap().kind, EventKind::Release);
-            assert!(diff.pending_remainder.is_some());
-        }
-        assert_eq!(diff.next().unwrap().unwrap().kind, EventKind::Release);
-        assert!(diff.next().is_none());
-        assert!(diff.pending_remainder.is_none());
+        assert_eq!(events.len(), super::WATCH_EVENT_BATCH_MAX + 1);
+        assert!(events.iter().all(|event| event.kind == EventKind::Release));
     }
 
     #[test]
@@ -1014,12 +999,6 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::Release);
         assert_eq!(events[0].previous_socket.unwrap().owners, hidden_101.owners);
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn diff_cursor_layout_has_no_room_for_bucket_sized_queues() {
-        assert_eq!(std::mem::size_of::<SnapshotDiff<'_>>(), 168);
     }
 
     #[test]

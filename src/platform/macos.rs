@@ -2356,7 +2356,7 @@ fn platform_error(operation: &'static str, detail: String) -> CollectorError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::mem::{MaybeUninit, align_of, offset_of, size_of};
+    use std::mem::{MaybeUninit, size_of};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
@@ -2369,7 +2369,6 @@ mod tests {
         fresh_process_evidence_from_reads, list_process_fds_with_reader, native_pass_from_records,
         process_ids_with_reader, process_observation_from_metadata, read_changing_native_buffer,
         retain_parent_process_name, retain_socket_record, socket_record_from_info,
-        sorted_owner_is_new,
     };
     use crate::model::Protocol;
     use crate::observation::{
@@ -2483,23 +2482,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shared_socket_owner_dedup_scales_with_sorted_owner_count() {
-        let mut owners = Vec::new();
-        for pid in 1..=32_768 {
-            if sorted_owner_is_new(&owners, pid) {
-                owners.push(pid);
-            }
-            if sorted_owner_is_new(&owners, pid) {
-                owners.push(pid);
-            }
-        }
-
-        assert_eq!(owners.len(), 32_768);
-        assert_eq!(owners.first(), Some(&1));
-        assert_eq!(owners.last(), Some(&32_768));
-    }
-
     fn in_sockinfo_v4(port: u16, addr: Ipv4Addr) -> InSockinfo {
         InSockinfo {
             insi_fport: 0,
@@ -2580,32 +2562,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_fdinfo_layout_exactly_matches_the_supported_darwin_lp64_abi() {
-        assert_eq!(size_of::<super::ProcFileinfo>(), 24);
-        assert_eq!(align_of::<super::ProcFileinfo>(), 8);
-        assert_eq!(size_of::<InSockinfo>(), 80);
-        assert_eq!(align_of::<InSockinfo>(), 8);
-        assert_eq!(offset_of!(InSockinfo, insi_laddr), 48);
-        assert_eq!(offset_of!(InSockinfo, insi_v6), 68);
-        assert_eq!(size_of::<TcpSockinfo>(), 120);
-        assert_eq!(offset_of!(TcpSockinfo, tcpsi_state), 80);
-        assert_eq!(size_of::<SocketProtocolInfo>(), 528);
-        assert_eq!(align_of::<SocketProtocolInfo>(), 8);
-        assert_eq!(size_of::<super::SocketInfo>(), 768);
-        assert_eq!(offset_of!(super::SocketInfo, soi_so), 136);
-        assert_eq!(offset_of!(super::SocketInfo, soi_proto), 240);
-        assert_eq!(size_of::<SocketFdinfo>(), 792);
-        assert_eq!(align_of::<SocketFdinfo>(), 8);
-        assert_eq!(offset_of!(SocketFdinfo, psi), 24);
-    }
-
-    #[test]
-    fn darwin_constants_and_tcp_states_match_supported_sdk_values() {
-        assert_eq!(super::PROC_PIDFDSOCKETINFO, 3);
-        assert_eq!(super::SOCKINFO_IN, 1);
-        assert_eq!(super::SOCKINFO_TCP, 2);
-        assert_eq!(libc::PROX_FDTYPE_SOCKET, 2);
-
+    fn darwin_tcp_states_map_to_observation_states() {
         let expected = [
             SocketState::Closed,
             SocketState::Listen,

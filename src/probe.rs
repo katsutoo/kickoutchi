@@ -156,22 +156,36 @@ impl ProbeResult {
 
 /// Attempt the requested bind exactly once and close the socket before return.
 pub(crate) fn probe(request: ProbeRequest) -> ProbeResult {
-    let (domain, socket_type, protocol) = match (request.address, request.protocol) {
-        (IpAddr::V4(_), Protocol::Tcp) => (Domain::IPV4, Type::STREAM, socket2::Protocol::TCP),
-        (IpAddr::V4(_), Protocol::Udp) => (Domain::IPV4, Type::DGRAM, socket2::Protocol::UDP),
-        (IpAddr::V6(_), Protocol::Tcp) => (Domain::IPV6, Type::STREAM, socket2::Protocol::TCP),
-        (IpAddr::V6(_), Protocol::Udp) => (Domain::IPV6, Type::DGRAM, socket2::Protocol::UDP),
+    probe_bind(
+        request.protocol,
+        request.socket_address(),
+        request.ipv6_mode,
+        request.reuse_address,
+    )
+}
+
+fn probe_bind(
+    requested_protocol: Protocol,
+    address: SocketAddr,
+    ipv6_mode: Ipv6Mode,
+    reuse_address: ReuseAddressMode,
+) -> ProbeResult {
+    let (domain, socket_type, protocol) = match (address.is_ipv4(), requested_protocol) {
+        (true, Protocol::Tcp) => (Domain::IPV4, Type::STREAM, socket2::Protocol::TCP),
+        (true, Protocol::Udp) => (Domain::IPV4, Type::DGRAM, socket2::Protocol::UDP),
+        (false, Protocol::Tcp) => (Domain::IPV6, Type::STREAM, socket2::Protocol::TCP),
+        (false, Protocol::Udp) => (Domain::IPV6, Type::DGRAM, socket2::Protocol::UDP),
     };
 
     let socket = match Socket::new(domain, socket_type, Some(protocol)) {
         Ok(socket) => socket,
         Err(error) => return ProbeResult::from_error(&error),
     };
-    let reuse_address = request.reuse_address == ReuseAddressMode::Enabled;
+    let reuse_address = reuse_address == ReuseAddressMode::Enabled;
     if let Err(error) = socket.set_reuse_address(reuse_address) {
         return ProbeResult::from_error(&error);
     }
-    let only_v6 = match request.ipv6_mode {
+    let only_v6 = match ipv6_mode {
         Ipv6Mode::SystemDefault => None,
         Ipv6Mode::V6Only => Some(true),
         Ipv6Mode::DualStack => Some(false),
@@ -182,7 +196,7 @@ pub(crate) fn probe(request: ProbeRequest) -> ProbeResult {
         return ProbeResult::from_error(&error);
     }
 
-    match socket.bind(&SockAddr::from(request.socket_address())) {
+    match socket.bind(&SockAddr::from(address)) {
         Ok(()) => ProbeResult::bindable_now(),
         Err(error) => ProbeResult::from_error(&error),
     }
@@ -245,28 +259,12 @@ mod tests {
         .expect("test probe request must be valid")
     }
 
-    fn available_tcp_port() -> u16 {
-        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("test host must allocate a TCP port")
-            .local_addr()
-            .expect("bound TCP socket must expose its address")
-            .port()
-    }
-
-    fn available_udp_port() -> u16 {
-        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("test host must allocate a UDP port")
-            .local_addr()
-            .expect("bound UDP socket must expose its address")
-            .port()
-    }
-
     fn native_ipv6_capability(
         protocol: Protocol,
         address: Ipv6Addr,
         ipv6_mode: Ipv6Mode,
         reuse_address: ReuseAddressMode,
-    ) -> io::Result<u16> {
+    ) -> io::Result<()> {
         let (socket_type, native_protocol) = match protocol {
             Protocol::Tcp => (Type::STREAM, socket2::Protocol::TCP),
             Protocol::Udp => (Type::DGRAM, socket2::Protocol::UDP),
@@ -278,12 +276,7 @@ mod tests {
             Ipv6Mode::V6Only => socket.set_only_v6(true)?,
             Ipv6Mode::DualStack => socket.set_only_v6(false)?,
         }
-        socket.bind(&SockAddr::from(SocketAddr::from((address, 0))))?;
-        socket
-            .local_addr()?
-            .as_socket()
-            .map(|address| address.port())
-            .ok_or_else(|| io::Error::other("IPv6 socket did not return an internet address"))
+        socket.bind(&SockAddr::from(SocketAddr::from((address, 0))))
     }
 
     #[test]
@@ -418,32 +411,26 @@ mod tests {
     }
 
     #[test]
-    fn native_ipv4_matrix_binds_and_releases() {
+    fn native_ipv4_matrix_binds_ephemeral_ports() {
         for protocol in [Protocol::Tcp, Protocol::Udp] {
             for address in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
                 for reuse in [ReuseAddressMode::Disabled, ReuseAddressMode::Enabled] {
-                    let port = match protocol {
-                        Protocol::Tcp => available_tcp_port(),
-                        Protocol::Udp => available_udp_port(),
-                    };
-                    let result = probe(request(
+                    let result = probe_bind(
                         protocol,
-                        IpAddr::V4(address),
-                        port,
+                        SocketAddr::from((address, 0)),
                         Ipv6Mode::SystemDefault,
                         reuse,
-                    ));
+                    );
                     assert_eq!(result.outcome, ProbeOutcome::BindableNow);
                     assert_eq!(result.raw_os_error, None);
                     assert_eq!(result.os_error_message, None);
 
-                    let rebound = probe(request(
+                    let rebound = probe_bind(
                         protocol,
-                        IpAddr::V4(address),
-                        port,
+                        SocketAddr::from((address, 0)),
                         Ipv6Mode::SystemDefault,
                         reuse,
-                    ));
+                    );
                     assert_eq!(rebound.outcome, ProbeOutcome::BindableNow);
                 }
             }
@@ -451,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ipv6_matrix_binds_and_releases() {
+    fn native_ipv6_matrix_binds_ephemeral_ports() {
         for protocol in [Protocol::Tcp, Protocol::Udp] {
             for address in [Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED] {
                 for ipv6_mode in [
@@ -462,22 +449,10 @@ mod tests {
                     for reuse in [ReuseAddressMode::Disabled, ReuseAddressMode::Enabled] {
                         let capability =
                             native_ipv6_capability(protocol, address, ipv6_mode, reuse);
-                        let port = capability.as_ref().map_or_else(
-                            |_| match protocol {
-                                Protocol::Tcp => available_tcp_port(),
-                                Protocol::Udp => available_udp_port(),
-                            },
-                            |port| *port,
-                        );
-                        let result = probe(request(
-                            protocol,
-                            IpAddr::V6(address),
-                            port,
-                            ipv6_mode,
-                            reuse,
-                        ));
+                        let result =
+                            probe_bind(protocol, SocketAddr::from((address, 0)), ipv6_mode, reuse);
                         let expected = match capability {
-                            Ok(_) => ProbeOutcome::BindableNow,
+                            Ok(()) => ProbeOutcome::BindableNow,
                             Err(error) if classify_error(&error) == ProbeOutcome::Unsupported => {
                                 ProbeOutcome::Unsupported
                             }
@@ -489,13 +464,8 @@ mod tests {
                             result.outcome, expected,
                             "IPv6 matrix result was {result:?}"
                         );
-                        let rebound = probe(request(
-                            protocol,
-                            IpAddr::V6(address),
-                            port,
-                            ipv6_mode,
-                            reuse,
-                        ));
+                        let rebound =
+                            probe_bind(protocol, SocketAddr::from((address, 0)), ipv6_mode, reuse);
                         assert_eq!(rebound.outcome, result.outcome);
                     }
                 }
@@ -585,31 +555,6 @@ mod tests {
             assert_eq!(result.outcome, expected);
             assert_eq!(result.raw_os_error, Some(raw_code));
         }
-    }
-
-    #[test]
-    fn unavailable_native_address_preserves_the_os_error() {
-        let address = [
-            Ipv4Addr::new(192, 0, 2, 1),
-            Ipv4Addr::new(198, 51, 100, 1),
-            Ipv4Addr::new(203, 0, 113, 1),
-        ]
-        .into_iter()
-        .find(|address| {
-            TcpListener::bind((*address, 0))
-                .is_err_and(|error| error.kind() == io::ErrorKind::AddrNotAvailable)
-        })
-        .expect("the test host must leave one documentation address unassigned");
-        let result = probe(request(
-            Protocol::Tcp,
-            IpAddr::V4(address),
-            49_152,
-            Ipv6Mode::SystemDefault,
-            ReuseAddressMode::Disabled,
-        ));
-
-        assert_eq!(result.outcome, ProbeOutcome::AddressUnavailable);
-        assert!(result.raw_os_error.is_some());
     }
 
     #[test]

@@ -107,8 +107,8 @@ The relevant attacker is a local unprivileged user or process able to influence
 configuration, CLI arguments, process metadata, socket churn, child-process
 output, or a downstream output consumer. Kernel and native APIs provide
 authority but are not trusted for stable sizes or timing. Docker output,
-downloaded build tools, GitHub Actions, package registries, release hosting, and
-the Homebrew tap cross separate trust boundaries.
+downloaded build tools, GitHub Actions, package registries, release hosting, the
+Homebrew tap, and the Scoop bucket cross separate trust boundaries.
 
 Security objectives are correct process identity and signal delivery, truthful
 scope and certainty claims, memory safety at native boundaries, bounded resource
@@ -119,19 +119,30 @@ dedicated serializers; destructive actions revalidate fresh identity and
 protection evidence; retries and retained event state have fixed limits; watch
 and Why never invoke Docker.
 
-Release workflows pin actions by commit and cargo-dist archives by version and
-platform digest before execution. Homebrew credentials are absent during formula
-download and validation and exist only for the final push; update or style
-failures stop before formula staging. Release planning has read-only repository
-permission; no write-scoped token is exported to checkout or release-tool
-installation. Explicit repository `GH_TOKEN` environment values exist only on
-the dist plan, dist host, and final release steps. GitHub permissions remain
-job-scoped, so full-SHA actions in the host job still run where `contents: write`
-is available. Release checksums are published through the same repository
-authority as their artifacts, so they
-detect accidental corruption but are not an independent signature or provenance
-channel. Release-candidate verification must recheck advisories, hashes, native
-artifacts, and publisher settings against the exact commit being shipped.
+Release workflows pin actions by full commit SHA and install the exact
+`cargo-dist 0.32.0` crate with Cargo's locked dependency resolution. Release
+planning has read-only repository permission; checkout never persists GitHub
+credentials, and no write-scoped token is exported to release-tool installation.
+Explicit repository `GH_TOKEN` values exist only on the dist planning, hosting,
+GitHub Release, and Homebrew push steps that require them. GitHub permissions
+remain job-scoped, so pinned actions in the host job still execute where
+`contents: write` is available.
+
+The Homebrew publisher downloads the generated formula, runs `brew update` and
+`brew style`, stages only formula files, and receives the tap-scoped
+`HOMEBREW_TAP_TOKEN` only for the final push. Stable GitHub Releases are then
+observed independently by the public Scoop bucket's scheduled Excavator
+workflow, which regenerates and commits its manifest URL and hash; Kickoutchi's
+release workflow does not hold a Scoop write token. Package-manager repositories
+can therefore lag a new release or fail independently.
+
+Release checksums are published through the same repository authority as their
+artifacts. They detect accidental corruption but are not an independent
+signature or provenance channel. Release verification builds the native binaries
+for the exact workflow commit, then validates each generated archive's checksum,
+layout, executable permissions, and both binary entry points before upload.
+Users must still decide whether they trust the GitHub repository and
+package-manager publisher boundaries.
 
 Read-only inspect reports join socket owners, process-table rows, and optional
 command lines only when PID and process start identity agree. A port owner that

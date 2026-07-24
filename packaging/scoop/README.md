@@ -4,8 +4,8 @@ Personal [Scoop](https://scoop.sh) bucket reference for Nuggocto projects and
 release artifacts. The live bucket is `nuggocto/scoop-bucket`; this directory is
 kept as the source reference inside the Kickoutchi repository.
 
-The live bucket updates itself: Excavator watches upstream releases and commits
-new versions, URLs, and hashes there on its own (see "How updates happen"
+The live bucket updates itself: Excavator watches stable upstream releases and
+commits new versions, URLs, and hashes there on its own (see "How updates happen"
 below). This in-repo copy is a bootstrap seed, not the source of truth; if it
 lags a release, that is expected and installs are unaffected.
 
@@ -42,7 +42,9 @@ permissions** so Excavator can commit manifest updates with the repo's own
 Each manifest can carry `checkver` and `autoupdate` entries so Excavator can
 watch upstream GitHub releases, regenerate versions, URLs, and hashes, then
 commit the update. The workflow runs every four hours and can also be dispatched
-manually.
+manually. Its write access and `GITHUB_TOKEN` belong to the bucket repository;
+the Kickoutchi release workflow does not push Scoop manifests or hold a bucket
+credential.
 
 To test a manifest change before pushing:
 

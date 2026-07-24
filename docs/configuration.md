@@ -476,3 +476,10 @@ kick watch --tcp --address 127.0.0.1 \
 # Complete evidence output: no list filters, sort, or system-row hiding apply.
 kick list --snapshot-json
 ```
+
+## Related documentation
+
+- [Documentation index](README.md)
+- [Security policy](../SECURITY.md), including sensitive labels and output
+- [Structured output](structured-output.md)
+- [Platform support and observation limits](platform-support.md)

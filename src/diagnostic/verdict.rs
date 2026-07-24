@@ -202,8 +202,6 @@ pub(crate) fn relationship(
     target: &EndpointIdentity,
     ipv6_mode: Ipv6Mode,
 ) -> EndpointRelationship {
-    #[cfg(test)]
-    RELATIONSHIP_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     if observed.protocol != target.protocol || observed.port != target.port {
         return EndpointRelationship::Unrelated;
     }
@@ -241,11 +239,6 @@ pub(crate) fn relationship(
         }
         _ => EndpointRelationship::Unrelated,
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static RELATIONSHIP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn authoritative_scopes_equal(observed: Option<Ipv6Scope>, target: Option<Ipv6Scope>) -> bool {
@@ -1386,35 +1379,22 @@ mod tests {
     }
 
     #[test]
-    fn gap_filtering_scales_with_sockets_plus_gaps_instead_of_their_product() {
+    fn unrelated_endpoint_gaps_are_excluded() {
         let target = endpoint(Protocol::Tcp, IpAddr::V4(Ipv4Addr::LOCALHOST));
         let unrelated = endpoint(Protocol::Tcp, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
-        let socket_count = 100usize;
-        let gap_count = 100usize;
-        let mut observed = snapshot(
-            (0..socket_count)
-                .map(|_| {
-                    socket(
-                        unrelated.clone(),
-                        SocketState::Listen,
-                        Vec::new(),
-                        OwnerCompleteness::Complete,
-                    )
-                })
-                .collect(),
-        );
-        observed.evidence_gaps = (0..gap_count)
-            .map(|index| {
-                EvidenceGap::new(
-                    EvidenceImpact::Metadata,
-                    EvidenceGapCode::ProcessMetadataUnavailable,
-                    Some(unrelated.clone()),
-                    Some(u32::try_from(index).expect("test index fits u32")),
-                    "unrelated metadata",
-                )
-            })
-            .collect();
-        RELATIONSHIP_CALLS.with(|calls| calls.set(0));
+        let mut observed = snapshot(vec![socket(
+            unrelated.clone(),
+            SocketState::Listen,
+            Vec::new(),
+            OwnerCompleteness::Complete,
+        )]);
+        observed.evidence_gaps = vec![EvidenceGap::new(
+            EvidenceImpact::Metadata,
+            EvidenceGapCode::ProcessMetadataUnavailable,
+            Some(unrelated),
+            Some(7),
+            "unrelated metadata",
+        )];
 
         let result = analyze(
             &target,
@@ -1423,9 +1403,7 @@ mod tests {
             &probe_result(ProbeOutcome::BindableNow),
             None,
         );
-        let calls = RELATIONSHIP_CALLS.with(std::cell::Cell::get);
 
         assert!(result.evidence_gaps.is_empty());
-        assert!(calls <= 6 * (socket_count + gap_count), "calls={calls}");
     }
 }

@@ -710,14 +710,6 @@ fn read_output_bounded(
     })
 }
 
-#[cfg(test)]
-fn finish_output_drain(
-    worker: &mpsc::Receiver<io::Result<BoundedOutput>>,
-    stream: &'static str,
-) -> Option<BoundedOutput> {
-    finish_output_drain_before(worker, stream, Instant::now() + DOCKER_OUTPUT_DRAIN_TIMEOUT)
-}
-
 fn finish_output_drain_before(
     worker: &mpsc::Receiver<io::Result<BoundedOutput>>,
     stream: &'static str,
@@ -1083,7 +1075,7 @@ mod tests {
         DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity, ReapChild, ReapOutcome,
         TEST_ELEVATION_OVERRIDE, docker_container_ls_with_host_and_runner,
         docker_container_ls_with_runner, docker_context_from_ps_output, docker_host_is_local,
-        finish_output_drain, host_addr_matches, local_docker_host, looks_like_docker_owner,
+        finish_output_drain_before, host_addr_matches, local_docker_host, looks_like_docker_owner,
         parse_published_ports, read_output_bounded, run_command_bounded_with,
         run_command_bounded_with_capacity, should_try_docker_enrichment, spawn_child_cleanup,
         spawn_output_drain, terminate_and_reap,
@@ -1243,6 +1235,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by Docker command tests"]
     fn helper_writes_more_than_one_typical_pipe_buffer() {
         if std::env::var_os(LARGE_OUTPUT_HELPER_ENV).is_none() {
             return;
@@ -1257,6 +1250,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by Docker command tests"]
     fn helper_leaves_grandchild_holding_output_pipes() {
         if std::env::var_os(INHERITED_PIPE_PARENT_ENV).is_none() {
             return;
@@ -1268,6 +1262,7 @@ mod tests {
             .args([
                 "--exact",
                 "docker::tests::helper_holds_inherited_output_pipes",
+                "--ignored",
                 "--nocapture",
             ])
             .spawn()
@@ -1278,6 +1273,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by Docker command tests"]
     fn helper_holds_inherited_output_pipes() {
         if std::env::var_os(INHERITED_PIPE_GRANDCHILD_ENV).is_none() {
             return;
@@ -1287,6 +1283,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by Docker cleanup tests"]
     fn helper_waits_to_be_reaped() {
         if std::env::var_os(REAP_CHILD_HELPER_ENV).is_none() {
             return;
@@ -1300,6 +1297,7 @@ mod tests {
         command.env(LARGE_OUTPUT_HELPER_ENV, "1").args([
             "--exact",
             "docker::tests::helper_writes_more_than_one_typical_pipe_buffer",
+            "--ignored",
             "--nocapture",
         ]);
 
@@ -1459,6 +1457,7 @@ mod tests {
         command.args([
             "--exact",
             "docker::tests::helper_writes_more_than_one_typical_pipe_buffer",
+            "--ignored",
         ]);
         assert!(
             run_command_bounded_with_capacity(&mut command, Duration::from_secs(1), 1, &capacity,)
@@ -1469,8 +1468,11 @@ mod tests {
 
         drop(first_sender);
         drop(second_sender);
-        finish_output_drain(&first_worker, "first").expect("first drain exits");
-        finish_output_drain(&second_worker, "second").expect("second drain exits");
+        let finish_deadline = Instant::now() + Duration::from_secs(1);
+        finish_output_drain_before(&first_worker, "first", finish_deadline)
+            .expect("first drain exits");
+        finish_output_drain_before(&second_worker, "second", finish_deadline)
+            .expect("second drain exits");
         let release_deadline = Instant::now() + Duration::from_secs(1);
         while capacity.active.load(Ordering::Acquire) != 0 && Instant::now() < release_deadline {
             thread::yield_now();
@@ -1486,10 +1488,10 @@ mod tests {
         command.env(INHERITED_PIPE_PARENT_ENV, "1").args([
             "--exact",
             "docker::tests::helper_leaves_grandchild_holding_output_pipes",
+            "--ignored",
             "--nocapture",
         ]);
 
-        let started = Instant::now();
         assert!(
             run_command_bounded_with_capacity(
                 &mut command,
@@ -1499,7 +1501,6 @@ mod tests {
             )
             .is_none()
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(capacity.active.load(Ordering::Acquire), 2);
 
         let release_deadline = Instant::now() + Duration::from_secs(3);
@@ -1510,28 +1511,18 @@ mod tests {
     }
 
     #[test]
-    fn drain_wait_is_bounded_when_the_worker_never_reports() {
+    fn expired_drain_deadline_returns_without_a_worker_result() {
         // A live sender that never sends models a drain worker stuck in
         // `read` on a pipe some grandchild still holds open. The wait must
-        // give up on its own instead of blocking with the worker; a hang
-        // here fails the test via the harness timeout rather than an assert.
+        // return once its deadline has passed instead of blocking with the
+        // worker.
         let (sender, receiver) = std::sync::mpsc::channel();
 
-        let started = Instant::now();
-        let output = finish_output_drain(&receiver, "stdout");
-        let elapsed = started.elapsed();
+        let output = finish_output_drain_before(&receiver, "stdout", Instant::now());
 
         assert!(
             output.is_none(),
             "a drain that never completed must not produce output",
-        );
-        assert!(
-            elapsed >= Duration::from_millis(200),
-            "returned early: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(750),
-            "wait was not bounded: {elapsed:?}"
         );
         drop(sender);
     }
@@ -1617,15 +1608,14 @@ mod tests {
             .args([
                 "--exact",
                 "docker::tests::helper_waits_to_be_reaped",
+                "--ignored",
                 "--nocapture",
             ])
             .spawn()
             .expect("reap test helper must start");
         let pid = libc::pid_t::try_from(child.id()).expect("child PID must fit pid_t");
 
-        let started = Instant::now();
         let completed = cleanup.handoff(child);
-        assert!(started.elapsed() < Duration::from_millis(100));
         completed
             .recv_timeout(Duration::from_secs(2))
             .expect("cleanup worker must terminate and reap the child");

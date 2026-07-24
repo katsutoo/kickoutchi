@@ -1,117 +1,38 @@
 # Kickoutchi ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
-**"What are you doing in my swamp?!"** but for whatever is squatting on your
+**"What are you doing in my swamp?!"**, but for whatever is squatting on your
 local ports.
 
-Kickoutchi is a small TUI and CLI that shows open local TCP/UDP ports, names the
-process behind them when the OS allows it, and lets you kick stale dev servers
-out safely. Two binaries, one tool: `kickoutchi` is the full name, `kick` is the
-daily-use shortcut.
+Kickoutchi is a native TUI and CLI for finding local TCP/UDP sockets, understanding
+who owns them, and safely evicting stale development processes. Use `kickoutchi`
+for the full name or `kick` when every keystroke counts.
 
 Website: <https://kickoutchi.com>
 
-## What You Need
+## Highlights
 
-- **Rust 1.95.0+** to build from source or install with Cargo.
-- **Git** if you are cloning the repository or using `cargo install --git`.
-- **Linux 5.3+** for safe termination through `pidfd`; listing ports works on
-  older kernels too.
-- **Windows or macOS source builds** need their normal native Rust developer
-  tooling.
+- Browse listening TCP and bound UDP sockets in a terminal UI.
+- Script port discovery with human tables, legacy JSON, or a complete versioned
+  native snapshot.
+- Attach names such as `web dev` or `local postgres` to exact or wildcard
+  endpoints.
+- Stream bind, release, replacement, and collection-gap events with `kick watch`.
+- Ask whether exact endpoints are bindable now with `kick why`.
+- Inspect process families before acting.
+- Terminate one verified process, a process tree, or a POSIX process group with
+  explicit confirmation and fail-closed revalidation.
+- Collect through native OS APIs. Core socket discovery does not parse `ss`,
+  `netstat`, or `lsof` output.
 
-Published release archives target:
-
-| Platform | Release targets | Notes |
-| --- | --- | --- |
-| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | GNU libc; Linux 5.3+ required for termination |
-| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Intel and Apple Silicon |
-| Windows | `x86_64-pc-windows-msvc` | x64 only; ARM64 is not shipped |
-
-Other Rust targets may build from source but are not release-supported until
-they are added to the native test and artifact matrix.
-
-## What It Does
-
-- Lists listening TCP sockets and bound UDP sockets.
-- Shows address, port, PID, process name, parent, path, command, bind scope, and
-  permission status when available.
-- Names configured endpoints in CLI and TUI tables, search, filters, and JSON.
-- Explains Docker-owned or partial-metadata ports in details when Docker CLI
-  metadata is available; Docker is optional and never required for normal port
-  listing. PATH-based Docker enrichment is disabled while Kickoutchi is elevated
-  so a user-writable executable search path cannot cross a privilege boundary.
-- Opens as a terminal UI when run without a command.
-- Works as a script-friendly CLI with table or JSON output.
-- Exports a complete within-scope native observation with
-  `list --snapshot-json`, using the versioned `kickoutchi.snapshot/1` contract.
-- Explains whether exact TCP/UDP endpoints are bindable now with `why`, combining
-  one native snapshot with sequential bind probes and reporting evidence,
-  evidence gaps, certainty, and an aggregate exit status.
-- Asks before termination, because Donkey may yell but Donkey does not kill
-  random swamp residents without confirmation.
-- Kicks out whole process trees (`kill --tree` in the CLI; `t`/`T` in the TUI
-  on Linux and macOS): Linux/macOS freeze the root first so it cannot spawn
-  more children, then sweep and signal the verified tree leaves-first. Windows
-  uses Job Object containment instead: it preflights safely, assigns the root as
-  the commit boundary, converges descendants, then hard-terminates contained
-  members. Useful for dev servers, agents, and runners that leave workers
-  behind; even ones actively spawning.
-- Kicks out whole process groups too (`kill --group`, Linux and macOS): same
-  freeze-first pipeline, but membership comes from the POSIX process group
-  instead of parent links; for survivors that reparented away from the tree
-  (double-fork daemons, orphaned workers) and for spawners too big for the
-  tree cap. The confirmation lists every member, because a group can contain
-  more than you think.
-- Inspects a process family without signalling anything (`inspect --port` or
-  `--pid`): ancestors, descendants, siblings, ports, and kill hints, so you can
-  pick the right root before using `--tree` or `--group` where available.
-  Windows omits the POSIX process-group section because there is no Windows
-  process-group analog.
-- Uses native collectors: no `ss`, `netstat`, or `lsof` parsing in the default
-  path.
-- Watches native socket snapshots for deterministic baseline, bind, release,
-  replacement, and collection-gap events without invoking Docker or external
-  network tools in the polling loop.
-
-## Performance
-
-Performance depends strongly on process, descriptor, and socket counts. The
-previous exact local timing table was removed because its raw samples and
-harness were not retained, so it could not be independently reproduced. The
-repository now carries the release-artifact sampling protocol in
-[`benchmarks/README.md`](benchmarks/README.md). Results are reported only when
-their raw samples, workload, artifact hash, and environment remain available.
-
-The retained 2026-07-24 Linux qualification measured candidate artifact
-`847fcf0ab12648cd0ccd3b2f30870e26a3b263b69956c5a2206d6f9c8a159855` on an
-Azure x86_64 host with 4 logical CPUs, 15.61 GiB RAM, Linux
-`6.17.0-1020-azure`, glibc 2.39, the `performance` CPU governor, and Rust
-1.95.0. The manifest exposed the architecture but not the CPU model. Candidate
-results below include process startup and output handling:
-
-| Workload | Rows | Samples | p50 | p95 | p99 | p50 CPU | Peak RSS |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `list --json`, typical | 64 | 10,000 | 8.517 ms | 8.579 ms | 10.652 ms | 7.532 ms | 23.64 MiB |
-| `list --json`, high | 1,024 | 10,000 | 25.135 ms | 27.285 ms | 29.366 ms | 24.653 ms | 29.90 MiB |
-| `list --snapshot-json`, typical | 64 | 10,000 | 10.601 ms | 10.665 ms | 10.798 ms | 8.634 ms | 29.90 MiB |
-| `list --snapshot-json`, high | 1,024 | 10,000 | 41.699 ms | 45.795 ms | 48.219 ms | 41.334 ms | 32.06 MiB |
-| Synthetic snapshot, large | 65,536 | 100 | 105.477 ms | 111.793 ms | 126.275 ms | 104.443 ms | 32.06 MiB |
-| Synthetic snapshot, maximum | 262,144 | 20 | 425.250 ms | 431.371 ms | 466.575 ms | 423.680 ms | 78.42 MiB |
-| `why`, eight-endpoint matrix | 8 | 10,000 | 8.506 ms | 8.542 ms | 8.633 ms | 7.632 ms | 32.06 MiB |
-
-These are environment-specific qualification measurements, not a cross-machine
-performance promise. All listed invocations completed without execution or
-output failures, but the overall candidate verdict was **FAIL**: the high
-`list` workload exceeded four predeclared regression budgets against v1.2.0.
-See the [benchmark review](STAGE12_REVIEW.md) and retained
-[GitHub Actions run](https://github.com/nuggocto/kickoutchi/actions/runs/30072678499)
-for baseline comparisons, calibration, caveats, artifact IDs, and raw hashes.
+Kickoutchi asks before terminating anything unless you pass `--yes`. It refuses
+ambiguous ownership, unsafe PIDs, changed identities, incomplete destructive
+evidence, and protected processes that were not explicitly confirmed.
 
 ## Install
 
-Pick your swamp path.
+### GitHub Release
 
-Linux and macOS users can use the generated GitHub Release installer:
+Linux and macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -119,140 +40,69 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | sh
 ```
 
-Windows users get the PowerShell spell:
+Windows PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex"
 ```
 
-`-ExecutionPolicy Bypass` is scoped to that installer process; it does not
-persistently change your user or machine execution policy.
+Installer-based installs include `kickoutchi-update` for later upgrades.
+Release pages also provide direct archives, per-archive `.sha256` files, and a
+release-wide `sha256.sum`. Same-release checksums detect corruption; they are not
+an independent signature.
 
-Installer-based installs also include `kickoutchi-update`. Run it later to check
-for and install the newest GitHub Release:
-
-```sh
-kickoutchi-update
-```
-
-If you installed Kickoutchi before this updater existed, rerun the latest
-installer once to get `kickoutchi-update`; later upgrades can use the updater.
-
-Every release also includes direct archives for Linux, macOS, and Windows, plus
-matching `.sha256` files and a release-wide `sha256.sum`. If installers make you
-nervous, grab the archive, check the hash, and run `kickoutchi` or `kick`.
-
-On Linux or macOS, verify an archive downloaded beside `sha256.sum` with:
+### Package Managers
 
 ```sh
-sha256sum --ignore-missing --check sha256.sum
-```
-
-On Windows PowerShell, compare the published sidecar value with:
-
-```powershell
-(Get-FileHash .\kickoutchi-*.zip -Algorithm SHA256).Hash.ToLower()
-```
-
-Checksums downloaded from the same GitHub Release detect corruption; they are
-not an independent signature or provenance proof.
-
-macOS users can install from the Homebrew tap (one formula, both `kickoutchi`
-and `kick`):
-
-```sh
+# Homebrew
 brew install nuggocto/tap/kickoutchi
+
+# Cargo from Git
+cargo install --locked --git https://github.com/nuggocto/kickoutchi
+
+# Nix
+nix run github:nuggocto/kickoutchi
+nix profile install github:nuggocto/kickoutchi
 ```
 
-Windows users can install from the Scoop bucket:
-
 ```powershell
+# Scoop
 scoop bucket add nuggocto https://github.com/nuggocto/scoop-bucket
 scoop install kickoutchi
 ```
 
-Arch and Nix are first-class too. The Homebrew formula is generated and pushed to
-the tap on every release; the Scoop manifest lives in `packaging/scoop/` and
-auto-updates its bucket. winget is not planned right now. Homebrew users should
-use `nuggocto/tap`; PRs for winget or Homebrew/core are welcome if someone wants
-to maintain them :3.
+Stable releases publish their generated Homebrew formula to
+[`nuggocto/homebrew-tap`](https://github.com/nuggocto/homebrew-tap) after formula
+validation. [`nuggocto/scoop-bucket`](https://github.com/nuggocto/scoop-bucket)
+checks GitHub Releases every four hours with Scoop Excavator. Those repositories
+are the package-manager sources of truth; the Scoop files under `packaging/` are
+only a bootstrap reference.
 
-Rust users can install from Git:
+Arch package templates live in `packaging/arch/`; the AUR package is not
+published yet.
 
-```sh
-cargo install --locked --git https://github.com/nuggocto/kickoutchi
-```
-
-Nix users can run or install the flake directly:
+## Quick Start
 
 ```sh
-nix run github:nuggocto/kickoutchi
-nix run github:nuggocto/kickoutchi#kick -- list
-nix profile install github:nuggocto/kickoutchi
+kickoutchi                              # open the TUI
+kick list                               # list visible ports
+kick list --port 3000                   # select one port
+kick list --json                        # stable script-friendly array
+kick list --snapshot-json               # complete within-scope snapshot
+kick inspect --port 3000                # inspect the owning process family
+kick watch --port 3000 --duration 30s   # stream socket changes
+kick why 3000                            # probe TCP loopback bindability
+kick kill --port 3000                    # confirm, then terminate one owner
+kick kill --pid 12345 --tree             # terminate a verified process tree
+kick kill --pid 12345 --group            # Linux/macOS process group
 ```
 
-The flake is locked in the repository for reproducible builds; release commits
-update `flake.lock` deliberately instead of floating silently with nixpkgs.
+`kick` and `kickoutchi` expose the same commands. Running either without a
+subcommand opens the TUI.
 
-The AUR package is not published yet. After a maintainer publishes it, Arch
-users will be able to install it with:
+## Watch Changes
 
-```sh
-yay -S kickoutchi-bin
-```
-
-The AUR templates live in `packaging/arch/` for maintainers who want to build or
-review the package locally before publication. They are pinned to the latest
-published GitHub Release assets and checksums; bumped only after each release's
-assets exist, never against placeholders. Publication will proceed when AUR
-package maintenance is assigned.
-
-Then use either binary name:
-
-```sh
-kick list
-kick kill --port 3000
-kickoutchi
-```
-
-Running either binary with no command opens the TUI.
-
-## Get The Code
-
-```sh
-git clone https://github.com/nuggocto/kickoutchi.git
-cd kickoutchi
-```
-
-## Run From Source
-
-```sh
-cargo run                                 # open the TUI
-cargo run --bin kick -- list              # list ports
-cargo run --bin kick -- list --port 3000  # show one port
-cargo run --bin kick -- list --json       # JSON for scripts
-cargo run --bin kick -- list --snapshot-json  # complete within-scope snapshot
-cargo run --bin kick -- list --filter label:web
-cargo run --bin kick -- watch --port 3000 --duration 30s
-cargo run --bin kick -- watch --filter state:listen --json
-cargo run --bin kick -- why 3000          # explain TCP loopback bindability
-cargo run --bin kick -- why 3000 --all-protocols --all-addresses --json
-cargo run --bin kick -- kill --port 3000  # ask, then kick it out
-cargo run --bin kick -- inspect --port 3000  # read-only family view
-cargo run --bin kick -- inspect --pid 12345  # inspect a portless supervisor
-cargo run --bin kick -- kill --port 3000 --tree  # kick out the whole tree
-cargo run --bin kick -- kill --port 3000 --group  # kick out the whole process group (Linux/macOS)
-```
-
-Kickoutchi asks before it terminates anything unless you pass `--yes`. Use
-`--yes` only when you already trust the exact target; protected processes still
-require stronger confirmation.
-
-## Watch Socket Changes
-
-`kick watch` collects full-state native socket snapshots and streams changes until
-Ctrl-C. Use `--duration` for a bounded run and `--json` for one independently
-valid `kickoutchi.watch_event/1` JSON record per line:
+`kick watch` polls full-state native snapshots and reports deterministic changes:
 
 ```sh
 kick watch
@@ -261,57 +111,35 @@ kick watch --filter label:web --interval 500ms
 kick watch --filter state:established --duration 30s --json
 ```
 
-Intervals must be `100ms..=60s`; the default is `1s`. Explicit durations must be
-`100ms..=7d`. Time values use one unsigned integer followed by `ms`, `s`, `m`,
-`h`, or `d`.
+Intervals are `100ms..=60s` and default to `1s`. Explicit durations are
+`100ms..=7d`. JSON mode writes one `kickoutchi.watch_event/1` object per line.
 
-Watch accepts the list filter vocabulary plus `state:` across all native TCP
-states and UDP `bound`. Failed polls emit `collection_gap` and retain the last
-valid snapshot, so recovery cannot fabricate release events. Three consecutive
-collection failures end the command with exit code 1 after the third gap is
-flushed. Ctrl-C, duration expiry, and a closed stdout consumer exit successfully.
+Watch is polling, not a kernel event feed. Activity entirely between polls can be
+missed, and event times describe capture intervals rather than exact kernel event
+times. Failed polls emit `collection_gap`; three consecutive failures stop the
+command. Ctrl-C, duration expiry, and a closed stdout consumer exit successfully.
 
-Watch is polling, not a kernel event feed. A socket that opens and closes between
-polls can be missed, multiple changes can collapse into one net difference, and
-event times describe capture intervals rather than exact kernel event times.
+## Explain Availability
 
-## Explain Port Availability
-
-`kick why PORT` checks exact endpoints without terminating anything. By default
-it evaluates TCP on IPv4 and IPv6 loopback; selectors can choose TCP, UDP, one
-literal address, all loopback/wildcard addresses, IPv6 mode, scope ID, and
-reuse-address behavior:
+`kick why PORT` combines one native snapshot with immediate, sequential bind
+probes. It never terminates a process and does not invoke Docker.
 
 ```sh
 kick why 3000
 kick why 5353 --udp --address 127.0.0.1
 kick why 3000 --tcp --address :: --ipv6-only --json
+kick why 3000 --all-protocols --all-addresses --json
 ```
 
-Why collects one bounded native snapshot, then binds and immediately closes each
-requested endpoint in sequence. A successful probe temporarily occupies the
-endpoint, and another process can bind after it closes; `bindable_now` proves
-only that exact probe at its completion time. Why does not invoke Docker.
-
-Why exits `0` only when every requested endpoint is proven bindable now, `3` for
-an unavailable endpoint, `4` when permission prevents a reliable answer, `1`
-for an indeterminate or operational result, and `2` for invalid arguments. With
-multiple endpoints, `1` takes precedence over `4`, then `3`, then `0`.
-
-## Install Locally
-
-```sh
-cargo install --path . --locked
-```
+A successful probe temporarily occupies and then releases the endpoint. It proves
+only that the exact bind succeeded at that moment; it does not reserve the port or
+eliminate a later race.
 
 ## Configuration
 
-The default config is `~/.config/kickoutchi/config.toml` on Linux and the
-platform config directory returned by the OS on macOS and Windows. Use
-`--config FILE` to select another file. Unknown keys and files above 64 KiB are
-rejected. See the complete
-[configuration and filter reference](docs/configuration.md) for platform paths,
-precedence, validation, label matching, and current command capabilities.
+The default file is `~/.config/kickoutchi/config.toml` on Linux and the native
+platform config directory on macOS and Windows. Use `--config FILE` to select a
+different file. Unknown keys and files larger than 64 KiB are rejected.
 
 ```toml
 refresh_interval_seconds = 3
@@ -333,134 +161,104 @@ port = 8080
 label = "local web services"
 ```
 
-Configured protected names extend rather than replace the built-in safety list.
-Endpoint labels support exact literal-address selectors and explicit `"*"`
-fallbacks; exact selectors take precedence. Labels appear in list, snapshot,
-watch, and Why output.
+Configured protected names extend the built-in safety list. Exact endpoint labels
+take precedence over wildcard labels. See [`docs/configuration.md`](docs/configuration.md)
+for paths, precedence, validation, and the complete filter reference.
 
-`list`, TUI search, and `watch` share plain search and structured `pid:`,
-`port:`, `proto:`, `scope:`, `protected:`, `parent:`, `label:`, `address:`,
-`scope_id:`, and `family:` terms. Watch additionally accepts `state:` because it
-observes the full native socket-state snapshot. Terms compose with AND semantics;
-Why instead uses exact endpoint arguments and has no general filter expression.
+List, TUI search, and watch support plain search plus structured `pid:`, `port:`,
+`proto:`, `scope:`, `protected:`, `parent:`, `label:`, `address:`, `scope_id:`, and
+`family:` terms. Watch also supports `state:`. Terms compose with AND semantics.
+
+## Structured Output
+
+- `list --json` emits the stable `kickoutchi.list/1` top-level array. It can
+  include process names, paths, parent data, and complete command lines.
+- `list --snapshot-json` emits one `kickoutchi.snapshot/1` object containing the
+  bounded full-state native observation within the declared platform scope.
+- `watch --json` emits `kickoutchi.watch_event/1` NDJSON.
+- `why --json` emits one `kickoutchi.why/1` result document.
+
+Structured output can contain sensitive local information: endpoints, PIDs,
+process identities, names, executable paths, labels, and command lines. JSON
+escaping and terminal sanitization are not redaction. Review output before
+sharing it. Schema details live in
+[`docs/structured-output.md`](docs/structured-output.md).
 
 ## Exit Codes
 
 | Code | Meaning |
 | ---: | --- |
-| 0 | Command completed successfully |
+| 0 | Command completed and its requested positive condition holds |
 | 1 | Operational or internal failure |
 | 2 | Invalid arguments |
-| 3 | Valid query had no match or requested endpoint was unavailable |
+| 3 | No match, or a requested endpoint is unavailable |
 | 4 | Permissions prevented a reliable answer |
 | 5 | Kill was cancelled |
 | 6 | A protected process requires confirmation |
 
-## Structured Output And Privacy
+## Platform Support
 
-Kickoutchi has four distinct structured interfaces:
+Published archives target:
 
-- `list --json` is the stable `kickoutchi.list/1` top-level array for legacy
-  scripts. It is a filtered listening-TCP/bound-UDP projection and can include
-  process and parent names, executable paths, and complete command lines.
-- `list --snapshot-json` emits one versioned `kickoutchi.snapshot/1` object. It
-  bypasses list filters, sorting, and system-row hiding and includes the complete
-  full-state native observation within the declared scope. It omits complete
-  command lines and parent process names.
-- `watch --json` emits one independently valid `kickoutchi.watch_event/1` JSON
-  object per line. It reports baseline and changes, not a complete retained
-  history, and omits complete command lines.
-- `why --json` emits one versioned `kickoutchi.why/1` object after evaluating the
-  whole endpoint matrix. It omits complete command lines and Docker enrichment.
+| Platform | Targets | Notes |
+| --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | Linux 5.3+ is required for identity-safe termination through pidfd |
+| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` | Intel and Apple Silicon |
+| Windows | `x86_64-pc-windows-msvc` | x64; hard termination through process handles and Job Objects |
 
-All four remain sensitive, as does `inspect`, which can show process-family
-command lines and relationships. Depending on the contract, output can expose
-endpoints, PIDs, stable process-start markers, process and parent names,
-executable paths, ownership, configured labels, scope identifiers, evidence,
-and errors. `list --json` can additionally expose complete command lines
-containing tokens, credentials, URLs, paths, or user data. Optional TUI details
-can expose local Docker and Compose metadata. Human terminal sanitization and
-JSON escaping are not redaction; remove sensitive values before sharing output.
+- Linux observes the current network namespace through `/proc`. PID namespace
+  and procfs permissions can separately limit owner attribution.
+- macOS uses process-first `libproc` collection. Sockets without a visible user
+  process descriptor are outside its declared scope.
+- Windows uses IP Helper and excludes the separate WSL network stack. Run the
+  Linux build inside WSL to inspect WSL sockets and processes.
+- Tree kill is supported on all three platforms. Process-group kill is available
+  only on Linux and macOS.
 
-Certainty applies only to the claim carrying it: `proven` is established by an
-authoritative native fact or exact probe, `estimated` is derived from an interval
-or timer, `heuristic` is plausible but not authoritative, and `unknown` records
-permission, scope, race, platform, or evidence limits.
+Completeness is always relative to the declared native observation scope. See
+[`docs/platform-support.md`](docs/platform-support.md) for permanent limitations,
+permissions, WSL, polling, IPv6 scope, and certainty semantics.
 
-See the [structured output reference](docs/structured-output.md) for schemas,
-stable values, limits, ordering, streams, and exact exit behavior. Diagnostics
-use stderr and do not contaminate structured stdout.
+## Security and Safety
 
-Report suspected vulnerabilities privately as described in
-[`SECURITY.md`](SECURITY.md).
+Kickoutchi never elevates itself. Destructive commands require confirmation by
+default, reject ambiguous or incomplete ownership, and revalidate process
+identity immediately before termination. Linux retains pidfds and Windows
+retains process handles across final validation and delivery. macOS revalidates
+native process start identity but cannot eliminate the platform's final raw-PID
+signal race.
 
-## Platform Notes
+Socket visibility, owner visibility, and process metadata visibility are
+separate. An empty or partial result is not a machine-wide proof that an endpoint
+or owner does not exist. Structured and inspect output may contain sensitive
+local paths, command lines, labels, PIDs, endpoints, and process relationships;
+review and redact it before sharing.
 
-- **Linux:** native `/proc` collection. Termination uses `pidfd`, so the final
-  signal is tied to the prepared process handle instead of a recycled PID. Socket
-  observation covers only the current network namespace, while procfs/PID
-  namespace visibility can separately limit owner attribution. Elevation may
-  reduce permission gaps but does not widen namespace scope.
-- **Windows:** native IP Helper collection, process-handle single-PID
-  termination, read-only `inspect`, and CLI `kill --tree` through Job Object
-  containment. Windows termination is hard termination (`TerminateProcess` /
-  `TerminateJobObject`); there is no graceful signal tier. Use an elevated
-  terminal when higher-privilege processes hide metadata or reject termination.
-  The final tree-validation freeze uses Windows' private Job Object information
-  class 18. Kickoutchi tests freeze and thaw support on an empty job before
-  assigning the target and refuses without containment when the host does not
-  support it.
-  `--group` and the TUI `t`/`T` tree keys are not available on Windows. Native
-  Windows cannot observe the separate WSL network stack or individual Linux
-  processes inside WSL; use the Linux build inside WSL for those sockets and
-  trees. Elevation does not merge the two network stacks.
-- **macOS:** native `libproc` / `sysctl` collection and Unix `SIGTERM` / `SIGKILL`
-  termination. macOS has no pidfd, so Kickoutchi re-checks process identity right
-  before signalling and refuses if the PID changed faces. Collection is
-  process-first, so sockets without a visible user-process descriptor are outside
-  its declared scope.
+Release archives include checksums for corruption detection, but the checksums
+and archives share the same GitHub repository trust boundary and are not an
+independent signature. Report suspected vulnerabilities privately through
+[GitHub Security Advisories](https://github.com/nuggocto/kickoutchi/security/advisories/new).
+The full threat model, authority boundaries, output-handling guidance, and
+release controls are in [`SECURITY.md`](SECURITY.md).
 
-A `complete` result is complete only within the platform's declared native
-observation scope. See
-[platform support and observation limits](docs/platform-support.md) for
-permanent scope exclusions, permission behavior, polling limits, bind-probe
-races, WSL, IPv6 scope availability, and safe certainty interpretation.
+## Build From Source
 
-## Safety Rules
+Rust 1.95.0 or newer is required.
 
-- PID `0`, PID `1`, Kickoutchi's own PID, and Windows PID `4` are blocked.
-- `kill --port` refuses ambiguous ports instead of guessing.
-- Unreadable processes elsewhere on the host do not make `kill --port` require
-  root. Kickoutchi requires complete attributable ownership evidence for every
-  socket matching the selected port and refuses any observed target-local hidden
-  or ambiguous owner. On Linux, `/proc` cannot reveal whether an unreadable
-  process shares the same socket inode as a visible owner. Kickoutchi may safely
-  terminate the visible genuine owner while that hidden co-holder keeps the port
-  bound, which the post-kill check reports.
-- Protected processes require typing the PID or process name.
-- Force kill requires stronger confirmation by default.
-- Termination targets only the confirmed PID; `--tree` and `--group` are the
-  explicit opt-ins for more. They require the typed word (`tree` or `group`, or
-  `force`) unless `--yes` passes the all-clear scoped-kill gates. `--group` is
-  Linux/macOS-only.
-- Linux/macOS tree and group kills refuse anything uncertain: a set over its cap
-  (256 for trees, 512 for groups), an unsafe or protected member, unreadable
-  process metadata, or an identity that changed under it; and every refusal
-  after freezing thaws what it stopped.
-- Windows tree kill refuses cleanly before Job Object commit when preflight sees
-  an unsafe PID, protected descendant, incomplete metadata, identity drift, or an
-  over-cap tree. If Windows reports a parent link into the confirmed tree but the
-  creation-time metadata needed to sanity-check that edge is missing, Kickoutchi
-  refuses as incomplete metadata rather than omitting a possible descendant.
-  After the root is assigned, Kickoutchi freezes the Job Object through the
-  private class-18 ABI for one final bounded validation sweep before termination.
-  Freeze or validation failure withholds whole-job termination, attempts thaw
-  when needed, and reports the primary, secondary, and cleanup failures plus
-  verified fallback termination or not-terminated PIDs; partial work is never
-  hidden as full success. The preview is an observed tree, not the complete blast radius:
-  Windows may also terminate newly spawned job-contained children that were not
-  visible before confirmation.
-- A protected tree or group root requires its PID or name *and* the scope
-  word, checked again against a fresh scan right before scoped execution.
-- Group kill shows every member before asking, never signals a raw `-pgid`,
-  and refuses outright if Kickoutchi itself sits in the target group.
+```sh
+git clone https://github.com/nuggocto/kickoutchi.git
+cd kickoutchi
+cargo build --locked
+cargo test --locked --all-features
+cargo run --bin kick -- list
+```
+
+Install the local checkout with:
+
+```sh
+cargo install --path . --locked
+```
+
+## License
+
+[MIT](LICENSE)

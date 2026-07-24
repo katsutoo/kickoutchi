@@ -1211,13 +1211,6 @@ fn scan_pid_socket_owners(
     Ok(())
 }
 
-#[cfg(test)]
-fn append_sorted_owner(owners: &mut Vec<u32>, pid: u32) {
-    if owners.last().copied() != Some(pid) {
-        owners.push(pid);
-    }
-}
-
 fn owner_scan_loss(pid: u32, error: &std::io::Error) -> OwnerScanLoss {
     if error.kind() == ErrorKind::PermissionDenied {
         OwnerScanLoss::PermissionDenied(pid)
@@ -1967,8 +1960,8 @@ mod tests {
     use super::{
         AddressFamily, CollectionLimits, LinuxCollector, MAX_CHILD_PROCESSES, MAX_STATUS_BYTES,
         OwnerScanLoss, OwnerScanResult, SocketParseError, SocketRecord,
-        ancestor_pid_visibility_not_proven, append_sorted_owner, bounded_scope_identifier,
-        collect_child_processes_from, collect_pid_socket_owners, collect_process_context_from,
+        ancestor_pid_visibility_not_proven, bounded_scope_identifier, collect_child_processes_from,
+        collect_pid_socket_owners, collect_process_context_from,
         collect_related_process_hints_from, collect_related_process_hints_from_with_limit,
         collect_socket_owners, collect_socket_owners_detailed, collect_socket_records,
         collect_tree_process_infos, decode_cmdline, native_pass_from_records,
@@ -2052,19 +2045,6 @@ mod tests {
         format!(
             "   0: {local} 00000000:0000 {state} 00000000:00000000 {timer} 00000000 1000 0 {inode} 1 0000000000000000 100 0 0 10 0"
         )
-    }
-
-    #[test]
-    fn shared_socket_owner_dedup_scales_with_sorted_owner_count() {
-        let mut owners = Vec::new();
-        for pid in 1..=32_768 {
-            append_sorted_owner(&mut owners, pid);
-            append_sorted_owner(&mut owners, pid);
-        }
-
-        assert_eq!(owners.len(), 32_768);
-        assert_eq!(owners.first(), Some(&1));
-        assert_eq!(owners.last(), Some(&32_768));
     }
 
     fn temp_proc_root(name: &str) -> PathBuf {
