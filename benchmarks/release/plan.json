@@ -7,8 +7,8 @@
   "decision": "Fail absolute safety and correctness budgets first; classify practical regressions with metric-specific same-artifact calibration; otherwise withhold on excessive noise.",
   "ordering_seed": 731294887,
   "protocol_identity": {
-    "harness_commit": "db3945f629c43f87797e1f628b3ef8cd7876cc18",
-    "harness_tree_sha256": "695d7fa9068bb0437a7f8400887134b20d294e01ad15c32f00b2c7c298f4d9f9",
+    "harness_commit": "6cc9c0a1df1a8f9f975fd3d100d3dd9bfac381a0",
+    "harness_tree_sha256": "b641cf105659b6ba82f67638c29068b37524a2798a7c17bdac749b45a804561e",
     "included_product_sources_sha256": "edf2d231932313f4e750bfaf2cfd814f464dfa3332d515c72a4b96fa8ef3cf1c",
     "diff_helper_source_sha256": "55061c3435ea3770e9c7e59c72311500acb181eebc23c69369babbccdc3c8904",
     "diff_helper_lock_sha256": "a94652813b0d3243e549a020c1a68b995eef13ad6029df9abf3a59b5ad9444e7",
