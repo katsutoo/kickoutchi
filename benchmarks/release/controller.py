@@ -394,11 +394,15 @@ def _git_commit() -> str:
     return result.stdout.strip()
 
 
+def _source_bytes(path: Path) -> bytes:
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def _tree_hash(paths: list[Path], base: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths):
         relative = path.relative_to(base).as_posix().encode("utf-8")
-        contents = path.read_bytes().replace(b"\r\n", b"\n")
+        contents = _source_bytes(path)
         digest.update(len(relative).to_bytes(4, "big")); digest.update(relative)
         digest.update(len(contents).to_bytes(8, "big")); digest.update(contents)
     return digest.hexdigest()
@@ -436,7 +440,7 @@ def verify_protocol_identity(plan: dict[str, Any]) -> None:
     harness_hash = _tree_hash(harness_sources, root)
     helper_source_hash = _tree_hash(helper_sources, root)
     product_hash = _tree_hash(product_sources, root)
-    lock_hash = sha256_bytes(lock_path.read_bytes())
+    lock_hash = sha256_bytes(_source_bytes(lock_path))
     rustc = subprocess.run(["rustc", "--version", "--verbose"], capture_output=True, text=True, timeout=10, check=False)
     lines = rustc.stdout.splitlines()
     rustc_version = lines[0] if rustc.returncode == 0 and lines else None
