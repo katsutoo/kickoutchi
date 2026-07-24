@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The release runbook and the product recap that `1.3.0` added. Both were
+  maintainer-only working documents, never shipped in a package or archive, and
+  the qualification state they tracked is now recorded in the release itself.
+
 ### Changed
 
 - Every surface that only reads a port row now borrows it from the authoritative

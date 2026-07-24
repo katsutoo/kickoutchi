@@ -2,10 +2,10 @@
 //! kill flow all pass around.
 //!
 //! Platform collectors produce one authoritative `NetworkSnapshot`, and
-//! [`PortEntryView`] borrows a row out of it. Every read-only surface — list,
-//! kill, scoped kill, inspect, Docker enrichment, the TUI table — speaks that
-//! view, and it also owns the stable `list --json` serialization contract while
-//! internal identity evidence remains outside that wire shape.
+//! [`PortEntryView`] borrows a row out of it. Every surface that only reads a
+//! row — list, kill, scoped kill, inspect, Docker enrichment, TUI rendering —
+//! speaks that view, and it also owns the stable `list --json` serialization
+//! contract while internal identity evidence remains outside that wire shape.
 //! [`PortEntry`] is the owned mirror, kept only where a row must outlive the
 //! snapshot it came from.
 
@@ -118,16 +118,19 @@ impl BindScope {
 /// not a source of truth. Every field is derived by `project_legacy*`, and the
 /// snapshot is authoritative for anything a destructive decision rests on.
 ///
-/// No function signature takes this type any more: list, kill, scoped kill,
-/// inspect, Docker enrichment, and the TUI all pass [`PortEntryView`], which
-/// borrows the same facts from a live snapshot without copying the shared
-/// process metadata. What is left are the three places a row genuinely has to
-/// outlive the snapshot that produced it:
+/// No signature that only *reads* a row names this type. List, kill, scoped
+/// kill, inspect, Docker enrichment, and TUI rendering all take
+/// [`PortEntryView`], which borrows the same facts from a live snapshot without
+/// copying the shared process metadata. The signatures that still name the
+/// owned form are the ones that produce or hold a row outliving the snapshot it
+/// came from:
 ///
 /// - the TUI's stored table, which keeps rows across frames while snapshots
-///   come and go, and hands one to a details worker on another thread;
-/// - the `collect_*_ports` seams, whose closures own a snapshot internally and
-///   must return something after it drops;
+///   come and go, hands one to a details worker on another thread, and lets
+///   `mark_protected` stamp them in place;
+/// - the `collect_*_ports` seams and the `CollectPorts` closure bounds they
+///   satisfy, which own a snapshot internally and must return rows that
+///   survive it;
 /// - test fixtures, which are clearer written out than assembled into a whole
 ///   `NetworkSnapshot` (see `entry_views`).
 ///
@@ -205,6 +208,15 @@ impl PortEntryView<'_> {
         self.scope().label()
     }
 
+    /// Best-effort "is this a system/service process?" check, used for optional
+    /// hiding.
+    ///
+    /// Deliberately cautious: PID 0/1, direct children of PID 1, and a short
+    /// list of well-known OS names. We don't collect per-row owner UID (that's
+    /// resolved lazily for the selected row only), so this table-wide check
+    /// can't lean on it. And a protected app like `postgres` doesn't count as a
+    /// system process just because it's protected — those are two different
+    /// ideas.
     pub(crate) fn is_system_process(self) -> bool {
         SystemProcessCheck {
             platform: self.platform,
@@ -362,7 +374,7 @@ pub(crate) struct SystemProcessCheck<'a> {
 
 impl SystemProcessCheck<'_> {
     /// Best-effort system/service classification; see
-    /// `PortEntry::is_system_process` for the policy rationale.
+    /// [`PortEntryView::is_system_process`] for the policy rationale.
     pub(crate) fn is_system_process(&self) -> bool {
         match self.platform {
             Platform::Windows => self.is_windows_system_process(),

@@ -99,7 +99,13 @@ pub(crate) fn collect_snapshot(
     }
 }
 
-/// Temporary legacy projection used by existing command and TUI surfaces.
+/// Collect one snapshot and hand back owned legacy rows that outlive it.
+///
+/// The owned projection exists because this function drops the snapshot it
+/// collected from: the TUI stores these rows across frames, and the kill and
+/// scoped-kill seams re-collect through closures that must return something
+/// after their snapshot goes away. Callers that hold a live snapshot should
+/// project `PortEntryView` from it instead of coming through here.
 pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
     collect_ports_with_profile(MetadataProfile::LegacyList)
 }

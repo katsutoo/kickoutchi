@@ -1,10 +1,10 @@
 //! Table and JSON rendering for CLI mode.
 //!
-//! This layer only knows how to format projected `PortEntry` indexes. It writes
-//! rows incrementally so large shared process metadata is never duplicated into
-//! cell vectors or a complete output string. Total output bytes are externally
-//! driven by the selected row count and writer; this module retains no complete
-//! rendered output.
+//! This layer only knows how to format borrowed `PortEntryView` rows by index.
+//! It writes rows incrementally so large shared process metadata is never
+//! duplicated into cell vectors or a complete output string. Total output bytes
+//! are externally driven by the selected row count and writer; this module
+//! retains no complete rendered output.
 
 use std::io::Write;
 

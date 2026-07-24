@@ -76,7 +76,7 @@ fn scope_authorization(confirmation: ScopedConfirmationFacts) -> tree::ScopeAuth
 }
 
 /// The injected seams for a tree kill, bundled so the entry point stays under
-/// the argument-count limit and mirrors [`KillCollectors`].
+/// the argument-count limit and mirrors `KillCollectors` in the `kill` module.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts> {
     collect_context: CollectContext,
