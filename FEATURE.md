@@ -2535,13 +2535,20 @@ most favorable workloads for the README.
 
 ### Stage 12 gate
 
-- [ ] Correctness was verified before measurement.
-- [ ] Baseline and candidate were measured under equivalent conditions.
+- [x] Correctness was verified before measurement.
+- [x] Baseline and candidate were measured under equivalent conditions.
 - [ ] No practical regression budget was exceeded.
-- [ ] Results are reproducible and include uncertainty and caveats.
-- [ ] Linux and Windows results use the declared native sampling protocol, and
+- [x] Results are reproducible and include uncertainty and caveats.
+- [x] Linux and Windows results use the declared native sampling protocol, and
       any README table remains traceable to complete immutable evidence.
-- [ ] Binary and dependency growth are justified.
+- [x] Binary and dependency growth are justified.
+
+The retained native benchmark review in `STAGE12_REVIEW.md` is complete with a
+FAIL verdict and `hold` recommendation. Linux exceeded predeclared practical
+latency and CPU regression budgets for the 1,024-socket list workload, and
+Windows exceeded the absolute maximum latency for the complete Why matrix. The
+candidate must not proceed to Stage 13. Any optimized candidate must repeat the
+affected release gates and this benchmark.
 
 ## Stage 13: Final Release Review
 

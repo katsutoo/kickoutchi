@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Release qualification now records exact-source benchmark helper identities
+  without requiring nondeterministic Windows linker output to match an arbitrary
+  prior build, gives the full frozen sample plan sufficient bounded execution
+  time, and validates retained manifest duration against that declared bound.
+- Windows replacement QA now creates the replacement listener in a distinct
+  process, so the charter proves changed owner identity instead of depending on
+  incidental partial ownership from the host socket table.
 - Confirmation input now applies its 128-byte limit to the entered UTF-8 payload
   rather than counting the terminal line ending, keeping CLI and TUI boundaries
   consistent while still rejecting the first excess payload byte.
