@@ -82,6 +82,31 @@ repository now carries the release-artifact sampling protocol in
 [`benchmarks/README.md`](benchmarks/README.md). Results are reported only when
 their raw samples, workload, artifact hash, and environment remain available.
 
+The retained 2026-07-24 Linux qualification measured candidate artifact
+`847fcf0ab12648cd0ccd3b2f30870e26a3b263b69956c5a2206d6f9c8a159855` on an
+Azure x86_64 host with 4 logical CPUs, 15.61 GiB RAM, Linux
+`6.17.0-1020-azure`, glibc 2.39, the `performance` CPU governor, and Rust
+1.95.0. The manifest exposed the architecture but not the CPU model. Candidate
+results below include process startup and output handling:
+
+| Workload | Rows | Samples | p50 | p95 | p99 | p50 CPU | Peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `list --json`, typical | 64 | 10,000 | 8.517 ms | 8.579 ms | 10.652 ms | 7.532 ms | 23.64 MiB |
+| `list --json`, high | 1,024 | 10,000 | 25.135 ms | 27.285 ms | 29.366 ms | 24.653 ms | 29.90 MiB |
+| `list --snapshot-json`, typical | 64 | 10,000 | 10.601 ms | 10.665 ms | 10.798 ms | 8.634 ms | 29.90 MiB |
+| `list --snapshot-json`, high | 1,024 | 10,000 | 41.699 ms | 45.795 ms | 48.219 ms | 41.334 ms | 32.06 MiB |
+| Synthetic snapshot, large | 65,536 | 100 | 105.477 ms | 111.793 ms | 126.275 ms | 104.443 ms | 32.06 MiB |
+| Synthetic snapshot, maximum | 262,144 | 20 | 425.250 ms | 431.371 ms | 466.575 ms | 423.680 ms | 78.42 MiB |
+| `why`, eight-endpoint matrix | 8 | 10,000 | 8.506 ms | 8.542 ms | 8.633 ms | 7.632 ms | 32.06 MiB |
+
+These are environment-specific qualification measurements, not a cross-machine
+performance promise. All listed invocations completed without execution or
+output failures, but the overall candidate verdict was **FAIL**: the high
+`list` workload exceeded four predeclared regression budgets against v1.2.0.
+See the [benchmark review](STAGE12_REVIEW.md) and retained
+[GitHub Actions run](https://github.com/nuggocto/kickoutchi/actions/runs/30072678499)
+for baseline comparisons, calibration, caveats, artifact IDs, and raw hashes.
+
 ## Install
 
 Pick your swamp path.
