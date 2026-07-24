@@ -119,6 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- macOS normal termination now distinguishes a process that exits between
+  `SIGTERM` delivery and the guarded `SIGCONT` identity check from an unreadable
+  or recycled PID, avoiding a false cleanup failure without signaling a new
+  process.
 - macOS release-profile watch journeys retry only the exact partial-initial-socket
   condition with a fixed three-attempt budget. The shared runner uses
   noninteractive elevation for that fixture-owned journey and now fails unless

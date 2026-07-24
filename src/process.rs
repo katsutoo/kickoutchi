@@ -918,7 +918,7 @@ fn macos_cont_if_matches(
     macos_cont_if_matches_with(
         pid,
         rollback_marker,
-        crate::platform::macos::process_start_time_marker,
+        crate::platform::macos::process_start_time_marker_result,
         tree_cont,
     )
 }
@@ -931,16 +931,19 @@ fn macos_cont_if_matches_with<ReadMarker, Continue>(
     continue_process: Continue,
 ) -> crate::tree::TreeSignalResult
 where
-    ReadMarker: FnOnce(u32) -> Option<ProcessStartMarker>,
+    ReadMarker: FnOnce(u32) -> std::io::Result<ProcessStartMarker>,
     Continue: FnOnce(u32) -> crate::tree::TreeSignalResult,
 {
     let Some(rollback_marker) = rollback_marker else {
         return crate::tree::TreeSignalResult::Denied;
     };
-    if read_marker(pid) != Some(rollback_marker) {
-        return crate::tree::TreeSignalResult::Denied;
+    match read_marker(pid) {
+        Ok(marker) if marker == rollback_marker => continue_process(pid),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            crate::tree::TreeSignalResult::NotFound
+        }
+        Ok(_) | Err(_) => crate::tree::TreeSignalResult::Denied,
     }
-    continue_process(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -1629,7 +1632,7 @@ mod tests {
         let result = macos_cont_if_matches_with(
             42,
             Some(rollback_marker),
-            |_| Some(rollback_marker),
+            |_| Ok(rollback_marker),
             |pid| {
                 continued.push(pid);
                 crate::tree::TreeSignalResult::Delivered
@@ -1738,11 +1741,31 @@ mod tests {
         let result = macos_cont_if_matches_with(
             42,
             Some(rollback_marker),
-            |_| Some(changed_marker),
+            |_| Ok(changed_marker),
             |_| panic!("changed identity must not receive SIGCONT"),
         );
 
         assert_eq!(result, crate::tree::TreeSignalResult::Denied);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cleanup_treats_an_exited_process_as_already_thawed() {
+        let rollback_marker = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("rollback marker is valid");
+
+        let result = macos_cont_if_matches_with(
+            42,
+            Some(rollback_marker),
+            |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            |_| panic!("an exited process must not receive SIGCONT"),
+        );
+
+        assert_eq!(result, crate::tree::TreeSignalResult::NotFound);
+        assert_eq!(
+            outcome_after_thaw(42, TerminationOutcome::Success, result),
+            TerminationOutcome::Success
+        );
     }
 
     #[test]

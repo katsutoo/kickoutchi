@@ -829,9 +829,13 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
 }
 
 pub(crate) fn process_start_time_marker(pid: u32) -> Option<ProcessStartMarker> {
-    read_process_bsdinfo(pid)
-        .ok()
-        .and_then(|info| process_start_time_marker_from_bsd_info(&info).ok())
+    process_start_time_marker_result(pid).ok()
+}
+
+pub(crate) fn process_start_time_marker_result(pid: u32) -> std::io::Result<ProcessStartMarker> {
+    let info = read_process_bsdinfo(pid)?;
+    process_start_time_marker_from_bsd_info(&info)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Best-effort command line for one PID, for the read-only inspect view.
