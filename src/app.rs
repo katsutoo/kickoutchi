@@ -675,6 +675,7 @@ impl App {
         self.modal_scroll = rows;
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn cancel_confirmation_for_layout(&mut self) {
         self.cancel_confirmation();
         self.kill_status = Some(

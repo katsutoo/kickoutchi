@@ -407,7 +407,7 @@ pub(crate) fn spawn_worker(
 ) -> io::Result<thread::JoinHandle<()>> {
     #[cfg(not(unix))]
     {
-        return builder.spawn(operation);
+        builder.spawn(operation)
     }
 
     #[cfg(unix)]

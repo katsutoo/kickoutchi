@@ -4389,8 +4389,26 @@ mod linux {
             "group\n",
         );
 
-        assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
         let killed_stderr = stderr(&killed);
+        if killed.status.code() == Some(1)
+            && killed_stderr.contains("collecting ports before kill failed: observation raced")
+        {
+            assert!(
+                killed_stderr.contains("no termination was sent"),
+                "{killed_stderr}"
+            );
+            assert!(
+                pid_exists(root_pid),
+                "a raced observation must not signal the root"
+            );
+            assert!(
+                pid_exists(orphan_pid),
+                "a raced observation must not signal the reparented member"
+            );
+            let _ = fs::remove_file(ready_file);
+            return;
+        }
+        assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
         assert!(killed_stderr.contains("Scope: group"), "{killed_stderr}");
         // Every member is listed, the reparented one included.
         assert!(

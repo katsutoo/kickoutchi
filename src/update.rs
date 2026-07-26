@@ -449,6 +449,7 @@ fn valid_updater(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
+        let _ = metadata;
         true
     }
 }
@@ -636,9 +637,12 @@ fn write_state(paths: &CachePaths, state: &CacheState) -> io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
+    #[cfg(unix)]
     let result = set_private_file_permissions(&file)
         .and_then(|()| file.write_all(&bytes))
         .and_then(|()| file.sync_all());
+    #[cfg(not(unix))]
+    let result = file.write_all(&bytes).and_then(|()| file.sync_all());
     drop(file);
     if let Err(error) = result {
         let _ = fs::remove_file(&temporary);
@@ -718,10 +722,9 @@ fn secure_cache_file(path: &Path) -> io::Result<fs::Metadata> {
     Ok(metadata)
 }
 
+#[cfg(unix)]
 fn set_private_file_permissions(file: &File) -> io::Result<()> {
-    #[cfg(unix)]
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    let _ = file;
     Ok(())
 }
 

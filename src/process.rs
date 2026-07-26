@@ -245,6 +245,13 @@ pub(crate) enum TerminationOutcome {
     TargetChanged,
     UnsafePid(UnsafePidReason),
     UnknownFailure(String),
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "Windows termination does not stop processes before delivery"
+        )
+    )]
     ThawFailed {
         pid: u32,
         prior: Box<TerminationOutcome>,
