@@ -119,7 +119,7 @@ fn foreground_with(
     spawn: impl FnOnce(&str) -> io::Result<()>,
 ) -> Option<UpdateNotice> {
     let (notice, worker_token) = {
-        let _lock = acquire_lock(paths).ok()?;
+        let lock = acquire_lock(paths).ok()?;
         let mut state = read_state(paths).unwrap_or_default();
         let original_state = state.clone();
         let notice = pending_notice(&mut state);
@@ -127,6 +127,7 @@ fn foreground_with(
         if state != original_state && write_state(paths, &state).is_err() {
             return None;
         }
+        drop(lock);
         (notice, worker_token)
     };
 
