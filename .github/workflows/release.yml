@@ -487,6 +487,10 @@ jobs:
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
 
+          tap_path="$(brew --repository)/Library/Taps/nuggocto/homebrew-tap"
+          mkdir -p "$(dirname "$tap_path")"
+          git clone --no-hardlinks "$GITHUB_WORKSPACE" "$tap_path"
+
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
             name=$(echo "$filename" | sed "s/\.rb$//")
@@ -501,7 +505,8 @@ jobs:
             # We avoid reformatting user-provided data such as the app description and homepage.
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
 
-            brew install --formula "./Formula/${filename}"
+            cp "Formula/${filename}" "${tap_path}/Formula/${filename}"
+            brew install --formula "nuggocto/tap/${name}"
             prefix=$(brew --prefix "$name")
             test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${version}"
             test "$(cat "${prefix}/share/kickoutchi/install-provenance")" = "homebrew"
