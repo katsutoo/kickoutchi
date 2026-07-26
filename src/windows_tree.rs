@@ -2600,7 +2600,8 @@ mod tests {
             info(101, Some(100), 101),
             info(102, Some(100), 102),
         ];
-        let mut api = FakeApi::new(vec![snapshot]);
+        let after_exit = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let mut api = FakeApi::new(vec![snapshot, after_exit]);
         api.deny_assign.insert(102);
         api.wait_results
             .insert(102, VecDeque::from([WindowsWaitResult::Exited]));
@@ -2652,7 +2653,10 @@ mod tests {
 
     #[test]
     fn exited_member_after_assign_failure_is_not_reported_alive() {
-        let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
+        let mut api = FakeApi::new(vec![
+            vec![info(100, None, 100), info(101, Some(100), 101)],
+            vec![info(100, None, 100)],
+        ]);
         api.deny_assign.insert(101);
         api.wait_results
             .insert(101, VecDeque::from([WindowsWaitResult::Exited]));
