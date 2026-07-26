@@ -112,9 +112,24 @@ impl Drop for TuiSessionGuard {
 #[cfg(unix)]
 static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Keep the first shutdown request and ignore every later one.
+///
+/// Split out from the handler so the first-wins rule can be exercised against a
+/// caller-supplied slot. Driving the process-global from a test instead would
+/// race every concurrent reader of it — including the one inside
+/// [`wait_for_startup_worker`], which consumes the slot on each poll and would
+/// silently steal the recorded signal.
+///
+/// A relaxed compare-exchange is the whole body, so this stays
+/// async-signal-safe: no allocation, no locks, no reentrancy.
+#[cfg(unix)]
+fn record_first_signal(slot: &AtomicI32, signal: libc::c_int) {
+    let _ = slot.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 #[cfg(unix)]
 extern "C" fn record_termination_signal(signal: libc::c_int) {
-    let _ = TERMINATION_SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+    record_first_signal(&TERMINATION_SIGNAL, signal);
 }
 
 #[cfg(unix)]
@@ -706,12 +721,19 @@ fn bounded_event_wait(wait: Duration) -> Duration {
     wait.min(SIGNAL_POLL_INTERVAL)
 }
 
+/// Consume the recorded request, leaving the slot empty. See
+/// [`record_first_signal`] for why this takes the slot as an argument.
 #[cfg(unix)]
-fn take_termination_signal() -> Option<libc::c_int> {
-    match TERMINATION_SIGNAL.swap(0, Ordering::Relaxed) {
+fn take_first_signal(slot: &AtomicI32) -> Option<libc::c_int> {
+    match slot.swap(0, Ordering::Relaxed) {
         0 => None,
         signal => Some(signal),
     }
+}
+
+#[cfg(unix)]
+fn take_termination_signal() -> Option<libc::c_int> {
+    take_first_signal(&TERMINATION_SIGNAL)
 }
 
 fn draw(frame: &mut Frame, app: &mut App, theme: Theme) -> bool {
@@ -1394,30 +1416,37 @@ mod tests {
             return;
         }
 
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "ui::tests::finalization_delivers_process_signal_only_after_worker_safe_teardown",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .status()
-            .expect("final-signal child must start");
+        let status = crate::test_sync::status_guarded(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::finalization_delivers_process_signal_only_after_worker_safe_teardown",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1"),
+        )
+        .expect("final-signal child must start");
         assert!(status.success(), "final-signal child exited with {status}");
     }
 
+    /// The slot is local on purpose. The process-global one is consumed by
+    /// `wait_for_startup_worker` on every poll, so a test that recorded into it
+    /// would hand its signal to whichever other test happened to be polling —
+    /// which is exactly the race this test used to lose intermittently. The
+    /// installed handler is covered end to end by the child-process tests
+    /// below, with real signals; this one owns the first-wins state machine.
     #[cfg(unix)]
     #[test]
     fn signal_handler_records_the_first_shutdown_request_for_normal_control_flow() {
-        use super::{TERMINATION_SIGNAL, record_termination_signal, take_termination_signal};
-        use std::sync::atomic::Ordering;
+        use super::{record_first_signal, take_first_signal};
+        use std::sync::atomic::AtomicI32;
 
-        TERMINATION_SIGNAL.store(0, Ordering::Relaxed);
-        record_termination_signal(libc::SIGTERM);
-        record_termination_signal(libc::SIGHUP);
+        let slot = AtomicI32::new(0);
+        record_first_signal(&slot, libc::SIGTERM);
+        record_first_signal(&slot, libc::SIGHUP);
 
-        assert_eq!(take_termination_signal(), Some(libc::SIGTERM));
-        assert_eq!(take_termination_signal(), None);
+        assert_eq!(take_first_signal(&slot), Some(libc::SIGTERM));
+        assert_eq!(take_first_signal(&slot), None);
     }
 
     #[cfg(unix)]
@@ -1438,15 +1467,16 @@ mod tests {
             unreachable!("default SIGTERM returned");
         }
 
-        let status = Command::new(std::env::current_exe().expect("test executable must exist"))
-            .args([
-                "--exact",
-                "ui::tests::sigterm_is_reraised_with_conventional_process_status",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .status()
-            .expect("signal child must start");
+        let status = crate::test_sync::status_guarded(
+            Command::new(std::env::current_exe().expect("test executable must exist"))
+                .args([
+                    "--exact",
+                    "ui::tests::sigterm_is_reraised_with_conventional_process_status",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1"),
+        )
+        .expect("signal child must start");
 
         assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
@@ -1496,15 +1526,16 @@ mod tests {
         }
 
         for mode in ["custom", "ignored"] {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ui::tests::sigterm_restores_and_honors_custom_and_ignored_dispositions",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, mode)
-                .status()
-                .expect("signal-disposition child must start");
+            let status = crate::test_sync::status_guarded(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "ui::tests::sigterm_restores_and_honors_custom_and_ignored_dispositions",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ENV, mode),
+            )
+            .expect("signal-disposition child must start");
             assert!(status.success(), "{mode} child exited with {status}");
         }
     }
@@ -1576,15 +1607,16 @@ mod tests {
             return;
         }
 
-        let output = Command::new(std::env::current_exe().expect("test executable must exist"))
-            .args([
-                "--exact",
-                "ui::tests::completed_tui_session_restores_the_previous_panic_hook",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .output()
-            .expect("panic-hook child must start");
+        let output = crate::test_sync::output_guarded(
+            Command::new(std::env::current_exe().expect("test executable must exist"))
+                .args([
+                    "--exact",
+                    "ui::tests::completed_tui_session_restores_the_previous_panic_hook",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1"),
+        )
+        .expect("panic-hook child must start");
 
         assert!(
             output.status.success(),

@@ -982,7 +982,6 @@ mod tests {
         state = read_state(&paths).unwrap();
         assert!(!state.notice_pending);
         assert_eq!(state.available_version.as_deref(), Some("99.0.0"));
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1008,7 +1007,6 @@ mod tests {
         assert!(acknowledge_with(&paths, &notice).is_err());
         drop(lock);
         assert!(read_state(&paths).unwrap().notice_pending);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1041,7 +1039,6 @@ mod tests {
             .is_none()
         );
         assert!(retried, "failed spawn reservation must be immediately due");
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1061,7 +1058,6 @@ mod tests {
         let state = read_state(&paths).unwrap();
         assert_eq!(state.worker_token.as_deref(), Some("replacement-token"));
         assert_eq!(state.last_attempt, Some(601));
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1093,7 +1089,6 @@ mod tests {
         assert_eq!(read_marker(&marker), Some(Provenance::Homebrew));
         fs::write(&marker, "homebrew; rm -rf /\n").unwrap();
         assert_eq!(read_marker(&marker), None);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[cfg(unix)]
@@ -1111,17 +1106,12 @@ mod tests {
         let link = directory.join("link");
         symlink(&target, &link).unwrap();
         assert!(secure_cache_file(&link).is_err());
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn worker_records_failed_attempt_before_network_and_waits_a_week() {
         let directory = test_directory("worker");
-        let paths = CachePaths {
-            state: directory.join("update.json"),
-            lock: directory.join("update.lock"),
-            directory: directory.clone(),
-        };
+        let paths = cache_paths_for(&directory);
         let token = schedule_worker(&paths, 500);
         let result = run_worker_with(&paths, 500, &token, None, || {
             Err(io::Error::other("offline"))
@@ -1137,17 +1127,12 @@ mod tests {
         })
         .unwrap();
         assert!(!called);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn each_successful_outdated_week_can_schedule_one_reminder() {
         let directory = test_directory("reminder");
-        let paths = CachePaths {
-            state: directory.join("update.json"),
-            lock: directory.join("update.lock"),
-            directory: directory.clone(),
-        };
+        let paths = cache_paths_for(&directory);
         let release = || {
             Ok(GithubRelease {
                 tag_name: "v99.0.0".to_owned(),
@@ -1170,17 +1155,12 @@ mod tests {
         let token = schedule_worker(&paths, 500 + WEEK_SECONDS);
         run_worker_with(&paths, 500 + WEEK_SECONDS, &token, None, release).unwrap();
         assert!(pending_notice(&mut read_state(&paths).unwrap()).is_some());
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn successful_current_release_records_success_without_notice() {
         let directory = test_directory("current");
-        let paths = CachePaths {
-            state: directory.join("update.json"),
-            lock: directory.join("update.lock"),
-            directory: directory.clone(),
-        };
+        let paths = cache_paths_for(&directory);
         let token = schedule_worker(&paths, 700);
         run_worker_with(&paths, 700, &token, None, || {
             Ok(GithubRelease {
@@ -1196,7 +1176,6 @@ mod tests {
         assert_eq!(state.last_success, Some(700));
         assert!(!state.notice_pending);
         assert!(state.available_version.is_none());
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1221,7 +1200,6 @@ mod tests {
         assert_eq!(state.last_success, Some(800));
         assert_eq!(state.available_version.as_deref(), Some("99.0.0"));
         assert!(state.notice_pending);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1234,7 +1212,6 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(paths.lock.exists());
         drop(lock);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1252,7 +1229,6 @@ mod tests {
         assert!(paths.lock.exists());
         drop(second);
         assert!(paths.lock.exists());
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1280,7 +1256,33 @@ mod tests {
         token
     }
 
-    fn test_directory(label: &str) -> PathBuf {
+    /// A private cache directory for one test.
+    ///
+    /// It carries the shared guard that keeps the suite's process-spawning
+    /// tests from forking while this test holds an advisory lock on a file
+    /// inside it; see `crate::test_sync` for why that matters. Removal happens
+    /// in `Drop` rather than at the end of each test body, so a failing
+    /// assertion cannot leave the directory behind in the temp folder.
+    struct TestCacheDir {
+        path: PathBuf,
+        _fork_guard: std::sync::RwLockReadGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for TestCacheDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestCacheDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_directory(label: &str) -> TestCacheDir {
         let path = std::env::temp_dir().join(format!(
             "kickoutchi-update-{label}-{}-{}",
             std::process::id(),
@@ -1292,7 +1294,10 @@ mod tests {
         fs::create_dir(&path).unwrap();
         #[cfg(unix)]
         fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        path
+        TestCacheDir {
+            path,
+            _fork_guard: crate::test_sync::holding_file_lock(),
+        }
     }
 
     fn set_private_file(path: &Path) {

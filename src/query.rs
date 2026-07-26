@@ -139,6 +139,13 @@ fn matching_indices(
     if options.port == Some(0) {
         return Err(invalid_value("port", "0", "a TCP/UDP port from 1 to 65535"));
     }
+    if options.process == Some("") {
+        return Err(invalid_value(
+            "process",
+            "",
+            "a nonempty process name substring",
+        ));
+    }
     let terms = parse_filter_text(options.filter_text, options.capabilities)?;
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
@@ -727,6 +734,36 @@ mod tests {
 
         assert_eq!(ports, vec![3000]);
         assert!(result.explicit_filter_active);
+    }
+
+    /// The CLI parser rejects an empty `--process` before this seam is reached,
+    /// so this guards the other construction site: a programmatic caller must
+    /// not be able to turn an empty needle into "every row with a readable
+    /// name", which is what an unguarded substring match would produce.
+    #[test]
+    fn empty_process_option_is_refused_instead_of_matching_every_named_row() {
+        let mut hidden = entry(8080, "hidden");
+        hidden.process_name = None;
+        let rows = [entry(3000, "node"), hidden];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        let refused = query_view_indices(
+            &views,
+            QueryOptions {
+                process: Some(""),
+                ..query("")
+            },
+        )
+        .expect_err("an empty process selector must be refused");
+
+        assert_eq!(
+            refused,
+            QueryError::InvalidValue {
+                field: "process",
+                value: String::new(),
+                expected: "a nonempty process name substring",
+            }
+        );
     }
 
     #[test]

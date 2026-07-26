@@ -35,6 +35,10 @@ mod process_evidence;
 mod protection;
 mod public_output;
 mod query;
+// Keeps the suite's process-spawning tests from forking while its cache-lock
+// tests hold advisory locks; see the module for why that combination misfires.
+#[cfg(test)]
+mod test_sync;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

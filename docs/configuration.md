@@ -342,7 +342,11 @@ For list and TUI rows, each plain term can match any of:
 - parent PID or parent process name.
 
 The separate `list --process TEXT` option searches only process names, using a
-case-insensitive substring, and excludes rows with no process name.
+case-insensitive substring, and excludes rows with no process name. `TEXT` must
+be nonempty. An empty substring matches every name, so it would reduce the
+result to "rows whose process name was readable" rather than filter it; that is
+rejected as an invalid argument (exit `2`). Whitespace is accepted, because a
+space is a legitimate substring of a process title.
 
 Watch deliberately collects the `Display` metadata profile rather than the
 legacy list/TUI profile. Watch plain search includes:

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `list --process ""` is now an invalid-argument error (exit `2`) instead of
+  quietly selecting every row whose process name was readable. An empty
+  substring matches every name, so the old result narrowed the list instead of
+  filtering it, and a script passing an unset variable got a wrong answer under
+  a success exit code. Nonempty values are unchanged, whitespace included.
+
+### Fixed
+
+- Snapshot, watch, and Why output no longer repeats an evidence gap that both
+  consistency passes observed. The repeat carried no evidence the first copy did
+  not and consumed half of each snapshot's gap retention budget, so a host with
+  enough distinct gaps could overflow that budget and then have watch refuse to
+  diff and kill refuse to signal on an observation that was complete enough to
+  act on. A process that exhausts its optional-metadata budget on several fields
+  now also reports one gap instead of one per field.
+
 ## [1.3.5] - 2026-07-26
 
 ### Fixed

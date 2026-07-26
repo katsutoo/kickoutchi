@@ -2181,9 +2181,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_tree_stop_returns_only_after_stopped_state_is_observable() {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
+        let child = crate::test_sync::spawn_guarded(std::process::Command::new("sleep").arg("30"))
             .expect("spawn test child");
         let mut child = ChildGuard(child);
         let pid = child.0.id();

@@ -216,7 +216,7 @@ pub(crate) struct ListArgs {
     pub(crate) port: Option<u16>,
 
     /// Only show rows whose process name contains this text.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_process)]
     pub(crate) process: Option<String>,
 
     /// Apply plain search or structured filters (all terms must match).
@@ -408,6 +408,19 @@ fn diagnostic_port_without_confirmed_socket(
 fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
     SortMode::from_label(value)
         .ok_or_else(|| "expected one of: port, pid, protocol, process, parent, scope".to_owned())
+}
+
+/// Reject an empty `--process` selector.
+///
+/// An empty needle is a substring of every name, so the row set it selects is
+/// "every row whose process name was readable" — a silently narrowed answer
+/// rather than a filter, and one nobody asks for deliberately. Whitespace is
+/// left alone: a space is a legitimate substring of a real process title.
+fn parse_process(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("expected a nonempty process name substring".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_port(value: &str) -> Result<u16, String> {
@@ -887,6 +900,25 @@ mod tests {
         ];
         for invocation in invocations {
             assert!(Cli::try_parse_from(*invocation).is_err(), "{invocation:?}");
+        }
+    }
+
+    /// An empty needle is a substring of every name, so `--process ""` used to
+    /// select "every row whose process name was readable" and exit 0 on that
+    /// silently narrowed answer. Every structured filter already rejects an
+    /// empty value; this selector now agrees, and a script that passes an
+    /// unset variable gets a usage error instead of a wrong list.
+    #[test]
+    fn empty_process_selector_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["kickoutchi", "list", "--process", ""]).is_err());
+
+        // Only the empty string: whitespace is a real substring of a process
+        // title, and a nonempty needle is the ordinary case.
+        for accepted in [" ", "node"] {
+            assert!(
+                Cli::try_parse_from(["kickoutchi", "list", "--process", accepted]).is_ok(),
+                "{accepted:?}",
+            );
         }
     }
 

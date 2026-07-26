@@ -1558,15 +1558,28 @@ fn merge_attempt_uncertainty(
     pass_b.omitted_evidence_gap_count = pass_b
         .omitted_evidence_gap_count
         .saturating_add(pass_a.omitted_evidence_gap_count);
-    let mut gaps = std::mem::take(&mut pass_a.associations.evidence_gaps);
+    // Both passes observe the same host, so a gap that is identical in every
+    // field normally shows up in both. Merging them verbatim would emit each
+    // one twice: the copy carries no evidence the first one did not, it halves
+    // the effective retention budget, and once that budget overflows the
+    // resulting `omitted_evidence_gap_count` makes watch refuse to diff and
+    // kill refuse to signal on an observation that was actually complete
+    // enough. Deduplicate here, at the point where the second copy is born,
+    // so the budget is spent on distinct evidence.
+    let mut merged: BTreeSet<EvidenceGap> = std::mem::take(&mut pass_a.associations.evidence_gaps)
+        .into_iter()
+        .collect();
     for gap in pass_b.associations.evidence_gaps.drain(..) {
-        if gaps.len() < EVIDENCE_GAPS_MAX {
-            gaps.push(gap);
-        } else {
-            pass_b.omitted_evidence_gap_count = pass_b.omitted_evidence_gap_count.saturating_add(1);
+        if merged.contains(&gap) {
+            continue;
         }
+        if merged.len() >= EVIDENCE_GAPS_MAX {
+            pass_b.omitted_evidence_gap_count = pass_b.omitted_evidence_gap_count.saturating_add(1);
+            continue;
+        }
+        merged.insert(gap);
     }
-    pass_b.associations.evidence_gaps = gaps;
+    pass_b.associations.evidence_gaps = merged.into_iter().collect();
     Ok(())
 }
 
@@ -1683,6 +1696,13 @@ fn build_snapshot(
         pass.associations.global_completeness.clone()
     };
     evidence_gaps.sort();
+    // The merge above removes the cross-pass copies. This second pass covers
+    // the remaining in-pass source: one process that exceeds the retention
+    // budget on several optional fields raises the same PID-scoped gap once
+    // per field. A repeated gap is not repeated evidence, and the public
+    // ordering contract treats a gap as the tuple of all its fields, so the
+    // serialized list must not contain the same tuple twice.
+    evidence_gaps.dedup();
     let completeness = derive_snapshot_completeness(
         raced,
         &owner_completeness,
@@ -3464,7 +3484,10 @@ mod tests {
             .iter()
             .map(|gap| gap.endpoint.as_ref().unwrap().port.get())
             .collect::<Vec<_>>();
-        assert_eq!(gap_ports, vec![80, 80, 81, 81]);
+        // Both passes report the same two gaps in opposite orders. The result
+        // is that pair once, in canonical order: reporting order does not
+        // reach the snapshot, and observing one gap twice does not make it two.
+        assert_eq!(gap_ports, vec![80, 81]);
 
         let projected = project_legacy(&snapshot).expect("legacy projection");
         assert_eq!(
@@ -3994,18 +4017,23 @@ mod tests {
     #[test]
     fn evidence_gap_overflow_is_counted_and_forces_partial() {
         let row = socket(80);
-        let gap = EvidenceGap::new(
-            EvidenceImpact::Metadata,
-            EvidenceGapCode::ProcessMetadataUnavailable,
-            None,
-            Some(1),
-            "missing",
-        );
+        // Four gaps that differ by PID. Overflow accounting has to be driven
+        // by evidence that genuinely differs, because repeating one gap is
+        // merged down to a single retained gap rather than filling the budget.
+        let gap = |pid| {
+            EvidenceGap::new(
+                EvidenceImpact::Metadata,
+                EvidenceGapCode::ProcessMetadataUnavailable,
+                None,
+                Some(pid),
+                "missing",
+            )
+        };
         let associations = OwnerAssociations {
             owners_by_socket: vec![vec![]],
             local_completeness: vec![OwnerCompleteness::Complete],
             global_completeness: OwnerCompleteness::Complete,
-            evidence_gaps: vec![gap.clone(), gap],
+            evidence_gaps: vec![gap(1), gap(2), gap(3), gap(4)],
             omitted_evidence_gap_count: 0,
         };
         let steps = vec![
@@ -4025,6 +4053,59 @@ mod tests {
         assert_eq!(snapshot.evidence_gaps.len(), 1);
         assert_eq!(snapshot.omitted_evidence_gap_count, 3);
         assert_eq!(snapshot.completeness, SnapshotCompleteness::Partial);
+    }
+
+    /// Both consistency passes read the same host, so a real collector reports
+    /// the same per-PID gaps in each one. Retaining both copies would spend
+    /// half the gap budget on evidence already recorded, and the resulting
+    /// overflow would make an otherwise usable observation refuse a watch diff
+    /// and a kill.
+    #[test]
+    fn a_gap_observed_in_both_passes_is_retained_once_and_costs_one_budget_slot() {
+        let row = socket(80);
+        let gap = |pid| {
+            EvidenceGap::new(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                None,
+                Some(pid),
+                "denied",
+            )
+        };
+        let associations = OwnerAssociations {
+            owners_by_socket: vec![vec![]],
+            local_completeness: vec![OwnerCompleteness::Complete],
+            global_completeness: OwnerCompleteness::Complete,
+            evidence_gaps: vec![gap(1), gap(2)],
+            omitted_evidence_gap_count: 0,
+        };
+        let steps = vec![
+            Step::Clock(1),
+            Step::Sockets(vec![row.clone()]),
+            Step::Owners(associations.clone()),
+            Step::Sockets(vec![row]),
+            Step::Owners(associations),
+            Step::Clock(2),
+        ];
+        let mut source = FakeSource::new(steps);
+        // A budget of exactly two: the distinct pair fits, a doubled pair
+        // would not, so this also pins that the copies never reach the budget.
+        let mut exact = limits(8);
+        exact.evidence_gaps = 2;
+
+        let snapshot =
+            collect_consistent_with_limits(&mut source, scope(), MetadataProfile::Display, exact)
+                .expect("duplicate gaps do not fail collection");
+
+        assert_eq!(
+            snapshot
+                .evidence_gaps
+                .iter()
+                .map(|gap| gap.pid)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)],
+        );
+        assert_eq!(snapshot.omitted_evidence_gap_count, 0);
     }
 
     #[test]
