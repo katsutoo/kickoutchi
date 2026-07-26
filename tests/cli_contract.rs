@@ -1114,7 +1114,7 @@ mod linux {
                 thread::sleep(Duration::from_millis(10));
             }
             for &pid in &self.pids {
-                while pid_exists(pid) {
+                while !pid_is_terminated(pid) {
                     assert!(
                         Instant::now() < deadline,
                         "deep-chain PID {pid} survived termination"
@@ -1136,7 +1136,7 @@ mod linux {
             let mut root = CommandChild(self.root.take());
             let _ = root.kill_and_reap(deadline);
             while Instant::now() < deadline {
-                if self.pids.iter().all(|pid| !pid_exists(*pid)) {
+                if self.pids.iter().all(|pid| pid_is_terminated(*pid)) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -1806,7 +1806,7 @@ mod linux {
     fn wait_for_pid_gone(pid: u32) {
         let deadline = Instant::now() + CHILD_EXIT_WAIT;
         loop {
-            if !pid_exists(pid) {
+            if pid_is_terminated(pid) {
                 return;
             }
             assert!(Instant::now() < deadline, "PID {pid} did not exit");
@@ -1830,6 +1830,10 @@ mod linux {
 
     fn pid_exists(pid: u32) -> bool {
         Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    fn pid_is_terminated(pid: u32) -> bool {
+        matches!(process_state(pid), None | Some('Z' | 'X'))
     }
 
     fn process_state(pid: u32) -> Option<char> {
@@ -2242,8 +2246,8 @@ mod linux {
         (guard, child_pid, ready_file)
     }
 
-    /// Every live process in group `pgid`, with its one-letter state. Reads
-    /// `/proc` directly; entries that vanish mid-scan simply drop out.
+    /// Every non-terminated process in group `pgid`, with its one-letter state.
+    /// Reads `/proc` directly; vanished, zombie, and dead entries drop out.
     fn process_group_members(pgid: u32) -> Vec<(u32, char)> {
         let pgid_text = pgid.to_string();
         let Ok(entries) = fs::read_dir("/proc") else {
@@ -2270,6 +2274,7 @@ mod linux {
             let group = fields.nth(1);
             if group == Some(pgid_text.as_str())
                 && let Some(state) = state
+                && !matches!(state, 'Z' | 'X')
             {
                 members.push((member_pid, state));
             }
@@ -3613,7 +3618,10 @@ mod linux {
             helper.pids.clone()
         };
         for pid in pids {
-            assert!(!pid_exists(pid), "dropped deep-chain PID {pid} must exit");
+            assert!(
+                pid_is_terminated(pid),
+                "dropped deep-chain PID {pid} must exit"
+            );
         }
     }
 
