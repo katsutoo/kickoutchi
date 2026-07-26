@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-07-26
+
+### Fixed
+
+- Homebrew release validation now installs generated formulas in a pinned,
+  disposable Homebrew container, avoiding hosted-runner temporary-volume
+  incompatibilities while preserving version and provenance checks.
+
 ## [1.3.4] - 2026-07-26
 
 ### Fixed
@@ -1139,7 +1147,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.4...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...HEAD
+[1.3.5]: https://github.com/nuggocto/kickoutchi/compare/v1.3.4...v1.3.5
 [1.3.4]: https://github.com/nuggocto/kickoutchi/compare/v1.3.3...v1.3.4
 [1.3.3]: https://github.com/nuggocto/kickoutchi/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/nuggocto/kickoutchi/compare/v1.3.1...v1.3.2

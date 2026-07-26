@@ -46,8 +46,10 @@ fn every_manager_package_installs_closed_provenance() {
     let release = read(".github/workflows/release.yml");
     assert!(release.contains("pkgshare/\\\"install-provenance"));
     assert!(release.contains("write(\\\"homebrew"));
+    assert!(release.contains("homebrew/brew@sha256:"));
+    assert!(release.contains("docker run --rm"));
     assert!(release.contains("brew install --formula"));
-    assert!(release.contains("brew uninstall \"$name\""));
+    assert!(release.contains("install-provenance") && release.contains("FORMULA_VERSION"));
     assert!(
         release
             .find("export PATH=\"/home/linuxbrew/.linuxbrew/bin:$PATH\"")

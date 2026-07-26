@@ -464,6 +464,7 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "github-actions[bot]"
       GITHUB_EMAIL: "github-actions[bot]@users.noreply.github.com"
+      HOMEBREW_IMAGE: "homebrew/brew@sha256:b0072bfdebf5934ae24b93b44a1928a88057399b3283ffa0177bb86084fdedfd"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -507,11 +508,19 @@ jobs:
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
 
             cp "Formula/${filename}" "${tap_path}/Formula/${filename}"
-            brew install --formula "nuggocto/tap/${name}"
-            prefix=$(brew --prefix "$name")
-            test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${version}"
-            test "$(cat "${prefix}/share/kickoutchi/install-provenance")" = "homebrew"
-            brew uninstall "$name"
+            docker run --rm \
+              --env "FORMULA_NAME=${name}" \
+              --env "FORMULA_VERSION=${version}" \
+              --env HOMEBREW_NO_AUTO_UPDATE=1 \
+              --env HOMEBREW_NO_INSTALL_CLEANUP=1 \
+              --volume "${tap_path}:/home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/nuggocto/homebrew-tap:ro" \
+              "${HOMEBREW_IMAGE}" \
+              /bin/bash -lc '
+                brew install --formula "nuggocto/tap/${FORMULA_NAME}"
+                prefix=$(brew --prefix "${FORMULA_NAME}")
+                test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${FORMULA_VERSION}"
+                test "$(cat "${prefix}/share/kickoutchi/install-provenance")" = "homebrew"
+              '
 
             git add "Formula/${filename}"
             git diff --cached --quiet || git commit -m "${name} ${version}"
