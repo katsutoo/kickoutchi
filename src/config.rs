@@ -624,6 +624,39 @@ label = "web"
     }
 
     #[test]
+    fn repository_example_is_valid_and_demonstrates_label_precedence() {
+        let example = include_str!("../config.example.toml");
+        let config = parse(example).expect("config.example.toml must remain valid");
+
+        assert_eq!(config.refresh_interval, Duration::from_secs(3));
+        assert_eq!(config.default_sort, SortMode::Port);
+        assert!(!config.hide_system_processes);
+        assert!(config.confirm_force_kill);
+        assert!(
+            config
+                .protected_processes
+                .iter()
+                .any(|name| name == "redis-server")
+        );
+        assert_eq!(
+            config
+                .labels
+                .resolve_parts(Protocol::Tcp, IpAddr::V4(Ipv4Addr::LOCALHOST), 3000, None),
+            Some("web dev")
+        );
+        assert_eq!(
+            config.labels.resolve_parts(
+                Protocol::Tcp,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                3000,
+                None,
+            ),
+            Some("local web services")
+        );
+        assert!(!example.contains("check_for_updates"));
+    }
+
+    #[test]
     fn broken_toml_is_an_invalid_config_error() {
         let error =
             parse("refresh_interval_seconds = \"fast\"").expect_err("invalid TOML value must fail");

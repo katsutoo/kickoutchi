@@ -1,0 +1,24 @@
+# Copy this file to your platform's Kickoutchi config directory, then keep only
+# the settings and endpoint labels you want to customize.
+
+refresh_interval_seconds = 3
+default_sort = "port"
+hide_system_processes = false
+confirm_force_kill = true
+
+# These names extend Kickoutchi's built-in protected-process list.
+protected_processes = ["redis-server"]
+
+# Exact endpoint labels take precedence over wildcard labels.
+[[ports]]
+protocol = "tcp"
+address = "127.0.0.1"
+port = 3000
+label = "web dev"
+
+# Fallback label for TCP port 3000 on every other address.
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 3000
+label = "local web services"

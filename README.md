@@ -191,6 +191,8 @@ eliminate a later race.
 The default file is `~/.config/kickoutchi/config.toml` on Linux and the native
 platform config directory on macOS and Windows. Use `--config FILE` to select a
 different file. Unknown keys and files larger than 64 KiB are rejected.
+A copy-ready [`config.example.toml`](config.example.toml) is included in the
+repository.
 
 ```toml
 refresh_interval_seconds = 3

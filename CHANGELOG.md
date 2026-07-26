@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added a copy-ready root `config.example.toml`, covered by the real config
+  parser tests so its settings and endpoint-label examples cannot drift from the
+  accepted schema.
+
 ## [1.3.6] - 2026-07-26
 
 ### Added
