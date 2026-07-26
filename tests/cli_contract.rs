@@ -688,24 +688,49 @@ mod portable_native {
             return None;
         }
         assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(stderr));
-        assert_eq!(records.len(), 4, "{records:#?}");
+        assert!(records.len() >= 4, "{records:#?}");
         assert_eq!(records[0]["event"], "baseline");
-        for (index, record) in records.iter().skip(1).enumerate() {
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["schema"], "kickoutchi.watch_event", "{records:#?}");
+            assert_eq!(record["version"], 1, "{records:#?}");
+            assert_eq!(
+                record["sequence"],
+                u64::try_from(index).unwrap(),
+                "{records:#?}"
+            );
+            assert!(
+                index == 0
+                    || matches!(record["event"].as_str(), Some("release" | "collection_gap")),
+                "{records:#?}"
+            );
+            if record["event"] == "collection_gap" {
+                assert!(
+                    matches!(
+                        record["data"]["error"]["code"].as_str(),
+                        Some("partial_socket_set" | "observation_raced")
+                    ),
+                    "{records:#?}"
+                );
+            }
+        }
+        for (index, record) in records.iter().rev().take(3).rev().enumerate() {
             assert_eq!(record["event"], "collection_gap", "{records:#?}");
             assert_eq!(
                 record["data"]["consecutive_failures"],
                 u64::try_from(index + 1).unwrap(),
                 "{records:#?}"
             );
-            assert!(
-                matches!(
-                    record["data"]["error"]["code"].as_str(),
-                    Some("partial_socket_set" | "observation_raced")
-                ),
-                "{records:#?}"
-            );
         }
-        Some(WatchOutcome::PartialSocketSet)
+        let release_count = records
+            .iter()
+            .filter(|record| record["event"] == "release")
+            .count();
+        assert!(release_count <= 1, "{records:#?}");
+        Some(if release_count == 1 {
+            WatchOutcome::Events(records.to_vec())
+        } else {
+            WatchOutcome::PartialSocketSet
+        })
     }
 
     fn run_with_binary(
@@ -884,11 +909,11 @@ mod portable_native {
     ///
     /// So both outcomes are asserted rather than one being demanded:
     /// [`partial_socket_set_outcome`] pins refusal before the baseline, while
-    /// [`partial_socket_set_after_baseline`] pins the baseline and three bounded
-    /// gap records when visibility is lost later. The caller pins the baseline
-    /// and release contract whenever complete observations arrive. A regression
-    /// cannot hide in either partial path because each exact public contract is
-    /// asserted.
+    /// [`partial_socket_set_after_baseline`] pins the ordered baseline, any valid
+    /// intermediate release or gap records, and the terminal three consecutive
+    /// gaps when visibility remains lost. The caller still pins a release that
+    /// arrived before those terminal gaps. A regression cannot hide in either
+    /// partial path because each exact public contract is asserted.
     ///
     /// The attempts remain because a complete observation asserts strictly more.
     /// They exist to prefer the richer assertion, not to retry a failure into a

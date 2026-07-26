@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-07-26
+
+### Fixed
+
+- macOS release journeys now retain valid release assertions when bounded
+  collection gaps occur both before and after the release event, while still
+  requiring the terminal fail-closed sequence of three consecutive gaps.
+
 ## [1.3.2] - 2026-07-26
 
 ### Fixed
@@ -1124,7 +1132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/nuggocto/kickoutchi/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/nuggocto/kickoutchi/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/nuggocto/kickoutchi/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/nuggocto/kickoutchi/compare/v1.2.0...v1.3.0
