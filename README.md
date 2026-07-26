@@ -121,17 +121,14 @@ scoop update
 scoop update kickoutchi
 ```
 
-Kickoutchi checks GitHub for a newer stable release at most once every seven
-days. The check runs silently outside the foreground command, writes only a
-small per-user cache, and shows nothing when the installed version is current.
-When an update exists, the message uses the package manager that owns the
-installation. Set `check_for_updates = false` in the configuration file to opt
-out. Structured JSON/NDJSON commands and elevated execution never check or
-display an update notice.
+Kickoutchi does not perform automatic release checks. The deprecated boolean
+configuration key `check_for_updates` is accepted and ignored so older strict
+configuration files continue to load. Use the generated standalone updater or
+the package manager commands above when you choose to check for an update.
 
 An unqualified Git or Linux Nix GitHub source follows the repository's default branch,
 which can contain changes newer than the latest stable release. For a
-reproducible stable source install, select an explicit tag such as `v1.3.5` and
+reproducible stable source install, select an explicit tag such as `v1.3.6` and
 replace that tag deliberately when upgrading. Direct-archive installs must be
 replaced manually after verifying the new archive.
 

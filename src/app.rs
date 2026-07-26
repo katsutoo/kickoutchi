@@ -3,7 +3,7 @@
 //! `App` holds the latest good snapshot, the filtered table view, the selection,
 //! search/sort state, which modal is open, and the bits of status we show.
 
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ type TreePreviewResult = Result<tree::ProcessTreeTarget, String>;
 
 #[derive(Debug)]
 struct RefreshWorker {
-    receiver: Receiver<RefreshResult>,
+    receiver: Receiver<Result<RefreshResult, crate::ui::WorkerFailure>>,
     stale: bool,
 }
 
@@ -50,7 +50,7 @@ enum PendingRefresh {
 #[derive(Debug)]
 struct ContextWorker {
     key: RowKey,
-    receiver: Receiver<ContextResult>,
+    receiver: Receiver<Result<ContextResult, crate::ui::WorkerFailure>>,
     stale: bool,
 }
 
@@ -66,7 +66,7 @@ enum ContextRequestState {
 #[derive(Debug)]
 struct TreePreviewWorker {
     root_pid: u32,
-    receiver: Receiver<TreePreviewResult>,
+    receiver: Receiver<Result<TreePreviewResult, crate::ui::WorkerFailure>>,
 }
 
 /// Whichever modal is currently sitting over the main table.
@@ -199,14 +199,6 @@ enum ForceKillConfirmation {
     YesOnly,
 }
 
-#[derive(Debug)]
-struct TuiUpdateNotice {
-    notice: crate::update::UpdateNotice,
-    visible: bool,
-    rendered: bool,
-    ack_attempted: bool,
-}
-
 impl ForceKillConfirmation {
     fn from_config(confirm_force_kill: bool) -> Self {
         if confirm_force_kill {
@@ -245,7 +237,6 @@ pub(crate) struct App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tree_preview_worker: Option<TreePreviewWorker>,
     kill_status: Option<String>,
-    update_notice: Option<TuiUpdateNotice>,
     refresh_worker: Option<RefreshWorker>,
     pending_refresh: PendingRefresh,
     last_successful_refresh: Option<Instant>,
@@ -253,6 +244,7 @@ pub(crate) struct App {
     modal: Modal,
     modal_scroll: u16,
     latest_error: Option<String>,
+    worker_failure: Option<crate::ui::WorkerFailure>,
     filter_error: Option<String>,
     should_quit: bool,
 }
@@ -265,14 +257,8 @@ impl App {
     /// does not wake it, so an async first load would leave the table blank for
     /// ~one tick on every launch. Only this initial load blocks — manual `r` and
     /// the auto-refresh tick still go through the off-thread [`App::refresh`].
-    pub(crate) fn new(config: &Config, update_notice: Option<crate::update::UpdateNotice>) -> Self {
+    pub(crate) fn new(config: &Config) -> Self {
         let mut app = Self::empty(config, Instant::now());
-        app.update_notice = update_notice.map(|notice| TuiUpdateNotice {
-            notice,
-            visible: true,
-            rendered: false,
-            ack_attempted: false,
-        });
         app.refresh_blocking();
         app
     }
@@ -320,7 +306,6 @@ impl App {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tree_preview_worker: None,
             kill_status: None,
-            update_notice: None,
             refresh_worker: None,
             pending_refresh: PendingRefresh::None,
             last_successful_refresh: None,
@@ -328,6 +313,7 @@ impl App {
             modal: Modal::None,
             modal_scroll: 0,
             latest_error: None,
+            worker_failure: None,
             filter_error: None,
             should_quit: false,
         }
@@ -351,18 +337,13 @@ impl App {
         // process fd directory to preserve shared-socket correctness; doing that
         // off the render loop keeps key handling out of the swamp mud without
         // letting scans pile up behind it.
-        let (sender, receiver) = mpsc::channel();
         match crate::ui::spawn_worker(
             thread::Builder::new().name("kickoutchi-refresh".to_owned()),
-            move || {
-                let _ = sender.send(collector::collect_snapshot(
-                    crate::observation::MetadataProfile::LegacyList,
-                ));
-            },
+            move || collector::collect_snapshot(crate::observation::MetadataProfile::LegacyList),
         ) {
-            Ok(_handle) => {
+            Ok(worker) => {
                 self.refresh_worker = Some(RefreshWorker {
-                    receiver,
+                    receiver: worker.detach(),
                     stale: false,
                 });
             }
@@ -383,7 +364,12 @@ impl App {
         };
 
         let result = match worker.receiver.try_recv() {
-            Ok(result) => result,
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                self.refresh_worker = None;
+                self.worker_failure = Some(error);
+                return;
+            }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err(collector::CollectorError::WorkerExited),
         };
@@ -404,7 +390,12 @@ impl App {
         };
 
         let result = match worker.receiver.try_recv() {
-            Ok(context) => context,
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => {
+                self.context_worker = None;
+                self.worker_failure = Some(error);
+                return;
+            }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.context_worker = None;
@@ -610,53 +601,6 @@ impl App {
         self.kill_status.as_deref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_update_notice(&mut self, notice: impl Into<String>) {
-        self.update_notice = Some(TuiUpdateNotice {
-            notice: crate::update::UpdateNotice::for_test(notice),
-            visible: true,
-            rendered: false,
-            ack_attempted: false,
-        });
-    }
-
-    pub(crate) fn visible_update_notice(&self) -> Option<&str> {
-        self.update_notice
-            .as_ref()
-            .filter(|state| state.visible)
-            .map(|state| state.notice.message())
-    }
-
-    pub(crate) fn update_notice_for_ack(&self) -> Option<&crate::update::UpdateNotice> {
-        self.update_notice
-            .as_ref()
-            .filter(|state| state.rendered && !state.ack_attempted)
-            .map(|state| &state.notice)
-    }
-
-    pub(crate) fn mark_update_overlay_rendered(&mut self) {
-        if let Some(state) = self.update_notice.as_mut() {
-            state.rendered = true;
-        }
-    }
-
-    pub(crate) fn mark_update_ack_attempted(&mut self) {
-        if let Some(state) = self.update_notice.as_mut() {
-            state.ack_attempted = true;
-        }
-    }
-
-    pub(crate) fn dismiss_update_notice(&mut self) -> bool {
-        let Some(state) = self.update_notice.as_mut() else {
-            return false;
-        };
-        if !state.visible || !state.rendered {
-            return false;
-        }
-        state.visible = false;
-        true
-    }
-
     pub(crate) fn modal_scroll(&self) -> u16 {
         self.modal_scroll
     }
@@ -688,6 +632,10 @@ impl App {
     #[cfg(test)]
     pub(crate) fn refresh_in_progress(&self) -> bool {
         self.refresh_worker.is_some()
+    }
+
+    pub(crate) fn take_worker_failure(&mut self) -> Option<crate::ui::WorkerFailure> {
+        self.worker_failure.take()
     }
 
     pub(crate) fn filter_text(&self) -> &str {
@@ -1002,15 +950,15 @@ impl App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn spawn_tree_preview_worker(&mut self, root_pid: u32, platform: crate::model::Platform) {
         let protected_names = self.protected_processes.clone();
-        let (sender, receiver) = mpsc::channel();
         match crate::ui::spawn_worker(
             thread::Builder::new().name("kickoutchi-tree-preview".to_owned()),
-            move || {
-                let _ = sender.send(collect_tree_preview(root_pid, &protected_names, platform));
-            },
+            move || collect_tree_preview(root_pid, &protected_names, platform),
         ) {
-            Ok(_handle) => {
-                self.tree_preview_worker = Some(TreePreviewWorker { root_pid, receiver });
+            Ok(worker) => {
+                self.tree_preview_worker = Some(TreePreviewWorker {
+                    root_pid,
+                    receiver: worker.detach(),
+                });
             }
             Err(error) => {
                 self.tree_preview_worker = None;
@@ -1027,7 +975,12 @@ impl App {
             return;
         };
         let result = match worker.receiver.try_recv() {
-            Ok(result) => result,
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                self.tree_preview_worker = None;
+                self.worker_failure = Some(error);
+                return;
+            }
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 Err("tree preview worker exited before returning".to_owned())
@@ -1613,22 +1566,19 @@ impl App {
             ipv6_scope: view.ipv6_scope,
         };
         let key = RowKey::from(&entry);
-        let (sender, receiver) = mpsc::channel();
         match crate::ui::spawn_worker(
             thread::Builder::new().name("kickoutchi-details".to_owned()),
             move || {
                 // The worker outlives the snapshot the view borrowed, so the row
                 // is owned across the thread boundary and re-borrowed here.
-                let _ = sender.send(collect_selected_process_context(PortEntryView::from(
-                    &entry,
-                )));
+                collect_selected_process_context(PortEntryView::from(&entry))
             },
         ) {
-            Ok(_handle) => {
+            Ok(worker) => {
                 self.context_request_state = ContextRequestState::Idle;
                 self.context_worker = Some(ContextWorker {
                     key,
-                    receiver,
+                    receiver: worker.detach(),
                     stale: false,
                 });
             }
@@ -2126,7 +2076,7 @@ mod tests {
         let key = RowKey::from(app.selected_row().expect("test app has selected row"));
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(context)
+            .send(Ok(context))
             .expect("test context result must send before polling");
         app.context_worker = Some(ContextWorker {
             key,
@@ -2283,7 +2233,7 @@ mod tests {
         );
 
         first_sender
-            .send(context(55))
+            .send(Ok(context(55)))
             .expect("the first worker result must be delivered");
         app.poll_process_context();
 
@@ -2691,10 +2641,10 @@ mod tests {
         assert!(app.refresh_in_progress());
         app.apply_action(Action::Refresh);
         stale_sender
-            .send(crate::collector::Collector::collect(
+            .send(Ok(crate::collector::Collector::collect(
                 &crate::collector::FakeCollector,
                 crate::observation::MetadataProfile::LegacyList,
-            ))
+            )))
             .expect("stale worker receiver must stay installed");
 
         let mut fresh_collections = 0;
@@ -2892,16 +2842,44 @@ mod tests {
             stale: false,
         });
         sender
-            .send(crate::collector::Collector::collect(
+            .send(Ok(crate::collector::Collector::collect(
                 &crate::collector::FakeCollector,
                 crate::observation::MetadataProfile::LegacyList,
-            ))
+            )))
             .expect("test refresh result must send");
 
         app.poll_refresh();
 
         assert!(!app.refresh_in_progress());
         assert!(app.rows().any(|row| row.local_port == 5173));
+        assert_eq!(app.latest_error(), None);
+    }
+
+    #[test]
+    fn refresh_worker_panic_is_reserved_for_owner_control_flow() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        let (sender, receiver) = mpsc::channel();
+        app.refresh_worker = Some(RefreshWorker {
+            receiver,
+            stale: false,
+        });
+        sender
+            .send(Err(crate::ui::WorkerFailure::for_test(
+                "kickoutchi-refresh",
+                "collector invariant failed",
+            )))
+            .expect("test worker failure must send");
+
+        app.poll_refresh();
+
+        assert!(!app.refresh_in_progress());
+        let failure = app
+            .take_worker_failure()
+            .expect("owner must receive the worker failure");
+        assert_eq!(
+            failure.to_string(),
+            "TUI worker kickoutchi-refresh panicked: collector invariant failed"
+        );
         assert_eq!(app.latest_error(), None);
     }
 
@@ -3293,7 +3271,7 @@ mod tests {
             // A worker result landing after the cancel must not reopen anything.
             let infos = vec![tree_info(3000, Some(1), "node", 55)];
             sender
-                .send(Ok(preview_of(&infos, 3000)))
+                .send(Ok(Ok(preview_of(&infos, 3000))))
                 .expect("test preview result must send");
             app.poll_tree_preview();
             assert_eq!(app.modal(), Modal::None);

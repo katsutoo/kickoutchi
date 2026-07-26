@@ -19,7 +19,6 @@ fn nix_is_linux_only_and_derives_the_cargo_version() {
     );
     assert!(flake.contains("builtins.fromTOML (builtins.readFile ./Cargo.toml)"));
     assert!(flake.contains("version = cargoPackage.package.version;"));
-    assert!(flake.contains("printf '%s\\n' nix"));
 }
 
 /// `.SRCINFO` is generated from its `PKGBUILD` and is what the AUR actually
@@ -67,43 +66,4 @@ fn arch_srcinfo_matches_its_regenerated_pkgbuild() {
             "{directory}/.SRCINFO checksums do not match its PKGBUILD; regenerate it",
         );
     }
-}
-
-#[test]
-fn every_manager_package_installs_closed_provenance() {
-    for path in [
-        "packaging/arch/kickoutchi/PKGBUILD",
-        "packaging/arch/kickoutchi-bin/PKGBUILD",
-    ] {
-        let package = read(path);
-        assert!(
-            package.contains("install-provenance"),
-            "missing marker in {path}"
-        );
-        assert!(
-            package.contains("printf '%s\\n' aur"),
-            "wrong marker in {path}"
-        );
-    }
-
-    let scoop = read("packaging/scoop/bucket/kickoutchi.json");
-    assert!(scoop.contains("'install-provenance'"));
-    assert!(scoop.contains("-Value 'scoop'"));
-
-    let release = read(".github/workflows/release.yml");
-    assert!(release.contains("pkgshare/\\\"install-provenance"));
-    assert!(release.contains("write(\\\"homebrew"));
-    assert!(release.contains("homebrew/brew@sha256:"));
-    assert!(release.contains("docker run --rm"));
-    assert!(release.contains("brew install --formula"));
-    assert!(release.contains("install-provenance") && release.contains("FORMULA_VERSION"));
-    assert!(
-        release
-            .find("export PATH=\"/home/linuxbrew/.linuxbrew/bin:$PATH\"")
-            .expect("Homebrew path must be configured")
-            < release
-                .find("tap_path=\"$(brew --repository)")
-                .expect("canonical tap path must be discovered"),
-        "Homebrew must be on PATH before its first invocation"
-    );
 }

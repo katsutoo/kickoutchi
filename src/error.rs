@@ -6,8 +6,8 @@ use thiserror::Error;
 
 /// Top-level error for the TUI path of the Kickoutchi binary.
 ///
-/// This only covers terminal/IO failures — the one kind of error that's truly
-/// fatal to the TUI loop. Config errors have their own type
+/// This covers failures that must leave the TUI loop: terminal/IO failures and
+/// caught worker panics. Config errors have their own type
 /// (`config::ConfigError`, handled before the TUI even starts), and collector
 /// and termination failures are operational, not fatal: those show up in the
 /// status line (last collector error, kill outcome) instead of bubbling all the
@@ -20,6 +20,10 @@ pub(crate) enum AppError {
     /// and the panic hook.
     #[error("terminal I/O failed: {0}")]
     Terminal(#[from] io::Error),
+    /// A background TUI worker hit a programmer error. The worker boundary
+    /// catches it so the owner can restore the terminal before reporting it.
+    #[error(transparent)]
+    Worker(#[from] crate::ui::WorkerFailure),
 }
 
 /// Shorthand `Result` for the fallible app paths.

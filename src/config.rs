@@ -14,6 +14,7 @@ use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
+use crate::display::{sanitize, sanitize_multiline};
 use crate::labels::{LABEL_SELECTORS_MAX, LabelInput, LabelRegistry};
 use crate::model::SortMode;
 use crate::protection;
@@ -48,6 +49,25 @@ pub(crate) enum ConfigError {
     Invalid { path: PathBuf, detail: String },
 }
 
+impl ConfigError {
+    /// Render config diagnostics without letting path or I/O text create lines.
+    /// TOML detail keeps its source excerpt and caret layout intentionally.
+    pub(crate) fn render_terminal(&self) -> String {
+        match self {
+            Self::Read { path, source } => format!(
+                "cannot read config file {}: {}",
+                sanitize(&path.to_string_lossy()),
+                sanitize(&source.to_string()),
+            ),
+            Self::Invalid { path, detail } => format!(
+                "invalid config file {}: {}",
+                sanitize(&path.to_string_lossy()),
+                sanitize_multiline(detail),
+            ),
+        }
+    }
+}
+
 /// The resolved runtime settings. Everything downstream reads this one shared
 /// source instead of sprinkling magic literals all over the codebase.
 #[derive(Debug, Clone)]
@@ -66,8 +86,6 @@ pub(crate) struct Config {
     pub(crate) hide_system_processes: bool,
     /// Whether force kill uses the stronger typed confirmation when `--yes` is absent.
     pub(crate) confirm_force_kill: bool,
-    /// Whether eligible interactive launches may use the weekly update cache.
-    pub(crate) check_for_updates: bool,
     /// Process names that require stronger confirmation before termination.
     pub(crate) protected_processes: Vec<String>,
     /// Validated endpoint annotations shared by CLI, TUI, and future diagnostics.
@@ -82,7 +100,6 @@ impl Default for Config {
             default_sort: SortMode::Port,
             hide_system_processes: false,
             confirm_force_kill: true,
-            check_for_updates: true,
             // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
@@ -104,6 +121,8 @@ struct ConfigFile {
     default_sort: Option<SortMode>,
     hide_system_processes: Option<bool>,
     confirm_force_kill: Option<bool>,
+    // Deprecated compatibility key. Keep its bool shape because persisted
+    // configs are strict, but automatic update checking no longer exists.
     check_for_updates: Option<bool>,
     protected_processes: Option<Vec<String>>,
     ports: Option<PortLabels>,
@@ -235,9 +254,7 @@ impl Config {
         if let Some(confirm) = file.confirm_force_kill {
             config.confirm_force_kill = confirm;
         }
-        if let Some(check) = file.check_for_updates {
-            config.check_for_updates = check;
-        }
+        let _ = file.check_for_updates;
         if let Some(protected) = file.protected_processes {
             config.protected_processes =
                 merge_protected_processes(config.protected_processes, protected).map_err(
@@ -338,16 +355,20 @@ fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
 /// An empty name can never match anything, so it's always a mistake worth
 /// flagging rather than dead weight we'd haul around on every refresh.
 ///
-/// The size bound applies to the merged list, but the user only sees their
-/// own file: the message spells out the built-in share of the count so "273
-/// entries" is not a mystery to someone who wrote 250.
-fn validate_protected_processes(names: &[String], default_count: usize) -> Result<(), String> {
+/// The size bound applies to the merged list, but the user only sees their own
+/// file. Keep every stage's count so duplicates do not make the diagnostic lie.
+fn validate_protected_processes(
+    names: &[String],
+    raw_configured_count: usize,
+    unique_configured_additions: usize,
+    default_count: usize,
+) -> Result<(), String> {
     if names.len() > PROTECTED_PROCESSES_MAX {
         return Err(format!(
-            "protected_processes has {} entries ({} configured plus {default_count} built-in \
-             defaults), the maximum is {PROTECTED_PROCESSES_MAX}",
+            "protected_processes has {} merged entries ({raw_configured_count} raw configured \
+             entries, {unique_configured_additions} unique configured additions, and \
+             {default_count} built-in defaults), the maximum is {PROTECTED_PROCESSES_MAX}",
             names.len(),
-            names.len() - default_count,
         ));
     }
     if names.iter().any(String::is_empty) {
@@ -366,12 +387,19 @@ fn merge_protected_processes(
     configured: Vec<String>,
 ) -> Result<Vec<String>, String> {
     let default_count = defaults.len();
+    let raw_configured_count = configured.len();
     for name in configured {
         if !defaults.iter().any(|existing| existing == &name) {
             defaults.push(name);
         }
     }
-    validate_protected_processes(&defaults, default_count)?;
+    let unique_configured_additions = defaults.len() - default_count;
+    validate_protected_processes(
+        &defaults,
+        raw_configured_count,
+        unique_configured_additions,
+        default_count,
+    )?;
     Ok(defaults)
 }
 
@@ -418,7 +446,6 @@ mod tests {
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
-        assert!(config.check_for_updates);
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
     }
 
@@ -574,7 +601,6 @@ label = "web"
             default_sort = "scope"
             hide_system_processes = true
             confirm_force_kill = false
-            check_for_updates = false
             protected_processes = ["redis", "postgres"]
             "#,
         )
@@ -583,7 +609,6 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Scope);
         assert!(config.hide_system_processes);
         assert!(!config.confirm_force_kill);
-        assert!(!config.check_for_updates);
         assert!(config.protected_processes.contains(&"docker".to_owned()));
         assert!(config.protected_processes.contains(&"postgres".to_owned()));
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
@@ -600,12 +625,61 @@ label = "web"
 
     #[test]
     fn broken_toml_is_an_invalid_config_error() {
-        let detail = invalid_detail(parse("refresh_interval_seconds = "));
-        assert!(!detail.is_empty());
+        let error =
+            parse("refresh_interval_seconds = \"fast\"").expect_err("invalid TOML value must fail");
+        let rendered = error.render_terminal();
+
+        assert!(
+            rendered.contains("1 | refresh_interval_seconds = \"fast\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line.contains('^')),
+            "{rendered}"
+        );
     }
 
     #[test]
-    fn update_check_requires_a_boolean() {
+    fn config_error_renderer_keeps_path_and_io_errors_on_one_line() {
+        let error = ConfigError::Read {
+            path: Path::new("config.toml\nforged: accepted\x1b[2J").to_path_buf(),
+            source: io::Error::other("denied\nforged: success\x07"),
+        };
+
+        let rendered = error.render_terminal();
+
+        assert_eq!(rendered.lines().count(), 1, "{rendered:?}");
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
+        assert!(!rendered.contains('\x07'), "{rendered:?}");
+        assert!(!rendered.lines().any(|line| line.starts_with("forged:")));
+    }
+
+    #[test]
+    fn deprecated_update_check_true_is_accepted_and_ignored() {
+        let config = parse("check_for_updates = true").expect("deprecated bool remains accepted");
+
+        assert_eq!(config.refresh_interval, Config::default().refresh_interval);
+        assert_eq!(config.default_sort, Config::default().default_sort);
+        assert_eq!(
+            config.protected_processes,
+            Config::default().protected_processes
+        );
+    }
+
+    #[test]
+    fn deprecated_update_check_false_is_accepted_and_ignored() {
+        let config = parse("check_for_updates = false").expect("deprecated bool remains accepted");
+
+        assert_eq!(config.refresh_interval, Config::default().refresh_interval);
+        assert_eq!(config.default_sort, Config::default().default_sort);
+        assert_eq!(
+            config.protected_processes,
+            Config::default().protected_processes
+        );
+    }
+
+    #[test]
+    fn deprecated_update_check_requires_a_boolean() {
         let detail = invalid_detail(parse("check_for_updates = \"yes\""));
         assert!(detail.contains("check_for_updates"), "detail: {detail}");
         assert!(detail.contains("boolean"), "detail: {detail}");
@@ -647,17 +721,40 @@ label = "web"
 
     #[test]
     fn oversized_protected_list_is_rejected() {
-        let names: Vec<String> = (0..=PROTECTED_PROCESSES_MAX)
+        let mut names: Vec<String> = (0..=PROTECTED_PROCESSES_MAX)
             .map(|index| format!("\"process-{index}\""))
             .collect();
+        names.push("\"docker\"".to_owned());
         let text = format!("protected_processes = [{}]", names.join(", "));
         let detail = invalid_detail(parse(&text));
         assert!(detail.contains("maximum"), "detail: {detail}");
         // The bound covers defaults + configured names, but the user only
         // sees their own file: the message must break the count down so the
         // total is not a mystery.
-        assert!(detail.contains("configured plus"), "detail: {detail}");
-        assert!(detail.contains("built-in defaults"), "detail: {detail}");
+        assert!(detail.contains("280 merged entries"), "detail: {detail}");
+        assert!(
+            detail.contains("258 raw configured entries"),
+            "detail: {detail}"
+        );
+        assert!(
+            detail.contains("257 unique configured additions"),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("23 built-in defaults"), "detail: {detail}");
+    }
+
+    #[test]
+    fn duplicate_built_ins_do_not_count_as_unique_additions_or_exceed_merged_limit() {
+        let duplicates = std::iter::repeat_n("\"docker\"", PROTECTED_PROCESSES_MAX + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let config = parse(&format!("protected_processes = [{duplicates}]"))
+            .expect("raw duplicate built-ins do not enlarge the merged set");
+
+        assert_eq!(
+            config.protected_processes,
+            Config::default().protected_processes
+        );
     }
 
     #[test]

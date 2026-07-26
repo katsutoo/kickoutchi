@@ -628,6 +628,12 @@ fn gap_applies(
     {
         return false;
     }
+    if gap.affected_pid_count().is_some()
+        && gap.endpoint.is_none()
+        && gap.impact == crate::observation::EvidenceImpact::Ownership
+    {
+        return complete_ownerless_active && !global_owner_completeness.is_complete();
+    }
     let Some(pid) = gap.pid else {
         return true;
     };

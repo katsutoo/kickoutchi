@@ -1,6 +1,6 @@
 [package]
 name = "kickoutchi"
-version = "1.3.5"
+version = "1.3.6"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
@@ -62,10 +62,6 @@ unicode-width = "0.2.2"
 # before bind. Keep the dependency exact and on its empty default feature set;
 # in particular, do not enable its broad `all` API surface.
 socket2 = "=0.6.5"
-
-# The update worker makes one bounded HTTPS request. Keep ureq exact and omit
-# compression, JSON, cookies, and proxy extras; serde_json parses the tiny body.
-ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 # Security-sensitive workflow key discovery uses a full YAML parser so quoted,

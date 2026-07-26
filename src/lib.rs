@@ -35,16 +35,11 @@ mod process_evidence;
 mod protection;
 mod public_output;
 mod query;
-// Keeps the suite's process-spawning tests from forking while its cache-lock
-// tests hold advisory locks; see the module for why that combination misfires.
-#[cfg(test)]
-mod test_sync;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod tree;
 mod ui;
-mod update;
 mod watch;
 #[cfg(windows)]
 mod windows_tree;
@@ -57,7 +52,7 @@ use clap::error::ErrorKind as ClapErrorKind;
 
 use crate::cli::{Cli, Command, ExitReason, WatchSignalGuard};
 use crate::config::Config;
-use crate::display::{sanitize, sanitize_multiline};
+use crate::display::sanitize_multiline;
 
 /// Run Kickoutchi and hand back the process exit code.
 ///
@@ -68,10 +63,6 @@ use crate::display::{sanitize, sanitize_multiline};
 /// process-wide handlers. The standalone binaries mask every worker they create.
 #[must_use]
 pub fn run() -> ExitCode {
-    if update::is_internal_worker() {
-        update::run_internal_worker();
-        return ExitReason::Success.into();
-    }
     init_tracing();
     let args = match Cli::try_parse() {
         Ok(args) => args,
@@ -113,34 +104,15 @@ pub fn run() -> ExitCode {
     let mut config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: {}", sanitize(&error.to_string()));
+            eprintln!("error: {}", error.render_terminal());
             return ExitReason::Failure.into();
         }
     };
     config.apply_cli_overrides(args.refresh_interval);
 
-    let update_notice = if config.check_for_updates
-        && args
-            .command
-            .as_ref()
-            .is_none_or(crate::cli::Command::allows_update_notice)
-        && !update::is_elevated()
-    {
-        update::foreground()
-    } else {
-        None
-    };
-
     match args.command {
-        Some(command) => {
-            if let Some(notice) = update_notice.as_ref()
-                && write_update_notice(io::stderr().lock(), notice.message()).is_ok()
-            {
-                let _ = update::acknowledge(notice);
-            }
-            cli::run(&command, &config, watch_signal_guard).into()
-        }
-        None => run_tui(&config, update_notice),
+        Some(command) => cli::run(&command, &config, watch_signal_guard).into(),
+        None => run_tui(&config),
     }
 }
 
@@ -152,8 +124,8 @@ pub fn run() -> ExitCode {
 /// alternate screen, so a panic during setup or rendering still restores the
 /// terminal before anything prints. Normal exits and `?`-errors are already
 /// covered by the `Drop` guard inside [`ui::run`].
-fn run_tui(config: &Config, update_notice: Option<update::UpdateNotice>) -> ExitCode {
-    let result = match ui::run_owned(|| ui::run(config, update_notice)) {
+fn run_tui(config: &Config) -> ExitCode {
+    let result = match ui::run_owned(|| ui::run(config)) {
         Ok(result) => result,
         Err(error) => Err(error.into()),
     };
@@ -169,11 +141,6 @@ fn run_tui(config: &Config, update_notice: Option<update::UpdateNotice>) -> Exit
             ExitReason::Failure.into()
         }
     }
-}
-
-fn write_update_notice(mut writer: impl Write, notice: &str) -> io::Result<()> {
-    writeln!(writer, "{}", sanitize(notice))?;
-    writer.flush()
 }
 
 fn write_cli_stdout(mut writer: impl Write, text: &str) -> io::Result<()> {

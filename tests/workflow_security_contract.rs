@@ -138,6 +138,21 @@ fn job_steps(job: &str) -> Vec<String> {
     sequence_items(&yaml_block(job, "steps", 4), 6)
 }
 
+fn step_name(step: &str) -> Option<&str> {
+    step.lines().find_map(|line| {
+        active_line(line)?
+            .strip_prefix("- name: ")
+            .map(|name| name.trim_matches('"'))
+    })
+}
+
+fn named_job_step(job: &str, name: &str) -> String {
+    job_steps(job)
+        .into_iter()
+        .find(|step| step_name(step) == Some(name))
+        .unwrap_or_else(|| panic!("missing workflow step {name}"))
+}
+
 fn step_env(step: &str, key: &str) -> Option<String> {
     let env = step
         .lines()
@@ -326,6 +341,40 @@ fn assert_no_ref_expression_in_run_scripts(workflow: &str) {
     inspect(&parsed_workflow(workflow));
 }
 
+fn assert_release_binary_journey(
+    step: &str,
+    kickoutchi_path: &str,
+    kick_path: &str,
+    require_linux_capabilities: bool,
+) {
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_RELEASE_E2E_REQUIRED").as_deref(),
+        Some("\"1\"")
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_E2E_KICKOUTCHI").as_deref(),
+        Some(kickoutchi_path)
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_E2E_KICK").as_deref(),
+        Some(kick_path)
+    );
+    assert_eq!(
+        step_env(step, "KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES").as_deref(),
+        require_linux_capabilities.then_some("\"1\"")
+    );
+
+    let active = step.lines().filter_map(active_line).collect::<Vec<_>>();
+    assert!(
+        active.contains(&"cargo test --locked --all-features --test cli_contract"),
+        "release journey must run the ordinary CLI contract suite"
+    );
+    assert!(
+        active.contains(&"cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored"),
+        "release journey must run the ignored artifact-path contract exactly"
+    );
+}
+
 #[test]
 fn actions_are_sha_pinned_and_checkout_never_persists_credentials() {
     assert_action_pins_and_checkout_credentials(CI_WORKFLOW);
@@ -344,6 +393,227 @@ fn workflow_permissions_follow_least_privilege() {
         "CI must remain read-only"
     );
     assert_release_job_permissions();
+}
+
+#[test]
+fn cargo_dist_linux_runner_images_are_digest_pinned() {
+    const IMAGE: &str = "rust:1.95-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf";
+    const TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
+
+    let workspace =
+        toml::from_str::<toml::Value>(DIST_WORKSPACE).expect("dist workspace must be valid TOML");
+    let runners = workspace
+        .get("dist")
+        .and_then(|dist| dist.get("github-custom-runners"))
+        .and_then(toml::Value::as_table)
+        .expect("dist must configure GitHub custom runners");
+    assert_eq!(
+        runners.len(),
+        TARGETS.len(),
+        "every configured custom runner must be reviewed for immutable images"
+    );
+
+    for target in TARGETS {
+        let image = runners
+            .get(target)
+            .and_then(|runner| runner.get("container"))
+            .and_then(|container| container.get("image"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("custom runner {target} must define a container image"));
+        assert_eq!(image, IMAGE, "custom runner {target} image must be pinned");
+    }
+}
+
+#[test]
+fn release_runs_are_globally_serialized_without_cancellation() {
+    assert_eq!(
+        yaml_mapping(RELEASE_WORKFLOW, "concurrency", 0),
+        [
+            ("group".to_owned(), "${{ github.workflow }}".to_owned()),
+            ("cancel-in-progress".to_owned(), "false".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn release_tag_is_rechecked_against_the_verified_commit_before_publication() {
+    let host = workflow_job(RELEASE_WORKFLOW, "host");
+    let host_step = job_steps(&host)
+        .into_iter()
+        .find(|step| {
+            step.lines()
+                .filter_map(active_line)
+                .any(|line| line == "- id: host")
+        })
+        .expect("missing dist host step");
+    let create_step = named_job_step(&host, "Create GitHub Release");
+
+    for step in [&host_step, &create_step] {
+        assert_eq!(
+            step_env(step, "RELEASE_COMMIT").as_deref(),
+            Some("\"${{ github.sha }}\"")
+        );
+        assert_eq!(
+            step_env(step, "RELEASE_TAG").as_deref(),
+            Some("\"${{ needs.plan.outputs.tag }}\"")
+        );
+        let active = step.lines().filter_map(active_line).collect::<Vec<_>>();
+        assert!(active.contains(
+            &"git fetch --force --no-tags origin \"refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}\""
+        ));
+        assert!(
+            active
+                .contains(&"TAG_COMMIT=\"$(git rev-parse --verify \"${RELEASE_TAG}^{commit}\")\"")
+        );
+        assert!(active.contains(&"test \"$TAG_COMMIT\" = \"$RELEASE_COMMIT\""));
+    }
+}
+
+#[test]
+fn every_release_job_has_the_approved_timeout() {
+    const EXPECTED: [(&str, &str); 7] = [
+        ("verify", "35"),
+        ("plan", "20"),
+        ("build-local-artifacts", "45"),
+        ("build-global-artifacts", "30"),
+        ("host", "20"),
+        ("publish-homebrew-formula", "30"),
+        ("publication-complete", "10"),
+    ];
+
+    let jobs = workflow_job_names(RELEASE_WORKFLOW);
+    assert_eq!(
+        jobs.len(),
+        EXPECTED.len(),
+        "new release jobs must receive an approved timeout"
+    );
+    for job_name in jobs {
+        let expected = EXPECTED
+            .iter()
+            .find_map(|(name, timeout)| (*name == job_name).then_some(*timeout))
+            .unwrap_or_else(|| panic!("release job {job_name} has no approved timeout"));
+        assert_eq!(
+            yaml_scalar(
+                &workflow_job(RELEASE_WORKFLOW, &job_name),
+                "timeout-minutes",
+                4
+            )
+            .as_deref(),
+            Some(expected),
+            "release job {job_name} timeout changed"
+        );
+    }
+}
+
+#[test]
+fn native_release_binary_journeys_run_the_complete_artifact_path_contract() {
+    for (job_name, kickoutchi_path, kick_path, linux) in [
+        (
+            "linux",
+            "${{ github.workspace }}/target/release/kickoutchi",
+            "${{ github.workspace }}/target/release/kick",
+            true,
+        ),
+        (
+            "windows",
+            "${{ github.workspace }}\\target\\release\\kickoutchi.exe",
+            "${{ github.workspace }}\\target\\release\\kick.exe",
+            false,
+        ),
+        (
+            "macos",
+            "${{ github.workspace }}/target/release/kickoutchi",
+            "${{ github.workspace }}/target/release/kick",
+            false,
+        ),
+    ] {
+        let job = workflow_job(CI_WORKFLOW, job_name);
+        let step = named_job_step(&job, "Run release binary journeys");
+        assert_release_binary_journey(&step, kickoutchi_path, kick_path, linux);
+    }
+
+    let verify = workflow_job(RELEASE_WORKFLOW, "verify");
+    for (platform, kickoutchi_path, kick_path, linux) in [
+        (
+            "Linux",
+            "${{ github.workspace }}/target/release/kickoutchi",
+            "${{ github.workspace }}/target/release/kick",
+            true,
+        ),
+        (
+            "Windows",
+            "${{ github.workspace }}\\target\\release\\kickoutchi.exe",
+            "${{ github.workspace }}\\target\\release\\kick.exe",
+            false,
+        ),
+        (
+            "macOS",
+            "${{ github.workspace }}/target/release/kickoutchi",
+            "${{ github.workspace }}/target/release/kick",
+            false,
+        ),
+    ] {
+        let step = named_job_step(
+            &verify,
+            &format!("Run release binary journeys ({platform})"),
+        );
+        assert_release_binary_journey(&step, kickoutchi_path, kick_path, linux);
+    }
+}
+
+#[test]
+fn nix_validation_uses_the_evaluated_package_version_without_provenance_markers() {
+    let nix = workflow_job(CI_WORKFLOW, "nix");
+    let step = named_job_step(&nix, "Build and verify native Nix package");
+    let active = step.lines().filter_map(active_line).collect::<Vec<_>>();
+
+    assert!(active.contains(
+        &"PACKAGE_VERSION=\"$(nix eval --raw \".#packages.${{ matrix.system }}.kickoutchi.version\")\""
+    ));
+    let version_checks = active
+        .iter()
+        .filter(|line| line.contains("./result/bin/") && line.contains("--version"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        version_checks,
+        [
+            "test \"$(./result/bin/kickoutchi --version)\" = \"kickoutchi ${PACKAGE_VERSION}\"",
+            "test \"$(./result/bin/kick --version)\" = \"kickoutchi ${PACKAGE_VERSION}\"",
+        ],
+        "Nix validation must compare against the evaluated package version"
+    );
+    assert!(
+        active
+            .iter()
+            .all(|line| !line.contains("install-provenance")),
+        "Nix validation must not require a deleted provenance marker"
+    );
+}
+
+#[test]
+fn homebrew_validates_both_installed_binaries_without_formula_provenance_mutation() {
+    let homebrew = workflow_job(RELEASE_WORKFLOW, "publish-homebrew-formula");
+    let step = named_job_step(&homebrew, "Commit formula files");
+    let active = step.lines().filter_map(active_line).collect::<Vec<_>>();
+
+    assert!(active.contains(&"brew install --formula \"nuggocto/tap/${FORMULA_NAME}\""));
+    assert!(active.contains(
+        &r#"test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${FORMULA_VERSION}""#
+    ));
+    assert!(active.contains(
+        &r#"test "$("${prefix}/bin/kick" --version)" = "kickoutchi ${FORMULA_VERSION}""#
+    ));
+    assert!(
+        active
+            .iter()
+            .all(|line| !line.contains("install-provenance")),
+        "Homebrew validation must not require a deleted provenance marker"
+    );
+    assert!(
+        active.iter().all(|line| !line.starts_with("ruby -e")),
+        "the generated formula must not be mutated with Ruby"
+    );
 }
 
 #[test]
@@ -424,10 +694,10 @@ fn tag_and_ref_values_are_passed_to_shells_through_environment_variables() {
         );
     }
 
-    let release_step = job_steps(&workflow_job(RELEASE_WORKFLOW, "host"))
-        .into_iter()
-        .find(|step| step_env(step, "RELEASE_TAG").is_some())
-        .expect("GitHub release creation must receive RELEASE_TAG through env");
+    let release_step = named_job_step(
+        &workflow_job(RELEASE_WORKFLOW, "host"),
+        "Create GitHub Release",
+    );
     assert!(
         release_step.contains("\"$RELEASE_TAG\""),
         "the release tag must be quoted when passed to gh"

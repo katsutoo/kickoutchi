@@ -7,10 +7,10 @@
 mod confirm;
 mod details;
 mod help;
-mod notice;
 mod table;
 mod theme;
 
+use std::any::Any;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -51,6 +51,7 @@ static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static OWNS_TUI_SESSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IS_TUI_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static;
@@ -67,6 +68,64 @@ struct OriginalPanicHook {
 pub(crate) struct PanicHookGuard {
     active: Arc<AtomicBool>,
     original: Option<Arc<OriginalPanicHook>>,
+}
+
+/// A panic caught at the TUI worker boundary and handed back to its owner.
+#[derive(Debug, thiserror::Error)]
+#[error("TUI worker {worker} panicked: {message}")]
+pub(crate) struct WorkerFailure {
+    worker: String,
+    message: String,
+}
+
+impl WorkerFailure {
+    fn from_panic(payload: &(dyn Any + Send)) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        let worker = thread::current().name().unwrap_or("unnamed").to_owned();
+        Self { worker, message }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(worker: &str, message: &str) -> Self {
+        Self {
+            worker: worker.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Result channel for one detached-capable TUI worker.
+pub(crate) struct Worker<T> {
+    receiver: mpsc::Receiver<Result<T, WorkerFailure>>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl<T> Worker<T> {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Result<T, WorkerFailure>, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    fn recv(&self) -> Result<Result<T, WorkerFailure>, mpsc::RecvError> {
+        self.receiver.recv()
+    }
+
+    /// Keep only the completion channel. Dropping the handle preserves Rust's
+    /// normal detached-thread behavior used by refresh/details/tree workers.
+    pub(crate) fn detach(self) -> mpsc::Receiver<Result<T, WorkerFailure>> {
+        self.receiver
+    }
+
+    fn join(self) -> thread::Result<()> {
+        self.handle.join()
+    }
 }
 
 impl Drop for PanicHookGuard {
@@ -387,6 +446,12 @@ pub(crate) fn install_panic_hook() -> PanicHookGuard {
     let active = Arc::new(AtomicBool::new(true));
     let hook_active = Arc::clone(&active);
     std::panic::set_hook(Box::new(move |panic_info| {
+        if hook_active.load(Ordering::Acquire) && IS_TUI_WORKER.with(std::cell::Cell::get) {
+            // `spawn_worker` catches this panic and reports it to owner control
+            // flow. Printing or restoring here would happen on the worker while
+            // the alternate screen still belongs to the owner.
+            return;
+        }
         if hook_active.load(Ordering::Acquire) && OWNS_TUI_SESSION.with(std::cell::Cell::get) {
             restore_terminal_if_active();
         }
@@ -416,13 +481,38 @@ pub(crate) fn run_owned<T>(operation: impl FnOnce() -> T) -> io::Result<T> {
 /// Spawn a TUI worker with SIGTERM/SIGHUP blocked from its first instruction.
 /// The child waits behind a gate until the owner thread's exact prior mask has
 /// been restored, so a failed restore never starts background work.
-pub(crate) fn spawn_worker(
+pub(crate) fn spawn_worker<T: Send + 'static>(
     builder: thread::Builder,
-    operation: impl FnOnce() + Send + 'static,
-) -> io::Result<thread::JoinHandle<()>> {
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<Worker<T>> {
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let run = move || {
+        IS_TUI_WORKER.with(|worker| worker.set(true));
+        match catch_unwind(AssertUnwindSafe(operation)) {
+            Ok(value) => {
+                let _ = result_sender.send(Ok(value));
+            }
+            Err(payload) => {
+                let failure = WorkerFailure::from_panic(payload.as_ref());
+                if result_sender.send(Err(failure)).is_err() {
+                    // No owner remains to surface the typed failure. Re-raise
+                    // with the marker cleared so the normal panic hook reports
+                    // the programmer error instead of silently dropping it.
+                    IS_TUI_WORKER.with(|worker| worker.set(false));
+                    resume_unwind(payload);
+                }
+            }
+        }
+        IS_TUI_WORKER.with(|worker| worker.set(false));
+    };
+
     #[cfg(not(unix))]
     {
-        builder.spawn(operation)
+        let handle = builder.spawn(run)?;
+        Ok(Worker {
+            receiver: result_receiver,
+            handle,
+        })
     }
 
     #[cfg(unix)]
@@ -431,7 +521,7 @@ pub(crate) fn spawn_worker(
         let (start_sender, start_receiver) = mpsc::sync_channel(0);
         let worker = match builder.spawn(move || {
             if start_receiver.recv().is_ok() {
-                operation();
+                run();
             }
         }) {
             Ok(worker) => worker,
@@ -452,7 +542,10 @@ pub(crate) fn spawn_worker(
             let _ = worker.join();
             return Err(io::Error::other("TUI worker stopped before its start gate"));
         }
-        Ok(worker)
+        Ok(Worker {
+            receiver: result_receiver,
+            handle: worker,
+        })
     }
 }
 
@@ -460,14 +553,11 @@ pub(crate) fn spawn_worker(
 ///
 /// Every exit path restores the terminal because the guard drops at the end of
 /// this function's scope, after the loop's result has been computed.
-pub(crate) fn run(
-    config: &Config,
-    update_notice: Option<crate::update::UpdateNotice>,
-) -> AppResult<()> {
+pub(crate) fn run(config: &Config) -> AppResult<()> {
     #[cfg(unix)]
     let signal_guard = TuiSignalGuard::install()?;
 
-    let startup = wait_for_initial_app(config.clone(), update_notice);
+    let startup = wait_for_initial_app(config.clone());
     let mut app = match startup {
         Ok(StartupOutcome::Ready(app)) => app,
         #[cfg(unix)]
@@ -505,24 +595,17 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn wait_for_initial_app(
-    config: Config,
-    update_notice: Option<crate::update::UpdateNotice>,
-) -> AppResult<StartupOutcome> {
-    let (sender, receiver) = mpsc::sync_channel(1);
+fn wait_for_initial_app(config: Config) -> AppResult<StartupOutcome> {
     let worker = spawn_worker(
         thread::Builder::new().name("kickoutchi-initial-collection".to_owned()),
-        move || {
-            let _ = sender.send(App::new(&config, update_notice));
-        },
+        move || App::new(&config),
     )?;
 
-    wait_for_startup_worker(worker, &receiver)
+    wait_for_startup_worker(worker)
 }
 
-fn wait_for_startup_worker<T>(
-    worker: thread::JoinHandle<()>,
-    receiver: &mpsc::Receiver<T>,
+fn wait_for_startup_worker<T: Send + 'static>(
+    worker: Worker<T>,
 ) -> AppResult<StartupOutcomeGeneric<T>> {
     loop {
         #[cfg(unix)]
@@ -531,12 +614,16 @@ fn wait_for_startup_worker<T>(
             return Ok(StartupOutcomeGeneric::Signal(signal));
         }
 
-        match receiver.recv_timeout(SIGNAL_POLL_INTERVAL) {
-            Ok(app) => {
+        match worker.recv_timeout(SIGNAL_POLL_INTERVAL) {
+            Ok(Ok(app)) => {
                 worker.join().map_err(|_| {
                     io::Error::other("initial collection worker panicked after returning")
                 })?;
                 return Ok(StartupOutcomeGeneric::Ready(app));
+            }
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error.into());
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -632,15 +719,10 @@ fn event_loop(
             return Ok(EventLoopExit::Signal(signal));
         }
 
-        app.poll_refresh();
-        app.poll_process_context();
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        app.poll_tree_preview();
-        let mut update_overlay_rendered = false;
-        terminal.draw(|frame| {
-            update_overlay_rendered = draw(frame, app, theme);
-        })?;
-        acknowledge_drawn_update(app, update_overlay_rendered, crate::update::acknowledge);
+        if let Some(error) = poll_workers(app) {
+            return Err(error.into());
+        }
+        terminal.draw(|frame| draw(frame, app, theme))?;
 
         let wait = std::cmp::min(
             config.tick_interval,
@@ -649,9 +731,7 @@ fn event_loop(
         match event::poll(bounded_event_wait(wait)) {
             Ok(true) => {
                 if let Event::Key(key) = event::read()? {
-                    if dismiss_drawn_update(app, update_overlay_rendered)
-                        || handle_modal_scroll(app, key)
-                    {
+                    if handle_modal_scroll(app, key) {
                         continue;
                     }
                     app.apply_action(input::action_for_key(
@@ -660,6 +740,12 @@ fn event_loop(
                         app.search_mode(),
                         !app.filter_text().is_empty(),
                     ));
+                    // A worker can fail while input is blocked. Poll again before
+                    // honoring quit so a queued programmer error cannot become a
+                    // successful TUI exit.
+                    if let Some(error) = poll_workers(app) {
+                        return Err(error.into());
+                    }
                 }
             }
             Ok(false) => {}
@@ -682,23 +768,12 @@ fn event_loop(
     }
 }
 
-fn dismiss_drawn_update(app: &mut App, overlay_rendered: bool) -> bool {
-    overlay_rendered && app.dismiss_update_notice()
-}
-
-fn acknowledge_drawn_update(
-    app: &mut App,
-    overlay_rendered: bool,
-    acknowledge: impl FnOnce(&crate::update::UpdateNotice) -> io::Result<()>,
-) {
-    if !overlay_rendered {
-        return;
-    }
-    app.mark_update_overlay_rendered();
-    if let Some(notice) = app.update_notice_for_ack() {
-        let _ = acknowledge(notice);
-        app.mark_update_ack_attempted();
-    }
+fn poll_workers(app: &mut App) -> Option<WorkerFailure> {
+    app.poll_refresh();
+    app.poll_process_context();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    app.poll_tree_preview();
+    app.take_worker_failure()
 }
 
 fn handle_modal_scroll(app: &mut App, key: KeyEvent) -> bool {
@@ -736,13 +811,13 @@ fn take_termination_signal() -> Option<libc::c_int> {
     take_first_signal(&TERMINATION_SIGNAL)
 }
 
-fn draw(frame: &mut Frame, app: &mut App, theme: Theme) -> bool {
+fn draw(frame: &mut Frame, app: &mut App, theme: Theme) {
     let area = frame.area();
 
     if is_too_small(area) {
         cancel_hidden_confirmation(app);
         render_too_small(frame, area, theme);
-        return false;
+        return;
     }
 
     let chunks = Layout::default()
@@ -772,12 +847,6 @@ fn draw(frame: &mut Frame, app: &mut App, theme: Theme) -> bool {
                 app.cancel_confirmation_for_layout();
             }
         }
-    }
-    if let Some(message) = app.visible_update_notice() {
-        notice::render(frame, centered_rect(90, 60, area), message, theme);
-        true
-    } else {
-        false
     }
 }
 
@@ -977,7 +1046,7 @@ fn format_age(duration: Option<Duration>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    #[cfg(unix)]
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -999,14 +1068,11 @@ mod tests {
         CUSTOM_SIGNAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn render_frame(app: &mut App, width: u16, height: u16) -> (String, bool) {
+    fn render_frame(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend must initialize");
-        let mut update_overlay_rendered = false;
         terminal
-            .draw(|frame| {
-                update_overlay_rendered = draw(frame, app, Theme::from_environment());
-            })
+            .draw(|frame| draw(frame, app, Theme::from_environment()))
             .expect("test frame must draw");
 
         let buffer = terminal.backend().buffer();
@@ -1018,11 +1084,11 @@ mod tests {
             }
             text.push('\n');
         }
-        (text, update_overlay_rendered)
+        text
     }
 
     fn render_text(app: &mut App, width: u16, height: u16) -> String {
-        render_frame(app, width, height).0
+        render_frame(app, width, height)
     }
 
     #[test]
@@ -1138,73 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn update_notice_renders_as_a_complete_sanitized_startup_overlay() {
-        let config = Config::default();
-        let mut app = App::new_fake(&config);
-        app.set_update_notice(
-            "Kickoutchi 2.0.0 is available. Download it from \
-             https://github.com/nuggocto/kickoutchi/releases/latest and replace the current \
-             executable manually.\nThis final sentence must remain visible.",
-        );
-
-        let text = render_text(&mut app, 80, 20);
-
-        assert!(text.contains("Kickoutchi Update"), "{text}");
-        assert!(
-            text.contains("Kickoutchi 2.0.0 is available. Download it"),
-            "{text}"
-        );
-        assert!(
-            text.contains("This final sentence must remain visible."),
-            "{text}"
-        );
-        assert!(text.contains("Any key dismisses"), "{text}");
-    }
-
-    #[test]
-    fn update_notice_acknowledgment_is_attempted_once_after_an_overlay_frame() {
-        use std::cell::Cell;
-
-        let config = Config::default();
-        let mut app = App::new_fake(&config);
-        app.set_update_notice("update");
-        let attempts = Cell::new(0);
-
-        super::acknowledge_drawn_update(&mut app, true, |_| {
-            attempts.set(attempts.get() + 1);
-            Err(io::Error::other("cache busy"))
-        });
-        super::acknowledge_drawn_update(&mut app, true, |_| {
-            attempts.set(attempts.get() + 1);
-            Ok(())
-        });
-
-        assert_eq!(attempts.get(), 1);
-        assert!(app.update_notice_for_ack().is_none());
-        assert_eq!(app.visible_update_notice(), Some("update"));
-    }
-
-    #[test]
-    fn undersized_frame_neither_acknowledges_nor_dismisses_update_notice() {
-        let config = Config::default();
-        let mut app = App::new_fake(&config);
-        app.set_update_notice("update");
-        let (text, rendered) = render_frame(&mut app, 40, 10);
-
-        assert!(text.contains("Terminal too small"), "{text}");
-        assert!(!rendered);
-        super::acknowledge_drawn_update(&mut app, rendered, |_| {
-            panic!("undersized frame must not acknowledge")
-        });
-        assert!(app.update_notice_for_ack().is_none());
-        // Even if an earlier full-size frame rendered this notice, the current
-        // undersized frame cannot use that old fact to dismiss it.
-        app.mark_update_overlay_rendered();
-        assert!(!super::dismiss_drawn_update(&mut app, rendered));
-        assert_eq!(app.visible_update_notice(), Some("update"));
-    }
-
-    #[test]
     fn help_and_details_bottom_rows_are_scrollable_at_minimum_size() {
         let mut config = Config::default();
         config.protected_processes.push("node".to_owned());
@@ -1237,19 +1236,21 @@ mod tests {
     }
 
     #[test]
-    fn initial_worker_disconnect_reports_a_panic() {
-        let (sender, receiver) = mpsc::sync_channel::<()>(1);
-        let worker = std::thread::spawn(move || {
-            drop(sender);
-            panic!("startup failed");
-        });
-
-        let error = super::wait_for_startup_worker(worker, &receiver)
-            .expect_err("worker panic must be reported");
+    fn initial_worker_panic_is_reported_as_a_typed_failure() {
+        let error = super::run_owned(|| {
+            let worker = super::spawn_worker(
+                std::thread::Builder::new().name("initial-test".to_owned()),
+                || panic!("startup failed"),
+            )
+            .unwrap();
+            super::wait_for_startup_worker(worker)
+        })
+        .unwrap()
+        .expect_err("worker panic must be reported");
         assert!(
             error
                 .to_string()
-                .contains("initial collection worker panicked")
+                .contains("TUI worker initial-test panicked: startup failed")
         );
     }
 
@@ -1355,6 +1356,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(receiver.recv().unwrap(), (true, true));
+        worker.recv().unwrap().unwrap();
         worker.join().unwrap();
         assert_eq!(current_signal_mask_contains(libc::SIGTERM), parent_term);
         assert_eq!(current_signal_mask_contains(libc::SIGHUP), parent_hup);
@@ -1412,20 +1414,20 @@ mod tests {
             assert_eq!(CUSTOM_SIGNAL_CALLS.load(Ordering::Relaxed), 1);
             assert_eq!(super::take_termination_signal(), None);
             release_sender.send(()).unwrap();
+            worker.recv().unwrap().unwrap();
             worker.join().unwrap();
             return;
         }
 
-        let status = crate::test_sync::status_guarded(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ui::tests::finalization_delivers_process_signal_only_after_worker_safe_teardown",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1"),
-        )
-        .expect("final-signal child must start");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ui::tests::finalization_delivers_process_signal_only_after_worker_safe_teardown",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("final-signal child must start");
         assert!(status.success(), "final-signal child exited with {status}");
     }
 
@@ -1467,16 +1469,15 @@ mod tests {
             unreachable!("default SIGTERM returned");
         }
 
-        let status = crate::test_sync::status_guarded(
-            Command::new(std::env::current_exe().expect("test executable must exist"))
-                .args([
-                    "--exact",
-                    "ui::tests::sigterm_is_reraised_with_conventional_process_status",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1"),
-        )
-        .expect("signal child must start");
+        let status = Command::new(std::env::current_exe().expect("test executable must exist"))
+            .args([
+                "--exact",
+                "ui::tests::sigterm_is_reraised_with_conventional_process_status",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("signal child must start");
 
         assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
@@ -1526,16 +1527,15 @@ mod tests {
         }
 
         for mode in ["custom", "ignored"] {
-            let status = crate::test_sync::status_guarded(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "ui::tests::sigterm_restores_and_honors_custom_and_ignored_dispositions",
-                        "--nocapture",
-                    ])
-                    .env(CHILD_ENV, mode),
-            )
-            .expect("signal-disposition child must start");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ui::tests::sigterm_restores_and_honors_custom_and_ignored_dispositions",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, mode)
+                .status()
+                .expect("signal-disposition child must start");
             assert!(status.success(), "{mode} child exited with {status}");
         }
     }
@@ -1569,10 +1569,15 @@ mod tests {
                     || panic!("startup worker panic"),
                 )
                 .unwrap();
-                assert!(worker.join().is_err());
+                let failure = worker
+                    .recv()
+                    .unwrap()
+                    .expect_err("worker panic must be typed");
+                assert!(failure.to_string().contains("startup worker panic"));
+                worker.join().unwrap();
             })
             .unwrap();
-            assert_eq!(PANICS.load(Ordering::Relaxed), 3);
+            assert_eq!(PANICS.load(Ordering::Relaxed), 2);
 
             super::run_owned(|| {
                 let error = super::run_owned(|| ()).expect_err("nested TUI must be refused");
@@ -1607,16 +1612,15 @@ mod tests {
             return;
         }
 
-        let output = crate::test_sync::output_guarded(
-            Command::new(std::env::current_exe().expect("test executable must exist"))
-                .args([
-                    "--exact",
-                    "ui::tests::completed_tui_session_restores_the_previous_panic_hook",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1"),
-        )
-        .expect("panic-hook child must start");
+        let output = Command::new(std::env::current_exe().expect("test executable must exist"))
+            .args([
+                "--exact",
+                "ui::tests::completed_tui_session_restores_the_previous_panic_hook",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("panic-hook child must start");
 
         assert!(
             output.status.success(),
@@ -1631,6 +1635,65 @@ mod tests {
             "pre-terminal panic emitted alternate-screen teardown: {:?}",
             String::from_utf8_lossy(&output.stdout),
         );
+    }
+
+    #[test]
+    fn worker_panic_after_terminal_activation_is_reported_by_owner_only() {
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CHILD_ENV: &str = "KICKOUTCHI_TEST_ACTIVE_WORKER_PANIC";
+        static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+        if std::env::var_os(CHILD_ENV).is_some() {
+            std::panic::set_hook(Box::new(|_| {
+                HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+                eprintln!("panic hook printed while terminal was active");
+            }));
+
+            super::run_owned(|| {
+                super::TERMINAL_ACTIVE.store(true, Ordering::Release);
+                let worker = super::spawn_worker(
+                    std::thread::Builder::new().name("kickoutchi-refresh".to_owned()),
+                    || panic!("refresh invariant failed"),
+                )
+                .unwrap();
+                let failure = worker
+                    .recv()
+                    .unwrap()
+                    .expect_err("owner must receive the worker panic");
+
+                assert!(
+                    super::TERMINAL_ACTIVE.load(Ordering::Acquire),
+                    "the worker must not restore terminal state"
+                );
+                super::TERMINAL_ACTIVE.store(false, Ordering::Release);
+                eprintln!("owner diagnostic after restore: {failure}");
+                worker.join().unwrap();
+            })
+            .unwrap();
+            assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 0);
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("test executable must exist"))
+            .args([
+                "--exact",
+                "ui::tests::worker_panic_after_terminal_activation_is_reported_by_owner_only",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("worker-panic child must start");
+        let stderr = String::from_utf8(output.stderr).expect("child stderr must be UTF-8");
+
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains(
+                "owner diagnostic after restore: TUI worker kickoutchi-refresh panicked: refresh invariant failed"
+            ),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("panic hook printed"), "{stderr}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

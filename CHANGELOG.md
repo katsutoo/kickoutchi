@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-07-26
+
+### Added
+
+- Versioned `EvidenceGap` output now carries an always-present nullable
+  `affected_pid_count`. Linux owner scans aggregate PID-scoped losses that have
+  no target socket edge into one positive bounded count while retaining exact
+  target-relevant losses under `pid`; repeated aggregate observations merge by
+  maximum rather than by an invented sum.
+
 ### Changed
 
 - `list --process ""` is now an invalid-argument error (exit `2`) instead of
@@ -14,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   substring matches every name, so the old result narrowed the list instead of
   filtering it, and a script passing an unset variable got a wrong answer under
   a success exit code. Nonempty values are unchanged, whitespace included.
+
+### Removed
+
+- Removed Kickoutchi's automatic weekly GitHub release check, update cache,
+  install-provenance-based notices, and the associated `ureq`/Rustls TLS
+  dependency stack. The deprecated boolean `check_for_updates` key remains
+  accepted and ignored so existing strict configuration files still load. The
+  cargo-dist-generated standalone `kickoutchi-update` installed by release
+  installers is unchanged.
 
 ### Fixed
 
@@ -24,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diff and kill refuse to signal on an observation that was complete enough to
   act on. A process that exhausts its optional-metadata budget on several fields
   now also reports one gap instead of one per field.
+- Configuration diagnostics now preserve TOML source excerpts and caret
+  placement while keeping hostile path and I/O text sanitized on one line.
+- Oversized protected-process diagnostics now distinguish the merged total, raw
+  configured entries, unique configured additions, and built-in defaults, so
+  duplicate configured or default names cannot make the count misleading.
+- Linux group-kill real-binary coverage now keeps the capability-required
+  success journey separate from the opportunistic observation-race fail-closed
+  journey, preventing a real race from satisfying the release success gate.
+- TUI background-worker panics now cross a typed result channel to the owner
+  thread, which restores the terminal before reporting the failure instead of a
+  worker panic hook writing while the alternate screen is active.
 
 ## [1.3.5] - 2026-07-26
 
@@ -1150,7 +1180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...HEAD
+[1.3.6]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...v1.3.6
 [1.3.5]: https://github.com/nuggocto/kickoutchi/compare/v1.3.1...v1.3.5
 [1.3.1]: https://github.com/nuggocto/kickoutchi/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/nuggocto/kickoutchi/compare/v1.2.0...v1.3.0

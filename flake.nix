@@ -31,11 +31,6 @@
             cargoBuildFlags = [ "--all-features" ];
             cargoTestFlags = [ "--all-features" "--lib" ];
 
-            postInstall = ''
-              mkdir -p "$out/share/kickoutchi"
-              printf '%s\n' nix > "$out/share/kickoutchi/install-provenance"
-            '';
-
             meta = with pkgs.lib; {
               description = "A clean TUI and CLI port janitor";
               homepage = "https://kickoutchi.com";

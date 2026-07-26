@@ -689,10 +689,10 @@ mod tests {
     use super::{Certainty, DiffError, EventKind, SnapshotDiff, baseline_events, diff_snapshots};
     use crate::model::Protocol;
     use crate::observation::{
-        EndpointIdentity, EvidenceGapCode, MetadataCompleteness, NetworkSnapshot, ObservationScope,
-        ObservationScopeKind, OwnerCompleteness, OwnerObservation, PlatformSocketToken,
-        ProcessIdentity, ProcessObservation, ProcessStartMarker, SnapshotCompleteness,
-        SocketObservation, SocketState,
+        EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataCompleteness,
+        NetworkSnapshot, ObservationScope, ObservationScopeKind, OwnerCompleteness,
+        OwnerObservation, PlatformSocketToken, ProcessIdentity, ProcessObservation,
+        ProcessStartMarker, SnapshotCompleteness, SocketObservation, SocketState,
     };
 
     fn identity(pid: u32, marker: u64) -> ProcessIdentity {
@@ -901,6 +901,35 @@ mod tests {
         .unwrap();
         let current = snapshot(vec![socket(3000, Some(identity(8, 11)))]);
         assert!(events(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn aggregate_ownership_gap_allows_bind_release_but_not_replacement() {
+        let add_aggregate_gap = |snapshot: &mut NetworkSnapshot| {
+            snapshot.completeness = SnapshotCompleteness::Partial;
+            snapshot.owner_completeness =
+                OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap();
+            snapshot.evidence_gaps.push(EvidenceGap::aggregate_for_pids(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                None,
+                std::num::NonZeroU64::new(4_097).unwrap(),
+                "unrelated PIDs could not be inspected",
+            ));
+        };
+
+        let mut previous = snapshot(vec![socket(3_000, Some(identity(7, 10)))]);
+        let mut current = snapshot(vec![socket(4_000, Some(identity(8, 11)))]);
+        add_aggregate_gap(&mut previous);
+        add_aggregate_gap(&mut current);
+        assert_eq!(
+            events(&previous, &current),
+            [(EventKind::Release, 3_000), (EventKind::Bind, 4_000)]
+        );
+
+        let mut replacement = snapshot(vec![socket(3_000, Some(identity(8, 11)))]);
+        add_aggregate_gap(&mut replacement);
+        assert!(events(&previous, &replacement).is_empty());
     }
 
     #[test]

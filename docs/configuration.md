@@ -58,8 +58,7 @@ valid and therefore selects all built-in defaults.
 `--refresh-interval SECONDS` is the global CLI override for
 `refresh_interval_seconds`; it accepts `1..=3600`. For `list`, `--sort MODE`
 overrides `default_sort` for that invocation. There are no CLI overrides for
-`hide_system_processes`, `confirm_force_kill`, `check_for_updates`, `protected_processes`, or
-`ports`.
+`hide_system_processes`, `confirm_force_kill`, `protected_processes`, or `ports`.
 
 The watch polling interval is separate: `watch --interval` does not use
 `refresh_interval_seconds`.
@@ -72,7 +71,7 @@ The watch polling interval is separate: `watch --interval` does not use
 | `default_sort` | string | `"port"` | Exactly `"port"`, `"pid"`, `"protocol"`, `"process"`, `"parent"`, or `"scope"`. Sets the initial TUI sort and the `list` sort when `--sort` is absent. |
 | `hide_system_processes` | boolean | `false` | When `true`, conservatively classified system/service rows are hidden from normal `list` and TUI views. It does not affect `watch` or `list --snapshot-json`. |
 | `confirm_force_kill` | boolean | `true` | When `true`, force kill uses stronger typed confirmation unless `--yes` applies. It does not weaken protected-process confirmation. |
-| `check_for_updates` | boolean | `true` | When `true`, eligible human CLI and TUI launches may use the bounded weekly release cache. The foreground command never waits for the network. Structured output and elevated execution suppress the feature. |
+| `check_for_updates` | boolean | N/A | Deprecated compatibility key. Both `true` and `false` are accepted and ignored so older configuration files still load. Kickoutchi performs no automatic update check. Non-boolean values remain invalid. |
 | `protected_processes` | array of strings | `[]` as a configured extension | Adds names to the built-in protected set; it never replaces that set. Empty names are invalid. The merged, exactly deduplicated set may contain at most 256 names. |
 | `ports` | array of tables | empty | Defines up to 256 validated endpoint label selectors. See [Endpoint labels](#endpoint-labels). |
 

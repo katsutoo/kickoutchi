@@ -13,8 +13,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::display::sanitize;
 use crate::labels::label_display_text;
-#[cfg(test)]
-use crate::model::PortEntry;
 use crate::model::PortEntryView;
 
 const COLUMN_COUNT: usize = 6;
@@ -47,16 +45,6 @@ const PADDING: [u8; crate::observation::PROCESS_NAME_MAX_BYTES] =
 /// Plain spaces, no box-drawing characters: this output gets piped into
 /// `grep`/`awk` all the time, so every line has to stay splittable on
 /// whitespace.
-#[cfg(test)]
-pub(crate) fn write_table(
-    writer: &mut impl Write,
-    entries: &[PortEntry],
-    indices: &[usize],
-) -> std::io::Result<()> {
-    let views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
-    write_view_table(writer, &views, indices, false)
-}
-
 pub(crate) fn write_view_table(
     writer: &mut impl Write,
     entries: &[PortEntryView<'_>],
@@ -114,16 +102,6 @@ fn write_labeled_view_table(
 /// Render entries as pretty-printed JSON. The shape is the serde contract on
 /// `PortEntry` (pinned by tests in `model`); the pretty-printing is just for
 /// human eyes and means nothing to a parser.
-#[cfg(test)]
-pub(crate) fn write_json(
-    writer: &mut impl Write,
-    entries: &[PortEntry],
-    indices: &[usize],
-) -> Result<(), serde_json::Error> {
-    let views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
-    write_view_json(writer, &views, indices)
-}
-
 pub(crate) fn write_view_json(
     writer: &mut impl Write,
     entries: &[PortEntryView<'_>],
@@ -227,10 +205,8 @@ mod tests {
 
     use unicode_width::UnicodeWidthStr;
 
-    use super::{write_json, write_table, write_view_json, write_view_table};
-    use crate::model::{
-        PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
-    };
+    use super::{write_view_json, write_view_table};
+    use crate::model::{PermissionStatus, Platform, PortEntry, Protocol, SocketState, entry_views};
 
     fn entry(port: u16, pid: Option<u32>, name: Option<&str>) -> PortEntry {
         PortEntry {
@@ -254,20 +230,22 @@ mod tests {
 
     fn table(entries: &[PortEntry]) -> String {
         let indices = (0..entries.len()).collect::<Vec<_>>();
+        let views = entry_views(entries);
         let mut bytes = Vec::new();
-        write_table(&mut bytes, entries, &indices).expect("table writes");
+        write_view_table(&mut bytes, &views, &indices, false).expect("table writes");
         String::from_utf8(bytes).expect("table is UTF-8")
     }
 
     fn json(entries: &[PortEntry]) -> String {
         let indices = (0..entries.len()).collect::<Vec<_>>();
+        let views = entry_views(entries);
         let mut bytes = Vec::new();
-        write_json(&mut bytes, entries, &indices).expect("JSON writes");
+        write_view_json(&mut bytes, &views, &indices).expect("JSON writes");
         String::from_utf8(bytes).expect("JSON is UTF-8")
     }
 
     fn labeled_table(entries: &[PortEntry], labels: &[Option<&str>]) -> String {
-        let mut views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let mut views = entry_views(entries);
         for (view, label) in views.iter_mut().zip(labels.iter().copied()) {
             view.label = label;
         }
@@ -387,7 +365,7 @@ mod tests {
             entry(3000, Some(1), Some("node")),
             entry(5353, Some(2), Some("mdns")),
         ];
-        let mut views = entries.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let mut views = entry_views(&entries);
         views[0].label = Some("web dev");
         let mut bytes = Vec::new();
         write_view_json(&mut bytes, &views, &[0, 1]).unwrap();

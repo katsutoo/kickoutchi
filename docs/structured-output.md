@@ -196,11 +196,23 @@ Snapshot-global ownership gaps remain in the snapshot's evidence-gap fields and 
   impact: "metadata" | "ownership" | "socket_set" | "scope",
   endpoint: Endpoint | null,
   pid: integer 0..4294967295 | null,
+  affected_pid_count: integer 1..131072 | null,
   message: string
 }
 ```
 
-`endpoint: null` means the gap may affect the whole observation scope rather than one endpoint. `pid: null` means the gap is not confined to a known PID. `message` is sanitized and limited to 512 UTF-8 bytes. It is explanatory text, not a stable programmatic value; use `code`, `impact`, `endpoint`, and `pid` for logic.
+`endpoint: null` means the gap may affect the whole observation scope rather than
+one endpoint. `affected_pid_count` is non-null only for an aggregated PID-scoped
+loss: the positive count is bounded by the 131,072 candidate-PID scan limit, and
+`pid` is always `null`. A gap tied to one exact PID instead uses `pid` and has
+`affected_pid_count: null`. When consistency passes repeat the same aggregate
+observation, Kickoutchi keeps the maximum count; it does not sum counts that may
+describe overlapping PID sets. `omitted_evidence_gap_count` is separate: it
+counts gap records not retained after an array cap, never PIDs represented by
+`affected_pid_count`. When both PID fields are `null`, the gap is not confined to
+a known PID and is not a PID-count aggregate. `message` is sanitized and limited
+to 512 UTF-8 bytes. It is explanatory text, not a stable programmatic value; use
+`code`, `impact`, `endpoint`, `pid`, and `affected_pid_count` for logic.
 
 #### `Scope`
 
@@ -494,7 +506,7 @@ Token values are nonzero in current collectors.
 
 - `sockets`: endpoint protocol, address family, address bytes, IPv6 scope, port, state, token with null last, owner-set key, then timer. A null timer sorts before a present timer. Present timers sort by kind (`none`, `retransmit`, `other`, `time_wait`, `zero_window_probe`, `unknown`), unknown native code, raw ticks, then estimated remaining milliseconds with null before a value.
 - `processes`: PID, marker kind, marker value.
-- `evidence_gaps`: impact in `socket_set`, `ownership`, `metadata`, `scope` order; code lexicographically; endpoint key; PID; message. For equal impact and code, a null endpoint sorts before concrete endpoints.
+- `evidence_gaps`: impact in `socket_set`, `ownership`, `metadata`, `scope` order; code lexicographically; endpoint key; PID; affected PID count; message. For equal impact and code, a null endpoint sorts before concrete endpoints.
 - Owner, reason, limitation, state, token, and endpoint subarrays use the common canonical rules.
 
 **Illustrative example:** scope, timestamps, PIDs, markers, sockets, and metadata vary by host.
@@ -920,10 +932,6 @@ The process-wide exit contract is:
 | 6 | A protected process requires confirmation; not produced by the structured commands in this document. |
 
 Stdout contains only the requested JSON, NDJSON, or human result. Diagnostics, warnings, parse errors, and operational errors use stderr. Structured stdout is never mixed with prose.
-
-Automatic release checks and update notices are disabled entirely for structured
-JSON, snapshot, watch, and Why invocations; they do not add stderr noise or
-consume a pending human notification.
 
 A broken stdout pipe is successful consumer termination for list, snapshot, and watch. Why evaluates all endpoints before writing, so a broken pipe preserves the already-computed aggregate exit code rather than converting an unavailable endpoint into success. Any other write or flush failure exits `1`.
 

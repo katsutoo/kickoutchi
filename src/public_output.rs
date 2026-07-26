@@ -363,6 +363,7 @@ pub(crate) struct EvidenceGapDto<'a> {
     impact: &'static str,
     endpoint: Option<EndpointDto<'a>>,
     pid: Option<u32>,
+    affected_pid_count: Option<u64>,
     message: Cow<'a, str>,
 }
 
@@ -373,6 +374,7 @@ impl<'a> From<&'a EvidenceGap> for EvidenceGapDto<'a> {
             impact: evidence_impact_name(gap.impact),
             endpoint: gap.endpoint.as_ref().map(EndpointDto::from),
             pid: gap.pid,
+            affected_pid_count: gap.affected_pid_count(),
             message: Cow::Owned(sanitize_bounded(gap.message(), EVIDENCE_MESSAGE_MAX_BYTES)),
         }
     }
@@ -974,6 +976,11 @@ fn compare_gap_index(snapshot: &NetworkSnapshot, left: &GapIndex, right: &GapInd
             (None, None) => Ordering::Equal,
         })
         .then_with(|| left_gap.pid.cmp(&right_gap.pid))
+        .then_with(|| {
+            left_gap
+                .affected_pid_count()
+                .cmp(&right_gap.affected_pid_count())
+        })
         .then_with(|| left.message.cmp(&right.message))
 }
 
@@ -1302,8 +1309,31 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(value["evidence_gaps"][0]["message"], "global message");
+        assert!(value["evidence_gaps"][0]["affected_pid_count"].is_null());
         assert_eq!(value["evidence_gaps"][1]["endpoint"]["port"], 9);
         assert_eq!(value["evidence_gaps"][2]["impact"], "metadata");
+    }
+
+    #[test]
+    fn aggregate_gap_count_is_public_and_part_of_canonical_order() {
+        let aggregate = |count| {
+            EvidenceGap::aggregate_for_pids(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                None,
+                NonZeroU64::new(count).expect("fixture count is nonzero"),
+                "at least the reported number of PIDs were denied",
+            )
+        };
+        let mut snapshot = snapshot(Vec::new());
+        snapshot.evidence_gaps = vec![aggregate(9), aggregate(2)];
+
+        let value = render(&snapshot, &LabelRegistry::default());
+        let gaps = value["evidence_gaps"].as_array().expect("gap array");
+
+        assert_eq!(gaps[0]["pid"], serde_json::Value::Null);
+        assert_eq!(gaps[0]["affected_pid_count"], 2);
+        assert_eq!(gaps[1]["affected_pid_count"], 9);
     }
 
     #[test]

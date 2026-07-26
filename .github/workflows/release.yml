@@ -24,6 +24,12 @@ env:
   DIST_VERSION: "0.32.0"
   RUST_VERSION: "1.95.0"
 
+concurrency:
+  # Every tag publishes to the same Homebrew branch, so different releases must
+  # not overlap after one has already created its GitHub Release.
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -126,21 +132,27 @@ jobs:
           KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
           KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
           KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
-        run: cargo test --locked --all-features --test cli_contract
+        run: |
+          cargo test --locked --all-features --test cli_contract
+          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
       - name: Run release binary journeys (Windows)
         if: matrix.name == 'Windows'
         env:
           KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
           KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\target\release\kickoutchi.exe
           KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\target\release\kick.exe
-        run: cargo test --locked --all-features --test cli_contract
+        run: |
+          cargo test --locked --all-features --test cli_contract
+          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
       - name: Run release binary journeys (macOS)
         if: matrix.name == 'macOS'
         env:
           KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
           KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
           KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
-        run: cargo test --locked --all-features --test cli_contract
+        run: |
+          cargo test --locked --all-features --test cli_contract
+          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
       - name: Test release artifact validator
         if: matrix.name == 'Supply Chain'
         run: cargo test --locked --test release_artifact_validator
@@ -151,6 +163,7 @@ jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
@@ -326,6 +339,7 @@ jobs:
       - verify
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
+    timeout-minutes: 30
     env:
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
@@ -383,6 +397,7 @@ jobs:
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' }}
     runs-on: "ubuntu-22.04"
+    timeout-minutes: 20
     permissions:
       contents: write
     outputs:
@@ -409,9 +424,14 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
           # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          TAG_COMMIT="$(git rev-parse --verify "${RELEASE_TAG}^{commit}")"
+          test "$TAG_COMMIT" = "$RELEASE_COMMIT"
           dist host $TAG_FLAG --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
@@ -441,11 +461,14 @@ jobs:
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
           # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
-          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          TAG_COMMIT="$(git rev-parse --verify "${RELEASE_TAG}^{commit}")"
+          test "$TAG_COMMIT" = "$RELEASE_COMMIT"
           gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   # Publish the dist-generated Homebrew formula to the tap repo. The push
@@ -458,6 +481,7 @@ jobs:
       - plan
       - host
     runs-on: "ubuntu-22.04"
+    timeout-minutes: 30
     permissions:
       contents: read
     env:
@@ -502,8 +526,6 @@ jobs:
             name=$(echo "$filename" | sed "s/\.rb$//")
             version=$(echo "$release" | jq .app_version --raw-output)
 
-            ruby -e 'path = ARGV.fetch(0); text = File.read(path); needle = "    install_binary_aliases!\n"; abort "missing unique install hook" unless text.scan(needle).length == 1; File.write(path, text.sub(needle, needle + "\n    (pkgshare/\"install-provenance\").write(\"homebrew\\n\")\n"))' "Formula/${filename}"
-
             # We avoid reformatting user-provided data such as the app description and homepage.
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
 
@@ -519,7 +541,7 @@ jobs:
                 brew install --formula "nuggocto/tap/${FORMULA_NAME}"
                 prefix=$(brew --prefix "${FORMULA_NAME}")
                 test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${FORMULA_VERSION}"
-                test "$(cat "${prefix}/share/kickoutchi/install-provenance")" = "homebrew"
+                test "$("${prefix}/bin/kick" --version)" = "kickoutchi ${FORMULA_VERSION}"
               '
 
             git add "Formula/${filename}"
@@ -542,6 +564,7 @@ jobs:
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

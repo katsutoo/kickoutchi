@@ -547,6 +547,7 @@ pub(crate) struct EvidenceGap {
     pub(crate) code: EvidenceGapCode,
     pub(crate) endpoint: Option<EndpointIdentity>,
     pub(crate) pid: Option<u32>,
+    affected_pid_count: Option<NonZeroU64>,
     message: String,
 }
 
@@ -562,6 +563,7 @@ impl Ord for EvidenceGap {
                 (None, None) => Ordering::Equal,
             })
             .then_with(|| self.pid.cmp(&other.pid))
+            .then_with(|| self.affected_pid_count.cmp(&other.affected_pid_count))
             .then_with(|| self.message.cmp(&other.message))
     }
 }
@@ -585,8 +587,44 @@ impl EvidenceGap {
             code,
             endpoint,
             pid,
+            affected_pid_count: None,
             message: truncate_utf8(message, EVIDENCE_MESSAGE_MAX_BYTES).to_owned(),
         }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn aggregate_for_pids(
+        impact: EvidenceImpact,
+        code: EvidenceGapCode,
+        endpoint: Option<EndpointIdentity>,
+        affected_pid_count: NonZeroU64,
+        message: &str,
+    ) -> Self {
+        Self {
+            impact,
+            code,
+            endpoint,
+            pid: None,
+            affected_pid_count: Some(affected_pid_count),
+            message: truncate_utf8(message, EVIDENCE_MESSAGE_MAX_BYTES).to_owned(),
+        }
+    }
+
+    pub(crate) const fn affected_pid_count(&self) -> Option<u64> {
+        match self.affected_pid_count {
+            Some(count) => Some(count.get()),
+            None => None,
+        }
+    }
+
+    fn same_aggregate_observation(&self, other: &Self) -> bool {
+        self.affected_pid_count.is_some()
+            && other.affected_pid_count.is_some()
+            && self.impact == other.impact
+            && self.code == other.code
+            && self.endpoint == other.endpoint
+            && self.pid == other.pid
+            && self.message == other.message
     }
 
     pub(crate) fn message(&self) -> &str {
@@ -1559,17 +1597,28 @@ fn merge_attempt_uncertainty(
         .omitted_evidence_gap_count
         .saturating_add(pass_a.omitted_evidence_gap_count);
     // Both passes observe the same host, so a gap that is identical in every
-    // field normally shows up in both. Merging them verbatim would emit each
-    // one twice: the copy carries no evidence the first one did not, it halves
-    // the effective retention budget, and once that budget overflows the
-    // resulting `omitted_evidence_gap_count` makes watch refuse to diff and
-    // kill refuse to signal on an observation that was actually complete
-    // enough. Deduplicate here, at the point where the second copy is born,
-    // so the budget is spent on distinct evidence.
+    // field normally shows up in both. Aggregate counts are observations, not
+    // disjoint sets: retain the maximum as "at least this many observed"
+    // rather than summing and inventing a union. Exact gaps still deduplicate
+    // by their complete tuple. Do this before enforcing the merged budget so
+    // only distinct evidence consumes retention slots.
     let mut merged: BTreeSet<EvidenceGap> = std::mem::take(&mut pass_a.associations.evidence_gaps)
         .into_iter()
         .collect();
     for gap in pass_b.associations.evidence_gaps.drain(..) {
+        if gap.affected_pid_count.is_some()
+            && let Some(existing) = merged
+                .iter()
+                .find(|existing| existing.same_aggregate_observation(&gap))
+                .cloned()
+        {
+            if gap.affected_pid_count > existing.affected_pid_count {
+                let removed = merged.remove(&existing);
+                debug_assert!(removed, "the aggregate gap was found immediately above");
+                merged.insert(gap);
+            }
+            continue;
+        }
         if merged.contains(&gap) {
             continue;
         }
@@ -4105,6 +4154,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(1), Some(2)],
         );
+        assert_eq!(snapshot.omitted_evidence_gap_count, 0);
+    }
+
+    #[test]
+    fn aggregate_gap_counts_merge_by_max_without_inventing_a_cross_pass_union() {
+        let row = socket(80);
+        let aggregate = |count| {
+            EvidenceGap::aggregate_for_pids(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                None,
+                NonZeroU64::new(count).expect("fixture count is nonzero"),
+                "at least the reported number of PIDs were denied",
+            )
+        };
+        let associations = |count| OwnerAssociations {
+            owners_by_socket: vec![vec![]],
+            local_completeness: vec![OwnerCompleteness::Complete],
+            global_completeness: OwnerCompleteness::partial([
+                EvidenceGapCode::OwnerPermissionDenied,
+            ])
+            .expect("one reason fits"),
+            evidence_gaps: vec![aggregate(count)],
+            omitted_evidence_gap_count: 0,
+        };
+        let steps = vec![
+            Step::Clock(1),
+            Step::Sockets(vec![row.clone()]),
+            Step::Owners(associations(4_096)),
+            Step::Sockets(vec![row]),
+            Step::Owners(associations(4_100)),
+            Step::Clock(2),
+        ];
+        let mut source = FakeSource::new(steps);
+
+        let snapshot = collect_consistent_with_limits(
+            &mut source,
+            scope(),
+            MetadataProfile::Display,
+            limits(8),
+        )
+        .expect("aggregate gaps merge within one slot");
+
+        assert_eq!(snapshot.evidence_gaps.len(), 1);
+        assert_eq!(snapshot.evidence_gaps[0].affected_pid_count(), Some(4_100));
         assert_eq!(snapshot.omitted_evidence_gap_count, 0);
     }
 

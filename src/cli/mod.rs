@@ -171,28 +171,6 @@ pub(crate) enum Command {
     Why(WhyArgs),
 }
 
-impl Command {
-    /// Update notices are strictly human-facing and never contaminate structured
-    /// or long-running output modes.
-    pub(crate) fn allows_update_notice(&self) -> bool {
-        match self {
-            Self::List(args) => {
-                !args.json
-                    && !args.snapshot_json
-                    && crate::query::validate_filter_text(
-                        args.filter.as_deref().unwrap_or_default(),
-                        crate::query::QueryCapabilities::LIST,
-                    )
-                    .is_ok()
-            }
-            Self::Watch(_) | Self::Why(_) => false,
-            Self::Kill(_) => true,
-            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-            Self::Inspect(_) => true,
-        }
-    }
-}
-
 /// `inspect` takes exactly one starting point, like `kill`: a PID (which may
 /// own no port — supervisors usually don't) or a port whose owner to start
 /// from. Strictly read-only; it never signals anything.
@@ -818,24 +796,6 @@ mod tests {
             invocation.extend(conflict);
             assert!(Cli::try_parse_from(invocation).is_err());
         }
-    }
-
-    #[test]
-    fn structured_and_streaming_modes_suppress_update_notices() {
-        let parse = |args: &[&str]| {
-            Cli::try_parse_from(args)
-                .expect("invocation parses")
-                .command
-                .unwrap()
-        };
-
-        assert!(!parse(&["kickoutchi", "list", "--json"]).allows_update_notice());
-        assert!(!parse(&["kickoutchi", "list", "--snapshot-json"]).allows_update_notice());
-        assert!(!parse(&["kickoutchi", "watch", "--duration", "1s"]).allows_update_notice());
-        assert!(!parse(&["kickoutchi", "why", "3000"]).allows_update_notice());
-        assert!(parse(&["kickoutchi", "list"]).allows_update_notice());
-        assert!(!parse(&["kickoutchi", "list", "--filter", "state:listen"]).allows_update_notice());
-        assert!(parse(&["kickoutchi", "kill", "--pid", "18422"]).allows_update_notice());
     }
 
     #[test]

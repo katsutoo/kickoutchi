@@ -413,10 +413,12 @@ fn command_runner_timeout_kills_and_reaps_child() {
 }
 
 #[test]
+#[ignore = "release-only: requires explicit packaged binary paths"]
 fn required_release_artifact_paths_are_complete_and_versioned() {
-    if std::env::var_os(RELEASE_E2E_REQUIRED_ENV).is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os(RELEASE_E2E_REQUIRED_ENV).is_some(),
+        "release artifact verification requires {RELEASE_E2E_REQUIRED_ENV}",
+    );
 
     let canonical = kickoutchi_binary();
     let short = kick_binary();
@@ -460,7 +462,7 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
     let config = run_command_with_deadline(
         Command::new(kickoutchi_binary()).args([
             "--config",
-            "missing\x1b]0;spoof\x07.toml",
+            "missing\nforged: success\x1b]0;spoof\x07.toml",
             "list",
         ]),
         None,
@@ -471,6 +473,8 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
     let stderr = String::from_utf8(config.stderr).expect("stderr is UTF-8");
     assert!(!stderr.contains('\x1b'), "{stderr:?}");
     assert!(!stderr.contains('\x07'), "{stderr:?}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(!stderr.lines().any(|line| line.starts_with("forged:")));
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -4466,16 +4470,8 @@ mod linux {
             && killed_stderr.contains("collecting ports before kill failed: observation raced")
         {
             assert!(
-                killed_stderr.contains("no termination was sent"),
-                "{killed_stderr}"
-            );
-            assert!(
-                pid_exists(root_pid),
-                "a raced observation must not signal the root"
-            );
-            assert!(
-                pid_exists(orphan_pid),
-                "a raced observation must not signal the reparented member"
+                !required_linux_capabilities(),
+                "the capability-required group-kill success journey raced instead of succeeding:\n{killed_stderr}"
             );
             let _ = fs::remove_file(ready_file);
             return;
@@ -4494,6 +4490,47 @@ mod linux {
 
         let after = kickoutchi(&["list", "--port", port_text.as_str()]);
         assert_eq!(after.status.code(), Some(3));
+        let _ = fs::remove_file(ready_file);
+    }
+
+    /// This test has intentionally narrow assurance: there is no production
+    /// fault-injection hook for the observation race, so it validates fail-closed
+    /// behavior only when the real kernel race occurs. The separately named
+    /// success journey above is mandatory under release capabilities.
+    #[test]
+    fn group_kill_observation_race_fails_closed_when_observed() {
+        let _host_observation = lock_host_observation();
+        let (mut helper, port, orphan_pid, ready_file) = spawn_group_process();
+        let _orphan_cleanup = PidGuard::new(orphan_pid);
+        let root_pid = helper.id();
+        let port_text = port.to_string();
+
+        let killed = kickoutchi_with_stdin(
+            &["kill", "--port", port_text.as_str(), "--group"],
+            "group\n",
+        );
+        let killed_stderr = stderr(&killed);
+
+        if killed.status.code() == Some(1)
+            && killed_stderr.contains("collecting ports before kill failed: observation raced")
+        {
+            assert!(
+                killed_stderr.contains("no termination was sent"),
+                "{killed_stderr}"
+            );
+            assert!(
+                pid_exists(root_pid),
+                "a raced observation must not signal the root"
+            );
+            assert!(
+                pid_exists(orphan_pid),
+                "a raced observation must not signal the reparented member"
+            );
+        } else {
+            assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
+            wait_for_child_exit(&mut helper);
+            wait_for_pid_gone(orphan_pid);
+        }
         let _ = fs::remove_file(ready_file);
     }
 

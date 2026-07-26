@@ -279,8 +279,8 @@ fn destructive_socket_match(
 ///
 /// Port targets are held to a stricter rule than PID targets: a PID target has
 /// already been resolved to one verified identity, but a port target must prove
-/// that *every* holder of that endpoint is accounted for — otherwise the signal
-/// frees a port someone else is still holding.
+/// that every observable endpoint-local holder is accounted for — otherwise
+/// the signal may leave another observed holder keeping the port open.
 fn socket_authority(
     socket: &crate::observation::SocketObservation,
     target_mode: DestructiveTargetMode,
@@ -1114,6 +1114,38 @@ mod tests {
             ))
         ));
         snapshot.evidence_gaps.retain(|gap| gap.pid != Some(18_422));
+    }
+
+    #[test]
+    fn aggregate_owner_scan_loss_does_not_block_an_observable_kill_target() {
+        let mut snapshot = FakeCollector
+            .collect(MetadataProfile::Display)
+            .expect("fake collection succeeds");
+        snapshot.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                .expect("one reason fits");
+        snapshot.evidence_gaps.push(EvidenceGap::aggregate_for_pids(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerPermissionDenied,
+            None,
+            std::num::NonZeroU64::new(4_097).expect("fixture count is nonzero"),
+            "unrelated PIDs could not be inspected",
+        ));
+
+        assert!(kill_ports_from_snapshot(&snapshot, Some(18_422), None).is_ok());
+        assert!(kill_ports_from_snapshot(&snapshot, None, Some(3000)).is_ok());
+
+        snapshot.evidence_gaps.push(EvidenceGap::new(
+            EvidenceImpact::Ownership,
+            EvidenceGapCode::OwnerPermissionDenied,
+            None,
+            Some(18_422),
+            "the target PID could not be inspected",
+        ));
+        assert!(matches!(
+            kill_ports_from_snapshot(&snapshot, Some(18_422), None),
+            Err(super::CollectorError::OwnershipPermissionDenied)
+        ));
     }
 
     #[test]

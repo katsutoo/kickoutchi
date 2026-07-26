@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -360,8 +361,16 @@ enum OwnerScanLoss {
 struct OwnerScanResult {
     owners: HashMap<u64, Vec<u32>>,
     losses: BTreeSet<OwnerScanLoss>,
+    aggregate_losses: OwnerScanAggregateLosses,
     omitted_loss_count: u64,
     owner_edges: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OwnerScanAggregateLosses {
+    permission_denied: u64,
+    disappeared: u64,
+    unattributable: u64,
 }
 
 impl OwnerScanResult {
@@ -375,6 +384,125 @@ impl OwnerScanResult {
             self.omitted_loss_count = self.omitted_loss_count.saturating_add(1);
         }
     }
+
+    fn record_pid_losses(&mut self, losses: BTreeSet<OwnerScanLoss>, has_target_owner_edge: bool) {
+        for loss in losses {
+            if has_target_owner_edge {
+                self.record_loss(loss);
+                continue;
+            }
+            match loss {
+                OwnerScanLoss::PermissionDenied(_) => {
+                    self.aggregate_losses.permission_denied =
+                        self.aggregate_losses.permission_denied.saturating_add(1);
+                }
+                OwnerScanLoss::Disappeared(_) => {
+                    self.aggregate_losses.disappeared =
+                        self.aggregate_losses.disappeared.saturating_add(1);
+                }
+                OwnerScanLoss::Unattributable(_) => {
+                    self.aggregate_losses.unattributable =
+                        self.aggregate_losses.unattributable.saturating_add(1);
+                }
+                OwnerScanLoss::EnumerationIncomplete
+                | OwnerScanLoss::AncestorPidOwnersInvisible => {
+                    unreachable!("PID scan losses always carry a PID")
+                }
+            }
+        }
+    }
+}
+
+fn owner_evidence(
+    owner_scan: &OwnerScanResult,
+) -> Result<(OwnerCompleteness, Vec<EvidenceGap>, u64), CollectorError> {
+    let mut reasons = BTreeSet::new();
+    let aggregate_loss_count = [
+        owner_scan.aggregate_losses.permission_denied,
+        owner_scan.aggregate_losses.disappeared,
+        owner_scan.aggregate_losses.unattributable,
+    ]
+    .into_iter()
+    .filter(|count| *count != 0)
+    .count();
+    let mut evidence_gaps =
+        Vec::with_capacity(owner_scan.losses.len().saturating_add(aggregate_loss_count));
+    let mut omitted_evidence_gap_count = owner_scan.omitted_loss_count;
+    for loss in &owner_scan.losses {
+        let (pid, code, message) = match *loss {
+            OwnerScanLoss::EnumerationIncomplete => (
+                None,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "process visibility or enumeration was incomplete before socket ownership could be attributed",
+            ),
+            OwnerScanLoss::AncestorPidOwnersInvisible => (
+                None,
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "ancestor PID namespace processes may own sockets but are invisible to this process enumeration",
+            ),
+            OwnerScanLoss::PermissionDenied(pid) => (
+                Some(pid),
+                EvidenceGapCode::OwnerPermissionDenied,
+                "permission denied before the PID's socket ownership could be attributed",
+            ),
+            OwnerScanLoss::Disappeared(pid) => (
+                Some(pid),
+                EvidenceGapCode::OwnerDisappeared,
+                "PID disappeared before its socket ownership could be attributed",
+            ),
+            OwnerScanLoss::Unattributable(pid) => (
+                Some(pid),
+                EvidenceGapCode::OwnerAttributionIncomplete,
+                "a PID file-descriptor entry could not be attributed to a socket",
+            ),
+        };
+        reasons.insert(code);
+        let gap = EvidenceGap::new(EvidenceImpact::Ownership, code, None, pid, message);
+        if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+            evidence_gaps.push(gap);
+        } else {
+            omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
+        }
+    }
+    for (count, code, message) in [
+        (
+            owner_scan.aggregate_losses.permission_denied,
+            EvidenceGapCode::OwnerPermissionDenied,
+            "permission denied before socket ownership could be attributed for at least the reported number of PIDs",
+        ),
+        (
+            owner_scan.aggregate_losses.disappeared,
+            EvidenceGapCode::OwnerDisappeared,
+            "at least the reported number of PIDs disappeared before socket ownership could be attributed",
+        ),
+        (
+            owner_scan.aggregate_losses.unattributable,
+            EvidenceGapCode::OwnerAttributionIncomplete,
+            "file-descriptor entries for at least the reported number of PIDs could not be attributed to sockets",
+        ),
+    ] {
+        let Some(affected_pid_count) = NonZeroU64::new(count) else {
+            continue;
+        };
+        reasons.insert(code);
+        let gap = EvidenceGap::aggregate_for_pids(
+            EvidenceImpact::Ownership,
+            code,
+            None,
+            affected_pid_count,
+            message,
+        );
+        if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
+            evidence_gaps.push(gap);
+        } else {
+            omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
+        }
+    }
+    Ok((
+        OwnerCompleteness::partial(reasons)?,
+        evidence_gaps,
+        omitted_evidence_gap_count,
+    ))
 }
 
 fn native_pass_from_records(
@@ -417,46 +545,8 @@ fn native_pass_from_records(
     let ancestor_pid_owners_invisible = owner_scan
         .losses
         .contains(&OwnerScanLoss::AncestorPidOwnersInvisible);
-    let mut reasons = BTreeSet::new();
-    let mut evidence_gaps = Vec::with_capacity(owner_scan.losses.len());
-    let mut omitted_evidence_gap_count = owner_scan.omitted_loss_count;
-    for loss in owner_scan.losses {
-        let (pid, code, message) = match loss {
-            OwnerScanLoss::EnumerationIncomplete => (
-                None,
-                EvidenceGapCode::OwnerAttributionIncomplete,
-                "process visibility or enumeration was incomplete before socket ownership could be attributed",
-            ),
-            OwnerScanLoss::AncestorPidOwnersInvisible => (
-                None,
-                EvidenceGapCode::OwnerAttributionIncomplete,
-                "ancestor PID namespace processes may own sockets but are invisible to this process enumeration",
-            ),
-            OwnerScanLoss::PermissionDenied(pid) => (
-                Some(pid),
-                EvidenceGapCode::OwnerPermissionDenied,
-                "permission denied before the PID's socket ownership could be attributed",
-            ),
-            OwnerScanLoss::Disappeared(pid) => (
-                Some(pid),
-                EvidenceGapCode::OwnerDisappeared,
-                "PID disappeared before its socket ownership could be attributed",
-            ),
-            OwnerScanLoss::Unattributable(pid) => (
-                Some(pid),
-                EvidenceGapCode::OwnerAttributionIncomplete,
-                "a PID file-descriptor entry could not be attributed to a socket",
-            ),
-        };
-        reasons.insert(code);
-        let gap = EvidenceGap::new(EvidenceImpact::Ownership, code, None, pid, message);
-        if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
-            evidence_gaps.push(gap);
-        } else {
-            omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
-        }
-    }
-    let global_completeness = OwnerCompleteness::partial(reasons)?;
+    let (global_completeness, evidence_gaps, omitted_evidence_gap_count) =
+        owner_evidence(&owner_scan)?;
     // Ordinary PID/fd traversal losses have no endpoint provenance and reduce
     // only global authority. Nested PID namespaces are different: an invisible
     // ancestor-namespace process may share any socket visible in the current
@@ -469,6 +559,7 @@ fn native_pass_from_records(
     } else {
         vec![OwnerCompleteness::Complete; records.len()]
     };
+    drop(owner_scan);
     Ok(crate::observation::NativeObservationPass {
         sockets,
         owners: OwnerAssociations {
@@ -935,9 +1026,7 @@ fn collect_socket_owners_detailed(
 ) -> Result<OwnerScanResult, CollectorError> {
     let mut result = OwnerScanResult {
         owners: HashMap::with_capacity(target_inodes.len()),
-        losses: BTreeSet::new(),
-        omitted_loss_count: 0,
-        owner_edges: 0,
+        ..OwnerScanResult::default()
     };
     if proc_visibility_restricted(proc_root) {
         result.record_loss(OwnerScanLoss::EnumerationIncomplete);
@@ -1127,9 +1216,8 @@ fn collect_pid_socket_owners(
     let owner_edges = owners.values().map(Vec::len).sum();
     let mut result = OwnerScanResult {
         owners: std::mem::take(owners),
-        losses: BTreeSet::new(),
-        omitted_loss_count: 0,
         owner_edges,
+        ..OwnerScanResult::default()
     };
     let scan = scan_pid_socket_owners(
         proc_root,
@@ -1151,15 +1239,19 @@ fn scan_pid_socket_owners(
     fd_entries_visited: &mut usize,
     max_fd_entries: usize,
 ) -> Result<(), CollectorError> {
+    let owner_edges_before = result.owner_edges;
+    let mut pid_losses = BTreeSet::new();
     let fd_dir = proc_root.join(pid.to_string()).join("fd");
     let fd_entries = match fs::read_dir(&fd_dir) {
         Ok(entries) => entries,
         Err(error) if process_vanished(&error) => {
-            result.record_loss(OwnerScanLoss::Disappeared(pid));
+            pid_losses.insert(OwnerScanLoss::Disappeared(pid));
+            result.record_pid_losses(pid_losses, false);
             return Ok(());
         }
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            result.record_loss(OwnerScanLoss::PermissionDenied(pid));
+            pid_losses.insert(OwnerScanLoss::PermissionDenied(pid));
+            result.record_pid_losses(pid_losses, false);
             return Ok(());
         }
         Err(source) => {
@@ -1178,14 +1270,14 @@ fn scan_pid_socket_owners(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                result.record_loss(owner_scan_loss(pid, &error));
+                pid_losses.insert(owner_scan_loss(pid, &error));
                 continue;
             }
         };
         let target = match fs::read_link(entry.path()) {
             Ok(target) => target,
             Err(error) => {
-                result.record_loss(owner_scan_loss(pid, &error));
+                pid_losses.insert(owner_scan_loss(pid, &error));
                 continue;
             }
         };
@@ -1206,6 +1298,8 @@ fn scan_pid_socket_owners(
             result.owner_edges += 1;
         }
     }
+    let has_target_owner_edge = result.owner_edges > owner_edges_before;
+    result.record_pid_losses(pid_losses, has_target_owner_edge);
     Ok(())
 }
 
@@ -3361,7 +3455,7 @@ mod tests {
     }
 
     #[test]
-    fn unattributable_owner_scan_denial_is_global_not_socket_local() {
+    fn edge_free_owner_scan_denial_is_aggregated_not_socket_local() {
         let record = SocketRecord {
             protocol: Protocol::Tcp,
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -3370,23 +3464,22 @@ mod tests {
             timer: None,
             inode: 77,
         };
-        let pass = native_pass_from_records(
-            &[record],
-            OwnerScanResult {
-                owners: HashMap::new(),
-                losses: [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
-                omitted_loss_count: 0,
-                owner_edges: 0,
-            },
-        )
-        .expect("denied scan is retained as partial evidence");
+        let mut scan = OwnerScanResult::default();
+        scan.record_pid_losses(
+            [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
+            false,
+        );
+        let pass = native_pass_from_records(&[record], scan)
+            .expect("denied scan is retained as partial evidence");
 
         assert_eq!(
             pass.owners.global_completeness,
             OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap()
         );
         assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
-        assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
+        assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+        assert_eq!(pass.owners.evidence_gaps[0].affected_pid_count(), Some(1));
+        assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
         assert_eq!(
             pass.owners.local_completeness,
             [OwnerCompleteness::Complete]
@@ -3403,16 +3496,17 @@ mod tests {
             timer: None,
             inode: 77,
         };
-        let pass = native_pass_from_records(
-            &[record],
-            OwnerScanResult {
-                owners: HashMap::from([(77, vec![1234])]),
-                losses: [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
-                omitted_loss_count: 0,
-                owner_edges: 1,
-            },
-        )
-        .expect("proven ownership remains usable");
+        let mut scan = OwnerScanResult {
+            owners: HashMap::from([(77, vec![1234])]),
+            owner_edges: 1,
+            ..OwnerScanResult::default()
+        };
+        scan.record_pid_losses(
+            [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
+            false,
+        );
+        let pass =
+            native_pass_from_records(&[record], scan).expect("proven ownership remains usable");
 
         assert!(!pass.owners.global_completeness.is_complete());
         assert_eq!(
@@ -3422,24 +3516,62 @@ mod tests {
     }
 
     #[test]
-    fn owner_scan_losses_are_bounded_at_the_source() {
-        let mut scan = OwnerScanResult::default();
-        for pid in 1..=u32::try_from(crate::observation::EVIDENCE_GAPS_MAX).unwrap() {
-            scan.record_loss(OwnerScanLoss::Disappeared(pid));
+    fn edge_free_owner_scan_losses_aggregate_across_gap_limit_boundaries() {
+        for count in [
+            0,
+            1,
+            crate::observation::EVIDENCE_GAPS_MAX,
+            crate::observation::EVIDENCE_GAPS_MAX + 1,
+        ] {
+            let proc_root = temp_proc_root("aggregate-owner-loss-boundary");
+            for pid in 1..=count {
+                fs::create_dir(proc_root.join(pid.to_string()))
+                    .expect("fixture PID directory must be created");
+            }
+
+            let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([77]), count, 0)
+                .expect("production owner scan remains bounded");
+            let pass = native_pass_from_records(&[], scan)
+                .expect("aggregate owner losses remain representable");
+            assert_eq!(pass.owners.evidence_gaps.len(), usize::from(count != 0));
+            assert_eq!(
+                pass.owners
+                    .evidence_gaps
+                    .first()
+                    .and_then(crate::observation::EvidenceGap::affected_pid_count),
+                (count != 0).then(|| u64::try_from(count).expect("fixture count fits")),
+            );
+            assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
+            fs::remove_dir_all(proc_root).expect("test proc root must clean up");
         }
-        assert_eq!(scan.losses.len(), crate::observation::EVIDENCE_GAPS_MAX);
-        assert_eq!(scan.omitted_loss_count, 0);
+    }
 
-        scan.record_loss(OwnerScanLoss::Disappeared(u32::MAX));
-        assert_eq!(scan.losses.len(), crate::observation::EVIDENCE_GAPS_MAX);
-        assert_eq!(scan.omitted_loss_count, 1);
+    #[test]
+    fn owner_scan_loss_stays_pid_specific_after_a_target_edge_is_discovered() {
+        let proc_root = temp_proc_root("exact-owner-loss-with-edge");
+        write_process(&proc_root, 42, "worker", 1);
+        fs::write(proc_root.join("42/fd/0"), b"not a symlink")
+            .expect("unattributable fd fixture must be written");
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("42/fd/1"))
+            .expect("target socket fixture must be linked");
+        let record = SocketRecord {
+            protocol: Protocol::Tcp,
+            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            local_port: 3000,
+            state: SocketState::Listen,
+            timer: None,
+            inode: 77,
+        };
+        let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([77]), 1, 2)
+            .expect("production owner scan remains representable");
 
-        let pass = native_pass_from_records(&[], scan).expect("bounded losses remain observable");
-        assert_eq!(
-            pass.owners.evidence_gaps.len(),
-            crate::observation::EVIDENCE_GAPS_MAX
-        );
-        assert_eq!(pass.owners.omitted_evidence_gap_count, 1);
+        let pass = native_pass_from_records(&[record], scan)
+            .expect("target-relevant loss remains representable");
+        assert_eq!(pass.owners.evidence_gaps.len(), 1);
+        assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
+        assert_eq!(pass.owners.evidence_gaps[0].affected_pid_count(), None);
+        assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 
     #[test]

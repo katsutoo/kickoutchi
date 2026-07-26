@@ -511,14 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn port_filter_is_exact() {
-        let row = entry(3000, Some(1), Some("node"));
-        let view = PortEntryView::from(&row);
-        assert_eq!(view.local_port, 3000);
-        assert_ne!(view.local_port, 300);
-    }
-
-    #[test]
     fn sort_mode_labels_match_config_values() {
         assert_eq!(SortMode::Port.label(), "port");
         assert_eq!(SortMode::Pid.label(), "pid");

@@ -44,6 +44,13 @@ Completeness has distinct dimensions:
   or scope. An omitted-evidence count means additional gaps could not be retained
   within the public bound and must itself be treated as uncertainty.
 
+For a PID-scoped loss aggregated across a bounded scan, an evidence gap can carry
+a positive `affected_pid_count` while its exact `pid` remains null. Exact PID
+gaps carry `pid` and a null count. Repeated aggregate observations retain the
+maximum count rather than summing potentially overlapping PID sets, and
+`omitted_evidence_gap_count` separately counts unretained gap records rather than
+affected PIDs.
+
 `partial` preserves facts that were successfully observed but prevents stronger
 claims affected by the reported gaps. `raced` means collection changed in a way
 that makes the relevant comparison unsafe. A failed collection is an error, not

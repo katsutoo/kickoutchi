@@ -505,7 +505,7 @@ fn render_human_result(
     for gap in &result.verdict.evidence_gaps {
         writeln!(
             output,
-            "  gap code={} impact={} endpoint={} pid={} message={}",
+            "  gap code={} impact={} endpoint={} pid={} affected_pid_count={} message={}",
             evidence_gap_code_name(gap.code),
             evidence_impact_name(gap.impact),
             gap.endpoint
@@ -513,6 +513,8 @@ fn render_human_result(
                 .map_or_else(|| "-".to_owned(), endpoint_text),
             gap.pid
                 .map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+            gap.affected_pid_count()
+                .map_or_else(|| "-".to_owned(), |count| count.to_string()),
             sanitize_bounded(gap.message(), PUBLIC_MESSAGE_MAX_BYTES),
         )?;
     }
@@ -741,6 +743,7 @@ fn write_diagnostic(writer: &mut impl Write, message: &str) {
 mod tests {
     use std::collections::HashMap;
     use std::io;
+    use std::num::NonZeroU64;
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::*;
@@ -748,7 +751,7 @@ mod tests {
     use crate::labels::{LabelInput, LabelRegistry};
     use crate::observation::{
         EvidenceGap, EvidenceGapCode, EvidenceImpact, ObservationScope, ObservationScopeKind,
-        OwnerCompleteness, ScopeLimitation, SnapshotCompleteness,
+        OwnerCompleteness, ScopeLimitation, SnapshotCompleteness, SocketObservation, SocketState,
     };
     use crate::probe::ProbeOutcome;
 
@@ -1511,14 +1514,79 @@ mod tests {
         );
         assert_object_keys(
             &value["results"][0]["evidence_gaps"][0],
-            &["code", "impact", "endpoint", "pid", "message"],
+            &[
+                "code",
+                "impact",
+                "endpoint",
+                "pid",
+                "affected_pid_count",
+                "message",
+            ],
         );
+        assert!(value["results"][0]["evidence_gaps"][0]["affected_pid_count"].is_null());
         assert_eq!(value["results"][0]["omitted_evidence_gap_count"], 2);
         assert!(
             !String::from_utf8(output)
                 .expect("JSON is UTF-8")
                 .contains("command_line")
         );
+    }
+
+    #[test]
+    fn privileged_ownerless_ipv4_result_reports_one_aggregate_gap_without_omission() {
+        let mut input = args();
+        input.address = Some("127.0.0.1".to_owned());
+        input.json = true;
+        let mut runtime = FakeRuntime::new(vec![ProbeOutcome::AddressInUse]);
+        let endpoint =
+            EndpointIdentity::new(Protocol::Tcp, IpAddr::V4(Ipv4Addr::LOCALHOST), 3000, None)
+                .expect("fixture endpoint is valid");
+        runtime.snapshot.sockets.push(SocketObservation {
+            local_endpoint: endpoint,
+            state: SocketState::Listen,
+            timer: None,
+            owners: Vec::new(),
+            owner_completeness: OwnerCompleteness::Complete,
+            socket_token: None,
+        });
+        runtime.snapshot.completeness = SnapshotCompleteness::Partial;
+        runtime.snapshot.owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                .expect("one reason fits");
+        runtime
+            .snapshot
+            .evidence_gaps
+            .push(EvidenceGap::aggregate_for_pids(
+                EvidenceImpact::Ownership,
+                EvidenceGapCode::OwnerPermissionDenied,
+                None,
+                NonZeroU64::new(4_097).expect("fixture count is nonzero"),
+                "permission denied for at least the reported number of PIDs",
+            ));
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        let reason = run_why_with(
+            &input,
+            &Config::default(),
+            &mut runtime,
+            &mut output,
+            &mut diagnostics,
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("why output is valid JSON");
+        let gaps = value["results"][0]["evidence_gaps"]
+            .as_array()
+            .expect("gap array");
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(value["results"][0]["verdict"], "kernel_state_observed");
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["code"], "owner_permission_denied");
+        assert!(gaps[0]["pid"].is_null());
+        assert_eq!(gaps[0]["affected_pid_count"], 4_097);
+        assert_eq!(value["results"][0]["omitted_evidence_gap_count"], 0);
+        assert!(diagnostics.is_empty());
     }
 
     #[test]
