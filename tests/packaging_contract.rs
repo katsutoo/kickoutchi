@@ -48,4 +48,13 @@ fn every_manager_package_installs_closed_provenance() {
     assert!(release.contains("write(\\\"homebrew"));
     assert!(release.contains("brew install --formula"));
     assert!(release.contains("brew uninstall \"$name\""));
+    assert!(
+        release
+            .find("export PATH=\"/home/linuxbrew/.linuxbrew/bin:$PATH\"")
+            .expect("Homebrew path must be configured")
+            < release
+                .find("tap_path=\"$(brew --repository)")
+                .expect("canonical tap path must be discovered"),
+        "Homebrew must be on PATH before its first invocation"
+    );
 }

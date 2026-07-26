@@ -487,6 +487,11 @@ jobs:
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
 
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          export HOMEBREW_CACHE="${RUNNER_TEMP}/homebrew-cache"
+
           tap_path="$(brew --repository)/Library/Taps/nuggocto/homebrew-tap"
           mkdir -p "$(dirname "$tap_path")"
           git clone --no-hardlinks "$GITHUB_WORKSPACE" "$tap_path"
@@ -498,10 +503,6 @@ jobs:
 
             ruby -e 'path = ARGV.fetch(0); text = File.read(path); needle = "    install_binary_aliases!\n"; abort "missing unique install hook" unless text.scan(needle).length == 1; File.write(path, text.sub(needle, needle + "\n    (pkgshare/\"install-provenance\").write(\"homebrew\\n\")\n"))' "Formula/${filename}"
 
-            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-            export HOMEBREW_NO_AUTO_UPDATE=1
-            export HOMEBREW_NO_INSTALL_CLEANUP=1
-            export HOMEBREW_CACHE="${RUNNER_TEMP}/homebrew-cache"
             # We avoid reformatting user-provided data such as the app description and homepage.
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
 
