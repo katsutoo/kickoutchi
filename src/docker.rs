@@ -286,7 +286,7 @@ fn docker_command_is_elevated() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn process_is_elevated() -> bool {
+fn process_is_elevated() -> bool {
     unix_ids_are_elevated() || linux_aux_is_secure() || linux_process_has_capabilities()
 }
 

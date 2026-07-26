@@ -149,7 +149,7 @@ pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 /// permission to signal the target (same rule as `kill`), but a sandbox or
 /// seccomp policy that blocks `pidfd_open`/`pidfd_send_signal` produces the same
 /// errno. We can't tell the two apart at this layer, so the message names both.
-pub(crate) const PERMISSION_DENIED_SANDBOX_HINT: &str =
+const PERMISSION_DENIED_SANDBOX_HINT: &str =
     "a sandbox or seccomp policy blocking the pidfd syscalls can also cause this";
 
 pub(crate) fn permission_denied_hint(platform: Platform) -> &'static str {
@@ -176,7 +176,7 @@ impl KillMode {
         }
     }
 
-    pub(crate) fn signal_label(self) -> &'static str {
+    fn signal_label(self) -> &'static str {
         match self {
             Self::Terminate => "SIGTERM",
             Self::Force => "SIGKILL",
@@ -294,7 +294,7 @@ pub(crate) struct TerminationHandle {
 }
 
 impl TerminationHandle {
-    pub(crate) fn pid(&self) -> u32 {
+    fn pid(&self) -> u32 {
         self.pid
     }
 }
@@ -417,7 +417,7 @@ impl KillTarget {
             .join(", ")
     }
 
-    pub(crate) fn has_children(&self) -> bool {
+    fn has_children(&self) -> bool {
         self.child_count > 0 || self.children_truncated
     }
 
@@ -492,7 +492,7 @@ pub(crate) enum KillWarning {
 impl KillWarning {
     /// The single-kill banner wording. Tree and group surfaces rewrite the
     /// process-scope suffix through [`tree_scope_warning_text`].
-    pub(crate) fn text(&self) -> String {
+    fn text(&self) -> String {
         match self {
             Self::Protected => "protected process; stronger confirmation is required".to_owned(),
             Self::SystemProcess => {

@@ -25,16 +25,6 @@ use super::scoped::run_group_kill;
 use super::scoped::run_tree_kill;
 use super::{ExitReason, KillArgs};
 
-const KILL_AUTHORITY_PROFILE: MetadataProfile = MetadataProfile::Display;
-
-pub(super) fn collect_kill_authority_ports(
-    pid: Option<u32>,
-    port: Option<u16>,
-) -> Result<Vec<PortEntry>, collector::CollectorError> {
-    debug_assert_eq!(KILL_AUTHORITY_PROFILE, MetadataProfile::Display);
-    collector::collect_kill_ports(pid, port)
-}
-
 pub(super) fn run_kill(
     args: &KillArgs,
     config: &Config,
@@ -57,7 +47,7 @@ pub(super) fn run_kill(
         entries,
         KillCollectors {
             collect_context: platform::collect_process_context,
-            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_kill_ports: || collector::collect_kill_ports(args.pid, args.port),
             collect_visibility_ports: || {
                 collector::collect_ports_with_profile(POST_KILL_VISIBILITY_PROFILE)
             },
@@ -670,7 +660,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        KILL_AUTHORITY_PROFILE, KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX,
+        KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX,
         POST_KILL_VISIBILITY_PROFILE, PostKillPortsStatus, read_confirmation_line_from,
         resolve_kill_target, run_kill_with, wait_for_confirmed_ports_to_clear,
     };
@@ -752,8 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_collection_profiles_separate_authority_from_post_kill_visibility() {
-        assert_eq!(KILL_AUTHORITY_PROFILE, MetadataProfile::Display);
+    fn post_kill_collection_uses_the_identity_only_profile() {
         assert_eq!(POST_KILL_VISIBILITY_PROFILE, MetadataProfile::IdentityOnly);
     }
 

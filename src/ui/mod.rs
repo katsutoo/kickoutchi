@@ -437,7 +437,7 @@ fn restore_terminal_if_active() {
 /// tears down — and poof, the message is gone. Restoring first means the panic
 /// lands on the normal screen where the user can actually read it. We keep the
 /// original hook so backtraces and `RUST_BACKTRACE` still work.
-pub(crate) fn install_panic_hook() -> PanicHookGuard {
+fn install_panic_hook() -> PanicHookGuard {
     let original_hook = std::panic::take_hook();
     let original = Arc::new(OriginalPanicHook {
         hook: original_hook,

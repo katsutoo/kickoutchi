@@ -11,7 +11,7 @@ use crate::observation::{
     owner_reason_names,
 };
 
-pub(crate) const WATCH_EVENTS_PER_POLL_MAX: usize = match SOCKET_OBSERVATIONS_MAX.checked_mul(2) {
+const WATCH_EVENTS_PER_POLL_MAX: usize = match SOCKET_OBSERVATIONS_MAX.checked_mul(2) {
     Some(limit) => limit,
     None => panic!("socket observation limit cannot be doubled"),
 };

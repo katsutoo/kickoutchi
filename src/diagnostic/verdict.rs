@@ -43,7 +43,7 @@ impl Verdict {
         }
     }
 
-    pub(crate) const fn certainty(self) -> Certainty {
+    const fn certainty(self) -> Certainty {
         match self {
             Self::BindableNow
             | Self::Owned
@@ -197,7 +197,7 @@ pub(crate) fn analyze(
     }
 }
 
-pub(crate) fn relationship(
+fn relationship(
     observed: &EndpointIdentity,
     target: &EndpointIdentity,
     ipv6_mode: Ipv6Mode,

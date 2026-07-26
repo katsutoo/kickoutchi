@@ -11,7 +11,7 @@ use crate::model::Protocol;
 use crate::observation::{EndpointIdentity, Ipv6Scope};
 
 pub(crate) const LABEL_SELECTORS_MAX: usize = 256;
-pub(crate) const LABEL_TEXT_MAX_BYTES: usize = 128;
+const LABEL_TEXT_MAX_BYTES: usize = 128;
 pub(crate) const LABEL_DISPLAY_MAX_COLUMNS: usize = 32;
 pub(crate) const SELECTOR_ADDRESS_MAX_BYTES: usize = 64;
 

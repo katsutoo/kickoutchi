@@ -180,22 +180,22 @@ pub(crate) enum Command {
 pub(crate) struct InspectArgs {
     /// PID whose family to show.
     #[arg(long)]
-    pub(crate) pid: Option<u32>,
+    pid: Option<u32>,
 
     /// Show the family of the process that owns this port.
     #[arg(long, value_parser = parse_port)]
-    pub(crate) port: Option<u16>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ListArgs {
     /// Only show rows bound to this exact port.
     #[arg(long, value_parser = parse_port)]
-    pub(crate) port: Option<u16>,
+    port: Option<u16>,
 
     /// Only show rows whose process name contains this text.
     #[arg(long, value_parser = parse_process)]
-    pub(crate) process: Option<String>,
+    process: Option<String>,
 
     /// Apply plain search or structured filters (all terms must match).
     ///
@@ -203,22 +203,22 @@ pub(crate) struct ListArgs {
     /// `parent:node`, `label:web`, `address:127.0.0.1`, `scope_id:3`,
     /// `family:ipv6`. `state:` is watch-only and rejected by list.
     #[arg(long, value_name = "TEXT")]
-    pub(crate) filter: Option<String>,
+    filter: Option<String>,
 
     /// Sort rows by port, pid, protocol, process, parent, or scope.
     #[arg(long, value_name = "MODE", value_parser = parse_sort_mode)]
-    pub(crate) sort: Option<SortMode>,
+    sort: Option<SortMode>,
 
     /// Print the legacy visible-row `kickoutchi.list/1` JSON array.
     #[arg(long, conflicts_with = "snapshot_json")]
-    pub(crate) json: bool,
+    json: bool,
 
     /// Print the complete, unfiltered `kickoutchi.snapshot/1` JSON observation.
     #[arg(
         long,
         conflicts_with_all = ["json", "port", "process", "filter", "sort"]
     )]
-    pub(crate) snapshot_json: bool,
+    snapshot_json: bool,
 }
 
 /// `kill` requires exactly one target: a PID or a port. Requiring one stops
@@ -233,27 +233,27 @@ pub(crate) struct ListArgs {
 pub(crate) struct KillArgs {
     /// PID of the process to terminate.
     #[arg(long)]
-    pub(crate) pid: Option<u32>,
+    pid: Option<u32>,
 
     /// Terminate the process that owns this port.
     #[arg(long, value_parser = parse_port)]
-    pub(crate) port: Option<u16>,
+    port: Option<u16>,
 
     /// Force kill instead of normal termination where the platform supports a distinction.
     #[arg(long)]
-    pub(crate) force: bool,
+    force: bool,
 
     /// Skip the confirmation prompt. Never bypasses protected-process
     /// confirmation.
     #[arg(long)]
-    pub(crate) yes: bool,
+    yes: bool,
 
     /// Terminate the whole process tree rooted at the target, not just the one
     /// process. Opt-in; typed confirmation unless --yes passes all-clear gates.
     /// Linux, macOS, and Windows CLI only.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[arg(long)]
-    pub(crate) tree: bool,
+    tree: bool,
 
     /// Terminate the target's whole process group — every process sharing its
     /// group ID, including members that reparented away from the tree. Opt-in;
@@ -261,7 +261,7 @@ pub(crate) struct KillArgs {
     /// only.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, conflicts_with = "tree")]
-    pub(crate) group: bool,
+    group: bool,
 }
 
 /// Run a CLI command to completion and report how the process should exit.

@@ -630,7 +630,7 @@ impl App {
     /// Whether a background refresh worker is still in flight. Test-only: the
     /// status bar deliberately does not surface refresh progress to the user.
     #[cfg(test)]
-    pub(crate) fn refresh_in_progress(&self) -> bool {
+    fn refresh_in_progress(&self) -> bool {
         self.refresh_worker.is_some()
     }
 

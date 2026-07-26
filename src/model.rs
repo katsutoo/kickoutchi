@@ -13,13 +13,12 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 
 /// Transport protocol of a socket row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Protocol {
     Tcp,
     Udp,
@@ -41,8 +40,7 @@ impl Protocol {
 /// UDP socket counts when it's bound (UDP has no listen state to speak of).
 /// Showing established connections could be a later filter, but it's not part of
 /// the core model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocketState {
     Listen,
     Bound,
@@ -65,8 +63,7 @@ impl SocketState {
     dead_code,
     reason = "non-host platform variants are constructed only for their target builds"
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Platform {
     Linux,
     Windows,
@@ -80,8 +77,7 @@ pub(crate) enum Platform {
 /// races, unsupported native fields, or retention bounds. It is not proof that
 /// the operating system denied permission; structured snapshots carry the
 /// precise evidence-gap reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionStatus {
     /// Owner verification and optional process metadata were complete.
     Full,
@@ -322,7 +318,7 @@ pub(crate) struct DockerContainerPort {
 }
 
 impl DockerContainerPort {
-    pub(crate) fn stop_target(&self) -> &str {
+    fn stop_target(&self) -> &str {
         if self.name.is_empty() {
             &self.id
         } else {

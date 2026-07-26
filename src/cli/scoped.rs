@@ -24,8 +24,8 @@ use crate::tree;
 #[cfg(windows)]
 use super::kill::post_kill_refresh_status_message;
 use super::kill::{
-    KillTargetError, collect_kill_authority_ports, print_post_kill_refresh_status,
-    print_target_error, read_confirmation_line, resolve_kill_target, revalidate_cli_target,
+    KillTargetError, print_post_kill_refresh_status, print_target_error, read_confirmation_line,
+    resolve_kill_target, revalidate_cli_target,
 };
 use super::{ExitReason, KillArgs, TREE_HOST_PLATFORM};
 
@@ -109,7 +109,7 @@ pub(super) fn run_tree_kill(
         TreeKillSeams {
             collect_context: platform::collect_process_context,
             prompt: prompt_tree_confirmation,
-            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_kill_ports: || collector::collect_kill_ports(args.pid, args.port),
             collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
         },
     )
@@ -243,7 +243,7 @@ fn run_windows_tree_kill(
             collect_tree: crate::platform::windows::collect_tree_process_infos,
             collect_context: platform::collect_process_context,
             prompt: prompt_tree_confirmation,
-            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_kill_ports: || collector::collect_kill_ports(args.pid, args.port),
             collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
             prepare_root: process::prepare_termination,
             execute: crate::windows_tree::execute_tree_kill,
@@ -1545,7 +1545,7 @@ pub(super) fn run_group_kill(
         TreeKillSeams {
             collect_context: platform::collect_process_context,
             prompt: prompt_group_confirmation,
-            collect_kill_ports: || collect_kill_authority_ports(args.pid, args.port),
+            collect_kill_ports: || collector::collect_kill_ports(args.pid, args.port),
             collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
         },
     )

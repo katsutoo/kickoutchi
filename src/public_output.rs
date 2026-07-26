@@ -6,13 +6,13 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
+use thiserror::Error;
 
 use crate::diagnostic::verdict::{Evidence, EvidenceCode, EvidenceSource};
 use crate::display::sanitize_bounded;
@@ -75,14 +75,21 @@ impl Serialize for LegacyListRecord<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(crate) enum PublicOutputError {
-    Io(io::Error),
-    Serialization(serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error("wall clock is unavailable")]
     ClockUnavailable,
+    #[error("capture completion precedes capture start")]
     InvalidWallClockInterval,
+    #[error("public count exceeds the u64 domain")]
     CountOutOfRange,
+    #[error("owner completeness reason limit exceeded")]
     OwnerReasonLimitExceeded,
+    #[error("invalid native timer state")]
     InvalidTimer,
 }
 
@@ -97,50 +104,6 @@ impl PublicOutputError {
             | Self::OwnerReasonLimitExceeded
             | Self::InvalidTimer => None,
         }
-    }
-}
-
-impl fmt::Display for PublicOutputError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => error.fmt(formatter),
-            Self::Serialization(error) => error.fmt(formatter),
-            Self::ClockUnavailable => formatter.write_str("wall clock is unavailable"),
-            Self::InvalidWallClockInterval => {
-                formatter.write_str("capture completion precedes capture start")
-            }
-            Self::CountOutOfRange => formatter.write_str("public count exceeds the u64 domain"),
-            Self::OwnerReasonLimitExceeded => {
-                formatter.write_str("owner completeness reason limit exceeded")
-            }
-            Self::InvalidTimer => formatter.write_str("invalid native timer state"),
-        }
-    }
-}
-
-impl std::error::Error for PublicOutputError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Serialization(error) => Some(error),
-            Self::ClockUnavailable
-            | Self::InvalidWallClockInterval
-            | Self::CountOutOfRange
-            | Self::OwnerReasonLimitExceeded
-            | Self::InvalidTimer => None,
-        }
-    }
-}
-
-impl From<io::Error> for PublicOutputError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<serde_json::Error> for PublicOutputError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Serialization(error)
     }
 }
 
@@ -798,10 +761,7 @@ fn owner_completeness_parts(
     }
 }
 
-pub(crate) fn compare_process_identity(
-    left: &ProcessIdentity,
-    right: &ProcessIdentity,
-) -> Ordering {
+fn compare_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> Ordering {
     left.pid
         .cmp(&right.pid)
         .then_with(|| compare_process_marker(left.start_marker, right.start_marker))
@@ -819,10 +779,7 @@ fn process_marker_key(marker: ProcessStartMarker) -> (u8, u64, u32) {
     }
 }
 
-pub(crate) fn compare_owner_observation(
-    left: &OwnerObservation,
-    right: &OwnerObservation,
-) -> Ordering {
+fn compare_owner_observation(left: &OwnerObservation, right: &OwnerObservation) -> Ordering {
     owner_kind_key(left)
         .cmp(&owner_kind_key(right))
         .then_with(|| owner_pid(left).cmp(&owner_pid(right)))
@@ -856,7 +813,7 @@ fn owner_reason(owner: &OwnerObservation) -> &'static str {
     }
 }
 
-pub(crate) fn compare_socket_token(
+fn compare_socket_token(
     left: Option<PlatformSocketToken>,
     right: Option<PlatformSocketToken>,
 ) -> Ordering {
@@ -1017,7 +974,7 @@ const fn permission_name(permission: PermissionStatus) -> &'static str {
     }
 }
 
-pub(crate) const fn timer_kind_name(kind: TcpTimerKind) -> &'static str {
+const fn timer_kind_name(kind: TcpTimerKind) -> &'static str {
     match kind {
         TcpTimerKind::None => "none",
         TcpTimerKind::Retransmit => "retransmit",
@@ -1028,7 +985,7 @@ pub(crate) const fn timer_kind_name(kind: TcpTimerKind) -> &'static str {
     }
 }
 
-pub(crate) const fn unverified_owner_reason_name(reason: UnverifiedOwnerReason) -> &'static str {
+const fn unverified_owner_reason_name(reason: UnverifiedOwnerReason) -> &'static str {
     match reason {
         UnverifiedOwnerReason::PermissionDenied => "owner_permission_denied",
         UnverifiedOwnerReason::Disappeared => "owner_disappeared",
@@ -1105,7 +1062,7 @@ pub(crate) const fn owner_completeness_name(completeness: &OwnerCompleteness) ->
     }
 }
 
-pub(crate) const fn metadata_completeness_name(completeness: MetadataCompleteness) -> &'static str {
+const fn metadata_completeness_name(completeness: MetadataCompleteness) -> &'static str {
     match completeness {
         MetadataCompleteness::Complete => "complete",
         MetadataCompleteness::Partial => "partial",

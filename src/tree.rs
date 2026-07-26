@@ -309,11 +309,11 @@ pub(crate) fn pin_root_before_revalidation<Ops: TreeProcessOps>(
 pub(crate) struct ProcessTreeNode {
     pub(crate) pid: u32,
     pub(crate) parent_pid: Option<u32>,
-    pub(crate) parent_process_name: Option<String>,
+    parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
     pub(crate) owner_uid: Option<u32>,
     pub(crate) protected: bool,
-    pub(crate) system_process: bool,
+    system_process: bool,
     pub(crate) depth: usize,
 }
 
@@ -416,7 +416,7 @@ impl ProcessTreeTarget {
 
     /// Protected descendants (never the root). v1 refuses the whole tree if any
     /// exist, so the caller only needs the first.
-    pub(crate) fn protected_descendants(&self) -> impl Iterator<Item = &ProcessTreeNode> {
+    fn protected_descendants(&self) -> impl Iterator<Item = &ProcessTreeNode> {
         self.nodes
             .iter()
             .filter(|node| node.depth > 0 && node.protected)
@@ -425,7 +425,7 @@ impl ProcessTreeTarget {
     /// The first node whose PID is an unsafe target (0, 1, or Kickoutchi
     /// itself). The root is already blocked at resolution; this guards
     /// descendants such as Kickoutchi appearing inside its own target's tree.
-    pub(crate) fn first_unsafe_node(&self) -> Option<&ProcessTreeNode> {
+    fn first_unsafe_node(&self) -> Option<&ProcessTreeNode> {
         self.nodes
             .iter()
             .find(|node| unsafe_pid_reason(node.pid).is_some())

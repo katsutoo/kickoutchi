@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parser tests so its settings and endpoint-label examples cannot drift from the
   accepted schema.
 
+### Changed
+
+- Simplified internal maintenance code without changing public behavior: workflow
+  security contracts now traverse parsed YAML instead of a handwritten
+  indentation reader, public-output errors share one typed implementation, and
+  unnecessary crate-wide visibility, serialization implementations, and stale
+  license allowances were removed.
+
 ## [1.3.6] - 2026-07-26
 
 ### Added

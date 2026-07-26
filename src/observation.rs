@@ -76,11 +76,11 @@ pub(crate) const OWNER_EDGES_MAX: usize = 262_144;
 ///
 /// The pair exists so one pathological attempt cannot spend the whole budget
 /// and starve the retry. Both fail closed.
-pub(crate) const PROCESS_IDENTITY_READS_PER_ATTEMPT_MAX: usize = 262_144;
-pub(crate) const PROCESS_IDENTITY_READS_TOTAL_MAX: usize = 524_288;
+const PROCESS_IDENTITY_READS_PER_ATTEMPT_MAX: usize = 262_144;
+const PROCESS_IDENTITY_READS_TOTAL_MAX: usize = 524_288;
 
 /// Rows the legacy `PortEntry` projection may emit. Fails closed.
-pub(crate) const DERIVED_PORT_ENTRIES_MAX: usize = 262_144;
+const DERIVED_PORT_ENTRIES_MAX: usize = 262_144;
 
 /// Owners serialized per owner set; the remainder becomes
 /// `omitted_owner_count`. Degrades, because the count keeps the omission
@@ -123,7 +123,7 @@ pub(crate) const PROTECTION_SCOPE_MAX_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// Two, not "until stable": a host whose socket table never settles must
 /// surface that fact, not spin until it happens to agree with itself.
-pub(crate) const CONSISTENCY_ATTEMPTS_MAX: usize = 2;
+const CONSISTENCY_ATTEMPTS_MAX: usize = 2;
 
 /// Retries when a native API reports that its output buffer grew between the
 /// size query and the read. Fails closed after the third attempt.
@@ -161,7 +161,7 @@ pub(crate) struct ObservationLimits {
 }
 
 impl ObservationLimits {
-    pub(crate) const PRODUCTION: Self = Self {
+    const PRODUCTION: Self = Self {
         sockets: SOCKET_OBSERVATIONS_MAX,
         candidate_pids: CANDIDATE_PROCESS_IDS_MAX,
         owner_edges: OWNER_EDGES_MAX,
@@ -514,7 +514,7 @@ impl EvidenceGapCode {
         }
     }
 
-    pub(crate) const fn name_order(self) -> u8 {
+    const fn name_order(self) -> u8 {
         match self {
             Self::NativeFieldUnavailable => 0,
             Self::NoncriticalEvidenceTruncated => 1,
@@ -909,7 +909,7 @@ pub(crate) fn snapshot_from_test_rows(rows: Vec<PortEntry>) -> NetworkSnapshot {
 pub(crate) struct PortEntryDescriptor {
     socket_index: u32,
     owner_index: u32,
-    pub(crate) protected: bool,
+    protected: bool,
 }
 
 impl NetworkSnapshot {

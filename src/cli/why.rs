@@ -38,11 +38,11 @@ pub(crate) struct WhyArgs {
 
     /// Evaluate TCP only (default; ordered before UDP in a matrix).
     #[arg(long, conflicts_with_all = ["udp", "all_protocols"])]
-    pub(crate) tcp: bool,
+    tcp: bool,
 
     /// Evaluate UDP endpoints only.
     #[arg(long, conflicts_with_all = ["tcp", "all_protocols"])]
-    pub(crate) udp: bool,
+    udp: bool,
 
     /// Evaluate TCP then UDP endpoints.
     #[arg(long, conflicts_with_all = ["tcp", "udp"])]
@@ -50,7 +50,7 @@ pub(crate) struct WhyArgs {
 
     /// Evaluate one literal local IP address (no `%zone`; use --scope-id).
     #[arg(long, value_name = "ADDRESS", conflicts_with = "all_addresses")]
-    pub(crate) address: Option<String>,
+    address: Option<String>,
 
     /// Use `127.0.0.1`, `0.0.0.0`, `::1`, then `::`; do not enumerate interfaces.
     #[arg(long, conflicts_with = "address")]
@@ -58,15 +58,15 @@ pub(crate) struct WhyArgs {
 
     /// Nonzero IPv6 interface index; requires one explicit IPv6 --address.
     #[arg(long, value_name = "ID")]
-    pub(crate) scope_id: Option<u32>,
+    scope_id: Option<u32>,
 
     /// Require IPv6-only behavior; valid only when every address is IPv6.
     #[arg(long, conflicts_with = "dual_stack")]
-    pub(crate) ipv6_only: bool,
+    ipv6_only: bool,
 
     /// Require dual-stack behavior; valid only when every address is IPv6.
     #[arg(long, conflicts_with = "ipv6_only")]
-    pub(crate) dual_stack: bool,
+    dual_stack: bool,
 
     /// Explicitly enable address reuse for the diagnostic bind.
     #[arg(long)]
@@ -197,7 +197,7 @@ fn run_why_with(
 
     let aggregate = aggregate_exit(completed.iter().map(|result| result.verdict.verdict));
     match render_document(output, &options, &snapshot, &completed)
-        .and_then(|()| output.flush().map_err(OutputError::from))
+        .and_then(|()| output.flush().map_err(PublicOutputError::from))
     {
         Ok(()) => aggregate,
         Err(error) if error.io_error_kind() == Some(ErrorKind::BrokenPipe) => aggregate,
@@ -364,7 +364,7 @@ fn render_document(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
-) -> Result<(), OutputError> {
+) -> Result<(), PublicOutputError> {
     if options.json {
         render_json(output, options, snapshot, results)
     } else {
@@ -377,7 +377,7 @@ fn render_json(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
-) -> Result<(), OutputError> {
+) -> Result<(), PublicOutputError> {
     let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
     let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
     let dto = WhyDto {
@@ -391,8 +391,8 @@ fn render_json(
         results: ResultSequence(results),
         aggregate_exit_code: aggregate as u8,
     };
-    serde_json::to_writer_pretty(&mut *output, &dto).map_err(OutputError::Serialization)?;
-    output.write_all(b"\n").map_err(OutputError::from)
+    serde_json::to_writer_pretty(&mut *output, &dto)?;
+    output.write_all(b"\n").map_err(PublicOutputError::from)
 }
 
 fn render_human(
@@ -400,7 +400,7 @@ fn render_human(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
-) -> Result<(), OutputError> {
+) -> Result<(), PublicOutputError> {
     let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
     let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
     writeln!(
@@ -457,7 +457,7 @@ fn render_human(
 fn render_human_result(
     output: &mut impl Write,
     result: &CompletedResult,
-) -> Result<(), OutputError> {
+) -> Result<(), PublicOutputError> {
     writeln!(
         output,
         "{} verdict={} certainty={} label={}",
@@ -688,45 +688,6 @@ const fn ipv6_mode_name(mode: Ipv6Mode) -> &'static str {
         Ipv6Mode::SystemDefault => "system_default",
         Ipv6Mode::V6Only => "v6_only",
         Ipv6Mode::DualStack => "dual_stack",
-    }
-}
-
-#[derive(Debug)]
-enum OutputError {
-    Io(io::Error),
-    Serialization(serde_json::Error),
-    Public(PublicOutputError),
-}
-
-impl OutputError {
-    fn io_error_kind(&self) -> Option<ErrorKind> {
-        match self {
-            Self::Io(error) => Some(error.kind()),
-            Self::Serialization(error) => error.io_error_kind(),
-            Self::Public(error) => error.io_error_kind(),
-        }
-    }
-}
-
-impl std::fmt::Display for OutputError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => error.fmt(formatter),
-            Self::Serialization(error) => error.fmt(formatter),
-            Self::Public(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl From<io::Error> for OutputError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<PublicOutputError> for OutputError {
-    fn from(error: PublicOutputError) -> Self {
-        Self::Public(error)
     }
 }
 
