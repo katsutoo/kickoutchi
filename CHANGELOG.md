@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The foreground update check explicitly releases its cache lock before
   spawning the detached worker, preserving the worker's bounded lock-acquisition
   contract under load.
+- macOS release journeys now validate bounded collection gaps when host socket
+  visibility becomes partial after a valid watch baseline, matching the same
+  fail-closed behavior already accepted before baseline publication.
 
 ## [1.3.1] - 2026-07-26
 

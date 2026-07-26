@@ -678,6 +678,36 @@ mod portable_native {
         WatchOutcome::PartialSocketSet
     }
 
+    #[cfg(target_os = "macos")]
+    fn partial_socket_set_after_baseline(
+        status: std::process::ExitStatus,
+        stderr: &[u8],
+        records: &[serde_json::Value],
+    ) -> Option<WatchOutcome> {
+        if status.code() != Some(1) {
+            return None;
+        }
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(stderr));
+        assert_eq!(records.len(), 4, "{records:#?}");
+        assert_eq!(records[0]["event"], "baseline");
+        for (index, record) in records.iter().skip(1).enumerate() {
+            assert_eq!(record["event"], "collection_gap", "{records:#?}");
+            assert_eq!(
+                record["data"]["consecutive_failures"],
+                u64::try_from(index + 1).unwrap(),
+                "{records:#?}"
+            );
+            assert!(
+                matches!(
+                    record["data"]["error"]["code"].as_str(),
+                    Some("partial_socket_set" | "observation_raced")
+                ),
+                "{records:#?}"
+            );
+        }
+        Some(WatchOutcome::PartialSocketSet)
+    }
+
     fn run_with_binary(
         binary: impl AsRef<OsStr>,
         config: &ConfigGuard,
@@ -815,14 +845,22 @@ mod portable_native {
         let mut lines = vec![baseline];
         lines.extend(receiver.into_iter().collect::<Result<Vec<_>, _>>().unwrap());
         stdout_reader.join().expect("watch stdout reader must join");
-        assert_eq!(status.code(), Some(0));
+        let records = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("watch line must be JSON"))
+            .collect::<Vec<_>>();
+        #[cfg(target_os = "macos")]
+        if let Some(outcome) = partial_socket_set_after_baseline(status, &stderr, &records) {
+            return outcome;
+        }
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{}; records: {records:#?}",
+            String::from_utf8_lossy(&stderr)
+        );
         assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-        WatchOutcome::Events(
-            lines
-                .iter()
-                .map(|line| serde_json::from_str(line).expect("watch line must be JSON"))
-                .collect(),
-        )
+        WatchOutcome::Events(records)
     }
 
     fn watch_release_attempt() -> (u16, WatchOutcome) {
@@ -840,16 +878,17 @@ mod portable_native {
     /// macOS collection is process-first through `libproc`, so a SIP-protected
     /// process holding a socket makes the machine-wide observation partial even
     /// under `sudo`. `watch` then refuses to publish a baseline it cannot vouch
-    /// for. That refusal is the designed behavior, not a defect, and no retry
-    /// budget can make a shared runner stop running protected processes.
+    /// for, or emits bounded collection gaps when the loss begins after a valid
+    /// baseline. Those refusals are the designed behavior, not defects, and no
+    /// retry budget can make a shared runner stop running protected processes.
     ///
     /// So both outcomes are asserted rather than one being demanded:
-    /// [`partial_socket_set_outcome`] pins the refusal contract on every partial
-    /// attempt — exit code 1, that exact stderr, and no emitted records — and
-    /// the caller pins the baseline and release contract whenever a complete
-    /// observation arrives. A regression cannot hide in the partial path: it
-    /// would have to reproduce that exact triple, which is the same evidence a
-    /// genuine partial observation produces.
+    /// [`partial_socket_set_outcome`] pins refusal before the baseline, while
+    /// [`partial_socket_set_after_baseline`] pins the baseline and three bounded
+    /// gap records when visibility is lost later. The caller pins the baseline
+    /// and release contract whenever complete observations arrive. A regression
+    /// cannot hide in either partial path because each exact public contract is
+    /// asserted.
     ///
     /// The attempts remain because a complete observation asserts strictly more.
     /// They exist to prefer the richer assertion, not to retry a failure into a
