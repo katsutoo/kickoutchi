@@ -6,8 +6,6 @@ use ratatui::text::{Line, Span};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use ratatui::widgets::Wrap;
 use ratatui::widgets::{Block, Clear, Paragraph};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::{self, App, KillConfirmation};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -17,6 +15,8 @@ use crate::process::ConfirmationRequirement;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::tree_scope_warning_text;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::wrapped_rows;
 use super::{field, theme::Theme};
 
 /// Ceiling on the node preview inside the tree confirmation modal. The actual
@@ -25,11 +25,6 @@ use super::{field, theme::Theme};
 /// below the fold — a confirmation must not accept input it is not showing.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TREE_MODAL_PREVIEW_MAX: usize = 8;
-
-/// Floor on the node preview: the root row always shows, however small the
-/// modal gets.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const TREE_MODAL_PREVIEW_MIN: usize = 1;
 
 pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let content_rows = usize::from(area.height.saturating_sub(2));
@@ -56,19 +51,32 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 /// Render the tree-kill confirmation modal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn render_tree(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+pub(crate) fn render_tree(frame: &mut Frame, area: Rect, app: &App, theme: Theme) -> bool {
     // Rows available inside the borders drive the preview budget, so the
     // prompt block stays visible at every supported terminal size.
     let content_rows = usize::from(area.height.saturating_sub(2));
     let content_cols = usize::from(area.width.saturating_sub(2));
     let lines = app.tree_confirmation().map_or_else(
         || {
-            vec![Line::styled(
+            Some(vec![Line::styled(
                 "No tree termination target selected.",
                 theme.muted(),
-            )]
+            )])
         },
         |confirmation| tree_confirmation_lines(confirmation, theme, content_rows, content_cols),
+    );
+    let (lines, actionable) = lines.map_or_else(
+        || {
+            (
+                vec![
+                    Line::styled("Confirmation unavailable", theme.warning()),
+                    Line::raw("The terminal cannot show every warning and confirmation field."),
+                    Line::raw("Enlarge the terminal and request the tree operation again."),
+                ],
+                false,
+            )
+        },
+        |lines| (lines, true),
     );
 
     let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
@@ -79,6 +87,7 @@ pub(crate) fn render_tree(frame: &mut Frame, area: Rect, app: &App, theme: Theme
     );
     frame.render_widget(Clear, area);
     frame.render_widget(modal, area);
+    actionable
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -87,8 +96,8 @@ fn tree_confirmation_lines(
     theme: Theme,
     content_rows: usize,
     content_cols: usize,
-) -> Vec<Line<'static>> {
-    let preview_budget = tree_preview_budget(confirmation, content_rows, content_cols);
+) -> Option<Vec<Line<'static>>> {
+    let preview_budget = tree_preview_budget(confirmation, content_rows, content_cols)?;
     let mut lines = vec![
         Line::styled(tree_header_text(confirmation), theme.title()),
         field(
@@ -118,11 +127,9 @@ fn tree_confirmation_lines(
                 theme,
             ));
             for node in preview.preview_nodes(preview_budget) {
-                let indent = "  ".repeat(node.depth + 1);
-                let name = sanitize(node.process_name.as_deref().unwrap_or("<unknown>"));
-                lines.push(Line::raw(format!("{indent}PID {} ({name})", node.pid)));
+                lines.push(Line::raw(tree_node_text(node)));
             }
-            if preview.len() > preview_budget {
+            if preview_budget > 0 && preview.len() > preview_budget {
                 lines.push(Line::raw(format!(
                     "  ... and {} more",
                     preview.len() - preview_budget,
@@ -170,46 +177,43 @@ fn tree_confirmation_lines(
         Span::raw(" cancels."),
     ]));
 
-    lines
+    Some(lines)
 }
 
-/// How many preview node rows fit once every other line of the modal is
-/// accounted for. Counts the same lines `tree_confirmation_lines` emits —
-/// header, ports, scope, the "... and N more" reserve, warnings, and the
-/// blank/instruction/input/error/Esc block — and gives the preview whatever
-/// remains, clamped to `[TREE_MODAL_PREVIEW_MIN, TREE_MODAL_PREVIEW_MAX]`.
+/// How many preview nodes fit once every rendered row outside the preview is
+/// accounted for. Node names are charged by wrapped terminal height rather
+/// than logical line count, so a long name cannot push the actionable prompt
+/// below the modal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tree_preview_budget(
     confirmation: &TreeKillConfirmation,
     content_rows: usize,
     content_cols: usize,
-) -> usize {
+) -> Option<usize> {
     let preview_overhead = match &confirmation.preview {
         // Loading state renders one placeholder line and no nodes.
         None => wrapped_rows("Enumerating the process tree...", content_cols),
         Some(preview) => {
-            // Scope line, a reserved "... and N more" row, and the
-            // scoped preview warnings when they apply.
+            // Scope and scoped preview warnings when they apply. Preview nodes
+            // and the omitted-count line are budgeted below.
             wrapped_rows(
                 &format!("Scope: tree ({} processes)", preview.len()),
                 content_cols,
-            ) + 1
-                + if preview.has_system_process() {
-                    wrapped_rows(
-                        "Warning: tree includes system/service processes; verify this is safe to terminate.",
-                        content_cols,
-                    )
-                } else {
-                    0
-                }
-                + if preview.has_owner_mismatch() {
-                    wrapped_rows(
-                        "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
-                        content_cols,
-                    )
-                } else {
-                    0
-                }
+            ) + if preview.has_system_process() {
+                wrapped_rows(
+                    "Warning: tree includes system/service processes; verify this is safe to terminate.",
+                    content_cols,
+                )
+            } else {
+                0
+            } + if preview.has_owner_mismatch() {
+                wrapped_rows(
+                    "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
+                    content_cols,
+                )
+            } else {
+                0
+            }
         }
     };
     let force_warning_rows = confirmation
@@ -247,18 +251,44 @@ fn tree_preview_budget(
         + input_rows
         + error_rows
         + wrapped_rows("Esc cancels.", content_cols);
-    content_rows
-        .saturating_sub(fixed_rows)
-        .clamp(TREE_MODAL_PREVIEW_MIN, TREE_MODAL_PREVIEW_MAX)
+    let available_rows = content_rows.checked_sub(fixed_rows)?;
+    let Some(preview) = confirmation.preview.as_ref() else {
+        return Some(0);
+    };
+    let max_nodes = preview.len().min(TREE_MODAL_PREVIEW_MAX);
+    let mut rendered_node_rows = 0;
+    let mut fitting_nodes = 0;
+    for (index, node) in preview.preview_nodes(max_nodes).iter().enumerate() {
+        rendered_node_rows += wrapped_rows(&tree_node_text(node), content_cols);
+        let count = index + 1;
+        let omitted_rows = if preview.len() > count {
+            wrapped_rows(
+                &format!("  ... and {} more", preview.len() - count),
+                content_cols,
+            )
+        } else {
+            0
+        };
+        if rendered_node_rows + omitted_rows > available_rows {
+            break;
+        }
+        fitting_nodes = count;
+    }
+    Some(fitting_nodes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_node_text(node: &crate::tree::ProcessTreeNode) -> String {
+    let indent = "  ".repeat(node.depth + 1);
+    let name = sanitize(node.process_name.as_deref().unwrap_or("<unknown>"));
+    format!("{indent}PID {} ({name})", node.pid)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tree_header_text(confirmation: &TreeKillConfirmation) -> String {
     format!(
         "{} process tree from {}",
-        confirmation
-            .mode
-            .action_label_for(confirmation.target.platform),
+        confirmation.mode.action_label(),
         confirmation.target.identity(),
     )
 }
@@ -282,52 +312,6 @@ fn tree_instruction_text(confirmation: &TreeKillConfirmation) -> String {
                 .delivery_label(confirmation.target.platform),
         ),
     }
-}
-
-/// Upper-bound row count for one logical line under the modal's
-/// `Wrap { trim: false }` word wrapping.
-///
-/// `ceil(chars / cols)` is only a lower bound: word wrapping pushes a word
-/// that does not fit onto the next row, so the columns wasted at each break
-/// can add rows — three 11-column words at 20 columns take three rows, not
-/// two. This walks the same greedy model (words fill a row until the next
-/// word no longer fits; a word wider than the modal hard-breaks), measured
-/// in terminal columns so double-width names count honestly. Where this
-/// model and the widget could disagree, the accounting rounds up: an
-/// overcount only shrinks the node preview, an undercount would push the
-/// prompt below the fold.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn wrapped_rows(text: &str, content_cols: usize) -> usize {
-    let cols = content_cols.max(1);
-    let mut rows: usize = 1;
-    let mut used_cols: usize = 0;
-    let mut first_word = true;
-
-    for word in text.split(' ') {
-        // Every split boundary is exactly one space; it travels with the
-        // word it precedes, so runs of spaces keep their full width.
-        let separator_cols = usize::from(!first_word);
-        first_word = false;
-        let word_cols = word.width();
-        if used_cols + separator_cols + word_cols <= cols {
-            used_cols += separator_cols + word_cols;
-            continue;
-        }
-        if used_cols > 0 {
-            rows += 1;
-        }
-        if word_cols <= cols {
-            used_cols = word_cols;
-        } else {
-            // Hard break: charge full rows and treat the last one as spent,
-            // which rounds up instead of tracking the exact remainder.
-            rows += word_cols.div_ceil(cols) - 1;
-            used_cols = cols;
-        }
-    }
-
-    // The character mass is a hard floor however the breaks land.
-    rows.max(text.width().div_ceil(cols)).max(1)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -395,9 +379,7 @@ fn confirmation_lines(
         Line::styled(
             format!(
                 "{} {}",
-                confirmation
-                    .mode
-                    .action_label_for(confirmation.target.platform),
+                confirmation.mode.action_label(),
                 confirmation.target.identity(),
             ),
             theme.title(),
@@ -452,10 +434,7 @@ fn instruction_line(confirmation: &KillConfirmation, theme: Theme) -> Line<'stat
             Span::styled("y", theme.key()),
             Span::raw(format!(
                 " confirms {}. ",
-                confirmation
-                    .mode
-                    .action_label_for(confirmation.target.platform)
-                    .to_ascii_lowercase(),
+                confirmation.mode.action_label().to_ascii_lowercase(),
             )),
             Span::styled("n", theme.key()),
             Span::raw(" cancels."),
@@ -492,6 +471,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::confirmation_lines;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::wrapped_rows;
     use crate::app::KillConfirmation;
     use crate::model::{
         PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
@@ -602,6 +583,7 @@ mod tests {
         // A tall modal: the preview budget is not the constraint here.
         let render = |confirmation: &TreeKillConfirmation| {
             tree_confirmation_lines(confirmation, Theme::from_environment(), 40, 100)
+                .expect("mandatory confirmation rows fit")
                 .into_iter()
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>()
@@ -719,11 +701,15 @@ mod tests {
         // 80x20 terminal, 76% modal height = 15 rows, minus borders = 13.
         let content_rows = 13;
         let lines =
-            tree_confirmation_lines(&confirmation, Theme::from_environment(), content_rows, 78);
+            tree_confirmation_lines(&confirmation, Theme::from_environment(), content_rows, 78)
+                .expect("mandatory confirmation rows fit");
+        let rendered_rows = lines
+            .iter()
+            .map(|line| wrapped_rows(&line.to_string(), 78))
+            .sum::<usize>();
         assert!(
-            lines.len() <= content_rows,
-            "modal emits {} lines for {content_rows} rows",
-            lines.len(),
+            rendered_rows <= content_rows,
+            "modal emits {rendered_rows} rendered rows for {content_rows} rows",
         );
         let text = lines
             .into_iter()
@@ -751,11 +737,133 @@ mod tests {
         assert_eq!(wrapped_rows("aaaaaaaaaaa bbbbbbbbbbb ccccccccccc", 20), 3);
         // Double-width names occupy two columns per char.
         assert_eq!(wrapped_rows("数据库数据库", 6), 2);
+        // Unicode em spaces are word boundaries and consume a terminal column;
+        // treating only ASCII space as a separator undercounts this as two rows.
+        assert_eq!(wrapped_rows("aaaa\u{2003}aaaa\u{2003}aaaa", 8), 3);
         // A single word wider than the modal hard-breaks across rows.
         assert_eq!(wrapped_rows(&"x".repeat(45), 20), 3);
         // Boundary cases keep the one-row floor.
         assert_eq!(wrapped_rows("", 20), 1);
         assert_eq!(wrapped_rows("short", 20), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_confirmation_refuses_when_all_mandatory_warnings_cannot_fit() {
+        use super::tree_confirmation_lines;
+        use crate::app::{TreeConfirmStage, TreeKillConfirmation};
+
+        let mut crowded_target = target(true);
+        crowded_target.process_name =
+            Some("service\u{2003}with\u{2003}unicode\u{2003}spaces".to_owned());
+        crowded_target.system_process = true;
+        crowded_target.permission = PermissionStatus::Partial;
+        // SAFETY: geteuid has no preconditions and only reads credentials.
+        crowded_target.owner_uid = Some(unsafe { libc::geteuid() }.wrapping_add(1));
+        crowded_target.child_count = 12;
+        crowded_target.children_truncated = true;
+        let infos = [crate::tree::TreeProcessInfo {
+            pid: 18422,
+            parent_pid: Some(1),
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: crowded_target.process_name.clone(),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
+            owner_uid: crowded_target.owner_uid,
+            process_group: None,
+        }];
+        let confirmation = TreeKillConfirmation {
+            target: crowded_target,
+            mode: KillMode::Force,
+            preview: Some(
+                crate::tree::plan_process_tree(
+                    18422,
+                    &infos,
+                    &[],
+                    crate::model::Platform::Linux,
+                    256,
+                )
+                .expect("preview must build"),
+            ),
+            stage: TreeConfirmStage::ProtectedRoot,
+            input: "184".to_owned(),
+            error: Some("type the complete protected process identity".to_owned()),
+        };
+
+        assert!(
+            tree_confirmation_lines(&confirmation, Theme::from_environment(), 13, 58,).is_none(),
+            "an overfull mandatory block must not remain actionable",
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tree_preview_budgets_wrapped_node_names_by_rendered_height() {
+        use super::{tree_confirmation_lines, wrapped_rows};
+        use crate::app::{TreeConfirmStage, TreeKillConfirmation};
+
+        let mut infos = vec![crate::tree::TreeProcessInfo {
+            pid: 18422,
+            parent_pid: Some(500),
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("root with a name that wraps over several rows".to_owned()),
+            start_time_marker: crate::observation::ProcessStartMarker::linux(55).ok(),
+            owner_uid: None,
+            process_group: None,
+        }];
+        for pid in 18430..18440 {
+            infos.push(crate::tree::TreeProcessInfo {
+                pid,
+                parent_pid: Some(18422),
+                unverified_parent_pid: None,
+                parent_process_name: None,
+                process_name: Some("worker with a name that also wraps repeatedly".to_owned()),
+                start_time_marker: crate::observation::ProcessStartMarker::linux(u64::from(pid))
+                    .ok(),
+                owner_uid: None,
+                process_group: None,
+            });
+        }
+        let confirmation = TreeKillConfirmation {
+            target: target(false),
+            mode: KillMode::Force,
+            preview: Some(
+                crate::tree::plan_process_tree(
+                    18422,
+                    &infos,
+                    &[],
+                    crate::model::Platform::Linux,
+                    256,
+                )
+                .expect("preview must build"),
+            ),
+            stage: TreeConfirmStage::Word,
+            input: "for".to_owned(),
+            error: None,
+        };
+
+        let content_rows = 18;
+        let lines =
+            tree_confirmation_lines(&confirmation, Theme::from_environment(), content_rows, 32)
+                .expect("mandatory confirmation rows fit");
+        let rendered_rows = lines
+            .iter()
+            .map(|line| wrapped_rows(&line.to_string(), 32))
+            .sum::<usize>();
+        let text = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered_rows <= content_rows,
+            "{rendered_rows} rows:\n{text}"
+        );
+        assert!(text.contains("Type force"), "{text}");
+        assert!(text.contains("Input: for"), "{text}");
+        assert!(text.contains("Esc cancels."), "{text}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -773,7 +881,8 @@ mod tests {
             error: None,
         };
 
-        let lines = tree_confirmation_lines(&confirmation, Theme::from_environment(), 10, 32);
+        let lines = tree_confirmation_lines(&confirmation, Theme::from_environment(), 10, 32)
+            .expect("mandatory loading rows fit");
         let ports = lines
             .iter()
             .map(ToString::to_string)

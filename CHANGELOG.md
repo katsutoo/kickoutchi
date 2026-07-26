@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-26
+
+### Added
+
+- Added a silent, timeout-bounded stable-release check that runs at most once
+  every seven days outside the foreground command. New-release notices use
+  install provenance to recommend Homebrew, Scoop, AUR, Linux Nix, Cargo, or the
+  standalone updater without contaminating structured output; configuration can
+  disable the check.
+
 ### Removed
 
 - The release runbook and the product recap that `1.3.0` added. Both were
@@ -14,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the qualification state they tracked is now recorded in the release itself.
 
 ### Changed
+
+- Nix flake outputs are now explicitly Linux-only. The package version is read
+  from `Cargo.toml`, and Linux Nix, Homebrew, Scoop, and AUR installations carry
+  closed provenance markers for manager-correct update instructions. Native
+  macOS archives and Homebrew support are unchanged.
+- Linux release archives are built in pinned Debian 11 containers with a
+  declared glibc 2.31 floor, and release validation rejects newer symbol
+  requirements.
 
 - Every surface that only reads a port row now borrows it from the authoritative
   snapshot instead of receiving an owned legacy copy. List, single-process kill,
@@ -26,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior, output, or exit code changes.
 
 ### Fixed
+
+- Linux and macOS scoped termination now waits for observable suspension under
+  one operation-wide deadline and tracks which stop transitions it observed.
+  Cleanup after refusal or failed delivery leaves a pre-stopped process untouched;
+  after successful `SIGTERM` delivery it guardedly continues even a pre-stopped
+  target so the pending termination can execute. Concurrent external
+  `SIGSTOP`/`SIGCONT` can still race stop-state attribution.
+- Windows tree termination now reconciles every live pinned descendant with the
+  frozen Job Object immediately before termination and thaws on every refusal.
+- Hidden TUI confirmations are cancelled on undersized terminals, terminal state
+  is restored before SIGTERM/SIGHUP is re-raised, the previous panic hook is
+  restored after the TUI, and initial collection happens before raw mode.
+- Windows Docker named-pipe validation now rejects remote, traversal, encoded,
+  and normalization-ambiguous endpoints instead of relying on a string prefix.
+- Corrected macOS dual-stack decoding and protected-process title matching,
+  Windows snapshot and long-path diagnostics, terminal escape stripping,
+  wrapped confirmation budgeting, Docker details clipping, filter help, and
+  help/version broken-pipe handling.
 
 - The macOS release-profile watch journey no longer fails when the host gives a
   partial observation for every attempt. That journey has two correct outcomes
@@ -159,9 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Tree and group cleanup no longer reports a member that exited under the freeze
-  as a thaw failure. Only a refused `SIGCONT` leaves a process that may still be
-  stopped, so only refusals are named; a member the kernel reports as gone is
-  not something the user can resume. This matches the classification the
+  as a thaw failure. Among Kickoutchi's cleanup results, a refused `SIGCONT` is
+  the result that proves a process may still be stopped, so only refusals are
+  named; concurrent external stop signals remain outside that attribution. A
+  member the kernel reports as gone is not something the user can resume. This
+  matches the classification the
   delivery paths and single-process termination already used, so a refusal such
   as a root that exits mid-freeze no longer prints a cleanup error naming a PID
   that no longer exists.
@@ -487,15 +525,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runners that leave worker children behind. It is opt-in: normal `kick kill`
   is unchanged and still signals exactly one PID.
   - Tree kill does a fresh bounded tree count before any signal is sent, then
-    freezes before it kills: it `SIGSTOP`s the root first so it cannot spawn
-    more children, sweeps its descendants to a fixed point, and re-verifies
-    every process's identity while it is stopped (where its PID cannot be
-    recycled) before signalling. This is what lets it clean up a process that
-    is actively spawning children rather than losing the race.
+    freezes before it kills: it `SIGSTOP`s the root first to prevent ordinary
+    child creation while the root remains stopped, sweeps descendants toward a
+    bounded fixed point, and re-verifies every process's identity before
+    signalling. External stop/continue actors can still race this sequence; it
+    is not an atomic kernel transaction.
   - It signals leaves-first, root last, sending `SIGTERM` then `SIGCONT` for a
     normal kill (or `SIGKILL` for `--force`). Any refusal after freezing —
     identity drift, a protected descendant, an unsafe PID, or exceeding the
-    256-process cap — thaws every process it stopped and sends no termination.
+    256-process cap — thaws each process it observed transition into stopped and
+    sends no termination. A process already stopped is left untouched on
+    refusal; after successful `SIGTERM`, it is continued so the pending signal
+    can execute.
   - Interactive confirmation requires typing `tree` (or `force` for
     `--force`); a protected root requires typing its PID or name and then the
     tree confirmation word. `--yes` only skips the prompt for an all-clear tree,
@@ -581,7 +622,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Same freeze-first pipeline and refusal gates as tree kill: the confirmed
     root is `SIGSTOP`ped first, members are swept to a fixed point, every
     frozen member's identity is re-verified while stopped, and any refusal
-    thaws everything. Group membership is re-proven after every stop (a
+    thaws members Kickoutchi observed transition into stopped. Group membership
+    is re-proven after every stop (a
     member whose group changed under the freeze refuses the whole kill), but
     a member whose *parent* died mid-kill is fine — reparenting does not
     change group membership, which is the point of the scope.

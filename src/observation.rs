@@ -2233,6 +2233,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_permission_partial_does_not_imply_permission_denial() {
+        let mut snapshot = crate::collector::Collector::collect(
+            &crate::collector::FakeCollector,
+            MetadataProfile::Display,
+        )
+        .expect("fake snapshot is valid");
+        let socket = snapshot
+            .sockets
+            .iter_mut()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("fixture has the selected socket");
+        socket.owner_completeness = OwnerCompleteness::partial([EvidenceGapCode::OwnerDisappeared])
+            .expect("one reason fits");
+
+        let rows = project_legacy(&snapshot).expect("legacy projection fits");
+        let row = rows
+            .iter()
+            .find(|row| row.local_port == 3000)
+            .expect("selected row is projected");
+
+        assert_eq!(row.permission, PermissionStatus::Partial);
+    }
+
+    #[test]
     fn lossy_utf8_length_matches_conversion() {
         for bytes in [
             b"a\xffb\xf0\x80\x80\x80c".as_slice(),

@@ -13,6 +13,9 @@
             ]
         }
     },
+    "installer": {
+        "script": "Set-Content -LiteralPath (Join-Path $dir 'install-provenance') -Value 'scoop' -NoNewline"
+    },
     "checkver": {
         "github": "https://github.com/nuggocto/kickoutchi"
     },

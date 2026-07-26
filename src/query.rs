@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::net::IpAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use thiserror::Error;
 
@@ -38,7 +38,6 @@ pub(crate) struct QueryCapabilities {
 
 impl QueryCapabilities {
     pub(crate) const LIST: Self = Self { state: false };
-    #[allow(dead_code, reason = "consumed by the full-state watch query path")]
     pub(crate) const WATCH: Self = Self { state: true };
 }
 
@@ -137,6 +136,9 @@ fn matching_indices(
     entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
 ) -> Result<MatchingIndices, QueryError> {
+    if options.port == Some(0) {
+        return Err(invalid_value("port", "0", "a TCP/UDP port from 1 to 65535"));
+    }
     let terms = parse_filter_text(options.filter_text, options.capabilities)?;
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
@@ -307,8 +309,10 @@ fn parse_pid(value: &str) -> Result<FilterTerm, QueryError> {
 fn parse_port(value: &str) -> Result<FilterTerm, QueryError> {
     value
         .parse::<u16>()
-        .map(FilterTerm::Port)
-        .map_err(|_| invalid_value("port", value, "a TCP/UDP port from 0 to 65535"))
+        .ok()
+        .and_then(NonZeroU16::new)
+        .map(|port| FilterTerm::Port(port.get()))
+        .ok_or_else(|| invalid_value("port", value, "a TCP/UDP port from 1 to 65535"))
 }
 
 fn parse_protocol(value: &str) -> Result<FilterTerm, QueryError> {
@@ -856,6 +860,18 @@ mod tests {
         assert!(matches!(
             error,
             QueryError::InvalidValue { field: "port", .. }
+        ));
+
+        assert!(matches!(
+            query_view_indices(&views, query("port:0")),
+            Err(QueryError::InvalidValue { field: "port", .. })
+        ));
+
+        let mut direct = query("");
+        direct.port = Some(0);
+        assert!(matches!(
+            query_view_indices(&views, direct),
+            Err(QueryError::InvalidValue { field: "port", .. })
         ));
 
         let error = query_view_indices(&views, query("protected:maybe")).expect_err("invalid bool");

@@ -24,6 +24,8 @@ const XZ_INPUT_BUFFER_BYTES: usize = 8192;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_OUTPUT_BYTES_MAX: usize = 4096;
+const READELF_OUTPUT_BYTES_MAX: usize = 64 * 1024;
+const MAXIMUM_GLIBC_VERSION: &[u32] = &[2, 31];
 const TEST_TIMEOUT: Duration = Duration::from_mins(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -771,6 +773,93 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> ValidationResult<Vec<u8>
     Ok(retained)
 }
 
+fn parse_glibc_version(tail: &[u8]) -> ValidationResult<Option<Vec<u32>>> {
+    if !tail.first().is_some_and(u8::is_ascii_digit) {
+        return Ok(None);
+    }
+    let end = tail
+        .iter()
+        .position(|byte| !byte.is_ascii_digit() && *byte != b'.')
+        .unwrap_or(tail.len());
+    if tail
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return Err("readelf reported a malformed GLIBC symbol version".to_owned());
+    }
+
+    let mut components = Vec::new();
+    let mut component = None::<u32>;
+    for byte in &tail[..end] {
+        if *byte == b'.' {
+            components.push(
+                component.take().ok_or_else(|| {
+                    "readelf reported a malformed GLIBC symbol version".to_owned()
+                })?,
+            );
+            continue;
+        }
+        let digit = u32::from(*byte - b'0');
+        component = Some(
+            component
+                .unwrap_or(0)
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(digit))
+                .ok_or_else(|| "readelf reported an oversized GLIBC symbol version".to_owned())?,
+        );
+    }
+    components.push(
+        component.ok_or_else(|| "readelf reported a malformed GLIBC symbol version".to_owned())?,
+    );
+    if components.len() < 2 {
+        return Err("readelf reported a malformed GLIBC symbol version".to_owned());
+    }
+    while components.len() > 2 && components.last() == Some(&0) {
+        components.pop();
+    }
+    Ok(Some(components))
+}
+
+fn maximum_glibc_requirement(output: &str) -> ValidationResult<Vec<u32>> {
+    const PREFIX: &[u8] = b"GLIBC_";
+
+    let mut remainder = output.as_bytes();
+    let mut maximum: Option<Vec<u32>> = None;
+    while let Some(offset) = remainder
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    {
+        remainder = &remainder[offset + PREFIX.len()..];
+        let Some(version) = parse_glibc_version(remainder)? else {
+            continue;
+        };
+        if maximum.as_ref().is_none_or(|current| version > *current) {
+            maximum = Some(version);
+        }
+    }
+    maximum.ok_or_else(|| "readelf output contained no parseable GLIBC requirement".to_owned())
+}
+
+fn format_numeric_version(version: &[u32]) -> String {
+    version
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn validate_glibc_requirements(output: &str) -> ValidationResult<Vec<u32>> {
+    let maximum = maximum_glibc_requirement(output)?;
+    if maximum.as_slice() > MAXIMUM_GLIBC_VERSION {
+        return Err(format!(
+            "release binary requires GLIBC_{}, above supported maximum GLIBC_{}",
+            format_numeric_version(&maximum),
+            format_numeric_version(MAXIMUM_GLIBC_VERSION)
+        ));
+    }
+    Ok(maximum)
+}
+
 fn terminate_and_wait(child: &mut Child) -> ValidationResult<ExitStatus> {
     match child.kill() {
         Ok(()) => {}
@@ -817,27 +906,36 @@ fn wait_with_deadline(
     }
 }
 
-fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
-    let mut child = Command::new(binary)
-        .arg("--version")
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_bounded_command(
+    command: &mut Command,
+    description: &str,
+    output_limit: usize,
+) -> ValidationResult<BoundedCommandOutput> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("could not execute {}: {error}", binary.display()))?;
+        .map_err(|error| format!("could not execute {description}: {error}"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "version stdout pipe was unavailable".to_owned())?;
+        .ok_or_else(|| format!("{description} stdout pipe was unavailable"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "version stderr pipe was unavailable".to_owned())?;
+        .ok_or_else(|| format!("{description} stderr pipe was unavailable"))?;
     let overflow = Arc::new(AtomicBool::new(false));
     let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
     let stdout_overflow = Arc::clone(&overflow);
     let _stdout_reader = thread::spawn(move || {
-        let result = read_bounded(stdout, VERSION_OUTPUT_BYTES_MAX);
+        let result = read_bounded(stdout, output_limit);
         if result
             .as_ref()
             .is_err_and(|error| error == "process output exceeded its byte limit")
@@ -849,7 +947,7 @@ fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
     let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
     let stderr_overflow = Arc::clone(&overflow);
     let _stderr_reader = thread::spawn(move || {
-        let result = read_bounded(stderr, VERSION_OUTPUT_BYTES_MAX);
+        let result = read_bounded(stderr, output_limit);
         if result
             .as_ref()
             .is_err_and(|error| error == "process output exceeded its byte limit")
@@ -861,22 +959,67 @@ fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
     let status_result = wait_with_deadline(&mut child, COMMAND_TIMEOUT, Some(&overflow));
     let stdout = stdout_receiver
         .recv_timeout(CHILD_CLEANUP_TIMEOUT)
-        .map_err(|error| format!("version stdout reader did not stop: {error}"))??;
+        .map_err(|error| format!("{description} stdout reader did not stop: {error}"))??;
     let stderr = stderr_receiver
         .recv_timeout(CHILD_CLEANUP_TIMEOUT)
-        .map_err(|error| format!("version stderr reader did not stop: {error}"))??;
-    let status = status_result?;
-    let stdout = str::from_utf8(&stdout)
+        .map_err(|error| format!("{description} stderr reader did not stop: {error}"))??;
+    Ok(BoundedCommandOutput {
+        status: status_result?,
+        stdout,
+        stderr,
+    })
+}
+
+fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
+    let description = format!("{} --version", binary.display());
+    let output = run_bounded_command(
+        Command::new(binary).arg("--version"),
+        &description,
+        VERSION_OUTPUT_BYTES_MAX,
+    )?;
+    let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| format!("version output was not UTF-8 for {}", binary.display()))?;
-    let stderr = str::from_utf8(&stderr)
+    let stderr = str::from_utf8(&output.stderr)
         .map_err(|_| format!("version stderr was not UTF-8 for {}", binary.display()))?;
     let expected = format!("kickoutchi {expected_version}\n");
-    if !status.success() || stdout != expected || !stderr.is_empty() {
+    if !output.status.success() || stdout != expected || !stderr.is_empty() {
         return Err(format!(
-            "unexpected version output from {}: status={status}, stdout={stdout:?}, stderr={stderr:?}",
+            "unexpected version output from {}: status={}, stdout={stdout:?}, stderr={stderr:?}",
             binary.display(),
+            output.status,
         ));
     }
+    Ok(())
+}
+
+fn inspect_glibc_abi(binary: &Path) -> ValidationResult<()> {
+    let description = format!("readelf --version-info {}", binary.display());
+    let output = run_bounded_command(
+        Command::new("readelf")
+            .arg("--version-info")
+            .arg(binary)
+            .env("LC_ALL", "C"),
+        &description,
+        READELF_OUTPUT_BYTES_MAX,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "readelf failed for {}: status={}, stdout={:?}, stderr={:?}",
+            binary.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = str::from_utf8(&output.stdout)
+        .map_err(|_| format!("readelf output was not UTF-8 for {}", binary.display()))?;
+    let maximum = validate_glibc_requirements(stdout)
+        .map_err(|error| format!("{}: {error}", binary.display()))?;
+    println!(
+        "validated GLIBC ABI: binary={}, maximum=GLIBC_{}",
+        binary.display(),
+        format_numeric_version(&maximum)
+    );
     Ok(())
 }
 
@@ -896,7 +1039,11 @@ fn run_archive_journeys(canonical: &Path, short: &Path, runner_os: &str) -> Vali
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if runner_os == "Linux" {
+    let release_container = matches!(
+        std::env::var("KICKOUTCHI_RELEASE_CONTAINER").as_deref(),
+        Ok("1")
+    );
+    if runner_os == "Linux" && !release_container {
         command.env("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES", "1");
     }
     let mut child = command
@@ -1003,6 +1150,10 @@ fn validate_release_artifact(
     let short = binaries
         .get(&short_name)
         .ok_or_else(|| "short release binary was not extracted".to_owned())?;
+    if runner_os == "Linux" {
+        inspect_glibc_abi(canonical)?;
+        inspect_glibc_abi(short)?;
+    }
     run_version(canonical, env!("CARGO_PKG_VERSION"))?;
     run_version(short, env!("CARGO_PKG_VERSION"))?;
     run_archive_journeys(canonical, short, runner_os)?;
@@ -1042,6 +1193,24 @@ mod tests {
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TarHostile {
+        Traversal,
+        Absolute,
+        Symlink,
+        Hardlink,
+        MalformedMode,
+        Duplicate,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ZipHostile {
+        Traversal,
+        Absolute,
+        Symlink,
+        Duplicate,
+    }
+
     fn temporary_directory(prefix: &str) -> TemporaryDirectory {
         TemporaryDirectory::new(prefix).expect("test temporary directory must be created")
     }
@@ -1078,6 +1247,89 @@ mod tests {
         encoder.finish().expect("test XZ stream must finish");
     }
 
+    fn set_raw_tar_path(header: &mut Header, path: &str) {
+        assert!(path.len() <= 100, "test TAR path must fit the name field");
+        header.as_mut_bytes()[0..100].fill(0);
+        header.as_mut_bytes()[0..path.len()].copy_from_slice(path.as_bytes());
+    }
+
+    fn write_hostile_tar(path: &Path, hostile: TarHostile) {
+        let file = File::create(path).expect("hostile TAR must be created");
+        let encoder = XzWriter::new(file, XzOptions::default()).expect("test XZ stream must start");
+        let mut builder = Builder::new(encoder);
+        let root = format!("kickoutchi-{LINUX_TARGET}");
+        let mut directory = Header::new_gnu();
+        directory.set_entry_type(EntryType::dir());
+        directory.set_mode(0o755);
+        directory.set_size(0);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, format!("{root}/"), io::empty())
+            .expect("test TAR directory must be written");
+
+        for name in ["CHANGELOG.md", "LICENSE", "README.md", "kickoutchi", "kick"] {
+            let is_hostile_member = match hostile {
+                TarHostile::Traversal | TarHostile::Absolute => name == "README.md",
+                TarHostile::Symlink | TarHostile::Hardlink | TarHostile::MalformedMode => {
+                    name == "kick"
+                }
+                TarHostile::Duplicate => false,
+            };
+            let contents = if is_hostile_member
+                && matches!(hostile, TarHostile::Symlink | TarHostile::Hardlink)
+            {
+                &b""[..]
+            } else {
+                name.as_bytes()
+            };
+            let mut header = Header::new_gnu();
+            header.set_entry_type(match hostile {
+                TarHostile::Symlink if is_hostile_member => EntryType::symlink(),
+                TarHostile::Hardlink if is_hostile_member => EntryType::hard_link(),
+                _ => EntryType::file(),
+            });
+            header.set_mode(if name == "kickoutchi" || name == "kick" {
+                0o755
+            } else {
+                0o644
+            });
+            header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
+            if matches!(hostile, TarHostile::Symlink | TarHostile::Hardlink) && is_hostile_member {
+                header
+                    .set_link_name(format!("{root}/kickoutchi"))
+                    .expect("test TAR link target must be set");
+            }
+            let member_path = match hostile {
+                TarHostile::Traversal if is_hostile_member => format!("{root}/../README.md"),
+                TarHostile::Absolute if is_hostile_member => "/README.md".to_owned(),
+                _ => format!("{root}/{name}"),
+            };
+            set_raw_tar_path(&mut header, &member_path);
+            if hostile == TarHostile::MalformedMode && is_hostile_member {
+                header.as_mut_bytes()[100..108].copy_from_slice(b"invalid\0");
+            }
+            header.set_cksum();
+            builder
+                .append(&header, contents)
+                .expect("hostile TAR member must be written");
+        }
+
+        if hostile == TarHostile::Duplicate {
+            let contents = b"duplicate";
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::file());
+            header.set_mode(0o644);
+            header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{root}/README.md"), &contents[..])
+                .expect("duplicate TAR member must be written");
+        }
+
+        let encoder = builder.into_inner().expect("hostile TAR must finish");
+        encoder.finish().expect("hostile XZ stream must finish");
+    }
+
     fn write_zip(path: &Path, extra: Option<&str>) {
         let file = File::create(path).expect("test ZIP must be created");
         let mut writer = ZipWriter::new(file);
@@ -1109,27 +1361,61 @@ mod tests {
         writer.finish().expect("test ZIP must finish");
     }
 
-    fn write_tar_symlink(path: &Path) {
-        let file = File::create(path).expect("test TAR must be created");
-        let encoder = XzWriter::new(file, XzOptions::default()).expect("test XZ stream must start");
-        let mut builder = Builder::new(encoder);
-        let mut header = Header::new_gnu();
-        header.set_entry_type(EntryType::symlink());
-        header.set_mode(0o777);
-        header.set_size(0);
-        header
-            .set_link_name("kickoutchi")
-            .expect("test TAR link target must be set");
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                format!("kickoutchi-{LINUX_TARGET}/kick"),
-                io::empty(),
-            )
-            .expect("test TAR symlink must be written");
-        let encoder = builder.into_inner().expect("test TAR must finish");
-        encoder.finish().expect("test XZ stream must finish");
+    fn write_hostile_zip(path: &Path, hostile: ZipHostile) {
+        let file = File::create(path).expect("hostile ZIP must be created");
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .unix_permissions(0o755);
+        for name in [
+            "CHANGELOG.md",
+            "LICENSE",
+            "README.md",
+            "kickoutchi.exe",
+            "kick.exe",
+        ] {
+            if hostile == ZipHostile::Symlink && name == "kick.exe" {
+                writer
+                    .add_symlink(name, "kickoutchi.exe", options)
+                    .expect("hostile ZIP symlink must be written");
+                continue;
+            }
+            let member_name = match hostile {
+                ZipHostile::Traversal if name == "README.md" => "../README.md",
+                ZipHostile::Absolute if name == "README.md" => "/README.md",
+                _ => name,
+            };
+            writer
+                .start_file(member_name, options)
+                .expect("hostile ZIP member must start");
+            writer
+                .write_all(name.as_bytes())
+                .expect("hostile ZIP member must be written");
+        }
+        if hostile == ZipHostile::Duplicate {
+            writer
+                .start_file("OTHER.txt", options)
+                .expect("placeholder ZIP member must start");
+            writer
+                .write_all(b"duplicate")
+                .expect("placeholder ZIP member must be written");
+        }
+        drop(writer.finish().expect("hostile ZIP must finish"));
+        if hostile == ZipHostile::Duplicate {
+            let mut bytes = fs::read(path).expect("duplicate ZIP fixture must be readable");
+            let mut replacements = 0;
+            for offset in 0..=bytes.len() - b"OTHER.txt".len() {
+                if bytes[offset..].starts_with(b"OTHER.txt") {
+                    bytes[offset..offset + b"README.md".len()].copy_from_slice(b"README.md");
+                    replacements += 1;
+                }
+            }
+            assert_eq!(
+                replacements, 2,
+                "placeholder name must occur in local and central ZIP headers"
+            );
+            fs::write(path, bytes).expect("duplicate ZIP fixture must be patched");
+        }
     }
 
     fn write_tar_extension(path: &Path) {
@@ -1161,26 +1447,6 @@ mod tests {
                 .write_all(b"x")
                 .expect("test ZIP member must be written");
         }
-        writer.finish().expect("test ZIP must finish");
-    }
-
-    fn write_zip_symlink(path: &Path) {
-        let file = File::create(path).expect("test ZIP must be created");
-        let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .unix_permissions(0o755);
-        for name in ["CHANGELOG.md", "LICENSE", "README.md", "kickoutchi.exe"] {
-            writer
-                .start_file(name, options)
-                .expect("test ZIP member must start");
-            writer
-                .write_all(name.as_bytes())
-                .expect("test ZIP member must be written");
-        }
-        writer
-            .add_symlink("kick.exe", "kickoutchi.exe", options)
-            .expect("test ZIP symlink must be written");
         writer.finish().expect("test ZIP must finish");
     }
 
@@ -1312,14 +1578,6 @@ mod tests {
                 .is_err()
         );
 
-        let symlink = temporary.path.join("symlink.tar.xz");
-        write_tar_symlink(&symlink);
-        let symlink_output = temporary.path.join("symlink-output");
-        fs::create_dir(&symlink_output).expect("symlink output directory");
-        let error = extract_tar_binaries(&symlink, &symlink_output, LINUX_TARGET, &expected)
-            .expect_err("TAR symlink must be rejected");
-        assert!(error.contains("forbidden or unsupported member"));
-
         let extension = temporary.path.join("extension.tar.xz");
         write_tar_extension(&extension);
         let extension_output = temporary.path.join("extension-output");
@@ -1350,6 +1608,52 @@ mod tests {
     }
 
     #[test]
+    fn tar_rejects_hostile_paths_links_modes_and_duplicates() {
+        let temporary = temporary_directory("kickoutchi-hostile-tar-test");
+        let expected = BTreeSet::from(["kickoutchi".to_owned(), "kick".to_owned()]);
+        for (hostile, label, error_fragment) in [
+            (
+                TarHostile::Traversal,
+                "traversal",
+                "unsafe archive member path",
+            ),
+            (
+                TarHostile::Absolute,
+                "absolute",
+                "unsafe archive member path",
+            ),
+            (
+                TarHostile::Symlink,
+                "symlink",
+                "forbidden or unsupported member",
+            ),
+            (
+                TarHostile::Hardlink,
+                "hardlink",
+                "forbidden or unsupported member",
+            ),
+            (
+                TarHostile::MalformedMode,
+                "malformed-mode",
+                "mode is invalid",
+            ),
+            (TarHostile::Duplicate, "duplicate", "duplicate member"),
+        ] {
+            let archive = temporary.path.join(format!("{label}.tar.xz"));
+            write_hostile_tar(&archive, hostile);
+            let output = temporary.path.join(format!("{label}-output"));
+            fs::create_dir(&output).expect("hostile TAR output directory must be created");
+
+            let error = extract_tar_binaries(&archive, &output, LINUX_TARGET, &expected)
+                .expect_err("hostile TAR fixture must be rejected");
+            assert!(
+                error.contains(error_fragment),
+                "hostile TAR fixture {label} reached the wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn zip_requires_exact_flat_layout() {
         let temporary = temporary_directory("kickoutchi-zip-test");
         let expected = BTreeSet::from(["kickoutchi.exe".to_owned(), "kick.exe".to_owned()]);
@@ -1377,14 +1681,6 @@ mod tests {
             .expect_err("first excess ZIP member must be rejected");
         assert!(error.contains("member count is outside the approved bound"));
 
-        let symlink = temporary.path.join("symlink.zip");
-        write_zip_symlink(&symlink);
-        let symlink_output = temporary.path.join("symlink-output");
-        fs::create_dir(&symlink_output).expect("symlink output directory");
-        let error = extract_zip_binaries(&symlink, &symlink_output, WINDOWS_TARGET, &expected)
-            .expect_err("ZIP symlink must be rejected");
-        assert!(error.contains("symbolic link"));
-
         let corrupt = temporary.path.join("corrupt.zip");
         write_zip(&corrupt, None);
         corrupt_zip_member(&corrupt, "README.md");
@@ -1396,9 +1692,81 @@ mod tests {
     }
 
     #[test]
+    fn zip_rejects_hostile_paths_symlinks_and_duplicates() {
+        let temporary = temporary_directory("kickoutchi-hostile-zip-test");
+        let expected = BTreeSet::from(["kickoutchi.exe".to_owned(), "kick.exe".to_owned()]);
+        for (hostile, label, error_fragment) in [
+            (
+                ZipHostile::Traversal,
+                "traversal",
+                "unsafe archive member path",
+            ),
+            (
+                ZipHostile::Absolute,
+                "absolute",
+                "unsafe archive member path",
+            ),
+            (ZipHostile::Symlink, "symlink", "symbolic link"),
+            (
+                ZipHostile::Duplicate,
+                "duplicate",
+                "entry count changed while opening",
+            ),
+        ] {
+            let archive = temporary.path.join(format!("{label}.zip"));
+            write_hostile_zip(&archive, hostile);
+            let output = temporary.path.join(format!("{label}-output"));
+            fs::create_dir(&output).expect("hostile ZIP output directory must be created");
+
+            let error = extract_zip_binaries(&archive, &output, WINDOWS_TARGET, &expected)
+                .expect_err("hostile ZIP fixture must be rejected");
+            assert!(
+                error.contains(error_fragment),
+                "hostile ZIP fixture {label} reached the wrong rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn process_output_reader_rejects_the_first_excess_byte() {
         assert_eq!(read_bounded(&b"abcd"[..], 4).expect("exact limit"), b"abcd");
         assert!(read_bounded(&b"abcde"[..], 4).is_err());
+    }
+
+    #[test]
+    fn glibc_parser_selects_the_highest_numeric_requirement() {
+        let output = r"
+          0x0010: Name: GLIBC_2.9 Flags: none Version: 8
+          0x0020: Name: GLIBC_PRIVATE Flags: none Version: 7
+          0x0030: Name: GLIBC_2.31.0 Flags: none Version: 6
+          004: 2 (GLIBC_2.10) 3 (GLIBC_2.2.5)
+        ";
+        assert_eq!(
+            maximum_glibc_requirement(output).expect("parseable readelf output"),
+            [2, 31]
+        );
+    }
+
+    #[test]
+    fn glibc_threshold_accepts_2_31_and_rejects_newer_versions() {
+        for accepted in ["GLIBC_2.30.99", "GLIBC_2.31", "GLIBC_2.31.0"] {
+            assert!(
+                validate_glibc_requirements(accepted).is_ok(),
+                "rejected {accepted}"
+            );
+        }
+        for rejected in ["GLIBC_2.31.1", "GLIBC_2.32", "GLIBC_3.0"] {
+            let error = validate_glibc_requirements(rejected)
+                .expect_err("newer GLIBC requirement must be rejected");
+            assert!(error.contains("above supported maximum GLIBC_2.31"));
+        }
+    }
+
+    #[test]
+    fn glibc_parser_rejects_missing_and_malformed_requirements() {
+        assert!(maximum_glibc_requirement("GLIBC_PRIVATE").is_err());
+        assert!(maximum_glibc_requirement("Name: GLIBC_2").is_err());
+        assert!(maximum_glibc_requirement("Name: GLIBC_2.31.future").is_err());
     }
 
     #[test]

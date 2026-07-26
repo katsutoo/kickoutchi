@@ -60,6 +60,7 @@ use crate::tree::TreeProcessInfo;
 const MAX_CHILD_PROCESSES: usize = 64;
 const MAX_RELATED_PROCESS_HINTS: usize = 8;
 const MAX_PROCESS_ANCESTORS: usize = 64;
+const WINDOWS_PROCESS_PATH_CODE_UNITS_MAX: usize = 32 * 1024;
 
 pub(crate) struct WindowsCollector;
 
@@ -443,7 +444,9 @@ impl ProcessSnapshot {
                 let parent_pid = (!parent_relation_changed)
                     .then_some(second_parent_pid)
                     .flatten();
-                let recorded_parent_pid = second_parent_pid.or(first_parent_pid);
+                // Only the latest relation can be reported as unverified. A
+                // parent seen solely in the first snapshot may already be stale.
+                let recorded_parent_pid = second_parent_pid;
                 let parent_name_budget = metadata_budget.saturating_sub(retained_bytes);
                 let (parent_pid, parent_process_name) = parent_pid
                     .and_then(|parent_pid| {
@@ -634,11 +637,21 @@ fn enumerate_process_relations(
         dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).expect("entry size fits u32"),
         ..PROCESSENTRY32W::default()
     };
-    let mut present = unsafe {
+    let first_present = unsafe {
         // SAFETY: entry has the required size and is writable.
         Process32FirstW(snapshot.as_raw_handle(), &raw mut entry)
     } != 0;
-    while present {
+    if !first_present {
+        let error = std::io::Error::last_os_error();
+        if windows_io_error_code(&error) == Some(ERROR_NO_MORE_FILES) {
+            return Ok(rows);
+        }
+        return Err(CollectorError::Platform {
+            operation: "Process32FirstW",
+            detail: error.to_string(),
+        });
+    }
+    loop {
         if rows.len() >= CANDIDATE_PROCESS_IDS_MAX {
             return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
         }
@@ -647,10 +660,13 @@ fn enumerate_process_relations(
             (entry.th32ParentProcessID != 0).then_some(entry.th32ParentProcessID),
         );
         names.insert(entry.th32ProcessID, entry.szExeFile);
-        present = unsafe {
+        let present = unsafe {
             // SAFETY: entry remains valid for the next API write.
             Process32NextW(snapshot.as_raw_handle(), &raw mut entry)
         } != 0;
+        if !present {
+            break;
+        }
     }
     let error = std::io::Error::last_os_error();
     if error
@@ -755,7 +771,7 @@ fn verified_parent_for_budget(parent: &VerifiedParent, max_bytes: usize) -> Veri
 }
 
 fn query_process_path(handle: &OwnedHandle, max_bytes: usize) -> Option<PathBuf> {
-    let code_units = max_bytes / 2;
+    let code_units = process_path_buffer_code_units(max_bytes);
     if code_units == 0 {
         return None;
     }
@@ -780,6 +796,15 @@ fn query_process_path(handle: &OwnedHandle, max_bytes: usize) -> Option<PathBuf>
         max_bytes.min(EXECUTABLE_PATH_MAX_BYTES),
     )
     .map(PathBuf::from)
+}
+
+fn process_path_buffer_code_units(max_bytes: usize) -> usize {
+    // A UTF-16 code unit contributes at least one byte to the decoded WTF-8/UTF-8
+    // path, so the final byte budget is also a safe code-unit bound. Capping at
+    // Windows' long-path buffer maximum avoids a needlessly larger allocation.
+    max_bytes
+        .min(EXECUTABLE_PATH_MAX_BYTES)
+        .min(WINDOWS_PROCESS_PATH_CODE_UNITS_MAX)
 }
 
 fn query_process_command_line(handle: &OwnedHandle, max_bytes: usize) -> Option<String> {
@@ -1727,10 +1752,10 @@ mod tests {
         append_tcp6_table, append_udp4_table, append_udp6_table, checked_table_byte_len,
         collect_socket_records_with, decode_command_line_utf16, decode_port, encode_port_for_tests,
         extend_socket_records_with_limit, filetime_to_u64, finish_bracketed_metadata,
-        mib_tcp_state, native_pass_from_records, process_read_from_metadata,
-        query_process_command_line_with, read_iphelper_table_with, read_process_observations_with,
-        tcp4_record, tcp4_rows, tcp6_record, tcp6_rows, tree_process_infos_from_snapshot_with,
-        udp4_record, udp4_rows, udp6_record, udp6_rows,
+        mib_tcp_state, native_pass_from_records, process_path_buffer_code_units,
+        process_read_from_metadata, query_process_command_line_with, read_iphelper_table_with,
+        read_process_observations_with, tcp4_record, tcp4_rows, tcp6_record, tcp6_rows,
+        tree_process_infos_from_snapshot_with, udp4_record, udp4_rows, udp6_record, udp6_rows,
     };
     use crate::collector::CollectorError;
     use crate::model::Protocol;
@@ -2585,6 +2610,39 @@ mod tests {
 
         assert!(!api.path_budgets.is_empty());
         assert!(api.path_budgets.iter().all(|budget| *budget <= 7));
+    }
+
+    #[test]
+    fn changed_parent_relation_never_reports_the_stale_first_parent() {
+        let first = HashMap::from([(1, None), (7, Some(1))]);
+        let second = HashMap::from([(1, None), (7, None)]);
+        let mut api = FakeProcessApi::stable(first);
+        api.relations[1] = second;
+
+        let metadata = ProcessSnapshot::collect_with(
+            &mut api,
+            MetadataProfile::Display,
+            ProcessSelection::Exact(&[7]),
+            super::OPTIONAL_METADATA_MAX_BYTES,
+        )
+        .expect("changed relation remains row-local")
+        .processes
+        .remove(&7)
+        .unwrap();
+
+        assert_eq!(metadata.parent_pid, None);
+        assert_eq!(metadata.unverified_parent_pid, None);
+        assert!(metadata.partial);
+    }
+
+    #[test]
+    fn executable_path_native_capacity_tracks_final_byte_budget() {
+        assert_eq!(process_path_buffer_code_units(0), 0);
+        assert_eq!(process_path_buffer_code_units(9), 9);
+        assert_eq!(
+            process_path_buffer_code_units(usize::MAX),
+            super::WINDOWS_PROCESS_PATH_CODE_UNITS_MAX
+        );
     }
 
     #[test]

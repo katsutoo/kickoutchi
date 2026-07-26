@@ -153,9 +153,11 @@ pub(crate) fn kill_ports_from_snapshot(
     };
 
     // An omitted gap is evidence we never got to inspect, so it is partial
-    // before any socket is examined.
+    // before any socket is examined. Races stay distinct because a raced
+    // observation cannot support a permission diagnosis from the same read.
     let mut authority = Authority::complete();
     authority.partial |= snapshot.omitted_evidence_gap_count != 0;
+    authority.raced |= snapshot.completeness == SnapshotCompleteness::Raced;
 
     let mut matched_endpoints = std::collections::BTreeSet::new();
     for socket in &snapshot.sockets {
@@ -169,7 +171,7 @@ pub(crate) fn kill_ports_from_snapshot(
     for gap in &snapshot.evidence_gaps {
         // A raced observation invalidates the whole snapshot regardless of
         // which endpoint or PID the gap names.
-        authority.partial |= gap.code == EvidenceGapCode::ObservationRaced;
+        authority.raced |= gap.code == EvidenceGapCode::ObservationRaced;
         if !gap_applies_to_target(gap, target_mode, &matched_endpoints) {
             continue;
         }
@@ -177,16 +179,18 @@ pub(crate) fn kill_ports_from_snapshot(
         authority.partial = true;
     }
 
-    // Permission denial outranks partiality: it is the more specific and more
-    // actionable refusal, and it maps to a distinct exit code.
+    // A race outranks all observations made inside that unstable read. Reporting
+    // permission denial would claim a stable cause we did not actually prove.
+    if authority.raced {
+        return Err(ObservationError::ObservationRaced.into());
+    }
+    // Permission denial outranks non-raced partiality: it is the more specific
+    // and actionable refusal, and it maps to a distinct exit code.
     if authority.permission_denied {
         return Err(CollectorError::OwnershipPermissionDenied);
     }
     if authority.partial {
         return Err(ObservationError::PartialSocketSet.into());
-    }
-    if snapshot.completeness == SnapshotCompleteness::Raced {
-        return Err(ObservationError::ObservationRaced.into());
     }
     project_legacy_target(snapshot, pid, port).map_err(CollectorError::from)
 }
@@ -200,6 +204,7 @@ pub(crate) fn kill_ports_from_snapshot(
 struct Authority {
     permission_denied: bool,
     partial: bool,
+    raced: bool,
 }
 
 impl Authority {
@@ -207,12 +212,14 @@ impl Authority {
         Self {
             permission_denied: false,
             partial: false,
+            raced: false,
         }
     }
 
     fn merge(&mut self, other: Self) {
         self.permission_denied |= other.permission_denied;
         self.partial |= other.partial;
+        self.raced |= other.raced;
     }
 }
 
@@ -291,6 +298,9 @@ fn socket_authority(
         permission_denied: socket_local_permission_gap || target_owner_permission_denied,
         partial: target_match.unverified_target_reason.is_some()
             || !socket.owner_completeness.is_complete(),
+        raced: socket.owner_completeness == OwnerCompleteness::Raced
+            || target_match.unverified_target_reason
+                == Some(crate::observation::UnverifiedOwnerReason::Raced),
     };
 
     if matches!(target_mode, DestructiveTargetMode::Port(_)) {
@@ -1309,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_refusal_precedes_raced_refusal_for_pid_and_port() {
+    fn raced_refusal_never_masquerades_as_permission_denial() {
         for (pid, port) in [(Some(18_422), None), (None, Some(3000))] {
             let mut snapshot = permission_denied_owner_snapshot();
             snapshot.completeness = SnapshotCompleteness::Raced;
@@ -1323,7 +1333,9 @@ mod tests {
 
             assert!(matches!(
                 kill_ports_from_snapshot(&snapshot, pid, port),
-                Err(super::CollectorError::OwnershipPermissionDenied)
+                Err(super::CollectorError::Observation(
+                    ObservationError::ObservationRaced
+                ))
             ));
         }
     }

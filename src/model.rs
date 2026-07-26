@@ -73,17 +73,19 @@ pub(crate) enum Platform {
     Macos,
 }
 
-/// How much of the process metadata the collector actually got to read.
+/// Legacy completeness flag retained under its original `permission` name.
 ///
-/// Ports still show up even when metadata is locked down, so this status lets the
-/// UI and CLI *explain* the blanks instead of just dropping the row.
+/// `Partial` means owner verification or optional process metadata was
+/// incomplete for any reason, including permission denial, disappearance,
+/// races, unsupported native fields, or retention bounds. It is not proof that
+/// the operating system denied permission; structured snapshots carry the
+/// precise evidence-gap reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PermissionStatus {
-    /// We could read everything.
+    /// Owner verification and optional process metadata were complete.
     Full,
-    /// The socket's visible, but some process metadata wasn't readable — usually
-    /// because the process belongs to another user.
+    /// The socket is visible, but owner verification or metadata was incomplete.
     Partial,
 }
 
@@ -110,9 +112,9 @@ impl BindScope {
 
 /// One open port and everything we know about the process behind it.
 ///
-/// `Option` fields are `None` when the OS wouldn't tell us; `permission` records
-/// that it happened, so consumers can tell "there's no value" apart from "we
-/// weren't allowed to look".
+/// `Option` fields are `None` when metadata was unavailable. The historical
+/// `permission` field records only complete versus partial legacy projection;
+/// it does not identify why a value is missing.
 ///
 /// This is an owned *projection* of [`crate::observation::NetworkSnapshot`],
 /// not a source of truth. Every field is derived by `project_legacy*`, and the

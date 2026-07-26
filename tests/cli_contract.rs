@@ -452,6 +452,10 @@ fn cli_and_config_errors_sanitize_terminal_controls() {
     assert_eq!(argument.status.code(), Some(2));
     let stderr = String::from_utf8(argument.stderr).expect("stderr is UTF-8");
     assert!(!stderr.contains('\u{202e}'), "{stderr:?}");
+    assert!(
+        stderr.contains("\n\nFor more information, try '--help'."),
+        "{stderr:?}"
+    );
 
     let config = run_command_with_deadline(
         Command::new(kickoutchi_binary()).args([
@@ -1027,11 +1031,9 @@ mod linux {
     const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
     const IPC_WAIT: Duration = Duration::from_secs(10);
     static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
-    // Port 0 never hosts a real listening socket (the kernel reads it as "assign an
-    // ephemeral port"), so `list --port 0` deterministically finds no confirmed
-    // socket — exactly the no-match condition these diagnostics exercise — with no
-    // free-port hunting and no bind/release race.
-    const DIAGNOSTIC_TEST_PORT: u16 = 0;
+    // Reserved for the no-match diagnostic helper's command line. Port zero is
+    // invalid user input, so use the top of the real port range instead.
+    const DIAGNOSTIC_TEST_PORT: u16 = u16::MAX;
 
     fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
         HOST_OBSERVATION_LOCK
@@ -4091,7 +4093,7 @@ mod linux {
     fn isolated_user_and_network_namespace_port_kill_delivers_sigterm() {
         let test_binary = std::env::current_exe().expect("test binary path resolves");
         let ready_file = temp_file_path("namespace-listener-ready");
-        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --ignored --nocapture & helper=$!; i=0; while test ! -s "$3"; do i=$((i+1)); test "$i" -lt 10000 || exit 90; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
+        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --ignored --nocapture & helper=$!; attempts=0; delay=0.001; while test ! -s "$3"; do attempts=$((attempts+1)); test "$attempts" -lt 100 || exit 90; sleep "$delay"; case "$delay" in 0.001) delay=0.002;; 0.002) delay=0.004;; 0.004) delay=0.008;; 0.008) delay=0.016;; 0.016) delay=0.032;; *) delay=0.050;; esac; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
         let output = run_command_with_deadline(
             Command::new("unshare")
                 .args([

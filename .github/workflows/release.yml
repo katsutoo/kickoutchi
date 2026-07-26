@@ -299,12 +299,17 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      - name: Require readelf for Linux ABI validation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: command -v readelf >/dev/null
       - name: Validate native release archive
         env:
           KICKOUTCHI_RELEASE_DISTRIB: target/distrib
           KICKOUTCHI_RELEASE_TARGETS_JSON: ${{ toJSON(matrix.targets) }}
           KICKOUTCHI_RELEASE_RUNNER_OS: ${{ runner.os }}
           KICKOUTCHI_RELEASE_RUNNER_ARCH: ${{ runner.arch }}
+          KICKOUTCHI_RELEASE_CONTAINER: ${{ matrix.container && '1' || '0' }}
         run: cargo test --locked --test release_artifact_validator validate_generated_native_archive -- --exact --ignored --nocapture
       - name: "Upload artifacts"
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -487,10 +492,20 @@ jobs:
             name=$(echo "$filename" | sed "s/\.rb$//")
             version=$(echo "$release" | jq .app_version --raw-output)
 
+            ruby -e 'path = ARGV.fetch(0); text = File.read(path); needle = "    install_binary_aliases!\n"; abort "missing unique install hook" unless text.scan(needle).length == 1; File.write(path, text.sub(needle, needle + "\n    (pkgshare/\"install-provenance\").write(\"homebrew\\n\")\n"))' "Formula/${filename}"
+
             export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-            brew update
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            export HOMEBREW_NO_INSTALL_CLEANUP=1
+            export HOMEBREW_CACHE="${RUNNER_TEMP}/homebrew-cache"
             # We avoid reformatting user-provided data such as the app description and homepage.
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
+
+            brew install --formula "./Formula/${filename}"
+            prefix=$(brew --prefix "$name")
+            test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${version}"
+            test "$(cat "${prefix}/share/kickoutchi/install-provenance")" = "homebrew"
+            brew uninstall "$name"
 
             git add "Formula/${filename}"
             git diff --cached --quiet || git commit -m "${name} ${version}"

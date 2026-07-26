@@ -199,6 +199,14 @@ enum ForceKillConfirmation {
     YesOnly,
 }
 
+#[derive(Debug)]
+struct TuiUpdateNotice {
+    notice: crate::update::UpdateNotice,
+    visible: bool,
+    rendered: bool,
+    ack_attempted: bool,
+}
+
 impl ForceKillConfirmation {
     fn from_config(confirm_force_kill: bool) -> Self {
         if confirm_force_kill {
@@ -237,11 +245,13 @@ pub(crate) struct App {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tree_preview_worker: Option<TreePreviewWorker>,
     kill_status: Option<String>,
+    update_notice: Option<TuiUpdateNotice>,
     refresh_worker: Option<RefreshWorker>,
     pending_refresh: PendingRefresh,
     last_successful_refresh: Option<Instant>,
     last_refresh_attempt: Instant,
     modal: Modal,
+    modal_scroll: u16,
     latest_error: Option<String>,
     filter_error: Option<String>,
     should_quit: bool,
@@ -255,8 +265,14 @@ impl App {
     /// does not wake it, so an async first load would leave the table blank for
     /// ~one tick on every launch. Only this initial load blocks — manual `r` and
     /// the auto-refresh tick still go through the off-thread [`App::refresh`].
-    pub(crate) fn new(config: &Config) -> Self {
+    pub(crate) fn new(config: &Config, update_notice: Option<crate::update::UpdateNotice>) -> Self {
         let mut app = Self::empty(config, Instant::now());
+        app.update_notice = update_notice.map(|notice| TuiUpdateNotice {
+            notice,
+            visible: true,
+            rendered: false,
+            ack_attempted: false,
+        });
         app.refresh_blocking();
         app
     }
@@ -304,11 +320,13 @@ impl App {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tree_preview_worker: None,
             kill_status: None,
+            update_notice: None,
             refresh_worker: None,
             pending_refresh: PendingRefresh::None,
             last_successful_refresh: None,
             last_refresh_attempt: now,
             modal: Modal::None,
+            modal_scroll: 0,
             latest_error: None,
             filter_error: None,
             should_quit: false,
@@ -334,13 +352,14 @@ impl App {
         // off the render loop keeps key handling out of the swamp mud without
         // letting scans pile up behind it.
         let (sender, receiver) = mpsc::channel();
-        match thread::Builder::new()
-            .name("kickoutchi-refresh".to_owned())
-            .spawn(move || {
+        match crate::ui::spawn_worker(
+            thread::Builder::new().name("kickoutchi-refresh".to_owned()),
+            move || {
                 let _ = sender.send(collector::collect_snapshot(
                     crate::observation::MetadataProfile::LegacyList,
                 ));
-            }) {
+            },
+        ) {
             Ok(_handle) => {
                 self.refresh_worker = Some(RefreshWorker {
                     receiver,
@@ -591,6 +610,78 @@ impl App {
         self.kill_status.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_update_notice(&mut self, notice: impl Into<String>) {
+        self.update_notice = Some(TuiUpdateNotice {
+            notice: crate::update::UpdateNotice::for_test(notice),
+            visible: true,
+            rendered: false,
+            ack_attempted: false,
+        });
+    }
+
+    pub(crate) fn visible_update_notice(&self) -> Option<&str> {
+        self.update_notice
+            .as_ref()
+            .filter(|state| state.visible)
+            .map(|state| state.notice.message())
+    }
+
+    pub(crate) fn update_notice_for_ack(&self) -> Option<&crate::update::UpdateNotice> {
+        self.update_notice
+            .as_ref()
+            .filter(|state| state.rendered && !state.ack_attempted)
+            .map(|state| &state.notice)
+    }
+
+    pub(crate) fn mark_update_overlay_rendered(&mut self) {
+        if let Some(state) = self.update_notice.as_mut() {
+            state.rendered = true;
+        }
+    }
+
+    pub(crate) fn mark_update_ack_attempted(&mut self) {
+        if let Some(state) = self.update_notice.as_mut() {
+            state.ack_attempted = true;
+        }
+    }
+
+    pub(crate) fn dismiss_update_notice(&mut self) -> bool {
+        let Some(state) = self.update_notice.as_mut() else {
+            return false;
+        };
+        if !state.visible || !state.rendered {
+            return false;
+        }
+        state.visible = false;
+        true
+    }
+
+    pub(crate) fn modal_scroll(&self) -> u16 {
+        self.modal_scroll
+    }
+
+    pub(crate) fn scroll_modal_by(&mut self, rows: i32) {
+        self.modal_scroll = if rows.is_negative() {
+            self.modal_scroll
+                .saturating_sub(u16::try_from(rows.unsigned_abs()).unwrap_or(u16::MAX))
+        } else {
+            self.modal_scroll
+                .saturating_add(u16::try_from(rows).unwrap_or(u16::MAX))
+        };
+    }
+
+    pub(crate) fn set_modal_scroll(&mut self, rows: u16) {
+        self.modal_scroll = rows;
+    }
+
+    pub(crate) fn cancel_confirmation_for_layout(&mut self) {
+        self.cancel_confirmation();
+        self.kill_status = Some(
+            "confirmation cancelled: terminal cannot show all mandatory safety text".to_owned(),
+        );
+    }
+
     /// Whether a background refresh worker is still in flight. Test-only: the
     /// status bar deliberately does not surface refresh progress to the user.
     #[cfg(test)]
@@ -636,9 +727,13 @@ impl App {
             Action::MoveDown => self.select_next(),
             Action::MoveUp => self.select_previous(),
             Action::OpenDetails => self.open_details(),
-            Action::OpenHelp => self.modal = Modal::Help,
+            Action::OpenHelp => {
+                self.modal_scroll = 0;
+                self.modal = Modal::Help;
+            }
             Action::CloseModal => {
                 self.modal = Modal::None;
+                self.modal_scroll = 0;
                 self.context_request_state = ContextRequestState::Idle;
             }
             Action::RequestTerminate => self.request_kill(KillMode::Terminate),
@@ -681,6 +776,7 @@ impl App {
     fn open_details(&mut self) {
         if self.selected_row().is_some() {
             self.search_mode = false;
+            self.modal_scroll = 0;
             self.load_selected_process_context();
             self.modal = Modal::Details;
         }
@@ -906,11 +1002,12 @@ impl App {
     fn spawn_tree_preview_worker(&mut self, root_pid: u32, platform: crate::model::Platform) {
         let protected_names = self.protected_processes.clone();
         let (sender, receiver) = mpsc::channel();
-        match thread::Builder::new()
-            .name("kickoutchi-tree-preview".to_owned())
-            .spawn(move || {
+        match crate::ui::spawn_worker(
+            thread::Builder::new().name("kickoutchi-tree-preview".to_owned()),
+            move || {
                 let _ = sender.send(collect_tree_preview(root_pid, &protected_names, platform));
-            }) {
+            },
+        ) {
             Ok(_handle) => {
                 self.tree_preview_worker = Some(TreePreviewWorker { root_pid, receiver });
             }
@@ -1516,15 +1613,16 @@ impl App {
         };
         let key = RowKey::from(&entry);
         let (sender, receiver) = mpsc::channel();
-        match thread::Builder::new()
-            .name("kickoutchi-details".to_owned())
-            .spawn(move || {
+        match crate::ui::spawn_worker(
+            thread::Builder::new().name("kickoutchi-details".to_owned()),
+            move || {
                 // The worker outlives the snapshot the view borrowed, so the row
                 // is owned across the thread boundary and re-borrowed here.
                 let _ = sender.send(collect_selected_process_context(PortEntryView::from(
                     &entry,
                 )));
-            }) {
+            },
+        ) {
             Ok(_handle) => {
                 self.context_request_state = ContextRequestState::Idle;
                 self.context_worker = Some(ContextWorker {
@@ -1742,8 +1840,9 @@ fn tree_kill_status_line(
 
     let delivery = mode.delivery_label(root.platform);
     match outcome {
-        TreeKillOutcome::ThawFailed { pids, .. } => format!(
-            "cleanup failed for PID(s) {}; they may remain stopped and require SIGCONT",
+        TreeKillOutcome::ThawFailed { pids, cause } => format!(
+            "{}; cleanup failed for PID(s) {}; they may remain stopped and require SIGCONT",
+            sanitize(&cause.failure_cause_text()),
             tree::format_pid_list(pids),
         ),
         TreeKillOutcome::Completed(report) if !report.thaw_failed.is_empty() => format!(
@@ -1883,8 +1982,9 @@ fn termination_status_line(
             target.identity(),
             sanitize(error),
         ),
-        TerminationOutcome::ThawFailed { pid, .. } => format!(
-            "cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+        TerminationOutcome::ThawFailed { pid, prior } => format!(
+            "{}; cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+            sanitize(&prior.failure_cause_text()),
         ),
     }
 }
@@ -1914,6 +2014,7 @@ fn preserved_selection(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -2078,6 +2179,21 @@ mod tests {
     }
 
     #[test]
+    fn selected_context_requests_docker_enrichment_without_a_rendering_gate() {
+        let mut row = entry(5432, Some("docker-proxy"));
+        row.executable_path = Some(std::path::PathBuf::from("/usr/bin/docker-proxy").into());
+        let enrichment_requested = Cell::new(false);
+
+        let _context =
+            super::collect_selected_process_context_with(PortEntryView::from(&row), |_| {
+                enrichment_requested.set(true);
+                None
+            });
+
+        assert!(enrichment_requested.get());
+    }
+
+    #[test]
     fn starts_sorted_and_selects_first_row() {
         let app = app_with_rows(vec![entry(5173, Some("vite")), entry(3000, Some("node"))]);
 
@@ -2087,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_movement_is_bounded() {
+    fn table_selection_never_requests_details_or_docker_context() {
         let mut app = app_with_rows(vec![entry(1, Some("one")), entry(2, Some("two"))]);
 
         app.apply_action(Action::MoveUp);
@@ -2097,6 +2213,7 @@ mod tests {
         app.apply_action(Action::MoveDown);
         assert_eq!(app.selected_index(), Some(1));
         assert_eq!(app.selected_process_context(), None);
+        assert!(app.context_worker.is_none());
 
         app.apply_action(Action::MoveDown);
         assert_eq!(app.selected_index(), Some(1));

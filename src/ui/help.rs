@@ -1,13 +1,15 @@
 //! Drawing the help modal.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::theme::Theme;
+use crate::app::App;
 
-pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
+use super::{rendered_rows, theme::Theme};
+
+pub(crate) fn render(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let mut lines = vec![
         Line::styled("Kickoutchi", theme.title()),
         Line::raw("Native ports with refresh, search filters, sortable rows, and process context."),
@@ -36,16 +38,38 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, theme: Theme) {
         Line::raw(""),
         Line::raw("Search mode: type to filter, Enter keeps the filter, Esc clears it."),
         Line::raw("Filters: pid:18422 port:3000 proto:udp scope:public protected:true parent:node"),
+        Line::raw("         label:web address:127.0.0.1 scope_id:3 family:ipv6"),
         Line::raw("Press Enter to load selected-row children, owner UID, and protected warnings."),
     ]);
-    let help = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::bordered()
-            .title("Help")
-            .title_style(theme.title())
-            .border_style(theme.border()),
-    );
+    let block = Block::bordered()
+        .title("Help")
+        .title_style(theme.title())
+        .border_style(theme.border());
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(help, area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let total_rows = rendered_rows(&lines, usize::from(chunks[0].width));
+    let max_scroll = total_rows.saturating_sub(usize::from(chunks[0].height));
+    let scroll = usize::from(app.modal_scroll()).min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Up/Down", theme.key()),
+            Span::raw(" scroll  "),
+            Span::styled("Esc", theme.key()),
+            Span::raw(" closes"),
+        ])),
+        chunks[1],
+    );
 }
 
 fn key_line(key: &'static str, description: &'static str, theme: Theme) -> Line<'static> {

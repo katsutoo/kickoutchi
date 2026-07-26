@@ -7,6 +7,9 @@
 //! binaries (`kickoutchi` and `kick`) that just call [`run`], so Cargo isn't
 //! stuck compiling and testing the same `main.rs` twice.
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("Kickoutchi supports only Linux, macOS, and Windows");
+
 mod app;
 mod cli;
 mod collector;
@@ -37,11 +40,12 @@ mod query;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod tree;
 mod ui;
+mod update;
 mod watch;
 #[cfg(windows)]
 mod windows_tree;
 
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -55,8 +59,15 @@ use crate::display::{sanitize, sanitize_multiline};
 ///
 /// Argument errors are rendered here rather than by clap's process-exiting
 /// helper so untrusted argv text passes through the terminal sanitizer.
+/// On Unix, embedded callers with pre-existing non-Kickoutchi threads must
+/// block `SIGTERM` and `SIGHUP` in those threads while the TUI owns its temporary
+/// process-wide handlers. The standalone binaries mask every worker they create.
 #[must_use]
 pub fn run() -> ExitCode {
+    if update::is_internal_worker() {
+        update::run_internal_worker();
+        return ExitReason::Success.into();
+    }
     init_tracing();
     let args = match Cli::try_parse() {
         Ok(args) => args,
@@ -66,10 +77,15 @@ pub fn run() -> ExitCode {
                 ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
             ) {
                 let rendered = sanitize_multiline(&error.to_string());
-                print!("{rendered}");
-                return ExitReason::Success.into();
+                return match write_cli_stdout(io::stdout().lock(), &rendered) {
+                    Ok(()) => ExitReason::Success.into(),
+                    Err(error) => {
+                        eprintln!("error: writing stdout failed: {error}");
+                        ExitReason::Failure.into()
+                    }
+                };
             }
-            let rendered = sanitize(&error.to_string());
+            let rendered = sanitize_multiline(&error.to_string());
             eprintln!("{}", rendered.trim_end());
             return ExitReason::InvalidArguments.into();
         }
@@ -99,25 +115,45 @@ pub fn run() -> ExitCode {
     };
     config.apply_cli_overrides(args.refresh_interval);
 
+    let update_notice = if config.check_for_updates
+        && args
+            .command
+            .as_ref()
+            .is_none_or(crate::cli::Command::allows_update_notice)
+        && !update::is_elevated()
+    {
+        update::foreground()
+    } else {
+        None
+    };
+
     match args.command {
-        Some(command) => cli::run(&command, &config, watch_signal_guard).into(),
-        None => run_tui(&config),
+        Some(command) => {
+            if let Some(notice) = update_notice.as_ref()
+                && write_update_notice(io::stderr().lock(), notice.message()).is_ok()
+            {
+                let _ = update::acknowledge(notice);
+            }
+            cli::run(&command, &config, watch_signal_guard).into()
+        }
+        None => run_tui(&config, update_notice),
     }
 }
 
-/// Run the TUI path. The panic hook lives here rather than in [`run`] because
-/// its whole job is putting the terminal back the way we found it — and the
-/// headless CLI path never enters the alternate screen, so it's happy with the
-/// default panic output.
+/// Run the TUI path. [`ui::run_owned`] scopes the panic hook to this path because
+/// its whole job is putting the terminal back the way we found it; the headless
+/// CLI path never enters the alternate screen and keeps the embedder's hook.
 ///
 /// Order matters for safety: install the panic hook *before* entering the
 /// alternate screen, so a panic during setup or rendering still restores the
 /// terminal before anything prints. Normal exits and `?`-errors are already
 /// covered by the `Drop` guard inside [`ui::run`].
-fn run_tui(config: &Config) -> ExitCode {
-    ui::install_panic_hook();
-
-    match ui::run(config) {
+fn run_tui(config: &Config, update_notice: Option<update::UpdateNotice>) -> ExitCode {
+    let result = match ui::run_owned(|| ui::run(config, update_notice)) {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
+    };
+    match result {
         Ok(()) => ExitReason::Success.into(),
         Err(error) => {
             // The terminal's already restored by now, so this lands on the
@@ -128,6 +164,21 @@ fn run_tui(config: &Config) -> ExitCode {
             eprintln!("error: {}", sanitize_multiline(&error.to_string()));
             ExitReason::Failure.into()
         }
+    }
+}
+
+fn write_update_notice(mut writer: impl Write, notice: &str) -> io::Result<()> {
+    writeln!(writer, "{}", sanitize(notice))?;
+    writer.flush()
+}
+
+fn write_cli_stdout(mut writer: impl Write, text: &str) -> io::Result<()> {
+    match writer
+        .write_all(text.as_bytes())
+        .and_then(|()| writer.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
     }
 }
 
@@ -142,4 +193,36 @@ fn init_tracing() {
         .with_writer(io::stderr)
         .with_max_level(tracing::Level::WARN)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+
+    use super::write_cli_stdout;
+
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn help_output_treats_a_closed_pipe_as_success() {
+        assert!(write_cli_stdout(FailingWriter(io::ErrorKind::BrokenPipe), "help").is_ok());
+    }
+
+    #[test]
+    fn help_output_preserves_non_pipe_write_failures() {
+        let error = write_cli_stdout(FailingWriter(io::ErrorKind::PermissionDenied), "help")
+            .expect_err("permission errors must remain failures");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 }

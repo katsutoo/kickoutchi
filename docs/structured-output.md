@@ -376,7 +376,7 @@ Each array element has exactly these fields:
 | `child_pids` | array of `u32` | Frozen `1.x` compatibility field with no backing data. It is always `[]`, on every row and every platform. Child processes are not part of this contract; use `inspect` for process relationships. |
 | `protected` | boolean | Whether configured and built-in protection rules classify the process as protected. |
 | `platform` | `"linux" \| "macos" \| "windows"` | Host collector platform. |
-| `permission` | `"full" \| "partial"` | Whether all legacy process metadata was available. Use this to distinguish unavailable metadata from known values. |
+| `permission` | `"full" \| "partial"` | Legacy completeness flag. `full` means owner verification and optional process metadata were complete; `partial` means either was incomplete for any reason. The historical field name does not prove permission denial; use snapshot evidence gaps for the cause. |
 | `label` | `string \| null` | Resolved configured endpoint label, or `null` when no selector matches. |
 
 Process names and command lines preserve the established lossy decoding behavior: invalid Unix bytes or Windows UTF-16 sequences become U+FFFD. Executable paths do not use lossy conversion; invalid UTF-8 becomes `null` and makes metadata partial.
@@ -920,6 +920,10 @@ The process-wide exit contract is:
 | 6 | A protected process requires confirmation; not produced by the structured commands in this document. |
 
 Stdout contains only the requested JSON, NDJSON, or human result. Diagnostics, warnings, parse errors, and operational errors use stderr. Structured stdout is never mixed with prose.
+
+Automatic release checks and update notices are disabled entirely for structured
+JSON, snapshot, watch, and Why invocations; they do not add stderr noise or
+consume a pending human notification.
 
 A broken stdout pipe is successful consumer termination for list, snapshot, and watch. Why evaluates all endpoints before writing, so a broken pipe preserves the already-computed aggregate exit code rather than converting an unavailable endpoint into success. Any other write or flush failure exits `1`.
 

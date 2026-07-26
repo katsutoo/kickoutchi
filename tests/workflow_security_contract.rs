@@ -2,6 +2,8 @@ const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const DIST_WORKSPACE: &str = include_str!("../dist-workspace.toml");
 
+use serde_yaml_ng::Value;
+
 fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -154,6 +156,56 @@ fn action_reference(step: &str) -> Option<String> {
     })
 }
 
+fn parsed_workflow(source: &str) -> Value {
+    serde_yaml_ng::from_str(source).expect("workflow must be valid YAML")
+}
+
+fn mapping_value<'a>(mapping: &'a serde_yaml_ng::Mapping, key: &str) -> Option<&'a Value> {
+    mapping
+        .iter()
+        .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
+}
+
+fn reusable_workflow_references(workflow: &str) -> Vec<String> {
+    let workflow = parsed_workflow(workflow);
+    let root = workflow
+        .as_mapping()
+        .expect("workflow root must be a mapping");
+    let jobs = mapping_value(root, "jobs")
+        .and_then(Value::as_mapping)
+        .expect("workflow jobs must be a mapping");
+
+    jobs.values()
+        .filter_map(Value::as_mapping)
+        .filter_map(|job| mapping_value(job, "uses"))
+        .map(|reference| {
+            reference
+                .as_str()
+                .expect("reusable workflow reference must be a string")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_pinned_reference(reference: &str, kind: &str) {
+    if reference.starts_with("./") {
+        return;
+    }
+    let (target, revision) = reference
+        .rsplit_once('@')
+        .unwrap_or_else(|| panic!("{kind} must specify a revision: {reference}"));
+    assert!(target.contains('/'), "invalid {kind}: {reference}");
+    assert_eq!(
+        revision.len(),
+        40,
+        "{kind} must use a full commit SHA: {reference}"
+    );
+    assert!(
+        revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{kind} must use a hexadecimal commit SHA: {reference}"
+    );
+}
+
 fn assert_action_pins_and_checkout_credentials(workflow: &str) {
     let steps = workflow_steps(workflow);
     let actions = steps
@@ -163,26 +215,11 @@ fn assert_action_pins_and_checkout_credentials(workflow: &str) {
     assert!(!actions.is_empty(), "workflow must use at least one action");
 
     for (step, reference) in actions {
-        if reference.starts_with("./") {
-            continue;
-        }
-        let (action, revision) = reference
-            .rsplit_once('@')
-            .unwrap_or_else(|| panic!("action must specify a revision: {reference}"));
-        assert!(
-            action.contains('/'),
-            "invalid action reference: {reference}"
-        );
-        assert_eq!(
-            revision.len(),
-            40,
-            "action must use a full commit SHA: {reference}"
-        );
-        assert!(
-            revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "action must use a hexadecimal commit SHA: {reference}"
-        );
+        assert_pinned_reference(&reference, "action reference");
 
+        let action = reference
+            .rsplit_once('@')
+            .map_or(reference.as_str(), |pair| pair.0);
         if action == "actions/checkout" {
             let active = step.lines().filter_map(active_line).collect::<Vec<_>>();
             assert!(
@@ -194,6 +231,10 @@ fn assert_action_pins_and_checkout_credentials(workflow: &str) {
                 "checkout credentials must not be replaced with an explicit token"
             );
         }
+    }
+
+    for reference in reusable_workflow_references(workflow) {
+        assert_pinned_reference(&reference, "reusable workflow reference");
     }
 }
 
@@ -262,30 +303,27 @@ fn assert_exact_semver(version: &str) {
 }
 
 fn assert_no_ref_expression_in_run_scripts(workflow: &str) {
-    let lines = workflow.lines().collect::<Vec<_>>();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(active) = active_line(line) else {
-            continue;
-        };
-        let Some(run) = active.strip_prefix("run:") else {
-            continue;
-        };
-        assert!(
-            !run.contains("${{ github.ref"),
-            "tag/ref expressions must reach shell commands through environment variables"
-        );
-
-        let run_indent = indentation(line);
-        for script_line in lines.iter().skip(index + 1) {
-            if active_line(script_line).is_some() && indentation(script_line) <= run_indent {
-                break;
+    fn inspect(value: &Value) {
+        match value {
+            Value::Mapping(mapping) => {
+                for (key, value) in mapping {
+                    if key.as_str() == Some("run") {
+                        let script = value.as_str().expect("workflow run value must be a string");
+                        assert!(
+                            !script.contains("${{ github.ref"),
+                            "tag/ref expressions must not be spliced into shell scripts"
+                        );
+                    }
+                    inspect(value);
+                }
             }
-            assert!(
-                !script_line.contains("${{ github.ref"),
-                "tag/ref expressions must not be spliced into shell scripts"
-            );
+            Value::Sequence(sequence) => sequence.iter().for_each(inspect),
+            Value::Tagged(tagged) => inspect(&tagged.value),
+            _ => {}
         }
     }
+
+    inspect(&parsed_workflow(workflow));
 }
 
 #[test]
@@ -505,13 +543,12 @@ fn native_archives_are_validated_before_upload_and_publication() {
     );
 }
 
-/// The helpers above are a hand-rolled YAML reader, kept instead of a parser
-/// dependency because these tests read one repository-controlled file. That
-/// trade is only safe while the reader is itself pinned: a helper that silently
-/// returned nothing would make every security assertion in this file pass
-/// vacuously. These tests exercise the reader against a fixture with the shapes
-/// the real workflows use — nesting, comments, inline comments, blank lines,
-/// multi-line steps — plus the failure modes that must stay loud.
+/// The shape-specific helpers above remain a deliberately small YAML reader;
+/// security-sensitive key enumeration uses `serde_yaml_ng` so valid alternate
+/// YAML spellings cannot evade it. A helper that silently returned nothing
+/// would still make the shape assertions pass vacuously, so these tests exercise
+/// nesting, comments, inline comments, blank lines, multi-line steps, and loud
+/// failure for missing blocks.
 #[cfg(test)]
 mod yaml_reader {
     use super::{
@@ -646,6 +683,65 @@ jobs:
         assert_eq!(step_env(&steps[0], "TOKEN"), None);
         assert_eq!(step_env(&steps[1], "ABSENT"), None);
     }
+}
+
+#[test]
+fn run_script_scanner_covers_every_yaml_mapping_form() {
+    let safe = r#"
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "$SAFE_REF"
+      - { "run": "echo $SAFE_REF" }
+      - name: quoted key
+        'run': |
+          echo "$SAFE_REF"
+"#;
+    assert_no_ref_expression_in_run_scripts(safe);
+
+    for hostile in [
+        "jobs:\n  fixture:\n    steps:\n      - run: echo ${{ github.ref_name }}\n",
+        "jobs:\n  fixture:\n    steps:\n      - { name: inline, run: 'echo ${{ github.ref }}' }\n",
+        "jobs:\n  fixture:\n    steps:\n      - 'run': |\n          echo ${{ github.ref_name }}\n",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_ref_expression_in_run_scripts(hostile)).is_err(),
+            "run expression escaped structural scanning: {hostile}"
+        );
+    }
+}
+
+#[test]
+fn reusable_workflows_are_discovered_and_require_commit_pins() {
+    let pinned = r"
+jobs:
+  remote:
+    uses: owner/repository/.github/workflows/ci.yml@1111111111111111111111111111111111111111
+  local:
+    uses: ./.github/workflows/local.yml
+";
+    assert_eq!(
+        reusable_workflow_references(pinned),
+        [
+            "owner/repository/.github/workflows/ci.yml@1111111111111111111111111111111111111111",
+            "./.github/workflows/local.yml",
+        ]
+    );
+    for reference in reusable_workflow_references(pinned) {
+        assert_pinned_reference(&reference, "reusable workflow reference");
+    }
+
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_pinned_reference(
+                "owner/repository/.github/workflows/ci.yml@main",
+                "reusable workflow reference",
+            );
+        })
+        .is_err(),
+        "a mutable reusable-workflow ref must fail the security contract"
+    );
 }
 
 /// Regression for the inline-comment blind spot: a permission line annotated

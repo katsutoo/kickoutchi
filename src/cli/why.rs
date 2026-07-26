@@ -1,6 +1,6 @@
 use std::io::{self, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::SystemTime;
 
 use clap::Args;
@@ -33,7 +33,8 @@ const PUBLIC_MESSAGE_MAX_BYTES: usize = 512;
 #[derive(Debug, Args)]
 pub(crate) struct WhyArgs {
     /// Port to diagnose (1..=65535).
-    pub(crate) port: u32,
+    #[arg(value_parser = super::parse_port)]
+    pub(crate) port: u16,
 
     /// Evaluate TCP only (default; ordered before UDP in a matrix).
     #[arg(long, conflicts_with_all = ["udp", "all_protocols"])]
@@ -209,10 +210,9 @@ fn run_why_with(
 
 impl WhyOptions {
     fn parse(args: &WhyArgs) -> Result<Self, String> {
-        let port = u16::try_from(args.port)
-            .ok()
-            .filter(|port| *port != 0)
-            .ok_or_else(|| "port must be in 1..=65535".to_owned())?;
+        let port = NonZeroU16::new(args.port)
+            .ok_or_else(|| "port must be in 1..=65535".to_owned())?
+            .get();
         // `--tcp` is read here rather than left to fall through the `else`.
         // Both mean TCP today, but a flag that works only because it matches
         // the default is a flag that breaks silently when the default moves.
@@ -997,14 +997,6 @@ mod tests {
             .is_ok()
         );
         assert!(WhyOptions::parse(&WhyArgs { port: 0, ..args() }).is_err());
-        assert!(
-            WhyOptions::parse(&WhyArgs {
-                port: 65_536,
-                ..args()
-            })
-            .is_err()
-        );
-
         let scoped = WhyArgs {
             address: Some("fe80::1".to_owned()),
             scope_id: Some(u32::MAX),

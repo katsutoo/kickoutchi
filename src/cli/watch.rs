@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Write};
 use std::net::IpAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -57,8 +57,8 @@ pub(crate) struct WatchArgs {
     #[arg(long, value_name = "ID")]
     scope_id: Option<u64>,
     /// Match this exact nonzero port.
-    #[arg(long)]
-    port: Option<u64>,
+    #[arg(long, value_parser = super::parse_port)]
+    port: Option<u16>,
     /// Apply plain or structured full-state filters using AND semantics.
     ///
     /// Fields: `pid:`, `port:`, `proto:`, `scope:`, `protected:`, `parent:`,
@@ -126,9 +126,8 @@ impl WatchOptions {
         let port = args
             .port
             .map(|value| {
-                u16::try_from(value)
-                    .ok()
-                    .filter(|value| *value != 0)
+                NonZeroU16::new(value)
+                    .map(NonZeroU16::get)
                     .ok_or_else(|| "--port must be in 1..=65535".to_owned())
             })
             .transpose()?;

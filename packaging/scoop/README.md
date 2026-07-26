@@ -50,6 +50,10 @@ manually. Its write access and `GITHUB_TOKEN` belong to the bucket repository;
 the Kickoutchi release workflow does not push Scoop manifests or hold a bucket
 credential.
 
+The manifest installs a closed `scoop` provenance marker beside the executable.
+Kickoutchi uses it only to render Scoop's own update command when the weekly
+release check finds a newer stable version.
+
 To test a manifest change before pushing:
 
 ```powershell

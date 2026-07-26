@@ -14,13 +14,15 @@
 //! `kill(-pgid)`: every member is enumerated, frozen, identity-verified, and
 //! signalled individually, so the same refusal gates apply to every PID.
 //!
-//! On Unix, the trick is to freeze before you count. A stopped process cannot `fork`, so
-//! once the root is `SIGSTOP`ped the shape of the tree stops growing from the
-//! top, and a bounded re-scan sweep then reaches every descendant. Identity is
-//! re-checked *after* each process is stopped, where its PID can no longer be
-//! recycled, so a signal can never wander onto a reused PID. Any refusal after
-//! freezing thaws every process it stopped — Kickoutchi never leaves the swamp
-//! full of frozen residents.
+//! On Unix, the trick is to freeze before you count. A process observed stopped
+//! cannot `fork` unless another actor continues it, so the tree normally stops
+//! growing from the root while a bounded re-scan sweep reaches descendants.
+//! Identity is re-checked after each observed stop; Linux pins delivery with a
+//! pidfd and macOS re-checks start markers at each raw-PID boundary. Any refusal
+//! after freezing thaws only processes Kickoutchi transitioned to stopped, so an
+//! externally stopped process is not resumed as refusal cleanup. Concurrent
+//! external `SIGSTOP`/`SIGCONT` can still race those observations; scoped kill is
+//! bounded best-effort convergence, not an atomic kernel transaction.
 //!
 //! This module is the pure orchestration. All real process I/O — enumerating
 //! `/proc`, sending signals — is injected through [`TreeProcessOps`], so the
@@ -32,10 +34,10 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Platform, SystemProcessCheck};
 use crate::observation::ProcessStartMarker;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::process::KillTarget;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::current_user_id;
 use crate::process::{KillMode, UnsafePidReason, unsafe_pid_reason};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process::{KillTarget, UNIX_STOP_ACKNOWLEDGEMENT_MAX};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
@@ -63,11 +65,11 @@ pub(crate) const PROCESS_TREE_INDEX_MAX: usize = crate::observation::CANDIDATE_P
 pub(crate) const MAX_GROUP_PROCESSES: usize = 512;
 
 /// Cap on freeze-sweep passes. Every pass drains one snapshot completely, so a
-/// static tree of any depth freezes in a single pass; a stopped process cannot
-/// fork, so passes only repeat while genuinely new processes keep appearing
-/// between snapshots. Exhausting the cap without a clean pass means the member
-/// set kept churning and could not be enumerated completely, so the kill is
-/// refused rather than run against a set we cannot vouch for.
+/// static tree of any depth freezes in a single pass; a process cannot fork on
+/// its own while it remains stopped, so passes only repeat while genuinely new
+/// processes appear between snapshots. Exhausting the cap without a clean pass
+/// means the member set kept churning and could not be enumerated completely,
+/// so the kill is refused rather than run against a set we cannot vouch for.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FREEZE_PASSES: usize = 8;
 
@@ -121,6 +123,31 @@ pub(crate) enum TreeSignalResult {
     Denied,
 }
 
+/// Result of stopping one member, including cleanup ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) enum TreeStopResult {
+    /// Stopped state was observed. `transitioned` is false when it was already
+    /// stopped before Kickoutchi submitted `SIGSTOP`.
+    Stopped { transitioned: bool },
+    /// The process exited before stopped state could be established.
+    NotFound,
+    /// The stop failed. A successful submission can still require cleanup when
+    /// the bounded stopped-state observation subsequently fails.
+    Failed {
+        cleanup_required: bool,
+        rollback_start_time_marker: Option<ProcessStartMarker>,
+        error: TreeStopError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) enum TreeStopError {
+    PermissionDenied,
+    ObservationFailed(String),
+}
+
 /// What portion of the process table a platform snapshot should prove.
 ///
 /// Linux already reads a complete `/proc` table cheaply. macOS uses this during
@@ -166,6 +193,40 @@ pub(crate) trait TreeProcessOps {
     }
     /// `SIGSTOP` a process.
     fn stop(&mut self, pid: u32) -> TreeSignalResult;
+    /// Stop and wait for observable stopped state, retaining whether cleanup may
+    /// later send `SIGCONT`.
+    ///
+    /// Real Unix signal helpers publish the richer result while preserving the
+    /// older signal-shaped `stop` boundary used by platform adapters. Test and
+    /// preview implementations that do not publish one retain the historical
+    /// assumption that a delivered fake stop made the transition.
+    fn stop_checked(&mut self, pid: u32, deadline: std::time::Instant) -> TreeStopResult {
+        if self.stop_acknowledgement_now() >= deadline {
+            return TreeStopResult::Failed {
+                cleanup_required: false,
+                rollback_start_time_marker: None,
+                error: TreeStopError::ObservationFailed(
+                    "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
+                ),
+            };
+        }
+        let result = crate::process::with_tree_stop_deadline(deadline, || self.stop(pid));
+        crate::process::take_tree_stop_result(pid).unwrap_or(match result {
+            TreeSignalResult::Delivered => TreeStopResult::Stopped { transitioned: true },
+            TreeSignalResult::NotFound => TreeStopResult::NotFound,
+            TreeSignalResult::Denied => TreeStopResult::Failed {
+                cleanup_required: false,
+                rollback_start_time_marker: None,
+                error: TreeStopError::PermissionDenied,
+            },
+        })
+    }
+    /// Clock used to bound stopped-state acknowledgement across this operation.
+    /// Implementations normally use the monotonic system clock; deterministic
+    /// fakes can override it without sleeping.
+    fn stop_acknowledgement_now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
     /// Capture the identity that accepted `SIGSTOP`, for guarded rollback.
     ///
     /// Linux continuation is pinned by pidfd, so retaining the previously
@@ -692,6 +753,9 @@ struct FrozenNode {
     /// Identity observed immediately after this PID accepted `SIGSTOP`, used
     /// only to guard rollback when termination authorization fails.
     rollback_start_time_marker: Option<ProcessStartMarker>,
+    /// Whether Kickoutchi observed this process running before its successful
+    /// stop submission. Only these members may receive cleanup `SIGCONT`.
+    resume_on_cleanup: bool,
     depth: usize,
 }
 
@@ -706,6 +770,7 @@ impl FrozenNode {
             owner_uid: info.owner_uid,
             start_time_marker: info.start_time_marker,
             rollback_start_time_marker: info.start_time_marker,
+            resume_on_cleanup: true,
             depth,
         }
     }
@@ -848,6 +913,48 @@ pub(crate) enum TreeKillOutcome {
     },
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl TreeKillOutcome {
+    pub(crate) fn failure_cause_text(&self) -> String {
+        match self {
+            Self::Completed(_) => "scoped signal delivery was incomplete".to_owned(),
+            Self::RootAlreadyExited => "the root process already exited".to_owned(),
+            Self::PermissionDenied { pid } => format!("permission denied for PID {pid}"),
+            Self::TargetChanged { pid } => format!("process identity changed at PID {pid}"),
+            Self::Truncated { limit } => format!("the process scope exceeded {limit} members"),
+            Self::SweepPassLimit { limit } => {
+                format!("the process scope did not converge after {limit} freeze passes")
+            }
+            Self::UnsafePid { pid, reason } => {
+                format!("unsafe PID {pid}: {}", reason.message())
+            }
+            Self::ProtectedDescendant { pid, name } => format!(
+                "protected process PID {pid} ({}) entered the scope",
+                name.as_deref().unwrap_or("<unknown>")
+            ),
+            Self::ProtectedRoot { pid, name } => format!(
+                "root PID {pid} ({}) became protected",
+                name.as_deref().unwrap_or("<unknown>")
+            ),
+            Self::FreshConfirmationRequired => {
+                "the process scope changed after confirmation".to_owned()
+            }
+            Self::OwnershipUnavailable { pid } => {
+                format!("ownership for PID {pid} became unavailable")
+            }
+            Self::PartialMetadata { pid } => {
+                format!("process metadata for PID {pid} was incomplete")
+            }
+            Self::SnapshotFailed(error) => error.clone(),
+            Self::ThawFailed { pids, cause } => format!(
+                "{}; cleanup could not continue PID(s) {}",
+                cause.failure_cause_text(),
+                format_pid_list(pids)
+            ),
+        }
+    }
+}
+
 /// Freeze the tree, verify it, and terminate it — root first to stop, root last
 /// to signal.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -897,11 +1004,12 @@ pub(crate) fn execute_group_kill<Ops: TreeProcessOps>(
 
 /// The shared freeze-first execution, for both scopes.
 ///
-/// The ordering is the safety contract: `SIGSTOP` the root before enumerating so
-/// it cannot fork; sweep the remaining members to a fixed point; verify every
-/// frozen identity where PID reuse is impossible; refuse (thawing everything) on
-/// any uncertainty; then signal tree members deepest-first/root-last, or group
-/// members with every terminating signal queued before any continue.
+/// The ordering is the safety contract: `SIGSTOP` the root before enumerating to
+/// prevent ordinary forks; sweep the remaining members to a fixed point; verify
+/// every frozen identity through pinned or marker-guarded delivery; refuse
+/// (thawing) on any uncertainty; then signal tree members
+/// deepest-first/root-last, or group members with every terminating signal
+/// queued before any continue.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn execute_freeze_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
@@ -927,19 +1035,54 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
         },
     });
 
-    // Stop the root before anything else: a stopped process cannot fork, so
-    // this freezes the member set's growth from the confirmed process before we
-    // ever look at it.
-    let rollback_start_time_marker = match ops.stop(root.pid) {
-        TreeSignalResult::Delivered => {
-            ops.rollback_identity_after_stop(root.pid, root.process_start_time_marker)
-        }
-        TreeSignalResult::NotFound => return TreeKillOutcome::RootAlreadyExited,
-        TreeSignalResult::Denied => return TreeKillOutcome::PermissionDenied { pid: root.pid },
-    };
+    let stop_deadline = ops.stop_acknowledgement_now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+
+    // Stop the root before anything else: while it remains stopped it cannot
+    // fork on its own, normally freezing growth before we inspect membership.
+    let (rollback_start_time_marker, root_transitioned) =
+        match stop_before_deadline(root.pid, stop_deadline, ops) {
+            TreeStopResult::Stopped { transitioned } => (
+                ops.rollback_identity_after_stop(root.pid, root.process_start_time_marker),
+                transitioned,
+            ),
+            TreeStopResult::NotFound => return TreeKillOutcome::RootAlreadyExited,
+            TreeStopResult::Failed {
+                cleanup_required: false,
+                rollback_start_time_marker: _,
+                error,
+            } => return tree_stop_error_outcome(root.pid, error),
+            TreeStopResult::Failed {
+                cleanup_required: true,
+                rollback_start_time_marker,
+                error,
+            } => {
+                let rollback_start_time_marker = rollback_start_time_marker.or_else(|| {
+                    ops.rollback_identity_after_stop(root.pid, root.process_start_time_marker)
+                });
+                let root_node = FrozenNode {
+                    pid: root.pid,
+                    parent_pid: None,
+                    parent_process_name: None,
+                    process_name: root.process_name.clone(),
+                    owner_uid: root.owner_uid,
+                    start_time_marker: root.process_start_time_marker,
+                    rollback_start_time_marker,
+                    resume_on_cleanup: true,
+                    depth: 0,
+                };
+                return refuse_after_thaw(
+                    tree_stop_error_outcome(root.pid, error),
+                    &[root_node],
+                    ops,
+                );
+            }
+        };
 
     let mut frozen = match verify_root_after_stop(root, scope, rollback_start_time_marker, ops) {
-        Ok(node) => vec![node],
+        Ok(mut node) => {
+            node.resume_on_cleanup = root_transitioned;
+            vec![node]
+        }
         Err((outcome, observed_root)) => {
             // Only the root is stopped at this point.
             let root_node = observed_root.map_or_else(
@@ -951,15 +1094,18 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
                     owner_uid: root.owner_uid,
                     start_time_marker: root.process_start_time_marker,
                     rollback_start_time_marker,
+                    resume_on_cleanup: root_transitioned,
                     depth: 0,
                 },
                 |node| *node,
             );
+            let mut root_node = root_node;
+            root_node.resume_on_cleanup = root_transitioned;
             return refuse_after_thaw(outcome, &[root_node], ops);
         }
     };
 
-    let convergence_snapshot = match freeze_sweep(&mut frozen, scope, ops) {
+    let convergence_snapshot = match freeze_sweep(&mut frozen, scope, stop_deadline, ops) {
         Ok(snapshot) => snapshot,
         Err(outcome) => return refuse_after_thaw(outcome, &frozen, ops),
     };
@@ -979,6 +1125,24 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
     }
 
     TreeKillOutcome::Completed(signal_tree(&mut frozen, scope, mode, ops))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_before_deadline<Ops: TreeProcessOps>(
+    pid: u32,
+    deadline: std::time::Instant,
+    ops: &mut Ops,
+) -> TreeStopResult {
+    if ops.stop_acknowledgement_now() >= deadline {
+        return TreeStopResult::Failed {
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+            error: TreeStopError::ObservationFailed(
+                "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
+            ),
+        };
+    }
+    ops.stop_checked(pid, deadline)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1042,13 +1206,15 @@ fn root_identity_matches(root: &KillTarget, info: &TreeProcessInfo) -> bool {
 /// whose parents were only frozen earlier in the same pass. A static tree of
 /// any depth therefore freezes in a single pass, because every generation is
 /// already present in that one snapshot. Converges because frozen processes
-/// cannot fork: a pass whose snapshot shows nothing new proves the member set
-/// is stable, so the pass limit only bounds genuine churn between snapshots
-/// (fresh forks in tree scope, `setpgid` joins in group scope).
+/// cannot fork on their own while they remain stopped. A pass whose snapshot
+/// shows nothing new is the pipeline's bounded convergence point; external
+/// continuations can still race it. The pass limit bounds churn between
+/// snapshots (fresh forks in tree scope, `setpgid` joins in group scope).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn freeze_sweep<Ops: TreeProcessOps>(
     frozen: &mut Vec<FrozenNode>,
     scope: SweepScope,
+    stop_deadline: std::time::Instant,
     ops: &mut Ops,
 ) -> Result<Vec<TreeProcessInfo>, TreeKillOutcome> {
     let member_cap = scope.member_cap();
@@ -1094,18 +1260,41 @@ fn freeze_sweep<Ops: TreeProcessOps>(
                 if member.start_time_marker.is_none() {
                     return Err(TreeKillOutcome::PartialMetadata { pid: member.pid });
                 }
-                match ops.stop(member.pid) {
-                    TreeSignalResult::Delivered => {
+                match stop_before_deadline(member.pid, stop_deadline, ops) {
+                    TreeStopResult::Stopped { transitioned } => {
                         let mut member = member;
                         member.rollback_start_time_marker =
                             ops.rollback_identity_after_stop(member.pid, member.start_time_marker);
+                        member.resume_on_cleanup = transitioned;
                         frozen.push(member);
                     }
-                    TreeSignalResult::NotFound => {
+                    TreeStopResult::NotFound => {
                         vanished.insert(member.pid);
                     }
-                    TreeSignalResult::Denied => {
-                        return Err(TreeKillOutcome::PermissionDenied { pid: member.pid });
+                    TreeStopResult::Failed {
+                        cleanup_required: false,
+                        rollback_start_time_marker: _,
+                        error,
+                    } => {
+                        return Err(tree_stop_error_outcome(member.pid, error));
+                    }
+                    TreeStopResult::Failed {
+                        cleanup_required: true,
+                        rollback_start_time_marker,
+                        error,
+                    } => {
+                        let mut member = member;
+                        let pid = member.pid;
+                        member.rollback_start_time_marker =
+                            rollback_start_time_marker.or_else(|| {
+                                ops.rollback_identity_after_stop(
+                                    member.pid,
+                                    member.start_time_marker,
+                                )
+                            });
+                        member.resume_on_cleanup = true;
+                        frozen.push(member);
+                        return Err(tree_stop_error_outcome(pid, error));
                     }
                 }
             }
@@ -1119,6 +1308,14 @@ fn freeze_sweep<Ops: TreeProcessOps>(
     Err(TreeKillOutcome::SweepPassLimit {
         limit: MAX_FREEZE_PASSES,
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_stop_error_outcome(pid: u32, error: TreeStopError) -> TreeKillOutcome {
+    match error {
+        TreeStopError::PermissionDenied => TreeKillOutcome::PermissionDenied { pid },
+        TreeStopError::ObservationFailed(error) => TreeKillOutcome::SnapshotFailed(error),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1165,9 +1362,9 @@ fn unfrozen_group_members(
 }
 
 /// Use the snapshot that proved sweep convergence to verify every frozen node.
-/// A stopped process cannot exec or exit, so its start marker and scope relation
-/// (parent PID for trees, group ID for groups) must be unchanged. A mismatch
-/// means something impossible-if-safe happened; refuse.
+/// A process that remains stopped cannot exec or exit on its own, so its start
+/// marker and scope relation (parent PID for trees, group ID for groups) must be
+/// unchanged. External signals can break that assumption; any mismatch refuses.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_frozen_identities(
     frozen: &mut [FrozenNode],
@@ -1348,21 +1545,20 @@ fn signal_tree<Ops: TreeProcessOps>(
     let mut thaw_failed = Vec::new();
     for node in frozen.iter() {
         let result = ops.deliver(node.pid, mode);
-        if mode == KillMode::Terminate {
-            // SIGTERM stays pending while the process is stopped; continue it so
-            // it actually handles the termination. SIGKILL needs no continue —
-            // it removes a stopped process directly.
-            if ops.cont(node.pid) == TreeSignalResult::Denied {
-                thaw_failed.push(node.pid);
-            }
-        }
         match result {
-            TreeSignalResult::Delivered => delivered += 1,
+            TreeSignalResult::Delivered => {
+                delivered += 1;
+                if mode == KillMode::Terminate && ops.cont(node.pid) == TreeSignalResult::Denied {
+                    // SIGTERM remains pending for any stopped process, including
+                    // one stopped before Kickoutchi observed it.
+                    thaw_failed.push(node.pid);
+                }
+            }
             TreeSignalResult::NotFound => already_exited += 1,
             TreeSignalResult::Denied => {
-                if mode == KillMode::Force {
-                    // SIGKILL needs no CONT only after it succeeds. A denied
-                    // force signal leaves the member stopped unless we thaw it.
+                if node.resume_on_cleanup {
+                    // A denied signal leaves a process we stopped in need of
+                    // cleanup. A process that was already stopped stays stopped.
                     if ops.cont(node.pid) == TreeSignalResult::Denied {
                         thaw_failed.push(node.pid);
                     }
@@ -1405,7 +1601,9 @@ fn signal_group<Ops: TreeProcessOps>(
             TreeSignalResult::NotFound => already_exited += 1,
             TreeSignalResult::Denied => {
                 denied.push(node.pid);
-                continue_after_delivery.push(node.pid);
+                if node.resume_on_cleanup {
+                    continue_after_delivery.push(node.pid);
+                }
             }
         }
     }
@@ -1429,7 +1627,8 @@ fn signal_group<Ops: TreeProcessOps>(
     }
 }
 
-/// Thaw every frozen member and report the ones that may still be stopped.
+/// Thaw every member Kickoutchi transitioned and report the ones that may still
+/// be stopped. Members observed already stopped are deliberately untouched.
 ///
 /// Only `Denied` counts as a cleanup failure, matching `signal_tree`,
 /// `signal_group`, and the single-process `outcome_after_thaw`. `NotFound`
@@ -1440,7 +1639,7 @@ fn signal_group<Ops: TreeProcessOps>(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) -> Vec<u32> {
     let mut failed = Vec::new();
-    for node in frozen.iter().rev() {
+    for node in frozen.iter().rev().filter(|node| node.resume_on_cleanup) {
         ops.prepare_thaw(node.pid, node.rollback_start_time_marker);
         if ops.cont(node.pid) == TreeSignalResult::Denied {
             failed.push(node.pid);
@@ -1477,8 +1676,8 @@ mod tests {
         FrozenNode, GROUP_YES_SKIP_MAX_PROCESSES, GroupPlanError, MAX_GROUP_PROCESSES,
         MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ScopeAuthorization,
         TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
-        execute_group_kill, execute_tree_kill, plan_process_group, plan_process_tree,
-        verify_frozen_identities,
+        TreeStopError, TreeStopResult, execute_group_kill, execute_tree_kill, plan_process_group,
+        plan_process_tree, verify_frozen_identities,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
@@ -1502,6 +1701,11 @@ mod tests {
         next: usize,
         events: Vec<Event>,
         deny_stop: Vec<u32>,
+        pre_stopped: Vec<u32>,
+        uncertain_stop: Vec<u32>,
+        stop_clock: std::time::Instant,
+        stop_elapsed: std::time::Duration,
+        stop_deadlines: Vec<std::time::Instant>,
         missing_stop: Vec<u32>,
         missing_deliver: Vec<u32>,
         deny_deliver: Vec<u32>,
@@ -1519,6 +1723,11 @@ mod tests {
                 next: 0,
                 events: Vec::new(),
                 deny_stop: Vec::new(),
+                pre_stopped: Vec::new(),
+                uncertain_stop: Vec::new(),
+                stop_clock: std::time::Instant::now(),
+                stop_elapsed: std::time::Duration::ZERO,
+                stop_deadlines: Vec::new(),
                 missing_stop: Vec::new(),
                 missing_deliver: Vec::new(),
                 deny_deliver: Vec::new(),
@@ -1557,6 +1766,48 @@ mod tests {
                 return TreeSignalResult::NotFound;
             }
             TreeSignalResult::Delivered
+        }
+
+        fn stop_checked(&mut self, pid: u32, deadline: std::time::Instant) -> TreeStopResult {
+            self.stop_deadlines.push(deadline);
+            self.stop_clock += self.stop_elapsed;
+            if self.stop_clock >= deadline {
+                return TreeStopResult::Failed {
+                    cleanup_required: false,
+                    rollback_start_time_marker: None,
+                    error: TreeStopError::ObservationFailed(
+                        "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
+                    ),
+                };
+            }
+            match self.stop(pid) {
+                TreeSignalResult::Delivered if self.uncertain_stop.contains(&pid) => {
+                    TreeStopResult::Failed {
+                        cleanup_required: true,
+                        rollback_start_time_marker: self
+                            .rollback_markers_after_stop
+                            .get(&pid)
+                            .copied()
+                            .flatten(),
+                        error: TreeStopError::ObservationFailed(
+                            "stopped-state observation failed".to_owned(),
+                        ),
+                    }
+                }
+                TreeSignalResult::Delivered => TreeStopResult::Stopped {
+                    transitioned: !self.pre_stopped.contains(&pid),
+                },
+                TreeSignalResult::NotFound => TreeStopResult::NotFound,
+                TreeSignalResult::Denied => TreeStopResult::Failed {
+                    cleanup_required: false,
+                    rollback_start_time_marker: None,
+                    error: TreeStopError::PermissionDenied,
+                },
+            }
+        }
+
+        fn stop_acknowledgement_now(&self) -> std::time::Instant {
+            self.stop_clock
         }
 
         fn rollback_identity_after_stop(
@@ -1646,6 +1897,7 @@ mod tests {
             owner_uid: None,
             start_time_marker: marker,
             rollback_start_time_marker: marker,
+            resume_on_cleanup: true,
             depth: 0,
         }];
         let mut ops = FakeOps::new(Vec::new());
@@ -1671,6 +1923,7 @@ mod tests {
             owner_uid: None,
             start_time_marker: marker,
             rollback_start_time_marker: marker,
+            resume_on_cleanup: true,
             depth: 0,
         };
         let frozen = [node(42), node(43)];
@@ -1684,6 +1937,242 @@ mod tests {
         // Both members are still attempted, deepest-first, even though only one
         // is reported.
         assert_eq!(ops.events, [Event::Cont(43), Event::Cont(42)]);
+    }
+
+    #[test]
+    fn refusal_does_not_resume_members_that_were_already_stopped() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "postgres", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);
+        ops.pre_stopped.push(101);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &["postgres".to_owned()],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(
+            outcome,
+            TreeKillOutcome::ProtectedDescendant { pid: 101, .. }
+        ));
+        assert!(ops.events.contains(&Event::Cont(100)));
+        assert!(!ops.events.contains(&Event::Cont(101)));
+    }
+
+    #[test]
+    fn later_refusal_does_not_resume_a_root_that_was_already_stopped() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "postgres", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);
+        ops.pre_stopped.push(100);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &["postgres".to_owned()],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(
+            outcome,
+            TreeKillOutcome::ProtectedDescendant { pid: 101, .. }
+        ));
+        assert!(ops.events.contains(&Event::Cont(101)));
+        assert!(!ops.events.contains(&Event::Cont(100)));
+    }
+
+    #[test]
+    fn successful_terminate_resumes_a_previously_stopped_member_after_delivery() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "child", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);
+        ops.pre_stopped.push(101);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(outcome, TreeKillOutcome::Completed(_)));
+        let delivered = ops
+            .events
+            .iter()
+            .position(|event| *event == Event::Deliver(101, KillMode::Terminate))
+            .expect("child receives SIGTERM");
+        let continued = ops
+            .events
+            .iter()
+            .position(|event| *event == Event::Cont(101))
+            .expect("child is resumed so pending SIGTERM can run");
+        assert!(delivered < continued);
+    }
+
+    #[test]
+    fn failed_stopped_state_observation_still_rolls_back_submitted_stop() {
+        let root = root_target(100, "root", 10);
+        let mut ops = FakeOps::new(vec![vec![info(100, Some(1), "root", 10)]]);
+        ops.uncertain_stop.push(100);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(
+            outcome,
+            TreeKillOutcome::SnapshotFailed("stopped-state observation failed".to_owned())
+        );
+        assert_eq!(ops.events, [Event::Stop(100), Event::Cont(100)]);
+        assert!(ops.delivered_pids().is_empty());
+    }
+
+    #[test]
+    fn identity_change_after_stop_retains_cleanup_for_the_observed_replacement() {
+        let root = root_target(100, "root", 10);
+        let replacement = crate::observation::ProcessStartMarker::linux(999).ok();
+        let mut ops = FakeOps::new(vec![vec![info(100, Some(1), "root", 10)]]);
+        ops.uncertain_stop.push(100);
+        ops.rollback_markers_after_stop.insert(100, replacement);
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Macos,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(
+            outcome,
+            TreeKillOutcome::SnapshotFailed("stopped-state observation failed".to_owned())
+        );
+        assert_eq!(ops.prepared_thaws.get(&100), Some(&replacement));
+        assert_eq!(ops.events, [Event::Stop(100), Event::Cont(100)]);
+    }
+
+    #[test]
+    fn stop_acknowledgements_share_one_operation_deadline() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "first", 11),
+            info(102, Some(100), "second", 12),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot]);
+        ops.stop_elapsed = std::time::Duration::from_millis(100);
+        let expected_deadline = ops.stop_clock + crate::process::UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Force,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert!(matches!(outcome, TreeKillOutcome::Completed(_)));
+        assert_eq!(
+            ops.stop_deadlines,
+            [expected_deadline, expected_deadline, expected_deadline]
+        );
+    }
+
+    #[test]
+    fn pre_signal_delay_past_shared_deadline_sends_no_stop() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![info(100, Some(1), "root", 10)];
+        let mut ops = FakeOps::new(vec![snapshot]);
+        ops.stop_elapsed = crate::process::UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+        let expected_deadline = ops.stop_clock + crate::process::UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(
+            outcome,
+            TreeKillOutcome::SnapshotFailed(
+                "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned()
+            )
+        );
+        assert!(
+            ops.events.is_empty(),
+            "SIGSTOP must not be sent at the deadline"
+        );
+        assert_eq!(ops.stop_deadlines, [expected_deadline]);
+    }
+
+    #[test]
+    fn root_delay_consumes_shared_deadline_before_descendant_stop() {
+        let root = root_target(100, "root", 10);
+        let snapshot = vec![
+            info(100, Some(1), "root", 10),
+            info(101, Some(100), "child", 11),
+        ];
+        let mut ops = FakeOps::new(vec![snapshot]);
+        ops.stop_elapsed = std::time::Duration::from_millis(250);
+        let expected_deadline = ops.stop_clock + crate::process::UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+
+        let outcome = execute_tree_kill(
+            &root,
+            KillMode::Terminate,
+            &[],
+            Platform::Linux,
+            auth(),
+            &mut ops,
+        );
+
+        assert_eq!(
+            outcome,
+            TreeKillOutcome::SnapshotFailed(
+                "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned()
+            )
+        );
+        assert_eq!(ops.events, [Event::Stop(100), Event::Cont(100)]);
+        assert_eq!(ops.stop_deadlines, [expected_deadline, expected_deadline]);
+    }
+
+    #[test]
+    fn scoped_thaw_failure_text_retains_the_primary_failure() {
+        let outcome = TreeKillOutcome::ThawFailed {
+            pids: vec![100],
+            cause: Box::new(TreeKillOutcome::PermissionDenied { pid: 101 }),
+        };
+
+        assert_eq!(
+            outcome.failure_cause_text(),
+            "permission denied for PID 101; cleanup could not continue PID(s) 100"
+        );
     }
 
     #[test]

@@ -93,6 +93,38 @@ jobs:
           KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
         run: cargo test --locked --all-features --test cli_contract
 
+  nix:
+    name: Nix (${{ matrix.system }})
+    needs: supply-chain
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Nix
+        uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
+
+      - name: Evaluate every declared Nix system
+        run: nix flake check --no-update-lock-file --all-systems
+
+      - name: Build and verify native Nix package
+        run: |
+          nix build --no-update-lock-file ".#packages.${{ matrix.system }}.kickoutchi"
+          test "$(./result/bin/kickoutchi --version)" = "kickoutchi 1.3.1"
+          test "$(cat ./result/share/kickoutchi/install-provenance)" = "nix"
+
   windows:
     name: Windows
     needs: supply-chain

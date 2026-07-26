@@ -42,13 +42,21 @@ pub(crate) fn default_protected_processes() -> Vec<String> {
         .collect()
 }
 
-/// Tag any entry whose process name is on the protected list.
+/// Tag entries whose process identity matches the protected list.
 pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[String]) {
     for entry in entries.iter_mut() {
-        let Some(name) = &entry.process_name else {
-            continue;
-        };
-        if is_protected_process_name(entry.platform, name, protected_names) {
+        let name_matches = entry
+            .process_name
+            .as_deref()
+            .is_some_and(|name| is_protected_process_name(entry.platform, name, protected_names));
+        let macos_executable_matches = entry.platform == Platform::Macos
+            && entry
+                .executable_path
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| protected_names.iter().any(|protected| protected == name));
+        if name_matches || macos_executable_matches {
             entry.protected = true;
         }
     }
@@ -58,10 +66,11 @@ pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[Strin
 ///
 /// Unix names are exact and case-sensitive. Linux also accepts the `/proc/comm`
 /// 15-byte truncation of a longer configured protected name, because that is all
-/// the collector can read from the kernel. Windows names match case-insensitively,
-/// because that's the platform convention. We never match on arbitrary substrings:
-/// `postgres-backup-helper` doesn't get to ride on `postgres`'s protection by
-/// accident.
+/// the collector can read from the kernel. macOS also accepts a configured name
+/// followed by a process-title delimiter (`:` or ASCII whitespace). Windows names
+/// match case-insensitively, because that's the platform convention. We never
+/// match on arbitrary substrings: `postgres-backup-helper` doesn't get to ride on
+/// `postgres`'s protection by accident.
 pub(crate) fn is_protected_process_name(
     platform: Platform,
     process_name: &str,
@@ -74,8 +83,19 @@ pub(crate) fn is_protected_process_name(
                 || (protected.len() > LINUX_COMM_MAX_BYTES
                     && linux_comm_prefix(protected) == process_name)
         }
-        Platform::Macos => protected == process_name,
+        Platform::Macos => macos_process_name_matches(protected, process_name),
     })
+}
+
+fn macos_process_name_matches(protected: &str, process_name: &str) -> bool {
+    protected == process_name
+        || (!protected.is_empty()
+            && process_name.strip_prefix(protected).is_some_and(|suffix| {
+                suffix
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch == ':' || ch.is_ascii_whitespace())
+            }))
 }
 
 pub(crate) fn windows_process_name_eq(left: &str, right: &str) -> bool {
@@ -194,6 +214,27 @@ mod tests {
     }
 
     #[test]
+    fn macos_matching_accepts_only_strict_process_title_boundaries() {
+        let protected = vec!["postgres".to_owned()];
+
+        for name in ["postgres", "postgres: checkpointer", "postgres worker"] {
+            assert!(is_protected_process_name(Platform::Macos, name, &protected));
+        }
+        for name in [
+            "Postgres",
+            "postgres-backup-helper",
+            "postgres.helper",
+            "postgres/worker",
+        ] {
+            assert!(!is_protected_process_name(
+                Platform::Macos,
+                name,
+                &protected
+            ));
+        }
+    }
+
+    #[test]
     fn windows_matching_is_exact_but_case_insensitive() {
         let protected = vec!["explorer.exe".to_owned(), "äpp.exe".to_owned()];
 
@@ -233,5 +274,21 @@ mod tests {
         assert!(rows[0].protected);
         assert!(!rows[1].protected);
         assert!(!rows[2].protected);
+    }
+
+    #[test]
+    fn macos_marking_uses_exact_executable_basename_when_available() {
+        let protected = vec!["postgres".to_owned()];
+        let mut exact = entry(5432, Some("renamed process"), Platform::Macos);
+        exact.executable_path = Some(std::path::PathBuf::from("/opt/postgres").into());
+        let mut prefixed = entry(5433, None, Platform::Macos);
+        prefixed.executable_path =
+            Some(std::path::PathBuf::from("/opt/postgres-backup-helper").into());
+        let mut rows = [exact, prefixed];
+
+        mark_protected(&mut rows, &protected);
+
+        assert!(rows[0].protected);
+        assert!(!rows[1].protected);
     }
 }

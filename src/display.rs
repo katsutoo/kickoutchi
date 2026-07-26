@@ -77,17 +77,17 @@ fn sanitize_with_layout(text: &str, preserve_newlines: bool) -> String {
 
 /// Drop the rest of a single ANSI escape sequence from the iterator.
 ///
-/// This handles CSI (`ESC [` ... final byte), two-character sequences such as
-/// `ESC (`, and OSC/PM/APC strings that end with BEL or ST. It is intentionally
-/// conservative: it stops at the first byte that does not belong to the
-/// sequence, so a malformed escape does not eat the whole string.
+/// This handles CSI (`ESC [` ... final byte), short escape sequences such as
+/// `ESC 7` and `ESC ( B`, and control strings that end with BEL or ST. It is
+/// intentionally conservative: it stops at the first byte that does not belong
+/// to the sequence, so a malformed escape does not eat the whole string.
 fn strip_ansi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     let Some(introducer) = chars.peek().copied() else {
         return;
     };
 
-    // OSC (ESC ]), PM (ESC ^), APC (ESC _): consume until BEL or ST.
-    if matches!(introducer, ']' | '^' | '_') {
+    // DCS, SOS, OSC, PM, and APC: consume until BEL or ST.
+    if matches!(introducer, 'P' | 'X' | ']' | '^' | '_') {
         chars.next();
         loop {
             match chars.next() {
@@ -104,21 +104,27 @@ fn strip_ansi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
         return;
     }
 
-    // CSI: ESC [ parameter bytes (0x30-0x3F) then intermediate/final bytes
-    // (0x20-0x7E). For all other introducers, consume parameter bytes the same
-    // way; most non-CSI introducers have zero or one parameter byte.
-    chars.next();
-    loop {
-        match chars.peek().copied() {
-            Some(c) if ('\x30'..='\x3f').contains(&c) => {
-                chars.next();
-            }
-            Some('\x20'..='\x7e') => {
-                chars.next();
-                break;
-            }
-            _ => break,
+    if introducer == '[' {
+        chars.next();
+        while chars.peek().is_some_and(|c| ('\x30'..='\x3f').contains(c)) {
+            chars.next();
         }
+        while chars.peek().is_some_and(|c| ('\x20'..='\x2f').contains(c)) {
+            chars.next();
+        }
+        if chars.peek().is_some_and(|c| ('\x40'..='\x7e').contains(c)) {
+            chars.next();
+        }
+        return;
+    }
+
+    // A non-CSI escape has zero or more intermediate bytes followed by one
+    // final byte. If the first byte is already final, consume only that byte.
+    while chars.peek().is_some_and(|c| ('\x20'..='\x2f').contains(c)) {
+        chars.next();
+    }
+    if chars.peek().is_some_and(|c| ('\x30'..='\x7e').contains(c)) {
+        chars.next();
     }
 }
 
@@ -178,6 +184,19 @@ mod tests {
         assert_eq!(sanitize("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(sanitize("\x1b[1;31mbold red\x1b[m"), "bold red");
         assert_eq!(sanitize("\x1b]0;title\x07after"), "after");
+    }
+
+    #[test]
+    fn strips_complete_csi_sequences_with_intermediate_bytes() {
+        assert_eq!(sanitize("before\x1b[1;2 $~after"), "beforeafter");
+        assert_eq!(sanitize("before\x1b[ qafter"), "beforeafter");
+    }
+
+    #[test]
+    fn two_byte_escapes_do_not_consume_following_text() {
+        assert_eq!(sanitize("before\x1b7after"), "beforeafter");
+        assert_eq!(sanitize("before\x1bcafter"), "beforeafter");
+        assert_eq!(sanitize("before\x1b(Bafter"), "beforeafter");
     }
 
     #[test]

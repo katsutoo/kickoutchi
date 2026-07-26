@@ -15,6 +15,7 @@ mod why;
 mod scoped;
 
 use std::io::{self, ErrorKind, Write};
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -170,6 +171,28 @@ pub(crate) enum Command {
     Why(WhyArgs),
 }
 
+impl Command {
+    /// Update notices are strictly human-facing and never contaminate structured
+    /// or long-running output modes.
+    pub(crate) fn allows_update_notice(&self) -> bool {
+        match self {
+            Self::List(args) => {
+                !args.json
+                    && !args.snapshot_json
+                    && crate::query::validate_filter_text(
+                        args.filter.as_deref().unwrap_or_default(),
+                        crate::query::QueryCapabilities::LIST,
+                    )
+                    .is_ok()
+            }
+            Self::Watch(_) | Self::Why(_) => false,
+            Self::Kill(_) => true,
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            Self::Inspect(_) => true,
+        }
+    }
+}
+
 /// `inspect` takes exactly one starting point, like `kill`: a PID (which may
 /// own no port — supervisors usually don't) or a port whose owner to start
 /// from. Strictly read-only; it never signals anything.
@@ -182,14 +205,14 @@ pub(crate) struct InspectArgs {
     pub(crate) pid: Option<u32>,
 
     /// Show the family of the process that owns this port.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_port)]
     pub(crate) port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ListArgs {
     /// Only show rows bound to this exact port.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_port)]
     pub(crate) port: Option<u16>,
 
     /// Only show rows whose process name contains this text.
@@ -235,7 +258,7 @@ pub(crate) struct KillArgs {
     pub(crate) pid: Option<u32>,
 
     /// Terminate the process that owns this port.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_port)]
     pub(crate) port: Option<u16>,
 
     /// Force kill instead of normal termination where the platform supports a distinction.
@@ -357,7 +380,10 @@ fn write_stdout_with(
     }
 }
 
-fn maybe_print_no_match_diagnostic(diagnostic_port: Option<u16>, entries: &[PortEntryView<'_>]) {
+pub(super) fn maybe_print_no_match_diagnostic(
+    diagnostic_port: Option<u16>,
+    entries: &[PortEntryView<'_>],
+) {
     let Some(port) = diagnostic_port_without_confirmed_socket(diagnostic_port, entries) else {
         return;
     };
@@ -382,6 +408,15 @@ fn diagnostic_port_without_confirmed_socket(
 fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
     SortMode::from_label(value)
         .ok_or_else(|| "expected one of: port, pid, protocol, process, parent, scope".to_owned())
+}
+
+fn parse_port(value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .ok()
+        .and_then(NonZeroU16::new)
+        .map(NonZeroU16::get)
+        .ok_or_else(|| "expected a TCP/UDP port in 1..=65535".to_owned())
 }
 
 /// Run the read-only family inspection and print the report to stdout.
@@ -773,6 +808,24 @@ mod tests {
     }
 
     #[test]
+    fn structured_and_streaming_modes_suppress_update_notices() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .expect("invocation parses")
+                .command
+                .unwrap()
+        };
+
+        assert!(!parse(&["kickoutchi", "list", "--json"]).allows_update_notice());
+        assert!(!parse(&["kickoutchi", "list", "--snapshot-json"]).allows_update_notice());
+        assert!(!parse(&["kickoutchi", "watch", "--duration", "1s"]).allows_update_notice());
+        assert!(!parse(&["kickoutchi", "why", "3000"]).allows_update_notice());
+        assert!(parse(&["kickoutchi", "list"]).allows_update_notice());
+        assert!(!parse(&["kickoutchi", "list", "--filter", "state:listen"]).allows_update_notice());
+        assert!(parse(&["kickoutchi", "kill", "--pid", "18422"]).allows_update_notice());
+    }
+
+    #[test]
     fn list_sort_rejects_unknown_modes_at_parse_time() {
         assert!(Cli::try_parse_from(["kickoutchi", "list", "--sort", "alphabetical"]).is_err());
     }
@@ -821,6 +874,20 @@ mod tests {
         assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "1", "--port", "80"]).is_err());
         assert!(Cli::try_parse_from(["kickoutchi", "kill", "--pid", "18422"]).is_ok());
         assert!(Cli::try_parse_from(["kickoutchi", "kill", "--port", "3000", "--force"]).is_ok());
+    }
+
+    #[test]
+    fn every_cli_port_selector_rejects_zero() {
+        let invocations: &[&[&str]] = &[
+            &["kickoutchi", "list", "--port", "0"],
+            &["kickoutchi", "kill", "--port", "0"],
+            &["kickoutchi", "inspect", "--port", "0"],
+            &["kickoutchi", "watch", "--port", "0"],
+            &["kickoutchi", "why", "0"],
+        ];
+        for invocation in invocations {
+            assert!(Cli::try_parse_from(*invocation).is_err(), "{invocation:?}");
+        }
     }
 
     #[cfg(windows)]

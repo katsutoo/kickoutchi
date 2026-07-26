@@ -986,7 +986,7 @@ fn map_windows_tree_completed_outcome<CollectPorts>(
 where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    if !report.containment_partial && report.not_terminated.is_empty() {
+    if report.termination_state.is_complete() && report.not_terminated.is_empty() {
         eprintln!(
             "terminated {} process(es) in the Windows Job Object for the tree rooted at {}",
             report.job_terminated_pids.len(),
@@ -1042,7 +1042,7 @@ fn windows_tree_partial_report_text(
             tree::format_pid_list(&report.not_terminated)
         )
     };
-    let withheld = if report.job_termination_withheld {
+    let withheld = if report.termination_state.is_withheld() {
         "; job termination was withheld because strict tree closure could not be established for every observed descendant"
     } else {
         ""
@@ -1091,7 +1091,35 @@ fn windows_cleanup_issue_text(issue: &crate::windows_tree::WindowsTreeCleanupIss
             "thawing the Windows Job Object after TerminateJobObject failed: {}",
             sanitize(error)
         ),
+        WindowsTreeCleanupIssue::PostTerminationSurvivorsThawed { pids, wait_errors } => format!(
+            "TerminateJobObject returned success but PID(s) {} were not confirmed exited; the job was thawed{}",
+            tree::format_pid_list(pids),
+            windows_wait_error_suffix(wait_errors),
+        ),
+        WindowsTreeCleanupIssue::PostTerminationSurvivorThawFailed {
+            pids,
+            wait_errors,
+            error,
+        } => format!(
+            "TerminateJobObject returned success but PID(s) {} were not confirmed exited, and thawing the job failed: {}{}",
+            tree::format_pid_list(pids),
+            sanitize(error),
+            windows_wait_error_suffix(wait_errors),
+        ),
     }
+}
+
+#[cfg(windows)]
+fn windows_wait_error_suffix(wait_errors: &[(u32, String)]) -> String {
+    if wait_errors.is_empty() {
+        return String::new();
+    }
+    let details = wait_errors
+        .iter()
+        .map(|(pid, error)| format!("PID {pid}: {}", sanitize(error)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; wait error(s): {details}")
 }
 
 #[cfg(windows)]
@@ -1126,6 +1154,10 @@ fn windows_post_commit_issue_text(
             "protected descendant PID {pid} ({}) appeared after commit",
             sanitize(name.as_deref().unwrap_or("<unknown>"))
         ),
+        WindowsTreePostCommitIssue::ProtectedRoot { pid, name } => format!(
+            "root PID {pid} ({}) became protected after commit and requires fresh confirmation",
+            sanitize(name.as_deref().unwrap_or("<unknown>"))
+        ),
         WindowsTreePostCommitIssue::FreshConfirmationRequired => {
             "tree gained warnings after --yes; rerun without --yes to review them".to_owned()
         }
@@ -1146,7 +1178,8 @@ fn windows_post_commit_issue_exit_reason(
     use crate::windows_tree::WindowsTreePostCommitIssue;
 
     match issue {
-        WindowsTreePostCommitIssue::ProtectedDescendant { .. } => {
+        WindowsTreePostCommitIssue::ProtectedDescendant { .. }
+        | WindowsTreePostCommitIssue::ProtectedRoot { .. } => {
             ExitReason::ProtectedNeedsConfirmation
         }
         WindowsTreePostCommitIssue::PermissionDenied { .. } => ExitReason::PermissionDenied,
@@ -1367,9 +1400,10 @@ where
 
     let delivery = mode.delivery_label(root.platform);
     match outcome {
-        TreeKillOutcome::ThawFailed { pids, .. } => {
+        TreeKillOutcome::ThawFailed { pids, cause } => {
             eprintln!(
-                "error: cleanup could not continue PID(s) {}; they may remain stopped and require SIGCONT",
+                "error: {}; cleanup could not continue PID(s) {}; they may remain stopped and require SIGCONT",
+                sanitize(&cause.failure_cause_text()),
                 tree::format_pid_list(pids),
             );
             ExitReason::Failure
@@ -1990,6 +2024,8 @@ mod tests {
     use crate::process::TerminationOutcome;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::tree::{ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult};
+    #[cfg(windows)]
+    use crate::windows_tree::WindowsTreeTerminationState;
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn locally_incomplete_kill_snapshot() -> NetworkSnapshot {
@@ -2169,8 +2205,7 @@ mod tests {
             job_terminated_pids: vec![100],
             already_exited_pids: Vec::new(),
             not_terminated: vec![101],
-            containment_partial: true,
-            job_termination_withheld: false,
+            termination_state: WindowsTreeTerminationState::Partial,
             post_commit_issue: Some(
                 crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
                     pid: 101,
@@ -2209,6 +2244,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_post_commit_protected_root_requires_confirmation() {
+        let issue = crate::windows_tree::WindowsTreePostCommitIssue::ProtectedRoot {
+            pid: 100,
+            name: Some("lsass.exe".to_owned()),
+        };
+
+        let text = super::windows_post_commit_issue_text(&issue);
+        let reason = super::windows_post_commit_issue_exit_reason(&issue);
+
+        assert!(text.contains("root PID 100"));
+        assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_tree_success_polls_post_kill_visibility() {
         let root = KillTarget {
             pid: 100,
@@ -2233,8 +2283,7 @@ mod tests {
             job_terminated_pids: vec![100],
             already_exited_pids: Vec::new(),
             not_terminated: Vec::new(),
-            containment_partial: false,
-            job_termination_withheld: false,
+            termination_state: WindowsTreeTerminationState::Complete,
             post_commit_issue: None,
             secondary_post_commit_issue: None,
             cleanup_issue: None,
@@ -2272,8 +2321,7 @@ mod tests {
             job_terminated_pids: Vec::new(),
             already_exited_pids: vec![102],
             not_terminated: vec![100, 103],
-            containment_partial: true,
-            job_termination_withheld: true,
+            termination_state: WindowsTreeTerminationState::Withheld,
             post_commit_issue: Some(
                 crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
                     pid: 103,
@@ -2348,8 +2396,7 @@ mod tests {
                 job_terminated_pids: Vec::new(),
                 already_exited_pids: vec![102],
                 not_terminated: vec![100],
-                containment_partial: true,
-                job_termination_withheld: false,
+                termination_state: WindowsTreeTerminationState::Partial,
                 post_commit_issue: None,
                 secondary_post_commit_issue: None,
                 cleanup_issue: Some(

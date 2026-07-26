@@ -1,6 +1,6 @@
 [package]
 name = "kickoutchi"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A clean TUI and CLI port janitor: see which process owns each open local port and kick it out safely"
@@ -63,7 +63,15 @@ unicode-width = "0.2.2"
 # in particular, do not enable its broad `all` API surface.
 socket2 = "=0.6.5"
 
+# The update worker makes one bounded HTTPS request. Keep ureq exact and omit
+# compression, JSON, cookies, and proxy extras; serde_json parses the tiny body.
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+
 [dev-dependencies]
+# Security-sensitive workflow key discovery uses a full YAML parser so quoted,
+# sequence-shorthand, and flow-mapping keys cannot bypass the contract tests.
+serde_yaml_ng = { version = "=0.10.0", default-features = false }
+
 # Release-only archive verification. These stay out of the shipped binaries and
 # replace the former Python validator with bounded native Rust parsers.
 sha2 = { version = "=0.10.9", default-features = false }
@@ -81,7 +89,7 @@ libc = "0.2.177"
 [target.'cfg(windows)'.dependencies]
 # Windows collection uses IP Helper directly, and termination uses process
 # handles so the signal target cannot wander off after confirmation.
-windows-sys = { version = "0.61.2", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [lints.clippy]
 pedantic = "warn"

@@ -64,7 +64,7 @@ yay -S kickoutchi
 # Cargo from Git
 cargo install --locked --git https://github.com/nuggocto/kickoutchi
 
-# Nix
+# Nix (Linux only)
 nix run github:nuggocto/kickoutchi
 nix profile install github:nuggocto/kickoutchi
 ```
@@ -108,7 +108,7 @@ brew upgrade nuggocto/tap/kickoutchi
 # Arch (AUR) — a normal full-system upgrade covers it
 yay -Syu
 
-# Nix profile installed from the repository flake
+# Nix profile installed from the repository flake (Linux only)
 nix profile upgrade kickoutchi
 
 # Cargo from Git
@@ -121,9 +121,17 @@ scoop update
 scoop update kickoutchi
 ```
 
-An unqualified Git or Nix GitHub source follows the repository's default branch,
+Kickoutchi checks GitHub for a newer stable release at most once every seven
+days. The check runs silently outside the foreground command, writes only a
+small per-user cache, and shows nothing when the installed version is current.
+When an update exists, the message uses the package manager that owns the
+installation. Set `check_for_updates = false` in the configuration file to opt
+out. Structured JSON/NDJSON commands and elevated execution never check or
+display an update notice.
+
+An unqualified Git or Linux Nix GitHub source follows the repository's default branch,
 which can contain changes newer than the latest stable release. For a
-reproducible stable source install, select an explicit tag such as `v1.3.0` and
+reproducible stable source install, select an explicit tag such as `v1.3.1` and
 replace that tag deliberately when upgrading. Direct-archive installs must be
 replaced manually after verifying the new archive.
 

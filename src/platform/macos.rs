@@ -1181,8 +1181,9 @@ fn child_process_ids(parent_pid: u32) -> Result<Vec<u32>, CollectorError> {
     child_process_ids_with_reader(&mut raw_pids, buffer_bytes, |buffer, buffer_bytes| {
         call_count_api(|| unsafe {
             // SAFETY: buffer owns buffer_bytes bytes and proc_listchildpids writes
-            // at most that many pid_t values into it. The count is capped at one
-            // past the tree limit; that is enough for the shared cap refusal.
+            // at most that many bytes, or `buffer.len()` pid_t elements, into it.
+            // The count is capped at one past the tree limit; that is enough for
+            // the shared cap refusal.
             libc::proc_listchildpids(
                 parent_pid,
                 buffer.as_mut_ptr().cast::<c_void>(),
@@ -1920,26 +1921,32 @@ fn decode_port(raw: libc::c_int) -> Option<u16> {
 }
 
 fn decode_local_addr(info: &InSockinfo, family: libc::c_int) -> Option<IpAddr> {
-    if info.insi_vflag & INI_IPV4 != 0 || family == libc::AF_INET {
+    let flags = info.insi_vflag & (INI_IPV4 | INI_IPV6);
+    let decode_v4 = || {
         let raw = unsafe {
-            // SAFETY: INI_IPV4/AF_INET says the IPv4 view of the address union is
-            // active for this socket.
+            // SAFETY: the caller selected the IPv4 view from the socket family
+            // and INI_IPV4 capability flag.
             info.insi_laddr.ina_46.i46a_addr4.s_addr
         };
-        return Some(IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes())));
-    }
-
-    if info.insi_vflag & INI_IPV6 != 0 || family == libc::AF_INET6 {
+        IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes()))
+    };
+    let decode_v6 = || {
         let raw = unsafe {
-            // SAFETY: INI_IPV6/AF_INET6 says the IPv6 view of the address union is
-            // active for this socket.
+            // SAFETY: the caller selected the IPv6 view from the socket family
+            // and INI_IPV6 capability flag.
             info.insi_laddr.ina_6.s6_addr
         };
         let addr = Ipv6Addr::from(raw);
-        return Some(addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4));
-    }
+        addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4)
+    };
 
-    None
+    match family {
+        libc::AF_INET if flags & INI_IPV4 != 0 => Some(decode_v4()),
+        libc::AF_INET6 if flags & INI_IPV6 != 0 => Some(decode_v6()),
+        _ if flags == INI_IPV4 => Some(decode_v4()),
+        _ if flags == INI_IPV6 => Some(decode_v6()),
+        _ => None,
+    }
 }
 
 fn read_process_bsdinfo(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
@@ -2712,6 +2719,34 @@ mod tests {
         assert_eq!(
             pass.sockets[0].endpoint.ipv6_scope,
             Some(Ipv6Scope::Unavailable)
+        );
+    }
+
+    #[test]
+    fn dual_stack_socket_uses_the_address_view_selected_by_family() {
+        let ipv4 = Ipv4Addr::new(198, 51, 100, 7);
+        let mut ipv4_info = in_sockinfo_v4(8079, ipv4);
+        ipv4_info.insi_vflag = super::INI_IPV4 | super::INI_IPV6;
+        assert_eq!(
+            super::decode_local_addr(&ipv4_info, libc::AF_INET),
+            Some(IpAddr::V4(ipv4))
+        );
+
+        let ipv6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42);
+        let mut info = in_sockinfo_v6(8080, ipv6);
+        info.insi_vflag = super::INI_IPV4 | super::INI_IPV6;
+
+        assert_eq!(
+            super::decode_local_addr(&info, libc::AF_INET6),
+            Some(IpAddr::V6(ipv6))
+        );
+
+        let mapped = Ipv4Addr::new(192, 0, 2, 44).to_ipv6_mapped();
+        let mut mapped_info = in_sockinfo_v6(8081, mapped);
+        mapped_info.insi_vflag = super::INI_IPV4 | super::INI_IPV6;
+        assert_eq!(
+            super::decode_local_addr(&mapped_info, libc::AF_INET6),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)))
         );
     }
 

@@ -111,6 +111,17 @@ downloaded build tools, GitHub Actions, package registries, release hosting,
 installer and updater execution, the Homebrew tap, the Scoop bucket, Git and Nix
 source installs, and AUR maintainers cross distinct trust boundaries.
 
+Eligible non-elevated human launches perform at most one silent stable-release
+check per seven days. The foreground command reads only a bounded per-user cache;
+a detached worker makes one timeout-bounded HTTPS request to GitHub's fixed
+`releases/latest` API endpoint. Failures are silent and still advance the attempt
+deadline. Cache paths reject links and unsafe Unix ownership or modes, writes are
+atomic, response bodies are bounded, and package provenance markers select only
+compiled-in update instructions. Marker contents are never executed. Set
+`check_for_updates = false` to disable the feature. Structured output and
+elevated execution do not check or display notices. No host or usage
+telemetry is sent; GitHub receives the normal metadata of the release request.
+
 Security objectives are correct process identity and signal delivery, truthful
 scope and certainty claims, memory safety at native boundaries, bounded resource
 use, terminal and structured-output integrity, process-metadata privacy, and
@@ -151,7 +162,7 @@ The documented Unix and PowerShell installer commands execute content from the
 mutable GitHub Release `latest` URL. TLS and the GitHub repository are therefore
 part of the trust decision before the installer can be inspected locally.
 `kickoutchi-update` uses the same release authority. An unqualified
-`cargo install --git` or `github:nuggocto/kickoutchi` Nix flake reference follows
+`cargo install --git` or `github:nuggocto/kickoutchi` Linux Nix flake reference follows
 the repository's default branch and can select unreleased code; `--locked` pins
 the selected checkout's Cargo dependency graph, not that checkout. Select an
 explicit tag or commit when reproducibility matters. The committed Nix lock pins

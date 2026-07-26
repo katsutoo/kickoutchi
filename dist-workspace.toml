@@ -27,6 +27,9 @@ publish-jobs = ["homebrew"]
 install-updater = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Linux release binaries are built in Debian 11 containers and must not acquire
+# symbols newer than the declared glibc 2.31 floor.
+min-glibc-version = { "aarch64-unknown-linux-gnu" = "2.31", "x86_64-unknown-linux-gnu" = "2.31" }
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 
@@ -38,5 +41,5 @@ install-path = "CARGO_HOME"
 # The namespace capability journey hangs on the older Ubuntu 22.04 runner
 # kernels. Keep archive execution native while matching the passing CI kernel.
 [dist.github-custom-runners]
-x86_64-unknown-linux-gnu = "ubuntu-latest"
-aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+x86_64-unknown-linux-gnu = { runner = "ubuntu-22.04", host = "x86_64-unknown-linux-gnu", container = { image = "rust:1.95-bullseye", host = "x86_64-unknown-linux-gnu", package-manager = "apt" } }
+aarch64-unknown-linux-gnu = { runner = "ubuntu-24.04-arm", host = "aarch64-unknown-linux-gnu", container = { image = "rust:1.95-bullseye", host = "aarch64-unknown-linux-gnu", package-manager = "apt" } }

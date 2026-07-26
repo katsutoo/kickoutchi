@@ -525,11 +525,7 @@ pub(super) fn print_target_error(error: KillTargetError) -> ExitReason {
 }
 
 fn print_kill_banner(target: &KillTarget, mode: KillMode) {
-    eprintln!(
-        "{} {}",
-        mode.action_label_for(target.platform),
-        target.identity()
-    );
+    eprintln!("{} {}", mode.action_label(), target.identity());
     eprintln!("Scope: process");
     eprintln!("Ports: {}", sanitize(&target.ports_text()));
     eprintln!(
@@ -643,8 +639,9 @@ fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &Term
             target.identity(),
             sanitize(error),
         ),
-        TerminationOutcome::ThawFailed { pid, .. } => eprintln!(
-            "error: cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+        TerminationOutcome::ThawFailed { pid, prior } => eprintln!(
+            "error: {}; cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+            sanitize(&prior.failure_cause_text()),
         ),
     }
 }

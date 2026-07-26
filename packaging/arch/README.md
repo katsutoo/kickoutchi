@@ -9,6 +9,10 @@ Swamp packages for Arch users.
 
 Both ship the `kickoutchi` binary and the `kick` shortcut. The `-bin` package is the quick path; the source package is for folks who want to compile their own onion layers.
 
+Both packages install a closed `aur` provenance marker so the weekly release
+notice keeps upgrades under the user's AUR helper instead of invoking the
+standalone installer updater.
+
 ## Install from the AUR
 
 ```sh

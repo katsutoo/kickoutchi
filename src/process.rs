@@ -5,6 +5,10 @@
 //! final stop request. The UI and CLI decide *when* to ask the user; this module
 //! decides what's actually safe to run. When in doubt, it says no.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::cell::{Cell, RefCell};
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -29,6 +33,113 @@ use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
 };
 use crate::protection::{is_protected_process_name, windows_process_name_eq};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+thread_local! {
+    static LAST_TREE_STOP_RESULT: RefCell<Option<(u32, crate::tree::TreeStopResult)>> = const {
+        RefCell::new(None)
+    };
+    static TREE_STOP_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) const UNIX_STOP_ACKNOWLEDGEMENT_MAX: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_tree_stop_result(pid: u32, result: crate::tree::TreeStopResult) {
+    LAST_TREE_STOP_RESULT.with(|slot| *slot.borrow_mut() = Some((pid, result)));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn take_tree_stop_result(pid: u32) -> Option<crate::tree::TreeStopResult> {
+    LAST_TREE_STOP_RESULT.with(|slot| match slot.borrow_mut().take() {
+        Some((recorded_pid, result)) if recorded_pid == pid => Some(result),
+        _ => None,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn with_tree_stop_deadline<T>(
+    deadline: std::time::Instant,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct RestoreTreeStopDeadline(Option<std::time::Instant>);
+
+    impl Drop for RestoreTreeStopDeadline {
+        fn drop(&mut self) {
+            TREE_STOP_DEADLINE.set(self.0);
+        }
+    }
+
+    let prior = TREE_STOP_DEADLINE.replace(Some(deadline));
+    let _restore = RestoreTreeStopDeadline(prior);
+    operation()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_stop_deadline() -> std::time::Instant {
+    TREE_STOP_DEADLINE
+        .get()
+        .unwrap_or_else(|| std::time::Instant::now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StopFailure {
+    outcome: TerminationOutcome,
+    cleanup_required: bool,
+    rollback_start_time_marker: Option<ProcessStartMarker>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixProcessState {
+    marker: ProcessStartMarker,
+    stopped: bool,
+    exited: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_deadline_failure(
+    cleanup_required: bool,
+    rollback_start_time_marker: Option<ProcessStartMarker>,
+) -> StopFailure {
+    StopFailure {
+        outcome: TerminationOutcome::UnknownFailure(
+            "process did not enter stopped state before the SIGSTOP acknowledgement deadline"
+                .to_owned(),
+        ),
+        cleanup_required,
+        rollback_start_time_marker,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_before_stop_deadline<T>(
+    deadline: std::time::Instant,
+    now: impl FnOnce() -> std::time::Instant,
+    operation: impl FnOnce() -> T,
+) -> Result<T, StopFailure> {
+    if now() >= deadline {
+        Err(stop_deadline_failure(false, None))
+    } else {
+        Ok(operation())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tree_stop_error(outcome: TerminationOutcome) -> crate::tree::TreeStopError {
+    match outcome {
+        TerminationOutcome::PermissionDenied => crate::tree::TreeStopError::PermissionDenied,
+        TerminationOutcome::UnknownFailure(error) => {
+            crate::tree::TreeStopError::ObservationFailed(error)
+        }
+        other => crate::tree::TreeStopError::ObservationFailed(format!(
+            "stopped-state observation failed: {other:?}"
+        )),
+    }
+}
 
 pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 
@@ -63,10 +174,6 @@ impl KillMode {
             Self::Terminate => "Terminate",
             Self::Force => "Force-kill",
         }
-    }
-
-    pub(crate) fn action_label_for(self, _platform: Platform) -> &'static str {
-        self.action_label()
     }
 
     pub(crate) fn signal_label(self) -> &'static str {
@@ -138,11 +245,32 @@ pub(crate) enum TerminationOutcome {
     TargetChanged,
     UnsafePid(UnsafePidReason),
     UnknownFailure(String),
-    #[allow(dead_code, reason = "constructed only by Unix thaw handling")]
     ThawFailed {
         pid: u32,
         prior: Box<TerminationOutcome>,
     },
+}
+
+impl TerminationOutcome {
+    pub(crate) fn failure_cause_text(&self) -> String {
+        match self {
+            Self::Success => "the termination signal was accepted".to_owned(),
+            Self::PermissionDenied => {
+                "permission denied delivering the termination signal".to_owned()
+            }
+            Self::OwnershipUnavailable => "process ownership became unavailable".to_owned(),
+            Self::AlreadyExited => "the process already exited".to_owned(),
+            Self::Cancelled => "termination was cancelled".to_owned(),
+            Self::ProtectedProcess => "the process became protected".to_owned(),
+            Self::TargetChanged => "the confirmed process identity changed".to_owned(),
+            Self::UnsafePid(reason) => format!("unsafe PID: {}", reason.message()),
+            Self::UnknownFailure(error) => error.clone(),
+            Self::ThawFailed { pid, prior } => format!(
+                "{}; cleanup could not continue PID {pid}",
+                prior.failure_cause_text()
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -185,65 +313,7 @@ impl KillTarget {
         entries: impl IntoIterator<Item = PortEntryView<'a>>,
         context: Option<&ProcessContext>,
     ) -> Self {
-        let mut process_name = None;
-        let mut platform = Platform::Linux;
-        let mut permission = PermissionStatus::Full;
-        let mut protected = false;
-        let mut system_process = false;
-        let mut ports = Vec::new();
-        let mut process_identity: Option<ProcessIdentity> = None;
-        let mut identity_consistent = true;
-        let mut saw_entry = false;
-        for entry in entries {
-            saw_entry = true;
-            assert_eq!(
-                entry.pid,
-                Some(pid),
-                "kill target row PID must match target PID"
-            );
-            if process_name.is_none() {
-                process_name = entry.process_name.map(str::to_owned);
-            }
-            platform = entry.platform;
-            if entry.permission == PermissionStatus::Partial {
-                permission = PermissionStatus::Partial;
-            }
-            protected |= entry.protected;
-            system_process |= entry.is_system_process();
-            if let Some(identity) = entry.process_identity {
-                identity_consistent &= identity.pid == pid
-                    && process_identity.is_none_or(|existing| existing == identity);
-                process_identity.get_or_insert(identity);
-            } else {
-                identity_consistent = false;
-            }
-            ports.push(KillTargetPort {
-                protocol: entry.protocol,
-                local_addr: entry.local_addr,
-                local_port: entry.local_port,
-                ipv6_scope: entry.ipv6_scope,
-            });
-        }
-        assert!(saw_entry, "kill target must contain at least one row");
-        ports.sort_unstable();
-        ports.dedup();
-        let children = context.map(|context| &context.children);
-        Self {
-            pid,
-            process_name,
-            platform,
-            permission,
-            protected,
-            system_process,
-            ports,
-            owner_uid: context.and_then(|context| context.owner_uid),
-            process_start_time_marker: identity_consistent
-                .then_some(process_identity)
-                .flatten()
-                .map(|identity| identity.start_marker),
-            child_count: children.map_or(0, |children| children.children.len()),
-            children_truncated: children.is_some_and(|children| children.truncated),
-        }
+        Self::from_entries(pid, entries, context)
     }
 
     pub(crate) fn from_entries<'a>(
@@ -796,6 +866,48 @@ fn outcome_after_thaw(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refuse_stopped_termination<Continue>(
+    pid: u32,
+    transitioned: bool,
+    rollback_marker: Option<ProcessStartMarker>,
+    outcome: TerminationOutcome,
+    continue_process: Continue,
+) -> TerminationOutcome
+where
+    Continue: FnOnce(u32, Option<ProcessStartMarker>) -> crate::tree::TreeSignalResult,
+{
+    if transitioned {
+        outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker))
+    } else {
+        outcome
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_stopped_termination<Terminate, Continue>(
+    pid: u32,
+    mode: KillMode,
+    transitioned: bool,
+    rollback_marker: Option<ProcessStartMarker>,
+    terminate: Terminate,
+    continue_process: Continue,
+) -> TerminationOutcome
+where
+    Terminate: FnOnce(KillMode) -> TerminationOutcome,
+    Continue: FnOnce(u32, Option<ProcessStartMarker>) -> crate::tree::TreeSignalResult,
+{
+    let outcome = terminate(mode);
+    let successful_terminate =
+        mode == KillMode::Terminate && outcome == TerminationOutcome::Success;
+    let cleanup_after_failure = transitioned && outcome != TerminationOutcome::Success;
+    if successful_terminate || cleanup_after_failure {
+        outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker))
+    } else {
+        outcome
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) struct TreeDeliveryHandle {
     pid: u32,
@@ -814,6 +926,183 @@ pub(crate) fn current_user_id() -> u32 {
     // SAFETY: geteuid takes no arguments, touches no memory, and can't fail —
     // it just hands back this process's effective UID.
     unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "macos")]
+const UNIX_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[cfg(target_os = "macos")]
+fn macos_status_is_exited(status: u32) -> bool {
+    status == libc::SZOMB
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_state(pid: u32) -> std::io::Result<UnixProcessState> {
+    let platform_pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "PID exceeds pid_t"))?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "proc_bsdinfo size exceeds c_int",
+        )
+    })?;
+    let bytes = unsafe {
+        // SAFETY: `info` points to one writable proc_bsdinfo and proc_pidinfo
+        // writes at most the supplied structure size without retaining it.
+        libc::proc_pidinfo(
+            platform_pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if bytes != size {
+        return Err(if bytes <= 0 {
+            std::io::Error::last_os_error()
+        } else {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proc_pidinfo returned a partial proc_bsdinfo",
+            )
+        });
+    }
+    let info = unsafe {
+        // SAFETY: proc_pidinfo reported that it initialized the full structure.
+        info.assume_init()
+    };
+    let microseconds = u32::try_from(info.pbi_start_tvusec).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process start microseconds exceed u32",
+        )
+    })?;
+    let marker = ProcessStartMarker::macos(info.pbi_start_tvsec, microseconds).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid process start time",
+        )
+    })?;
+    Ok(UnixProcessState {
+        marker,
+        stopped: info.pbi_status == libc::SSTOP,
+        exited: macos_status_is_exited(info.pbi_status),
+    })
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_stop_observation_result(
+    before: UnixProcessState,
+    observed: UnixProcessState,
+    deadline_expired: bool,
+) -> Option<Result<bool, StopFailure>> {
+    if observed.exited {
+        return Some(Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        }));
+    }
+    if observed.marker != before.marker {
+        return Some(Err(StopFailure {
+            outcome: TerminationOutcome::TargetChanged,
+            cleanup_required: observed.stopped,
+            rollback_start_time_marker: observed.stopped.then_some(observed.marker),
+        }));
+    }
+    if deadline_expired {
+        let cleanup_required = !before.stopped;
+        return Some(Err(stop_deadline_failure(
+            cleanup_required,
+            cleanup_required.then_some(observed.marker),
+        )));
+    }
+    observed.stopped.then_some(Ok(!before.stopped))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_stop_process(
+    pid: u32,
+    expected_marker: Option<ProcessStartMarker>,
+    deadline: std::time::Instant,
+) -> Result<bool, StopFailure> {
+    let before = macos_process_state(pid).map_err(|error| StopFailure {
+        outcome: macos_signal_outcome("proc_pidinfo before SIGSTOP", &error),
+        cleanup_required: false,
+        rollback_start_time_marker: None,
+    })?;
+    if before.exited {
+        return Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+    if expected_marker.is_some_and(|expected| expected != before.marker) {
+        return Err(StopFailure {
+            outcome: TerminationOutcome::TargetChanged,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+    let platform_pid = pid_to_macos_pid(pid).map_err(|outcome| StopFailure {
+        outcome,
+        cleanup_required: false,
+        rollback_start_time_marker: None,
+    })?;
+    let stop = run_before_stop_deadline(deadline, std::time::Instant::now, || unsafe {
+        // SAFETY: pid is range checked and SIGSTOP has no pointer arguments.
+        libc::kill(platform_pid, libc::SIGSTOP)
+    })?;
+    if stop != 0 {
+        return Err(StopFailure {
+            outcome: macos_signal_outcome("kill(SIGSTOP)", &std::io::Error::last_os_error()),
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let cleanup_required = !before.stopped;
+            return Err(stop_deadline_failure(
+                cleanup_required,
+                cleanup_required.then_some(before.marker),
+            ));
+        }
+        match macos_process_state(pid) {
+            Ok(state) => {
+                if let Some(result) = macos_stop_observation_result(
+                    before,
+                    state,
+                    std::time::Instant::now() >= deadline,
+                ) {
+                    return result;
+                }
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    let cleanup_required = !before.stopped;
+                    return Err(stop_deadline_failure(cleanup_required, None));
+                }
+                return Err(StopFailure {
+                    outcome: macos_signal_outcome("proc_pidinfo after SIGSTOP", &error),
+                    cleanup_required: !before.stopped,
+                    rollback_start_time_marker: None,
+                });
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let cleanup_required = !before.stopped;
+            return Err(stop_deadline_failure(
+                cleanup_required,
+                cleanup_required.then_some(before.marker),
+            ));
+        }
+        std::thread::sleep(UNIX_STOP_POLL.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -843,23 +1132,38 @@ fn terminate_handle_checked_platform(
     if target.process_start_time_marker != Some(handle.process_start_time_marker) {
         return TerminationOutcome::TargetChanged;
     }
+    let stop_deadline = std::time::Instant::now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+    let transitioned =
+        match macos_stop_process(handle.pid, target.process_start_time_marker, stop_deadline) {
+            Ok(transitioned) => transitioned,
+            Err(failure) if failure.cleanup_required => {
+                let rollback_marker = failure
+                    .rollback_start_time_marker
+                    .or_else(|| {
+                        macos_process_state(handle.pid)
+                            .ok()
+                            .map(|state| state.marker)
+                    })
+                    .or(target.process_start_time_marker);
+                return outcome_after_thaw(
+                    handle.pid,
+                    failure.outcome,
+                    macos_cont_if_matches(handle.pid, rollback_marker),
+                );
+            }
+            Err(failure) => return failure.outcome,
+        };
     let pid = match pid_to_macos_pid(handle.pid) {
         Ok(pid) => pid,
         Err(outcome) => return outcome,
     };
-    let stop = unsafe {
-        // SAFETY: pid is range checked and SIGSTOP has no pointer arguments.
-        libc::kill(pid, libc::SIGSTOP)
-    };
-    if stop != 0 {
-        return macos_signal_outcome("kill(SIGSTOP)", &std::io::Error::last_os_error());
-    }
     let fresh = crate::platform::macos::fresh_process_evidence(handle.pid);
     finish_macos_stopped_process(
         handle.pid,
         target,
         protected_names,
         mode,
+        transitioned,
         fresh,
         |mode| {
             let signal = match mode {
@@ -881,11 +1185,16 @@ fn terminate_handle_checked_platform(
 }
 
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the testable macOS stop boundary keeps termination, cleanup ownership, and injected signal operations explicit"
+)]
 fn finish_macos_stopped_process<Terminate, Continue>(
     pid: u32,
     target: &KillTarget,
     protected_names: &[String],
     mode: KillMode,
+    resume_on_cleanup: bool,
     fresh: Result<FreshProcessEvidence, ProcessEvidenceError>,
     terminate: Terminate,
     continue_process: Continue,
@@ -900,13 +1209,22 @@ where
         .map(|evidence| evidence.start_marker)
         .or(target.process_start_time_marker);
     if let Err(outcome) = check_final_evidence(target, protected_names, fresh) {
-        return outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker));
+        return refuse_stopped_termination(
+            pid,
+            resume_on_cleanup,
+            rollback_marker,
+            outcome,
+            continue_process,
+        );
     }
-    let outcome = terminate(mode);
-    if mode == KillMode::Terminate || outcome != TerminationOutcome::Success {
-        return outcome_after_thaw(pid, outcome, continue_process(pid, rollback_marker));
-    }
-    outcome
+    finish_stopped_termination(
+        pid,
+        mode,
+        resume_on_cleanup,
+        rollback_marker,
+        terminate,
+        continue_process,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -922,7 +1240,7 @@ fn macos_cont_if_matches(
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn macos_cont_if_matches_with<ReadMarker, Continue>(
     pid: u32,
     rollback_marker: Option<ProcessStartMarker>,
@@ -1027,34 +1345,227 @@ fn terminate_handle_checked_platform(
     protected_names: &[String],
     mode: KillMode,
 ) -> TerminationOutcome {
-    if let Err(outcome) = linux_pidfd_signal(handle, libc::SIGSTOP) {
-        return outcome;
-    }
+    let stop_deadline = std::time::Instant::now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+    let transitioned = match linux_stop_pidfd(
+        handle.pid,
+        handle.pidfd.as_raw_fd(),
+        target.process_start_time_marker,
+        stop_deadline,
+    ) {
+        Ok(transitioned) => transitioned,
+        Err(failure) if failure.cleanup_required => {
+            return outcome_after_thaw(
+                handle.pid,
+                failure.outcome,
+                tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
+            );
+        }
+        Err(failure) => return failure.outcome,
+    };
     if let Err(outcome) = check_final_evidence(
         target,
         protected_names,
         crate::platform::linux::fresh_process_evidence(handle.pid),
     ) {
-        return outcome_after_thaw(
+        return refuse_stopped_termination(
             handle.pid,
+            transitioned,
+            target.process_start_time_marker,
             outcome,
-            tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
+            |_, _| tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
         );
     }
     let signal = match mode {
         KillMode::Terminate => libc::SIGTERM,
         KillMode::Force => libc::SIGKILL,
     };
-    let outcome = linux_pidfd_signal(handle, signal)
-        .map_or_else(|outcome| outcome, |()| TerminationOutcome::Success);
-    if mode == KillMode::Terminate || outcome != TerminationOutcome::Success {
-        return outcome_after_thaw(
-            handle.pid,
-            outcome,
-            tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
-        );
+    finish_stopped_termination(
+        handle.pid,
+        mode,
+        transitioned,
+        target.process_start_time_marker,
+        |_| {
+            linux_pidfd_signal(handle, signal)
+                .map_or_else(|outcome| outcome, |()| TerminationOutcome::Success)
+        },
+        |_, _| tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_PROC_STAT_MAX_BYTES: u64 = 4096;
+#[cfg(target_os = "linux")]
+const UNIX_STOP_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_state(bytes: &[u8]) -> std::io::Result<UnixProcessState> {
+    let close = bytes
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing stat comm terminator",
+            )
+        })?;
+    let fields = bytes
+        .get(close + 1..)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated stat"))?
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|field| (field.len() == 1).then_some(field[0]))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing process state")
+        })?;
+    // `fields[0]` is proc stat field 3; starttime is field 22.
+    let start_ticks = std::str::from_utf8(fields.get(19).copied().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing process start time",
+        )
+    })?)
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 start time"))?
+    .parse::<u64>()
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid start time"))?;
+    let marker = ProcessStartMarker::linux(start_ticks).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "zero process start time")
+    })?;
+    Ok(UnixProcessState {
+        marker,
+        stopped: matches!(state, b'T' | b't'),
+        exited: matches!(state, b'Z' | b'X' | b'x'),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: u32) -> std::io::Result<UnixProcessState> {
+    let mut file = std::fs::File::open(format!("/proc/{pid}/stat"))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(LINUX_PROC_STAT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > LINUX_PROC_STAT_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process stat exceeded bounded read",
+        ));
     }
-    outcome
+    parse_linux_process_state(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stop_observation_result(
+    before: UnixProcessState,
+    transitioned: bool,
+    observed: UnixProcessState,
+    deadline_expired: bool,
+) -> Option<Result<bool, StopFailure>> {
+    if observed.marker != before.marker || observed.exited {
+        return Some(Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        }));
+    }
+    if deadline_expired {
+        return Some(Err(stop_deadline_failure(transitioned, None)));
+    }
+    observed.stopped.then_some(Ok(transitioned))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_state_failure(operation: &str, error: &std::io::Error) -> TerminationOutcome {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => TerminationOutcome::AlreadyExited,
+        std::io::ErrorKind::PermissionDenied => TerminationOutcome::PermissionDenied,
+        _ => TerminationOutcome::UnknownFailure(format!("{operation} failed: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stop_pidfd(
+    pid: u32,
+    pidfd: libc::c_int,
+    expected_marker: Option<ProcessStartMarker>,
+    deadline: std::time::Instant,
+) -> Result<bool, StopFailure> {
+    let before = linux_process_state(pid).map_err(|error| StopFailure {
+        outcome: linux_state_failure("reading process state before SIGSTOP", &error),
+        cleanup_required: false,
+        rollback_start_time_marker: None,
+    })?;
+    if before.exited {
+        return Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+    if expected_marker.is_some_and(|expected| expected != before.marker) {
+        return Err(StopFailure {
+            outcome: TerminationOutcome::TargetChanged,
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+    let transitioned = !before.stopped;
+    let result = run_before_stop_deadline(deadline, std::time::Instant::now, || unsafe {
+        // SAFETY: pidfd is live for this call; SIGSTOP has no pointer payload.
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGSTOP,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    })?;
+    if result != 0 {
+        return Err(StopFailure {
+            outcome: outcome_from_errno(
+                "pidfd_send_signal(SIGSTOP)",
+                &std::io::Error::last_os_error(),
+            ),
+            cleanup_required: false,
+            rollback_start_time_marker: None,
+        });
+    }
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(stop_deadline_failure(transitioned, None));
+        }
+        match linux_process_state(pid) {
+            Ok(state) => {
+                if let Some(result) = linux_stop_observation_result(
+                    before,
+                    transitioned,
+                    state,
+                    std::time::Instant::now() >= deadline,
+                ) {
+                    return result;
+                }
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(stop_deadline_failure(transitioned, None));
+                }
+                let outcome = linux_state_failure("reading process state after SIGSTOP", &error);
+                return Err(StopFailure {
+                    cleanup_required: transitioned && outcome != TerminationOutcome::AlreadyExited,
+                    outcome,
+                    rollback_start_time_marker: None,
+                });
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(stop_deadline_failure(transitioned, None));
+        }
+        std::thread::sleep(UNIX_STOP_POLL.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1099,9 +1610,39 @@ fn linux_pidfd_signal(
 /// immediately verifies identity while the process is stopped. Linux callers use
 /// `tree_stop_handle` instead so the root and every descendant are pinned
 /// before the first stop signal.
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn macos_tree_stop_result(
+    result: Result<bool, StopFailure>,
+) -> (crate::tree::TreeSignalResult, crate::tree::TreeStopResult) {
+    use crate::tree::{TreeSignalResult, TreeStopResult};
+
+    match result {
+        Ok(transitioned) => (
+            TreeSignalResult::Delivered,
+            TreeStopResult::Stopped { transitioned },
+        ),
+        Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited | TerminationOutcome::TargetChanged,
+            cleanup_required: false,
+            ..
+        }) => (TreeSignalResult::NotFound, TreeStopResult::NotFound),
+        Err(failure) => (
+            TreeSignalResult::Denied,
+            TreeStopResult::Failed {
+                cleanup_required: failure.cleanup_required,
+                rollback_start_time_marker: failure.rollback_start_time_marker,
+                error: tree_stop_error(failure.outcome),
+            },
+        ),
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
-    tree_send_signal(pid, libc::SIGSTOP)
+    let (signal_result, stop_result) =
+        macos_tree_stop_result(macos_stop_process(pid, None, tree_stop_deadline()));
+    record_tree_stop_result(pid, stop_result);
+    signal_result
 }
 
 /// Send `SIGCONT` to a PID. Best-effort: used to resume a process before its
@@ -1173,7 +1714,43 @@ pub(crate) fn tree_open_delivery_handle(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn tree_stop_handle(handle: &TreeDeliveryHandle) -> crate::tree::TreeSignalResult {
-    tree_send_pidfd_signal(handle, libc::SIGSTOP)
+    use crate::tree::{TreeSignalResult, TreeStopResult};
+
+    let (signal_result, stop_result) = match linux_stop_pidfd(
+        handle.pid,
+        handle.pidfd.as_raw_fd(),
+        None,
+        tree_stop_deadline(),
+    ) {
+        Ok(transitioned) => (
+            TreeSignalResult::Delivered,
+            TreeStopResult::Stopped { transitioned },
+        ),
+        Err(StopFailure {
+            outcome: TerminationOutcome::AlreadyExited | TerminationOutcome::TargetChanged,
+            ..
+        }) => (TreeSignalResult::NotFound, TreeStopResult::NotFound),
+        Err(failure) => {
+            let cleanup_required = failure.cleanup_required;
+            let rollback_start_time_marker = failure.rollback_start_time_marker;
+            (
+                if cleanup_required {
+                    // Preserve the pidfd in LinuxTreeOps so the immediate cleanup
+                    // continuation cannot wander to a recycled numeric PID.
+                    TreeSignalResult::Delivered
+                } else {
+                    TreeSignalResult::Denied
+                },
+                TreeStopResult::Failed {
+                    cleanup_required,
+                    rollback_start_time_marker,
+                    error: tree_stop_error(failure.outcome),
+                },
+            )
+        }
+    };
+    record_tree_stop_result(handle.pid, stop_result);
+    signal_result
 }
 
 #[cfg(target_os = "linux")]
@@ -1539,15 +2116,24 @@ mod tests {
     use crate::model::entry_views;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use super::outcome_after_thaw;
     use super::{
         ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
         confirmation_input_matches, confirmation_requirement, revalidate_confirmed_target,
         target_still_matches_confirmation, unsafe_pid_reason,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{
+        UnixProcessState, finish_stopped_termination, macos_cont_if_matches_with,
+        macos_stop_observation_result, macos_tree_stop_result, outcome_after_thaw,
+        refuse_stopped_termination, run_before_stop_deadline,
+    };
     #[cfg(target_os = "macos")]
-    use super::{finish_macos_stopped_process, macos_cont_if_matches_with};
+    use super::{finish_macos_stopped_process, macos_status_is_exited};
+    #[cfg(target_os = "linux")]
+    use super::{
+        linux_process_state, linux_stop_observation_result, parse_linux_process_state,
+        take_tree_stop_result, tree_cont_handle, tree_open_delivery_handle, tree_stop_handle,
+    };
     #[cfg(windows)]
     use super::{native_utf16_prefix, windows_api_outcome, windows_still_active_exit_code};
     use crate::model::{
@@ -1558,6 +2144,64 @@ mod tests {
     use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
     #[cfg(windows)]
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+
+    #[cfg(target_os = "linux")]
+    struct ChildGuard(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_state_parser_reads_stopped_state_and_identity() {
+        let stat =
+            b"42 (worker with ) chars) T 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20";
+        let state = parse_linux_process_state(stat).expect("valid proc stat parses");
+
+        assert!(state.stopped);
+        assert!(!state.exited);
+        assert_eq!(
+            state.marker,
+            crate::observation::ProcessStartMarker::linux(987).expect("nonzero marker")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tree_stop_returns_only_after_stopped_state_is_observable() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn test child");
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let handle = tree_open_delivery_handle(pid).expect("open child pidfd");
+
+        assert_eq!(
+            tree_stop_handle(&handle),
+            crate::tree::TreeSignalResult::Delivered
+        );
+        assert_eq!(
+            take_tree_stop_result(pid),
+            Some(crate::tree::TreeStopResult::Stopped { transitioned: true })
+        );
+        assert!(
+            linux_process_state(pid)
+                .expect("child state remains readable")
+                .stopped
+        );
+
+        assert_eq!(
+            tree_cont_handle(&handle),
+            crate::tree::TreeSignalResult::Delivered
+        );
+        child.0.kill().expect("terminate test child");
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1622,6 +2266,190 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn successful_sigterm_continues_a_pre_stopped_single_process_but_failure_does_not() {
+        let marker = crate::observation::ProcessStartMarker::linux(55).ok();
+        let mut continued = Vec::new();
+
+        let success = finish_stopped_termination(
+            42,
+            KillMode::Terminate,
+            false,
+            marker,
+            |_| TerminationOutcome::Success,
+            |pid, guarded_marker| {
+                continued.push((pid, guarded_marker));
+                crate::tree::TreeSignalResult::Delivered
+            },
+        );
+        let failed = finish_stopped_termination(
+            43,
+            KillMode::Terminate,
+            false,
+            marker,
+            |_| TerminationOutcome::PermissionDenied,
+            |_, _| panic!("failed delivery must not resume a pre-stopped process"),
+        );
+        let refused = refuse_stopped_termination(
+            44,
+            false,
+            marker,
+            TerminationOutcome::TargetChanged,
+            |_, _| panic!("refusal must not resume a pre-stopped process"),
+        );
+
+        assert_eq!(success, TerminationOutcome::Success);
+        assert_eq!(failed, TerminationOutcome::PermissionDenied);
+        assert_eq!(refused, TerminationOutcome::TargetChanged);
+        assert_eq!(continued, [(42, marker)]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn thaw_failure_text_retains_the_primary_failure() {
+        let outcome = outcome_after_thaw(
+            42,
+            TerminationOutcome::TargetChanged,
+            crate::tree::TreeSignalResult::Denied,
+        );
+
+        assert_eq!(
+            outcome.failure_cause_text(),
+            "the confirmed process identity changed; cleanup could not continue PID 42"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn deadline_recheck_prevents_a_delayed_sigstop_submission() {
+        let start = std::time::Instant::now();
+        let deadline = start + super::UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+        let signal_sent = std::cell::Cell::new(false);
+
+        let failure = run_before_stop_deadline(deadline, || deadline, || signal_sent.set(true))
+            .expect_err("an operation at the deadline must not run");
+
+        assert!(!signal_sent.get());
+        assert!(!failure.cleanup_required);
+        assert!(matches!(
+            failure.outcome,
+            TerminationOutcome::UnknownFailure(_)
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn delayed_poll_does_not_acknowledge_a_stop_after_the_deadline() {
+        let marker =
+            crate::observation::ProcessStartMarker::linux(55).expect("test marker is nonzero");
+        let before = UnixProcessState {
+            marker,
+            stopped: false,
+            exited: false,
+        };
+        let observed = UnixProcessState {
+            stopped: true,
+            ..before
+        };
+
+        let failure = macos_stop_observation_result(before, observed, true)
+            .expect("stopped observation is terminal")
+            .expect_err("late stopped observation must time out");
+
+        assert!(failure.cleanup_required);
+        assert_eq!(failure.rollback_start_time_marker, Some(marker));
+        assert!(matches!(
+            failure.outcome,
+            TerminationOutcome::UnknownFailure(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_delayed_poll_does_not_acknowledge_a_stop_after_the_deadline() {
+        let marker =
+            crate::observation::ProcessStartMarker::linux(55).expect("test marker is nonzero");
+        let before = UnixProcessState {
+            marker,
+            stopped: false,
+            exited: false,
+        };
+        let observed = UnixProcessState {
+            stopped: true,
+            ..before
+        };
+
+        let failure = linux_stop_observation_result(before, true, observed, true)
+            .expect("stopped observation is terminal")
+            .expect_err("late stopped observation must time out");
+
+        assert!(failure.cleanup_required);
+        assert!(matches!(
+            failure.outcome,
+            TerminationOutcome::UnknownFailure(_)
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn macos_pre_stopped_identity_replacement_is_guardedly_thawed_when_observed_stopped() {
+        let original = crate::observation::ProcessStartMarker::macos(20, 30)
+            .expect("original marker is valid");
+        let replacement = crate::observation::ProcessStartMarker::macos(21, 30)
+            .expect("replacement marker is valid");
+        let before = UnixProcessState {
+            marker: original,
+            stopped: true,
+            exited: false,
+        };
+        let observed = UnixProcessState {
+            marker: replacement,
+            stopped: true,
+            exited: false,
+        };
+
+        let failure = macos_stop_observation_result(before, observed, false)
+            .expect("identity replacement is terminal")
+            .expect_err("replacement must refuse termination");
+        assert!(failure.cleanup_required);
+        assert_eq!(failure.rollback_start_time_marker, Some(replacement));
+
+        let (signal, stop) = macos_tree_stop_result(Err(failure));
+
+        assert_eq!(signal, crate::tree::TreeSignalResult::Denied);
+        assert_eq!(
+            stop,
+            crate::tree::TreeStopResult::Failed {
+                cleanup_required: true,
+                rollback_start_time_marker: Some(replacement),
+                error: crate::tree::TreeStopError::ObservationFailed(
+                    "stopped-state observation failed: TargetChanged".to_owned()
+                ),
+            }
+        );
+
+        let mut continued = Vec::new();
+        let thaw = macos_cont_if_matches_with(
+            42,
+            Some(replacement),
+            |_| Ok(replacement),
+            |pid| {
+                continued.push(pid);
+                crate::tree::TreeSignalResult::Delivered
+            },
+        );
+        assert_eq!(thaw, crate::tree::TreeSignalResult::Delivered);
+        assert_eq!(continued, [42]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_zombie_status_is_classified_as_exited() {
+        assert!(macos_status_is_exited(libc::SZOMB));
+        assert!(!macos_status_is_exited(libc::SSTOP));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_cleanup_continues_the_identity_observed_after_stop() {
@@ -1675,6 +2503,7 @@ mod tests {
             &target,
             &[],
             KillMode::Terminate,
+            true,
             fresh,
             |_| panic!("replacement identity must not receive a terminating signal"),
             |pid, rollback_marker| {
@@ -1718,6 +2547,7 @@ mod tests {
             &target,
             &[],
             KillMode::Terminate,
+            true,
             Err(ProcessEvidenceError::PermissionDenied { pid: 42 }),
             |_| panic!("incomplete evidence must prevent termination"),
             |pid, rollback_marker| {
@@ -1728,6 +2558,39 @@ mod tests {
 
         assert_eq!(outcome, TerminationOutcome::PermissionDenied);
         assert_eq!(continued, [(42, Some(original_marker))]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_preexisting_stop_is_not_continued_on_refusal() {
+        let marker =
+            crate::observation::ProcessStartMarker::macos(20, 30).expect("marker is valid");
+        let target = KillTarget {
+            pid: 42,
+            process_name: Some("node".to_owned()),
+            platform: Platform::Macos,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: Some(marker),
+            child_count: 0,
+            children_truncated: false,
+        };
+
+        let outcome = finish_macos_stopped_process(
+            42,
+            &target,
+            &[],
+            KillMode::Terminate,
+            false,
+            Err(ProcessEvidenceError::PermissionDenied { pid: 42 }),
+            |_| panic!("failed evidence must prevent termination"),
+            |_, _| panic!("an externally stopped process must not receive SIGCONT"),
+        );
+
+        assert_eq!(outcome, TerminationOutcome::PermissionDenied);
     }
 
     #[cfg(target_os = "macos")]
@@ -1875,10 +2738,7 @@ mod tests {
             confirmation_requirement(false, Platform::Windows, KillMode::Terminate, true, true),
             Ok(None),
         );
-        assert_eq!(
-            KillMode::Terminate.action_label_for(Platform::Windows),
-            "Terminate",
-        );
+        assert_eq!(KillMode::Terminate.action_label(), "Terminate",);
         assert!(
             KillMode::Terminate
                 .force_warning(Platform::Windows)

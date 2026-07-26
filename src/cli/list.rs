@@ -4,13 +4,13 @@
 use std::io::{self, ErrorKind, Write};
 
 use crate::config::Config;
-use crate::diagnostic;
+use crate::diagnostic::requested_diagnostic_port;
 use crate::model::PortEntryView;
 use crate::observation::NetworkSnapshot;
 use crate::output;
 use crate::query::{self, QueryCapabilities, QueryOptions};
 
-use super::{ExitReason, ListArgs};
+use super::{ExitReason, ListArgs, maybe_print_no_match_diagnostic};
 
 pub(super) fn run_list_snapshot(
     args: &ListArgs,
@@ -73,10 +73,8 @@ fn run_list_views_with_writer(
     writer: &mut impl Write,
 ) -> ExitReason {
     let sort_mode = args.sort.unwrap_or(config.default_sort);
-    let diagnostic_port = diagnostic::requested_diagnostic_port(
-        args.port,
-        args.filter.as_deref().unwrap_or_default(),
-    );
+    let diagnostic_port =
+        requested_diagnostic_port(args.port, args.filter.as_deref().unwrap_or_default());
     let result = match query::query_view_indices(
         entries,
         QueryOptions {
@@ -118,7 +116,7 @@ fn run_list_views_with_writer(
         if let Err(error) = writeln!(writer, "no open ports{suffix}") {
             return output_error_reason(&error);
         }
-        maybe_print_no_match_diagnostic_views(diagnostic_port, entries);
+        maybe_print_no_match_diagnostic(diagnostic_port, entries);
     } else if let Err(error) =
         output::write_view_table(writer, entries, &visible_indices, !config.labels.is_empty())
     {
@@ -136,20 +134,6 @@ fn run_list_views_with_writer(
         return ExitReason::NoMatch;
     }
     ExitReason::Success
-}
-
-fn maybe_print_no_match_diagnostic_views(
-    diagnostic_port: Option<u16>,
-    entries: &[PortEntryView<'_>],
-) {
-    let Some(port) = diagnostic_port else { return };
-    if entries.iter().any(|entry| entry.local_port == port) {
-        return;
-    }
-    let hints = crate::platform::collect_related_process_hints(port);
-    if let Some(message) = diagnostic::diagnostic_message(port, &hints) {
-        eprint!("{message}");
-    }
 }
 
 fn output_error_reason(error: &io::Error) -> ExitReason {

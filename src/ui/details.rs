@@ -1,7 +1,7 @@
 //! The selected-row details: the panel down the side, and the bigger modal.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
@@ -12,13 +12,13 @@ use crate::model::{
     ProcessContext, Protocol,
 };
 
-use super::{field, theme::Theme};
+use super::{field, rendered_rows, theme::Theme, wrapped_rows};
 
 const MISSING: &str = "-";
-const PANEL_LINES_MAX: usize = 8;
 const CHILDREN_DISPLAY_MAX: usize = 8;
 
 pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+    let content_rows = usize::from(area.height.saturating_sub(2));
     let lines = app.selected_row().map_or_else(
         || empty_lines(theme),
         |entry| {
@@ -27,20 +27,41 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
                 app.selected_process_context(),
                 app.selected_process_context_loading(),
                 theme,
+                content_rows,
             )
         },
     );
-    let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::bordered()
-            .title("Details")
-            .title_style(theme.title())
-            .border_style(theme.border()),
-    );
-    frame.render_widget(panel, area);
+    let block = Block::bordered()
+        .title("Details")
+        .title_style(theme.title())
+        .border_style(theme.border());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.selected_row().is_some_and(|entry| entry.protected) {
+        let warning = Line::styled(
+            "Warning: protected process; stronger confirmation required.",
+            theme.protected(),
+        );
+        let warning_rows = wrapped_rows(&warning.to_string(), usize::from(inner.width));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(u16::try_from(warning_rows).unwrap_or(u16::MAX)),
+            ])
+            .split(inner);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
+        frame.render_widget(
+            Paragraph::new(warning).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
 }
 
 pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let mut lines = app.selected_row().map_or_else(
+    let lines = app.selected_row().map_or_else(
         || empty_lines(theme),
         |entry| {
             modal_lines(
@@ -51,24 +72,55 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
             )
         },
     );
-    lines.push(Line::raw(""));
-    // The footer only mentions the dismiss key for this modal. `q` quitting is a
-    // global thing already shown in the header and the help modal, so repeating
-    // it here would just tempt people into quitting when all they wanted was to
-    // close the panel.
-    lines.push(Line::from(vec![
-        Span::styled("Esc", theme.key()),
-        Span::raw(" closes this modal."),
-    ]));
-
-    let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::bordered()
-            .title("Port Details")
-            .title_style(theme.title())
-            .border_style(theme.border()),
-    );
+    let warning = app.selected_row().filter(|entry| entry.protected).map(|_| {
+        Line::styled(
+            "Protected process: stronger confirmation will be required before termination.",
+            theme.protected(),
+        )
+    });
+    let block = Block::bordered()
+        .title("Port Details")
+        .title_style(theme.title())
+        .border_style(theme.border());
+    let inner = block.inner(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(modal, area);
+    frame.render_widget(block, area);
+
+    let warning_rows = warning.as_ref().map_or(0, |warning| {
+        wrapped_rows(&warning.to_string(), usize::from(inner.width))
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(u16::try_from(warning_rows).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let total_rows = rendered_rows(&lines, usize::from(chunks[0].width));
+    let max_scroll = total_rows.saturating_sub(usize::from(chunks[0].height));
+    let scroll = usize::from(app.modal_scroll()).min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    if let Some(warning) = warning {
+        frame.render_widget(
+            Paragraph::new(warning).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Up/Down", theme.key()),
+            Span::raw(" scroll  "),
+            Span::styled("Esc", theme.key()),
+            Span::raw(" closes"),
+        ])),
+        chunks[2],
+    );
 }
 
 fn panel_lines(
@@ -76,6 +128,7 @@ fn panel_lines(
     context: Option<&ProcessContext>,
     context_loading: bool,
     theme: Theme,
+    max_rows: usize,
 ) -> Vec<Line<'static>> {
     let warning_or_permission = if entry.protected {
         Line::styled(
@@ -109,9 +162,6 @@ fn panel_lines(
             theme,
         ),
     ];
-    if let Some(text) = docker_panel_text(context) {
-        lines.push(field("Docker", text, theme));
-    }
     lines.extend([
         field("Parent", parent_text(entry), theme),
         field(
@@ -123,7 +173,12 @@ fn panel_lines(
         field("Command", sanitize_optional_str(entry.command_line), theme),
         warning_or_permission,
     ]);
-    debug_assert!(lines.len() <= PANEL_LINES_MAX);
+    if lines.len() < max_rows
+        && let Some(text) = docker_panel_text(context)
+    {
+        lines.insert(2, field("Docker", text, theme));
+    }
+    lines.truncate(max_rows);
     lines
 }
 
@@ -143,10 +198,6 @@ fn modal_lines(
         field("Process", sanitize_optional_str(entry.process_name), theme),
     ];
 
-    if let Some(docker) = context.and_then(|context| context.docker.as_ref()) {
-        lines.extend(docker_modal_lines(docker, theme));
-    }
-
     lines.extend([
         field("Parent", parent_text(entry), theme),
         field(
@@ -158,19 +209,17 @@ fn modal_lines(
         field("Permission", permission_text(entry.permission), theme),
     ]);
 
-    if entry.protected {
-        lines.push(Line::styled(
-            "Protected process: stronger confirmation will be required before termination.",
-            theme.protected(),
-        ));
-    }
-
     lines.push(field("Path", path_text(entry), theme));
     lines.push(field(
         "Command",
         sanitize_optional_str(entry.command_line),
         theme,
     ));
+
+    if let Some(docker) = context.and_then(|context| context.docker.as_ref()) {
+        let docker_rows = docker_modal_lines(docker, theme);
+        lines.splice(7..7, docker_rows);
+    }
 
     lines
 }
@@ -338,7 +387,7 @@ fn user_text(context: Option<&ProcessContext>) -> String {
 fn permission_text(permission: PermissionStatus) -> String {
     match permission {
         PermissionStatus::Full => "full".to_owned(),
-        PermissionStatus::Partial => "partial (metadata restricted)".to_owned(),
+        PermissionStatus::Partial => "partial (metadata unavailable)".to_owned(),
     }
 }
 
@@ -348,8 +397,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        MISSING, PANEL_LINES_MAX, children_text, docker_panel_text, docker_summary_text,
-        panel_lines, parent_text, permission_text, user_text,
+        MISSING, children_text, docker_panel_text, docker_summary_text, panel_lines, parent_text,
+        permission_text, user_text,
     };
     use crate::model::{
         ChildProcess, ChildProcessSnapshot, DockerContainerPort, DockerPortContext,
@@ -387,9 +436,10 @@ mod tests {
             Some(&context),
             false,
             Theme::from_environment(),
+            7,
         );
 
-        assert!(lines.len() <= PANEL_LINES_MAX);
+        assert_eq!(lines.len(), 7);
     }
 
     #[test]
@@ -416,9 +466,16 @@ mod tests {
             Some(&context),
             false,
             Theme::from_environment(),
+            7,
         );
 
-        assert!(lines.len() <= PANEL_LINES_MAX);
+        assert_eq!(lines.len(), 7);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().starts_with("Docker:")),
+            "Docker must not displace safety and OS metadata in a full panel",
+        );
         assert_eq!(
             docker_panel_text(Some(&context)).as_deref(),
             Some("swamp/db (postgres-dev) 5432->5432/tcp"),
@@ -426,6 +483,20 @@ mod tests {
         assert_eq!(
             docker_summary_text(&docker),
             "swamp/db (postgres-dev) 5432->5432/tcp",
+        );
+
+        let expanded = panel_lines(
+            PortEntryView::from(&row),
+            Some(&context),
+            false,
+            Theme::from_environment(),
+            8,
+        );
+        assert_eq!(expanded.len(), 8);
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.to_string().starts_with("Docker:")),
         );
     }
 
@@ -502,7 +573,7 @@ mod tests {
         assert_eq!(permission_text(PermissionStatus::Full), "full");
         assert_eq!(
             permission_text(PermissionStatus::Partial),
-            "partial (metadata restricted)"
+            "partial (metadata unavailable)"
         );
     }
 }

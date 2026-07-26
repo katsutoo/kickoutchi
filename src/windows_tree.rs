@@ -2,27 +2,34 @@
 //!
 //! This is deliberately separate from the Unix freeze-first tree executor. Windows
 //! has no supported SIGSTOP-equivalent safety primitive, so the safety boundary is
-//! different: verify process handles first, assign the root to a Job Object as the
-//! commit point, converge on descendants, then explicitly terminate the job.
+//! different: verify process handles first, begin containment by assigning the
+//! root, converge on descendants, freeze, then re-prove final membership before
+//! explicitly terminating the job. Assignment starts side effects; it is not an
+//! atomic tree-termination commit.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::Path;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectReserved1Information,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JobObjectBasicProcessIdList, JobObjectReserved1Information, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, WaitForSingleObject,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
 
 use crate::model::Platform;
-use crate::observation::ProcessStartMarker;
+use crate::observation::{ProcessIdentity, ProcessStartMarker};
 use crate::process::{KillTarget, UnsafePidReason, unsafe_pid_reason};
 use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
@@ -40,6 +47,8 @@ const WINDOWS_TREE_TERMINATE_EXIT_CODE: u32 = 1;
 const WINDOWS_TREE_WAIT_MS: u32 = 5_000;
 const WINDOWS_TREE_PROBE_WAIT_MS: u32 = 0;
 const JOB_OBJECT_FREEZE_OPERATION: u32 = 1;
+const JOB_MEMBERSHIP_QUERY_ATTEMPTS: usize = 8;
+const PROCESS_IMAGE_PATH_CODE_UNITS_MAX: usize = 32 * 1024;
 
 #[repr(C)]
 struct JobObjectWakeFilter {
@@ -67,17 +76,57 @@ pub(crate) struct WindowsTreeKillReport {
     pub(crate) job_terminated_pids: Vec<u32>,
     pub(crate) already_exited_pids: Vec<u32>,
     pub(crate) not_terminated: Vec<u32>,
-    pub(crate) containment_partial: bool,
-    pub(crate) job_termination_withheld: bool,
+    pub(crate) termination_state: WindowsTreeTerminationState,
     pub(crate) post_commit_issue: Option<WindowsTreePostCommitIssue>,
     pub(crate) secondary_post_commit_issue: Option<WindowsTreePostCommitIssue>,
     pub(crate) cleanup_issue: Option<WindowsTreeCleanupIssue>,
+}
+
+/// Whether Job Object termination covered the proven tree.
+///
+/// One state replaces the former adjacent `containment_partial` and
+/// `job_termination_withheld` booleans, making the unsafe contradictory state
+/// "withheld but not partial" unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsTreeTerminationState {
+    Complete,
+    Partial,
+    Withheld,
+}
+
+impl WindowsTreeTerminationState {
+    fn mark_partial(&mut self) {
+        if *self == Self::Complete {
+            *self = Self::Partial;
+        }
+    }
+
+    fn withhold(&mut self) {
+        *self = Self::Withheld;
+    }
+
+    pub(crate) const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    pub(crate) const fn is_withheld(self) -> bool {
+        matches!(self, Self::Withheld)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WindowsTreeCleanupIssue {
     WithheldJobThawFailed(String),
     FailedTerminationThawFailed(String),
+    PostTerminationSurvivorsThawed {
+        pids: Vec<u32>,
+        wait_errors: Vec<(u32, String)>,
+    },
+    PostTerminationSurvivorThawFailed {
+        pids: Vec<u32>,
+        wait_errors: Vec<(u32, String)>,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +138,7 @@ pub(crate) enum WindowsTreePostCommitIssue {
     SweepPassLimit { limit: usize },
     UnsafePid { pid: u32, reason: UnsafePidReason },
     ProtectedDescendant { pid: u32, name: Option<String> },
+    ProtectedRoot { pid: u32, name: Option<String> },
     FreshConfirmationRequired,
     PartialMetadata { pid: u32 },
     SnapshotFailed(String),
@@ -98,7 +148,6 @@ impl WindowsTreePostCommitIssue {
     fn from_outcome(outcome: WindowsTreeKillOutcome) -> Option<Self> {
         match outcome {
             WindowsTreeKillOutcome::Completed(_)
-            | WindowsTreeKillOutcome::ProtectedRoot { .. }
             | WindowsTreeKillOutcome::OwnershipUnavailable { .. }
             | WindowsTreeKillOutcome::CommitFailed { .. }
             | WindowsTreeKillOutcome::FreezeCapabilityUnavailable { .. }
@@ -117,6 +166,9 @@ impl WindowsTreePostCommitIssue {
             }
             WindowsTreeKillOutcome::ProtectedDescendant { pid, name } => {
                 Some(Self::ProtectedDescendant { pid, name })
+            }
+            WindowsTreeKillOutcome::ProtectedRoot { pid, name } => {
+                Some(Self::ProtectedRoot { pid, name })
             }
             WindowsTreeKillOutcome::FreshConfirmationRequired => {
                 Some(Self::FreshConfirmationRequired)
@@ -303,8 +355,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         job_terminated_pids: Vec::new(),
         already_exited_pids: Vec::new(),
         not_terminated: Vec::new(),
-        containment_partial: false,
-        job_termination_withheld: false,
+        termination_state: WindowsTreeTerminationState::Complete,
         post_commit_issue: None,
         secondary_post_commit_issue: None,
         cleanup_issue: None,
@@ -336,7 +387,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
     }
 
     let mut job_frozen = false;
-    if !report.job_termination_withheld {
+    if !report.termination_state.is_withheld() {
         match api.set_job_frozen(&job, true) {
             Ok(()) => {
                 job_frozen = true;
@@ -355,7 +406,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
                 }
             }
             Err(error) => {
-                report.job_termination_withheld = true;
+                report.termination_state.withhold();
                 record_post_commit_issue(
                     &mut report,
                     WindowsTreeKillOutcome::SnapshotFailed(format!(
@@ -374,7 +425,24 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         }
     }
 
-    if report.job_termination_withheld {
+    if job_frozen
+        && !report.termination_state.is_withheld()
+        && let Err(outcome) = reconcile_final_containment(
+            api,
+            &job,
+            root.pid,
+            protected_names,
+            protected_root_confirmed,
+            prompt_skipped,
+            &mut members,
+            &mut assigned,
+            &mut report,
+        )
+    {
+        record_post_commit_issue(&mut report, outcome);
+    }
+
+    if report.termination_state.is_withheld() {
         if job_frozen && let Err(error) = api.set_job_frozen(&job, false) {
             record_cleanup_issue(
                 &mut report,
@@ -399,8 +467,319 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         };
     }
 
-    finish_report(api, &members, &mut report);
+    finish_report(api, &job, &members, &mut report);
     WindowsTreeKillOutcome::Completed(Box::new(report))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the final Windows containment proof keeps all refusal and cleanup state explicit"
+)]
+fn reconcile_final_containment<Api: WindowsTreeApi>(
+    api: &mut Api,
+    job: &Api::JobHandle,
+    root_pid: u32,
+    protected_names: &[String],
+    protected_root_confirmed: bool,
+    prompt_skipped: bool,
+    members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
+    assigned: &mut HashSet<u32>,
+    report: &mut WindowsTreeKillReport,
+) -> Result<(), WindowsTreeKillOutcome> {
+    let exact_members = api.job_process_ids(job).map_err(job_membership_outcome)?;
+    let exact_member_set = exact_members.iter().copied().collect::<HashSet<_>>();
+    let snapshot = api
+        .snapshot()
+        .map_err(WindowsTreeKillOutcome::SnapshotFailed)?;
+    if snapshot.len() > PROCESS_TREE_INDEX_MAX {
+        return Err(WindowsTreeKillOutcome::Truncated {
+            limit: PROCESS_TREE_INDEX_MAX,
+        });
+    }
+
+    let snapshot_by_pid = snapshot_by_pid(&snapshot)?;
+    let reachable = generation_qualified_descendants(&snapshot, &snapshot_by_pid, members)?;
+    let mut final_pids = exact_member_set
+        .union(&reachable)
+        .copied()
+        .collect::<Vec<_>>();
+    if final_pids.len() > MAX_TREE_PROCESSES {
+        return Err(WindowsTreeKillOutcome::Truncated {
+            limit: MAX_TREE_PROCESSES,
+        });
+    }
+    final_pids.sort_unstable();
+
+    for pid in final_pids {
+        let info = snapshot_by_pid
+            .get(&pid)
+            .copied()
+            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+        if let Some(reason) = unsafe_pid_reason(pid) {
+            return Err(WindowsTreeKillOutcome::UnsafePid { pid, reason });
+        }
+        let marker = info
+            .start_time_marker
+            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+        if members
+            .get(&pid)
+            .is_some_and(|process| process.start_marker != marker)
+        {
+            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = members.entry(pid) {
+            let process =
+                open_verified_process(api, info, marker).map_err(|error| match error {
+                    OpenVerifiedError::NotFound => WindowsTreeKillOutcome::TargetChanged { pid },
+                    OpenVerifiedError::PermissionDenied => {
+                        WindowsTreeKillOutcome::PermissionDenied { pid }
+                    }
+                    OpenVerifiedError::PartialMetadata => {
+                        WindowsTreeKillOutcome::PartialMetadata { pid }
+                    }
+                    OpenVerifiedError::Other(error) => {
+                        WindowsTreeKillOutcome::SnapshotFailed(error)
+                    }
+                })?;
+            entry.insert(process);
+        }
+        let process = members
+            .get_mut(&pid)
+            .expect("the final member was retained or inserted above");
+        if process.status == PinnedProcessStatus::AlreadyExited
+            || api.process_start_marker(&process.handle) != Some(marker)
+        {
+            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+        }
+        let old_name = process.verified_name.clone();
+        let fresh_name = api
+            .process_name(&process.handle)
+            .map_err(|error| windows_evidence_outcome(windows_api_evidence_error(pid, &error)))?
+            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+        let mut evidence = ProcessEvidenceScope::new(1).map_err(windows_evidence_outcome)?;
+        process.verified_name = evidence
+            .observe(
+                &ExpectedProcessEvidence {
+                    pid,
+                    start_marker: marker,
+                    name: None,
+                },
+                Ok(FreshProcessEvidence {
+                    pid,
+                    start_marker: marker,
+                    name: fresh_name,
+                }),
+            )
+            .map_err(windows_evidence_outcome)?
+            .name;
+        evidence.finish().map_err(windows_evidence_outcome)?;
+        let protected =
+            is_protected_process_name(Platform::Windows, &process.verified_name, protected_names);
+        if !old_name.is_empty() && old_name != process.verified_name {
+            report.termination_state.withhold();
+            if protected {
+                return Err(if pid == root_pid {
+                    WindowsTreeKillOutcome::ProtectedRoot {
+                        pid,
+                        name: Some(process.verified_name.clone()),
+                    }
+                } else {
+                    WindowsTreeKillOutcome::ProtectedDescendant {
+                        pid,
+                        name: Some(process.verified_name.clone()),
+                    }
+                });
+            }
+            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+        }
+        if protected && (pid != root_pid || !protected_root_confirmed) {
+            report.termination_state.withhold();
+            return Err(if pid == root_pid {
+                WindowsTreeKillOutcome::ProtectedRoot {
+                    pid,
+                    name: Some(process.verified_name.clone()),
+                }
+            } else {
+                WindowsTreeKillOutcome::ProtectedDescendant {
+                    pid,
+                    name: Some(process.verified_name.clone()),
+                }
+            });
+        }
+        if prompt_skipped
+            && (crate::model::SystemProcessCheck {
+                platform: Platform::Windows,
+                pid: Some(pid),
+                parent_pid: info.parent_pid,
+                process_name: Some(&process.verified_name),
+                parent_process_name: info.parent_process_name.as_deref(),
+            })
+            .is_system_process()
+        {
+            report.termination_state.withhold();
+            return Err(WindowsTreeKillOutcome::FreshConfirmationRequired);
+        }
+        if !exact_member_set.contains(&pid) {
+            return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                "live graph descendant PID {pid} was absent from exact frozen Job membership"
+            )));
+        }
+        match api.process_in_job(job, &process.handle) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                    "exact frozen Job membership disagreed with the handle query for PID {pid}"
+                )));
+            }
+            Err(error) => {
+                return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                    "reading frozen Job membership for PID {pid} failed: {}",
+                    windows_api_error_text(&error)
+                )));
+            }
+        }
+        process.status = PinnedProcessStatus::AssignedToJob;
+        assigned.insert(pid);
+    }
+
+    let mut historical_pids = members.keys().copied().collect::<Vec<_>>();
+    historical_pids.sort_unstable();
+    for pid in historical_pids {
+        if exact_member_set.contains(&pid) {
+            continue;
+        }
+        let process = members
+            .get_mut(&pid)
+            .expect("PID came from the same retained-member map");
+        if process.status == PinnedProcessStatus::AlreadyExited {
+            continue;
+        }
+        if matches!(
+            api.wait_process_exit(&process.handle, WINDOWS_TREE_PROBE_WAIT_MS),
+            WindowsWaitResult::Exited
+        ) {
+            process.status = PinnedProcessStatus::AlreadyExited;
+            report.already_exited_pids.push(pid);
+            assigned.remove(&pid);
+        } else {
+            return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                "previously contained live PID {pid} was absent from exact frozen Job membership"
+            )));
+        }
+    }
+
+    let stable_members = api.job_process_ids(job).map_err(job_membership_outcome)?;
+    if stable_members != exact_members {
+        return Err(WindowsTreeKillOutcome::SnapshotFailed(
+            "frozen Job Object membership changed during final reconciliation".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn job_membership_outcome(error: JobMembershipError) -> WindowsTreeKillOutcome {
+    match error {
+        JobMembershipError::Oversized { limit } => WindowsTreeKillOutcome::Truncated { limit },
+        JobMembershipError::Raced => WindowsTreeKillOutcome::SnapshotFailed(
+            "frozen Job Object membership did not stabilize within the bounded query budget"
+                .to_owned(),
+        ),
+        JobMembershipError::Unreadable(error) => WindowsTreeKillOutcome::SnapshotFailed(error),
+    }
+}
+
+fn snapshot_by_pid(
+    snapshot: &[TreeProcessInfo],
+) -> Result<HashMap<u32, &TreeProcessInfo>, WindowsTreeKillOutcome> {
+    let mut by_pid = HashMap::with_capacity(snapshot.len());
+    for info in snapshot {
+        if by_pid.insert(info.pid, info).is_some() {
+            return Err(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid });
+        }
+    }
+    Ok(by_pid)
+}
+
+fn generation_qualified_descendants<Handle>(
+    snapshot: &[TreeProcessInfo],
+    snapshot_by_pid: &HashMap<u32, &TreeProcessInfo>,
+    members: &HashMap<u32, PinnedProcess<Handle>>,
+) -> Result<HashSet<u32>, WindowsTreeKillOutcome> {
+    let mut children_by_parent: HashMap<u32, Vec<&TreeProcessInfo>> = HashMap::new();
+    let mut unverified_by_parent: HashMap<u32, Vec<&TreeProcessInfo>> = HashMap::new();
+    for info in snapshot {
+        if let Some(parent_pid) = info.parent_pid {
+            children_by_parent.entry(parent_pid).or_default().push(info);
+        }
+        if let Some(parent_pid) = info.unverified_parent_pid {
+            unverified_by_parent
+                .entry(parent_pid)
+                .or_default()
+                .push(info);
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    let mut frontier = Vec::new();
+    for (&pid, process) in members {
+        if process.status == PinnedProcessStatus::AlreadyExited {
+            continue;
+        }
+        if snapshot_by_pid
+            .get(&pid)
+            .and_then(|info| info.start_time_marker)
+            == Some(process.start_marker)
+        {
+            reachable.insert(pid);
+            frontier.push(ProcessIdentity {
+                pid,
+                start_marker: process.start_marker,
+            });
+        }
+    }
+
+    while let Some(parent) = frontier.pop() {
+        if snapshot_by_pid
+            .get(&parent.pid)
+            .and_then(|info| info.start_time_marker)
+            != Some(parent.start_marker)
+        {
+            continue;
+        }
+        if let Some(children) = unverified_by_parent.get(&parent.pid)
+            && let Some(child) = children.first()
+        {
+            return Err(WindowsTreeKillOutcome::PartialMetadata { pid: child.pid });
+        }
+        for child in children_by_parent
+            .get(&parent.pid)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            let marker = child
+                .start_time_marker
+                .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid: child.pid })?;
+            if members
+                .get(&child.pid)
+                .is_some_and(|process| process.start_marker != marker)
+            {
+                return Err(WindowsTreeKillOutcome::TargetChanged { pid: child.pid });
+            }
+            if reachable.insert(child.pid) {
+                if reachable.len() > MAX_TREE_PROCESSES {
+                    return Err(WindowsTreeKillOutcome::Truncated {
+                        limit: MAX_TREE_PROCESSES,
+                    });
+                }
+                frontier.push(ProcessIdentity {
+                    pid: child.pid,
+                    start_marker: marker,
+                });
+            }
+        }
+    }
+    Ok(reachable)
 }
 
 fn build_precommit_preview(
@@ -606,6 +985,14 @@ fn windows_api_evidence_error(pid: u32, error: &WindowsApiError) -> ProcessEvide
     }
 }
 
+fn windows_api_error_text(error: &WindowsApiError) -> &str {
+    match error {
+        WindowsApiError::NotFound => "process was not found",
+        WindowsApiError::PermissionDenied => "permission denied",
+        WindowsApiError::Other(error) => error,
+    }
+}
+
 fn windows_evidence_outcome(error: ProcessEvidenceError) -> WindowsTreeKillOutcome {
     match error {
         ProcessEvidenceError::PermissionDenied { pid } => {
@@ -627,12 +1014,12 @@ fn windows_evidence_outcome(error: ProcessEvidenceError) -> WindowsTreeKillOutco
 }
 
 fn record_post_commit_issue(report: &mut WindowsTreeKillReport, outcome: WindowsTreeKillOutcome) {
-    report.containment_partial = true;
+    report.termination_state.mark_partial();
     // After root assignment, every sweep/evidence failure means the contained
     // membership is uncertain. Terminating the job could then kill an unknown
     // or newly protected process, so uncertainty always withholds it.
     if !matches!(outcome, WindowsTreeKillOutcome::ProtectedDescendant { .. }) {
-        report.job_termination_withheld = true;
+        report.termination_state.withhold();
     }
     let Some(issue) = WindowsTreePostCommitIssue::from_outcome(outcome) else {
         return;
@@ -645,7 +1032,7 @@ fn record_post_commit_issue(report: &mut WindowsTreeKillReport, outcome: Windows
 }
 
 fn record_cleanup_issue(report: &mut WindowsTreeKillReport, issue: WindowsTreeCleanupIssue) {
-    report.containment_partial = true;
+    report.termination_state.mark_partial();
     if report.cleanup_issue.is_none() {
         report.cleanup_issue = Some(issue);
     }
@@ -716,6 +1103,16 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
         let snapshot = api
             .snapshot()
             .map_err(WindowsTreeKillOutcome::SnapshotFailed)?;
+        let snapshot_by_pid = snapshot_by_pid(&snapshot)?;
+        for (&pid, process) in &*members {
+            if snapshot_by_pid
+                .get(&pid)
+                .and_then(|info| info.start_time_marker)
+                .is_some_and(|marker| marker != process.start_marker)
+            {
+                return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+            }
+        }
         let snapshot_index =
             ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(windows_plan_error)?;
         let preview = tree::plan_process_tree_with_index(
@@ -876,7 +1273,7 @@ fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
             process.status = PinnedProcessStatus::AssignedToJob;
             assigned.insert(pid);
             members.insert(pid, process);
-            report.job_termination_withheld = true;
+            report.termination_state.withhold();
             report.not_terminated.push(pid);
         }
         Ok(false) => report.not_terminated.push(pid),
@@ -884,7 +1281,7 @@ fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
             // An unknown containment state may mean the protected process is
             // already in the job. Terminating either the job or this handle
             // would therefore be unsafe.
-            report.job_termination_withheld = true;
+            report.termination_state.withhold();
             report.not_terminated.push(pid);
         }
     }
@@ -913,10 +1310,10 @@ fn handle_unknown_post_commit_child<Api: WindowsTreeApi>(
             process.status = PinnedProcessStatus::AssignedToJob;
             assigned.insert(pid);
             members.insert(pid, process);
-            report.job_termination_withheld = true;
+            report.termination_state.withhold();
         }
         Ok(false) => {}
-        Err(_) => report.job_termination_withheld = true,
+        Err(_) => report.termination_state.withhold(),
     }
     report.not_terminated.push(pid);
     windows_evidence_outcome(error)
@@ -957,19 +1354,20 @@ fn assign_or_withhold<Api: WindowsTreeApi>(
                 report.already_exited_pids.push(pid);
                 return;
             }
-            report.containment_partial = true;
-            report.job_termination_withheld = true;
+            report.termination_state.withhold();
         }
     }
 }
 
 fn finish_report<Api: WindowsTreeApi>(
     api: &mut Api,
+    job: &Api::JobHandle,
     members: &HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
     report: &mut WindowsTreeKillReport,
 ) {
     report.job_terminated_pids.clear();
     let deadline_ms = api.now_ms().saturating_add(u64::from(WINDOWS_TREE_WAIT_MS));
+    let mut wait_errors = Vec::new();
     let mut pids = members.keys().copied().collect::<Vec<_>>();
     pids.sort_unstable();
     for pid in pids {
@@ -982,7 +1380,13 @@ fn finish_report<Api: WindowsTreeApi>(
             let timeout_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX);
             match api.wait_process_exit(&process.handle, timeout_ms) {
                 WindowsWaitResult::Exited => report.job_terminated_pids.push(pid),
-                WindowsWaitResult::StillRunning | WindowsWaitResult::Failed(_) => {
+                WindowsWaitResult::StillRunning => {
+                    if !report.not_terminated.contains(&pid) {
+                        report.not_terminated.push(pid);
+                    }
+                }
+                WindowsWaitResult::Failed(error) => {
+                    wait_errors.push((pid, error));
                     if !report.not_terminated.contains(&pid) {
                         report.not_terminated.push(pid);
                     }
@@ -990,10 +1394,22 @@ fn finish_report<Api: WindowsTreeApi>(
             }
         }
     }
+    if !report.not_terminated.is_empty() {
+        let pids = report.not_terminated.clone();
+        let issue = match api.set_job_frozen(job, false) {
+            Ok(()) => WindowsTreeCleanupIssue::PostTerminationSurvivorsThawed { pids, wait_errors },
+            Err(error) => WindowsTreeCleanupIssue::PostTerminationSurvivorThawFailed {
+                pids,
+                wait_errors,
+                error,
+            },
+        };
+        record_cleanup_issue(report, issue);
+    }
     normalize_report_pids(report);
     report.total = observed_process_count(members, report);
     if !report.not_terminated.is_empty() {
-        report.containment_partial = true;
+        report.termination_state.mark_partial();
     }
 }
 
@@ -1015,7 +1431,7 @@ fn finish_failed_job_report<ProcessHandle>(
         .extend(members.iter().filter_map(|(pid, process)| {
             (process.status == PinnedProcessStatus::Pending).then_some(*pid)
         }));
-    report.containment_partial = true;
+    report.termination_state.mark_partial();
     normalize_report_pids(report);
     report.total = observed_process_count(members, report);
 }
@@ -1058,6 +1474,7 @@ fn open_verified_process<Api: WindowsTreeApi>(
     match api.process_start_marker(&handle) {
         Some(marker) if marker == expected_marker => Ok(PinnedProcess {
             handle,
+            start_marker: expected_marker,
             verified_name: String::new(),
             status: PinnedProcessStatus::Pending,
         }),
@@ -1068,6 +1485,7 @@ fn open_verified_process<Api: WindowsTreeApi>(
 
 struct PinnedProcess<Handle> {
     handle: Handle,
+    start_marker: ProcessStartMarker,
     verified_name: String,
     status: PinnedProcessStatus,
 }
@@ -1101,6 +1519,13 @@ enum WindowsWaitResult {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JobMembershipError {
+    Oversized { limit: usize },
+    Raced,
+    Unreadable(String),
+}
+
 trait WindowsTreeApi {
     type ProcessHandle;
     type JobHandle;
@@ -1125,6 +1550,7 @@ trait WindowsTreeApi {
         process: &Self::ProcessHandle,
     ) -> Result<(), WindowsApiError>;
     fn set_job_frozen(&mut self, job: &Self::JobHandle, frozen: bool) -> Result<(), String>;
+    fn job_process_ids(&mut self, job: &Self::JobHandle) -> Result<Vec<u32>, JobMembershipError>;
     fn terminate_job(&mut self, job: &Self::JobHandle) -> Result<(), String>;
     fn now_ms(&mut self) -> u64;
     fn wait_process_exit(
@@ -1136,14 +1562,12 @@ trait WindowsTreeApi {
 
 struct RealWindowsTreeApi {
     clock_origin: Instant,
-    snapshot_names: HashMap<u32, String>,
 }
 
 impl RealWindowsTreeApi {
     fn new() -> Self {
         Self {
             clock_origin: Instant::now(),
-            snapshot_names: HashMap::new(),
         }
     }
 }
@@ -1162,13 +1586,7 @@ impl WindowsTreeApi for RealWindowsTreeApi {
     type JobHandle = RealJobHandle;
 
     fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
-        let snapshot = crate::platform::windows::collect_tree_process_infos()
-            .map_err(|error| error.to_string())?;
-        self.snapshot_names = snapshot
-            .iter()
-            .filter_map(|info| Some((info.pid, info.process_name.clone()?)))
-            .collect();
-        Ok(snapshot)
+        crate::platform::windows::collect_tree_process_infos().map_err(|error| error.to_string())
     }
 
     fn open_process(&mut self, pid: u32) -> Result<Self::ProcessHandle, WindowsApiError> {
@@ -1202,7 +1620,7 @@ impl WindowsTreeApi for RealWindowsTreeApi {
         &mut self,
         process: &Self::ProcessHandle,
     ) -> Result<Option<String>, WindowsApiError> {
-        Ok(self.snapshot_names.get(&process.pid).cloned())
+        process_name_from_handle(process)
     }
 
     fn preflight_job_freeze_thaw(&mut self) -> Result<(), String> {
@@ -1304,6 +1722,10 @@ impl WindowsTreeApi for RealWindowsTreeApi {
         Ok(())
     }
 
+    fn job_process_ids(&mut self, job: &Self::JobHandle) -> Result<Vec<u32>, JobMembershipError> {
+        query_job_process_ids(job)
+    }
+
     fn terminate_job(&mut self, job: &Self::JobHandle) -> Result<(), String> {
         let result = unsafe {
             // SAFETY: the job handle is live and owned by this process. The exit
@@ -1349,9 +1771,150 @@ impl WindowsTreeApi for RealWindowsTreeApi {
     }
 }
 
+fn query_job_process_ids(job: &RealJobHandle) -> Result<Vec<u32>, JobMembershipError> {
+    let header_bytes = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    let entry_bytes = std::mem::size_of::<usize>();
+    let mut capacity = 8usize.min(MAX_TREE_PROCESSES);
+
+    for _ in 0..JOB_MEMBERSHIP_QUERY_ATTEMPTS {
+        let buffer_bytes = header_bytes
+            .checked_add(capacity.saturating_mul(entry_bytes))
+            .ok_or_else(|| {
+                JobMembershipError::Unreadable("Job membership buffer size overflowed".to_owned())
+            })?;
+        let words = buffer_bytes.div_ceil(entry_bytes);
+        let mut buffer = vec![0usize; words];
+        let mut returned_bytes = 0u32;
+        let result = unsafe {
+            // SAFETY: `buffer` is initialized, aligned for the SDK structure and
+            // sized from its actual variable-array offset. Windows writes at most
+            // the supplied byte count and does not retain either pointer.
+            QueryInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer_bytes).expect("bounded Job PID buffer fits u32"),
+                &raw mut returned_bytes,
+            )
+        };
+        if result == 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                windows_error_code(&error),
+                Some(ERROR_INSUFFICIENT_BUFFER | ERROR_MORE_DATA)
+            ) && capacity < MAX_TREE_PROCESSES
+            {
+                capacity = capacity.saturating_mul(2).min(MAX_TREE_PROCESSES);
+                continue;
+            }
+            return Err(JobMembershipError::Unreadable(format!(
+                "QueryInformationJobObject(JobObjectBasicProcessIdList) failed: {error}"
+            )));
+        }
+        if usize::try_from(returned_bytes).expect("u32 return length fits usize") < header_bytes {
+            return Err(JobMembershipError::Unreadable(
+                "Job membership query returned an incomplete header".to_owned(),
+            ));
+        }
+
+        let information = unsafe {
+            // SAFETY: the successful call initialized at least the fixed header;
+            // the allocation is aligned for `usize` and therefore for this type.
+            &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+        };
+        let assigned = usize::try_from(information.NumberOfAssignedProcesses)
+            .expect("u32 process count fits usize");
+        let listed = usize::try_from(information.NumberOfProcessIdsInList)
+            .expect("u32 process count fits usize");
+        if assigned > MAX_TREE_PROCESSES {
+            return Err(JobMembershipError::Oversized {
+                limit: MAX_TREE_PROCESSES,
+            });
+        }
+        if listed > assigned || listed > capacity {
+            return Err(JobMembershipError::Unreadable(
+                "Job membership query returned inconsistent process counts".to_owned(),
+            ));
+        }
+        if listed < assigned {
+            capacity = assigned
+                .max(capacity.saturating_mul(2))
+                .min(MAX_TREE_PROCESSES);
+            continue;
+        }
+
+        let first_entry = header_bytes / entry_bytes;
+        let process_ids = &buffer[first_entry..first_entry + listed];
+        let mut pids = Vec::with_capacity(listed);
+        for &pid in process_ids {
+            let pid = u32::try_from(pid).map_err(|_| {
+                JobMembershipError::Unreadable(
+                    "Job membership contained a PID outside the Windows PID range".to_owned(),
+                )
+            })?;
+            if pid == 0 {
+                return Err(JobMembershipError::Unreadable(
+                    "Job membership contained PID zero".to_owned(),
+                ));
+            }
+            pids.push(pid);
+        }
+        pids.sort_unstable();
+        if pids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(JobMembershipError::Unreadable(
+                "Job membership contained a duplicate PID".to_owned(),
+            ));
+        }
+        return Ok(pids);
+    }
+
+    Err(JobMembershipError::Raced)
+}
+
+fn process_name_from_handle(
+    process: &RealProcessHandle,
+) -> Result<Option<String>, WindowsApiError> {
+    let mut capacity = 260usize;
+    while capacity <= PROCESS_IMAGE_PATH_CODE_UNITS_MAX {
+        let mut path = vec![0u16; capacity];
+        let mut length = u32::try_from(path.len()).expect("bounded image path fits u32");
+        let result = unsafe {
+            // SAFETY: the process handle has query access, the UTF-16 buffer is
+            // initialized and writable for `length` elements, and no pointer is retained.
+            QueryFullProcessImageNameW(
+                process.handle.as_raw_handle(),
+                PROCESS_NAME_WIN32,
+                path.as_mut_ptr(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            path.truncate(usize::try_from(length).expect("u32 path length fits usize"));
+            let path = OsString::from_wide(&path);
+            return Ok(Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()));
+        }
+        let error = std::io::Error::last_os_error();
+        if windows_error_code(&error) == Some(ERROR_INSUFFICIENT_BUFFER)
+            && capacity < PROCESS_IMAGE_PATH_CODE_UNITS_MAX
+        {
+            capacity = capacity
+                .saturating_mul(2)
+                .min(PROCESS_IMAGE_PATH_CODE_UNITS_MAX);
+            continue;
+        }
+        return Err(windows_api_error("QueryFullProcessImageNameW", &error));
+    }
+    Ok(None)
+}
+
 fn last_windows_api_error(operation: &str) -> WindowsApiError {
-    let error = std::io::Error::last_os_error();
-    match windows_error_code(&error) {
+    windows_api_error(operation, &std::io::Error::last_os_error())
+}
+
+fn windows_api_error(operation: &str, error: &std::io::Error) -> WindowsApiError {
+    match windows_error_code(error) {
         Some(ERROR_INVALID_PARAMETER) => WindowsApiError::NotFound,
         Some(ERROR_ACCESS_DENIED) => WindowsApiError::PermissionDenied,
         _ if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1370,9 +1933,9 @@ fn windows_error_code(error: &std::io::Error) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RealWindowsTreeApi, WindowsApiError, WindowsTreeApi, WindowsTreeCleanupIssue,
-        WindowsTreeKillOutcome, WindowsTreePostCommitIssue, WindowsWaitResult,
-        execute_tree_kill_with,
+        JobMembershipError, RealWindowsTreeApi, WindowsApiError, WindowsTreeApi,
+        WindowsTreeCleanupIssue, WindowsTreeKillOutcome, WindowsTreePostCommitIssue,
+        WindowsTreeTerminationState, WindowsWaitResult, execute_tree_kill_with,
     };
     use crate::model::{PermissionStatus, Platform};
     use crate::process::KillTarget;
@@ -1390,6 +1953,12 @@ mod tests {
         SpawnedDescendant { parent_pid: u32, child_pid: u32 },
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct FakeProcessHandle {
+        pid: u32,
+        start_marker: crate::observation::ProcessStartMarker,
+    }
+
     #[derive(Default)]
     #[expect(
         clippy::struct_excessive_bools,
@@ -1399,8 +1968,10 @@ mod tests {
         snapshots: Vec<Vec<TreeProcessInfo>>,
         snapshot_errors: HashMap<usize, String>,
         next_snapshot: usize,
-        markers: HashMap<u32, crate::observation::ProcessStartMarker>,
-        names: HashMap<u32, String>,
+        current_markers: HashMap<u32, crate::observation::ProcessStartMarker>,
+        marker_overrides: HashMap<u32, crate::observation::ProcessStartMarker>,
+        names: HashMap<FakeProcessHandle, String>,
+        name_results: HashMap<FakeProcessHandle, VecDeque<Result<Option<String>, WindowsApiError>>>,
         deny_name: HashSet<u32>,
         events: Vec<Event>,
         deny_assign: HashSet<u32>,
@@ -1409,7 +1980,9 @@ mod tests {
         fail_terminate_job: bool,
         fail_freeze_job: bool,
         fail_thaw_job: bool,
-        already_in_job: HashSet<u32>,
+        already_in_job: HashSet<FakeProcessHandle>,
+        membership_results: VecDeque<Result<Vec<u32>, JobMembershipError>>,
+        force_not_in_job: HashSet<u32>,
         fail_in_job: HashSet<u32>,
         wait_results: HashMap<u32, VecDeque<WindowsWaitResult>>,
         wait_elapsed_ms: HashMap<u32, VecDeque<u32>>,
@@ -1421,27 +1994,48 @@ mod tests {
 
     impl FakeApi {
         fn new(snapshots: Vec<Vec<TreeProcessInfo>>) -> Self {
-            let markers = snapshots
-                .iter()
-                .flat_map(|snapshot| snapshot.iter())
-                .filter_map(|info| Some((info.pid, info.start_time_marker?)))
-                .collect();
             let names = snapshots
                 .iter()
                 .flat_map(|snapshot| snapshot.iter())
-                .filter_map(|info| Some((info.pid, info.process_name.clone()?)))
+                .filter_map(|info| {
+                    Some((
+                        FakeProcessHandle {
+                            pid: info.pid,
+                            start_marker: info.start_time_marker?,
+                        },
+                        info.process_name.clone()?,
+                    ))
+                })
                 .collect();
             Self {
                 snapshots,
-                markers,
                 names,
                 ..Self::default()
             }
         }
+
+        fn handle(pid: u32, marker: u64) -> FakeProcessHandle {
+            FakeProcessHandle {
+                pid,
+                start_marker: crate::observation::ProcessStartMarker::windows(marker).unwrap(),
+            }
+        }
+
+        fn contain(&mut self, pid: u32, marker: u64) {
+            self.already_in_job.insert(Self::handle(pid, marker));
+        }
+
+        fn set_name(&mut self, pid: u32, marker: u64, name: impl Into<String>) {
+            self.names.insert(Self::handle(pid, marker), name.into());
+        }
+
+        fn remove_name(&mut self, pid: u32, marker: u64) {
+            self.names.remove(&Self::handle(pid, marker));
+        }
     }
 
     impl WindowsTreeApi for FakeApi {
-        type ProcessHandle = u32;
+        type ProcessHandle = FakeProcessHandle;
         type JobHandle = ();
 
         fn snapshot(&mut self) -> Result<Vec<TreeProcessInfo>, String> {
@@ -1453,30 +2047,41 @@ mod tests {
                 .next_snapshot
                 .min(self.snapshots.len().saturating_sub(1));
             self.next_snapshot += 1;
-            Ok(self.snapshots.get(index).cloned().unwrap_or_default())
+            let snapshot = self.snapshots.get(index).cloned().unwrap_or_default();
+            self.current_markers = snapshot
+                .iter()
+                .filter_map(|info| Some((info.pid, info.start_time_marker?)))
+                .collect();
+            Ok(snapshot)
         }
 
         fn open_process(&mut self, pid: u32) -> Result<Self::ProcessHandle, WindowsApiError> {
-            if self.markers.contains_key(&pid) {
-                Ok(pid)
-            } else {
-                Err(WindowsApiError::NotFound)
-            }
+            self.marker_overrides
+                .get(&pid)
+                .or_else(|| self.current_markers.get(&pid))
+                .copied()
+                .map(|start_marker| FakeProcessHandle { pid, start_marker })
+                .ok_or(WindowsApiError::NotFound)
         }
 
         fn process_start_marker(
             &mut self,
             handle: &Self::ProcessHandle,
         ) -> Option<crate::observation::ProcessStartMarker> {
-            self.markers.get(handle).copied()
+            Some(handle.start_marker)
         }
 
         fn process_name(
             &mut self,
             handle: &Self::ProcessHandle,
         ) -> Result<Option<String>, WindowsApiError> {
-            if self.deny_name.contains(handle) {
+            if self.deny_name.contains(&handle.pid) {
                 return Err(WindowsApiError::PermissionDenied);
+            }
+            if let Some(results) = self.name_results.get_mut(handle)
+                && let Some(result) = results.pop_front()
+            {
+                return result;
             }
             Ok(self.names.get(handle).cloned())
         }
@@ -1499,10 +2104,13 @@ mod tests {
             _job: &Self::JobHandle,
             process: &Self::ProcessHandle,
         ) -> Result<bool, WindowsApiError> {
-            if self.fail_in_job.contains(process) {
+            if self.fail_in_job.contains(&process.pid) {
                 return Err(WindowsApiError::Other(
                     "containment query failed".to_owned(),
                 ));
+            }
+            if self.force_not_in_job.contains(&process.pid) {
+                return Ok(false);
             }
             Ok(self.already_in_job.contains(process))
         }
@@ -1512,14 +2120,32 @@ mod tests {
             _job: &Self::JobHandle,
             process: &Self::ProcessHandle,
         ) -> Result<(), WindowsApiError> {
-            self.events.push(Event::Assign(*process));
-            if *process == 100 && self.fail_root_assign {
+            self.events.push(Event::Assign(process.pid));
+            if process.pid == 100 && self.fail_root_assign {
                 return Err(WindowsApiError::Other("root cannot join job".to_owned()));
             }
-            if self.deny_assign.contains(process) {
+            if self.deny_assign.contains(&process.pid) {
                 return Err(WindowsApiError::Other("member cannot join job".to_owned()));
             }
+            self.already_in_job.insert(*process);
             Ok(())
+        }
+
+        fn job_process_ids(
+            &mut self,
+            _job: &Self::JobHandle,
+        ) -> Result<Vec<u32>, JobMembershipError> {
+            if let Some(result) = self.membership_results.pop_front() {
+                return result;
+            }
+            let mut pids = self
+                .already_in_job
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>();
+            pids.sort_unstable();
+            pids.dedup();
+            Ok(pids)
         }
 
         fn terminate_job(&mut self, _job: &Self::JobHandle) -> Result<(), String> {
@@ -1544,11 +2170,11 @@ mod tests {
             process: &Self::ProcessHandle,
             timeout_ms: u32,
         ) -> WindowsWaitResult {
-            self.events.push(Event::Wait(*process, timeout_ms));
-            let wait_count = self.wait_counts.entry(*process).or_default();
+            self.events.push(Event::Wait(process.pid, timeout_ms));
+            let wait_count = self.wait_counts.entry(process.pid).or_default();
             *wait_count += 1;
             if let Some((parent_pid, spawn_wait, child_pid)) = self.spawn_on_wait
-                && (parent_pid, spawn_wait) == (*process, *wait_count)
+                && (parent_pid, spawn_wait) == (process.pid, *wait_count)
             {
                 self.events.push(Event::SpawnedDescendant {
                     parent_pid,
@@ -1557,12 +2183,12 @@ mod tests {
             }
             let elapsed_ms = self
                 .wait_elapsed_ms
-                .get_mut(process)
+                .get_mut(&process.pid)
                 .and_then(VecDeque::pop_front)
                 .unwrap_or(0)
                 .min(timeout_ms);
             self.now_ms = self.now_ms.saturating_add(u64::from(elapsed_ms));
-            if let Some(results) = self.wait_results.get_mut(process)
+            if let Some(results) = self.wait_results.get_mut(&process.pid)
                 && let Some(result) = results.pop_front()
             {
                 return result;
@@ -1667,7 +2293,7 @@ mod tests {
     #[test]
     fn root_handle_identity_drift_refuses_before_job_creation() {
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
-        api.markers.insert(
+        api.marker_overrides.insert(
             100,
             crate::observation::ProcessStartMarker::windows(200).unwrap(),
         );
@@ -1681,7 +2307,7 @@ mod tests {
     #[test]
     fn missing_fresh_name_refuses_with_zero_delivery_or_job_termination() {
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
-        api.names.remove(&101);
+        api.remove_name(101, 101);
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 
@@ -1711,7 +2337,8 @@ mod tests {
     #[test]
     fn oversized_fresh_name_refuses_with_zero_delivery_or_job_termination() {
         let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
-        api.names.insert(
+        api.set_name(
+            101,
             101,
             "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES + 1),
         );
@@ -1744,8 +2371,10 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected completed report");
         };
-        assert!(report.containment_partial);
-        assert!(report.job_termination_withheld);
+        assert_eq!(
+            report.termination_state,
+            WindowsTreeTerminationState::Withheld
+        );
         assert_eq!(report.not_terminated, vec![100, 101]);
         assert!(!api.events.contains(&Event::TerminateJob));
         assert!(!api.events.contains(&Event::FreezeJob(true)));
@@ -1765,14 +2394,14 @@ mod tests {
             info(102, Some(100), 102),
         ];
         let mut api = FakeApi::new(vec![initial.clone(), initial.clone(), initial, late]);
-        api.already_in_job.insert(102);
+        api.contain(102, 102);
 
         let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], false, false, &mut api);
 
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("post-commit protection refusal returns a report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert!(report.not_terminated.contains(&100));
         assert!(report.not_terminated.contains(&101));
         assert!(report.not_terminated.contains(&102));
@@ -1808,7 +2437,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("post-commit warning refusal returns a report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(
             report.post_commit_issue,
             Some(WindowsTreePostCommitIssue::FreshConfirmationRequired)
@@ -1828,7 +2457,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("post-commit freeze failure returns a report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(report.not_terminated, vec![100, 101]);
         assert!(!api.events.contains(&Event::TerminateJob));
         assert!(matches!(
@@ -1886,7 +2515,7 @@ mod tests {
         let with_protected = vec![info(100, None, 100), info(101, Some(100), 101)];
         let with_unknown = vec![info(100, None, 100), info(102, Some(100), 102)];
         let mut api = FakeApi::new(vec![first, with_protected, with_unknown]);
-        api.names.remove(&102);
+        api.remove_name(102, 102);
 
         let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
 
@@ -1911,7 +2540,7 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let late = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first.clone(), first.clone(), first, late]);
-        api.already_in_job.insert(101);
+        api.contain(101, 101);
         api.fail_thaw_job = true;
 
         let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
@@ -1987,7 +2616,7 @@ mod tests {
         assert!(report.job_terminated_pids.is_empty());
         assert_eq!(report.already_exited_pids, vec![102]);
         assert_eq!(report.not_terminated, vec![100, 101]);
-        assert!(report.containment_partial);
+        assert!(!report.termination_state.is_complete());
         assert!(api.events.contains(&Event::TerminateJob));
     }
 
@@ -2015,7 +2644,7 @@ mod tests {
         };
         assert_eq!(report.job_terminated_pids, vec![100, 101]);
         assert_eq!(report.not_terminated, vec![102]);
-        assert!(report.containment_partial);
+        assert!(!report.termination_state.is_complete());
         assert!(api.events.contains(&Event::Wait(100, 5_000)));
         assert!(api.events.contains(&Event::Wait(101, 3_000)));
         assert!(api.events.contains(&Event::Wait(102, 0)));
@@ -2035,7 +2664,7 @@ mod tests {
         };
         assert_eq!(report.already_exited_pids, vec![101]);
         assert!(report.not_terminated.is_empty());
-        assert!(!report.containment_partial);
+        assert!(report.termination_state.is_complete());
         assert!(api.events.contains(&Event::Wait(101, 0)));
     }
 
@@ -2055,8 +2684,10 @@ mod tests {
         };
         assert!(report.already_exited_pids.is_empty());
         assert_eq!(report.not_terminated, vec![100, 101]);
-        assert!(report.containment_partial);
-        assert!(report.job_termination_withheld);
+        assert_eq!(
+            report.termination_state,
+            WindowsTreeTerminationState::Withheld
+        );
         assert!(!api.events.contains(&Event::TerminateJob));
         assert_eq!(api.wait_counts.get(&101), Some(&1));
     }
@@ -2066,7 +2697,7 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.already_in_job.insert(101);
+        api.contain(101, 101);
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 
@@ -2078,7 +2709,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_late_child_is_reported_after_commit() {
+    fn protected_late_child_withholds_final_job_termination() {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
@@ -2088,8 +2719,11 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected completed report");
         };
-        assert!(report.containment_partial);
-        assert_eq!(report.not_terminated, vec![101]);
+        assert_eq!(
+            report.termination_state,
+            WindowsTreeTerminationState::Withheld
+        );
+        assert_eq!(report.not_terminated, vec![100, 101]);
         assert_eq!(
             report.post_commit_issue,
             Some(WindowsTreePostCommitIssue::ProtectedDescendant {
@@ -2097,7 +2731,7 @@ mod tests {
                 name: Some("p101".to_owned()),
             })
         );
-        assert!(api.events.contains(&Event::TerminateJob));
+        assert!(!api.events.contains(&Event::TerminateJob));
     }
 
     #[test]
@@ -2105,17 +2739,17 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.already_in_job.insert(101);
+        api.contain(101, 101);
 
         let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
 
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected completed report");
         };
-        assert!(report.containment_partial);
+        assert!(!report.termination_state.is_complete());
         assert_eq!(report.not_terminated, vec![100, 101]);
         assert!(report.job_terminated_pids.is_empty());
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(
             report.post_commit_issue,
             Some(WindowsTreePostCommitIssue::ProtectedDescendant {
@@ -2132,8 +2766,8 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.names.insert(101, "lsass.exe".to_owned());
-        api.already_in_job.insert(101);
+        api.set_name(101, 101, "lsass.exe");
+        api.contain(101, 101);
 
         let outcome =
             execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
@@ -2141,7 +2775,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected truthful contained partial report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(report.not_terminated, vec![100, 101]);
         assert_eq!(
             report.post_commit_issue,
@@ -2158,15 +2792,15 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.names.remove(&101);
-        api.already_in_job.insert(101);
+        api.remove_name(101, 101);
+        api.contain(101, 101);
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected truthful contained partial report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(report.not_terminated, vec![100, 101]);
         assert_eq!(
             report.post_commit_issue,
@@ -2181,7 +2815,7 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.names.insert(101, "lsass.exe".to_owned());
+        api.set_name(101, 101, "lsass.exe");
         api.fail_in_job.insert(101);
 
         let outcome =
@@ -2189,7 +2823,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected fail-closed partial report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert!(!api.events.contains(&Event::TerminateJob));
     }
 
@@ -2198,14 +2832,14 @@ mod tests {
         let first = vec![info(100, None, 100)];
         let second = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second]);
-        api.names.remove(&101);
+        api.remove_name(101, 101);
         api.fail_in_job.insert(101);
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected fail-closed partial report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert!(!api.events.contains(&Event::TerminateJob));
     }
 
@@ -2219,7 +2853,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected post-commit report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert!(matches!(
             report.post_commit_issue,
             Some(WindowsTreePostCommitIssue::SnapshotFailed(_))
@@ -2242,7 +2876,7 @@ mod tests {
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected post-commit report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(
             report.post_commit_issue,
             Some(WindowsTreePostCommitIssue::SweepPassLimit {
@@ -2297,14 +2931,315 @@ mod tests {
         let second = first.clone();
         let third = vec![info(100, None, 100), info(101, Some(100), 101)];
         let mut api = FakeApi::new(vec![first, second, third]);
-        api.already_in_job.insert(101);
+        api.contain(101, 101);
 
         let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
         let WindowsTreeKillOutcome::Completed(report) = outcome else {
             panic!("expected post-commit report");
         };
-        assert!(report.job_termination_withheld);
+        assert!(report.termination_state.is_withheld());
         assert_eq!(report.not_terminated, vec![100, 101]);
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn final_reconciliation_keeps_a_descendant_whose_intermediate_parent_exited() {
+        let initial = vec![
+            info(100, None, 100),
+            info(101, Some(100), 101),
+            info(102, Some(101), 102),
+        ];
+        let reparented = vec![info(100, None, 100), info(102, Some(1), 102)];
+        let mut api = FakeApi::new(vec![
+            initial.clone(),
+            initial.clone(),
+            initial.clone(),
+            initial.clone(),
+            initial,
+            reparented,
+        ]);
+        api.wait_results
+            .insert(101, VecDeque::from([WindowsWaitResult::Exited]));
+        api.membership_results = VecDeque::from([Ok(vec![100, 102]), Ok(vec![100, 102])]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("expected completed report");
+        };
+        assert!(api.events.contains(&Event::TerminateJob));
+        assert_eq!(report.already_exited_pids, vec![101]);
+        assert_eq!(report.job_terminated_pids, vec![100, 102]);
+    }
+
+    #[test]
+    fn exact_membership_finds_unseen_inherited_protected_child() {
+        let root_only = vec![info(100, None, 100)];
+        let final_snapshot = vec![info(100, None, 100), info(102, Some(101), 102)];
+        let mut api = FakeApi::new(vec![
+            root_only.clone(),
+            root_only.clone(),
+            root_only.clone(),
+            root_only.clone(),
+            root_only,
+            final_snapshot,
+        ]);
+        api.contain(102, 102);
+
+        let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("protected inherited member returns a withheld report");
+        };
+        assert!(report.termination_state.is_withheld());
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::ProtectedDescendant {
+                pid: 102,
+                name: Some("p102".to_owned()),
+            })
+        );
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn final_graph_never_traverses_a_reused_root_pid() {
+        let original = vec![info(100, None, 100)];
+        let mut replacement_root = info(100, None, 200);
+        replacement_root.process_name = Some("lsass.exe".to_owned());
+        let replacement = vec![replacement_root, info(101, Some(100), 101)];
+        let mut api = FakeApi::new(vec![
+            original.clone(),
+            original.clone(),
+            original.clone(),
+            original.clone(),
+            original,
+            replacement,
+        ]);
+
+        let outcome =
+            execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("PID reuse after commit returns a withheld report");
+        };
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::TargetChanged { pid: 100 })
+        );
+        assert!(!api.events.contains(&Event::Assign(101)));
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn final_graph_never_traverses_a_reused_intermediate_pid() {
+        let original = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let replacement = vec![
+            info(100, None, 100),
+            info(101, Some(100), 201),
+            info(102, Some(101), 102),
+        ];
+        let mut api = FakeApi::new(vec![
+            original.clone(),
+            original.clone(),
+            original.clone(),
+            original.clone(),
+            original,
+            replacement,
+        ]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("intermediate PID reuse returns a withheld report");
+        };
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::TargetChanged { pid: 101 })
+        );
+        assert!(!api.events.contains(&Event::Assign(102)));
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn exact_membership_mismatch_withholds_termination() {
+        let snapshot = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let mut api = FakeApi::new(vec![snapshot]);
+        api.membership_results = VecDeque::from([Ok(vec![100])]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("membership mismatch returns a withheld report");
+        };
+        assert!(report.termination_state.is_withheld());
+        assert!(matches!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::SnapshotFailed(ref error))
+                if error.contains("PID 101 was absent from exact frozen Job membership")
+        ));
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn oversized_exact_membership_withholds_termination() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
+        api.membership_results = VecDeque::from([Err(JobMembershipError::Oversized {
+            limit: crate::tree::MAX_TREE_PROCESSES,
+        })]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("oversized membership returns a withheld report");
+        };
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::Truncated {
+                limit: crate::tree::MAX_TREE_PROCESSES,
+            })
+        );
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn changing_exact_membership_during_validation_withholds_termination() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
+        api.membership_results = VecDeque::from([Ok(vec![100]), Ok(Vec::new())]);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("raced membership returns a withheld report");
+        };
+        assert!(matches!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::SnapshotFailed(ref error))
+                if error.contains("membership changed during final reconciliation")
+        ));
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn survivor_after_successful_job_termination_is_thawed_and_reported() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
+        api.wait_results
+            .insert(100, VecDeque::from([WindowsWaitResult::StillRunning]));
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("successful job termination returns a report");
+        };
+        assert_eq!(
+            report.cleanup_issue,
+            Some(WindowsTreeCleanupIssue::PostTerminationSurvivorsThawed {
+                pids: vec![100],
+                wait_errors: Vec::new(),
+            })
+        );
+        assert!(api.events.contains(&Event::TerminateJob));
+        assert!(api.events.contains(&Event::FreezeJob(false)));
+    }
+
+    #[test]
+    fn survivor_thaw_failure_after_successful_job_termination_is_distinct() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
+        api.wait_results.insert(
+            100,
+            VecDeque::from([WindowsWaitResult::Failed("wait failed".to_owned())]),
+        );
+        api.fail_thaw_job = true;
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("successful job termination returns a report");
+        };
+        assert_eq!(
+            report.cleanup_issue,
+            Some(WindowsTreeCleanupIssue::PostTerminationSurvivorThawFailed {
+                pids: vec![100],
+                wait_errors: vec![(100, "wait failed".to_owned())],
+                error: "job freeze transition failed".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn protected_root_change_after_commit_keeps_typed_confirmation_result() {
+        let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
+        api.name_results.insert(
+            FakeApi::handle(100, 100),
+            VecDeque::from([
+                Ok(Some("p100".to_owned())),
+                Ok(Some("lsass.exe".to_owned())),
+            ]),
+        );
+
+        let outcome =
+            execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("post-commit protected root returns a withheld report");
+        };
+        assert_eq!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::ProtectedRoot {
+                pid: 100,
+                name: Some("lsass.exe".to_owned()),
+            })
+        );
+        assert!(report.termination_state.is_withheld());
+        assert!(!api.events.contains(&Event::TerminateJob));
+    }
+
+    #[test]
+    fn final_reconciliation_refuses_unproven_live_membership_and_thaws() {
+        let snapshot = vec![info(100, None, 100), info(101, Some(100), 101)];
+        let mut api = FakeApi::new(vec![snapshot]);
+        api.force_not_in_job.insert(101);
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("containment refusal returns a report");
+        };
+        assert!(report.termination_state.is_withheld());
+        assert!(!api.events.contains(&Event::TerminateJob));
+        let freeze = api
+            .events
+            .iter()
+            .position(|event| *event == Event::FreezeJob(true))
+            .expect("job was frozen");
+        let thaw = api
+            .events
+            .iter()
+            .position(|event| *event == Event::FreezeJob(false))
+            .expect("refusal thawed the job");
+        assert!(freeze < thaw);
+    }
+
+    #[test]
+    fn final_reconciliation_snapshot_error_always_thaws_the_job() {
+        let snapshot = vec![info(100, None, 100)];
+        let mut api = FakeApi::new(vec![snapshot]);
+        api.snapshot_errors
+            .insert(5, "final reconciliation failed".to_owned());
+
+        let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+
+        let WindowsTreeKillOutcome::Completed(report) = outcome else {
+            panic!("post-freeze error returns a report");
+        };
+        assert!(report.termination_state.is_withheld());
+        assert!(matches!(
+            report.post_commit_issue,
+            Some(WindowsTreePostCommitIssue::SnapshotFailed(ref error))
+                if error == "final reconciliation failed"
+        ));
+        assert!(api.events.contains(&Event::FreezeJob(true)));
+        assert!(api.events.contains(&Event::FreezeJob(false)));
         assert!(!api.events.contains(&Event::TerminateJob));
     }
 

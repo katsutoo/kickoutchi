@@ -78,6 +78,11 @@ PIDs, descriptor links, identities, or metadata. Permission denial while reading
 a required socket table fails collection; denial or disappearance during owner
 and metadata reads is retained as an explicit gap where possible.
 
+The legacy list/TUI `permission` field compresses these Unix outcomes for 1.x
+compatibility. `partial` covers permission denial, process disappearance, races,
+unsupported metadata, and bounded omission; it must not be interpreted as an
+`EACCES`/`EPERM` diagnosis. Snapshot evidence gaps preserve the specific cause.
+
 Linux `/proc/net/*6` rows do not expose an IPv6 scope identifier in the selected
 format. Every observed IPv6 endpoint therefore has unavailable scope. Such a row
 cannot support exact scoped-IPv6 matching or an exact-address proven observation,
@@ -114,6 +119,26 @@ time, and destructive actions re-read and compare identity immediately before
 signalling, but the process cannot be pinned to that identity across the final
 instructions. This residual PID-reuse race is a platform limitation and is not
 reported as Linux-style `pidfd` safety.
+
+## Unix scoped termination limits
+
+Unix tree and process-group termination uses a bounded freeze-and-verify
+sequence, not an atomic kernel transaction. Kickoutchi observes whether each
+member was stopped before its own `SIGSTOP` and normally sends cleanup `SIGCONT`
+only for transitions it observed. Another actor can concurrently send
+`SIGSTOP` or `SIGCONT` between those observations and signals, so ownership of a
+stopped state cannot be attributed perfectly. After a successfully delivered
+`SIGTERM`, Kickoutchi guardedly continues even a previously stopped target so
+the pending termination can execute; refusal and failed-delivery cleanup leave
+a target observed as previously stopped untouched.
+
+Process-group membership can also change through concurrent joins, exits, and
+external signals. Kickoutchi freezes enumerated members, repeats bounded
+snapshots toward a fixed point, rechecks identity and group membership, and
+queues every terminating signal before continuing members. This provides
+best-effort convergence over the observed group, with fixed member, pass, and
+operation-wide stop-acknowledgement bounds; it is not an absolute claim that a
+concurrently mutating process group was terminated atomically.
 
 ## Windows
 

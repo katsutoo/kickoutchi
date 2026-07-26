@@ -5,6 +5,7 @@
 //! video for the selected row.
 
 use ratatui::style::{Color, Modifier, Style};
+use std::ffi::OsStr;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Theme {
@@ -14,7 +15,7 @@ pub(crate) struct Theme {
 impl Theme {
     pub(crate) fn from_environment() -> Self {
         Self {
-            no_color: std::env::var_os("NO_COLOR").is_some(),
+            no_color: no_color_requested(std::env::var_os("NO_COLOR").as_deref()),
         }
     }
 
@@ -77,5 +78,23 @@ impl Theme {
         } else {
             Style::default().fg(color)
         }
+    }
+}
+
+fn no_color_requested(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::no_color_requested;
+
+    #[test]
+    fn no_color_requires_a_nonempty_value() {
+        assert!(!no_color_requested(None));
+        assert!(!no_color_requested(Some(OsStr::new(""))));
+        assert!(no_color_requested(Some(OsStr::new("1"))));
     }
 }

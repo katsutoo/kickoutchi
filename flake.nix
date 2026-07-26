@@ -10,9 +10,9 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
       ];
+
+      cargoPackage = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
       forAllSystems = f:
         nixpkgs.lib.genAttrs systems (system:
@@ -23,7 +23,7 @@
         let
           kickoutchi = pkgs.rustPlatform.buildRustPackage {
             pname = "kickoutchi";
-            version = "1.3.0";
+            version = cargoPackage.package.version;
 
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
@@ -31,10 +31,10 @@
             cargoBuildFlags = [ "--all-features" ];
             cargoTestFlags = [ "--all-features" "--lib" ];
 
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.darwin.apple_sdk.frameworks.CoreFoundation
-              pkgs.darwin.apple_sdk.frameworks.IOKit
-            ];
+            postInstall = ''
+              mkdir -p "$out/share/kickoutchi"
+              printf '%s\n' nix > "$out/share/kickoutchi/install-provenance"
+            '';
 
             meta = with pkgs.lib; {
               description = "A clean TUI and CLI port janitor";

@@ -7,6 +7,7 @@
 
 use std::io::{self, Read};
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -190,10 +191,18 @@ fn docker_container_ls_with_host_and_runner(
     }
 }
 
-fn local_docker_host(configured_host: Option<&str>) -> &str {
-    configured_host
-        .filter(|host| docker_host_is_local(host))
-        .unwrap_or(DEFAULT_LOCAL_DOCKER_HOST)
+fn local_docker_host(configured_host: Option<&str>) -> String {
+    #[cfg(windows)]
+    if let Some(host) = configured_host.and_then(normalize_windows_npipe_host) {
+        return host;
+    }
+
+    #[cfg(unix)]
+    if let Some(host) = configured_host.filter(|host| docker_host_is_local(host)) {
+        return (*host).to_owned();
+    }
+
+    DEFAULT_LOCAL_DOCKER_HOST.to_owned()
 }
 
 fn docker_host_is_local(host: &str) -> bool {
@@ -212,14 +221,49 @@ fn docker_host_is_local(host: &str) -> bool {
 
     #[cfg(windows)]
     {
-        const LOCAL_NPIPE_PREFIX: &str = "npipe:////./pipe/";
-        host.get(..LOCAL_NPIPE_PREFIX.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LOCAL_NPIPE_PREFIX))
-            && host.len() > LOCAL_NPIPE_PREFIX.len()
+        normalize_windows_npipe_host(host).is_some()
     }
 
     #[cfg(not(any(unix, windows)))]
     false
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_npipe_host(host: &str) -> Option<String> {
+    const LOCAL_PREFIX: &str = "////./pipe/";
+
+    if host.is_empty()
+        || host.len() > DOCKER_HOST_MAX_BYTES
+        || host.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+
+    let (scheme, endpoint) = host.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("npipe")
+        || endpoint.contains(['%', '?', '#'])
+        || endpoint.contains(':')
+    {
+        return None;
+    }
+
+    let endpoint = endpoint.replace('\\', "/");
+    let prefix = endpoint.get(..LOCAL_PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(LOCAL_PREFIX) {
+        return None;
+    }
+    let pipe_name = &endpoint[LOCAL_PREFIX.len()..];
+    if pipe_name.is_empty()
+        || pipe_name.split('/').any(|component| {
+            component.is_empty()
+                || matches!(component, "." | "..")
+                || component.trim_end_matches([' ', '.']) != component
+        })
+    {
+        return None;
+    }
+
+    Some(format!("npipe:////./pipe/{pipe_name}"))
 }
 
 #[cfg(test)]
@@ -228,7 +272,7 @@ thread_local! {
         std::cell::Cell::new(None)
     };
     #[cfg(target_os = "linux")]
-    static TEST_LINUX_ELEVATION_SOURCES: std::cell::Cell<Option<(bool, bool, bool)>> = const {
+    pub(crate) static TEST_LINUX_ELEVATION_SOURCES: std::cell::Cell<Option<(bool, bool, bool)>> = const {
         std::cell::Cell::new(None)
     };
 }
@@ -242,12 +286,12 @@ fn docker_command_is_elevated() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn process_is_elevated() -> bool {
+pub(crate) fn process_is_elevated() -> bool {
     unix_ids_are_elevated() || linux_aux_is_secure() || linux_process_has_capabilities()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn process_is_elevated() -> bool {
+pub(crate) fn process_is_elevated() -> bool {
     unix_ids_are_elevated()
 }
 
@@ -329,7 +373,7 @@ fn linux_status_has_capabilities(status: &str) -> Option<bool> {
 }
 
 #[cfg(windows)]
-fn process_is_elevated() -> bool {
+pub(crate) fn process_is_elevated() -> bool {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -372,7 +416,7 @@ fn process_is_elevated() -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_is_elevated() -> bool {
+pub(crate) fn process_is_elevated() -> bool {
     false
 }
 
@@ -1010,7 +1054,11 @@ fn parse_port_range(ports: &str) -> Option<PortRange> {
 }
 
 fn parse_port(port: &str) -> Option<u16> {
-    port.trim().parse().ok()
+    port.trim()
+        .parse::<u16>()
+        .ok()
+        .and_then(NonZeroU16::new)
+        .map(NonZeroU16::get)
 }
 
 fn parse_protocol(protocol: &str) -> Option<Protocol> {
@@ -1078,9 +1126,9 @@ mod tests {
         TEST_ELEVATION_OVERRIDE, docker_container_ls_with_host_and_runner,
         docker_container_ls_with_runner, docker_context_from_ps_output, docker_host_is_local,
         finish_output_drain_before, host_addr_matches, local_docker_host, looks_like_docker_owner,
-        parse_published_ports, read_output_bounded, run_command_bounded_with,
-        run_command_bounded_with_capacity, should_try_docker_enrichment, spawn_child_cleanup,
-        spawn_output_drain, terminate_and_reap,
+        normalize_windows_npipe_host, parse_published_ports, read_output_bounded,
+        run_command_bounded_with, run_command_bounded_with_capacity, should_try_docker_enrichment,
+        spawn_child_cleanup, spawn_output_drain, terminate_and_reap,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState,
@@ -1422,6 +1470,45 @@ mod tests {
         assert_eq!(local_docker_host(Some(host)), host);
     }
 
+    #[test]
+    fn windows_named_pipe_hosts_are_structurally_normalized() {
+        assert_eq!(
+            normalize_windows_npipe_host("NPIPE://\\\\.\\PIPE\\docker_engine\\rootless").as_deref(),
+            Some("npipe:////./pipe/docker_engine/rootless")
+        );
+        assert_eq!(
+            normalize_windows_npipe_host("npipe:////./PIPE/docker_engine").as_deref(),
+            Some("npipe:////./pipe/docker_engine")
+        );
+    }
+
+    #[test]
+    fn windows_named_pipe_hosts_reject_nonlocal_or_ambiguous_paths() {
+        for host in [
+            "npipe:////remote/pipe/docker_engine",
+            "npipe://localhost/pipe/docker_engine",
+            "npipe:////?/pipe/docker_engine",
+            "npipe:////./pipe/../docker_engine",
+            "npipe:////./pipe/a/../../docker_engine",
+            "npipe:////./pipe/.. /docker_engine",
+            "npipe:////./pipe/docker_engine. ",
+            "npipe:////./pipe//docker_engine",
+            "npipe:////./pipe/docker_engine/",
+            "npipe:////./pipe/%2e%2e/docker_engine",
+            "npipe:////%2e/pipe/docker_engine",
+            "npipe:////./pipe/docker_engine?ignored",
+            "npipe:////./pipe/docker_engine#ignored",
+            "npipe:////./pipe/C:/docker_engine",
+            "npipe:////.\\pipe\\..\\docker_engine",
+        ] {
+            assert_eq!(
+                normalize_windows_npipe_host(host),
+                None,
+                "unexpectedly accepted {host}"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn capability_only_elevation_blocks_the_real_docker_command_gate() {
@@ -1691,6 +1778,12 @@ mod tests {
         assert_eq!(ports[0].protocol, Protocol::Tcp);
         assert_eq!(ports[1].host_addr, Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
         assert_eq!(ports[1].protocol, Protocol::Udp);
+    }
+
+    #[test]
+    fn published_port_parser_rejects_zero_at_the_input_boundary() {
+        assert!(parse_published_ports("0.0.0.0:0->5432/tcp").is_empty());
+        assert!(parse_published_ports("0.0.0.0:5432->0/tcp").is_empty());
     }
 
     #[test]

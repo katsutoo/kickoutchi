@@ -50,7 +50,7 @@ pub(crate) enum ConfigError {
 
 /// The resolved runtime settings. Everything downstream reads this one shared
 /// source instead of sprinkling magic literals all over the codebase.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Config {
     /// The longest the event loop will sit waiting for input before looping.
     ///
@@ -66,6 +66,8 @@ pub(crate) struct Config {
     pub(crate) hide_system_processes: bool,
     /// Whether force kill uses the stronger typed confirmation when `--yes` is absent.
     pub(crate) confirm_force_kill: bool,
+    /// Whether eligible interactive launches may use the weekly update cache.
+    pub(crate) check_for_updates: bool,
     /// Process names that require stronger confirmation before termination.
     pub(crate) protected_processes: Vec<String>,
     /// Validated endpoint annotations shared by CLI, TUI, and future diagnostics.
@@ -80,6 +82,7 @@ impl Default for Config {
             default_sort: SortMode::Port,
             hide_system_processes: false,
             confirm_force_kill: true,
+            check_for_updates: true,
             // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
@@ -101,6 +104,7 @@ struct ConfigFile {
     default_sort: Option<SortMode>,
     hide_system_processes: Option<bool>,
     confirm_force_kill: Option<bool>,
+    check_for_updates: Option<bool>,
     protected_processes: Option<Vec<String>>,
     ports: Option<PortLabels>,
 }
@@ -230,6 +234,9 @@ impl Config {
         }
         if let Some(confirm) = file.confirm_force_kill {
             config.confirm_force_kill = confirm;
+        }
+        if let Some(check) = file.check_for_updates {
+            config.check_for_updates = check;
         }
         if let Some(protected) = file.protected_processes {
             config.protected_processes =
@@ -411,6 +418,7 @@ mod tests {
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
+        assert!(config.check_for_updates);
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
     }
 
@@ -496,6 +504,24 @@ hostname = "localhost"
     }
 
     #[test]
+    fn endpoint_label_selector_rejects_port_zero() {
+        let detail = invalid_detail(parse(
+            r#"
+[[ports]]
+protocol = "tcp"
+address = "*"
+port = 0
+label = "invalid"
+"#,
+        ));
+
+        assert!(
+            detail.contains("ports[0].port must be in 1..=65535"),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn endpoint_label_missing_field_names_the_selector_index() {
         let detail = invalid_detail(parse(
             r#"
@@ -548,6 +574,7 @@ label = "web"
             default_sort = "scope"
             hide_system_processes = true
             confirm_force_kill = false
+            check_for_updates = false
             protected_processes = ["redis", "postgres"]
             "#,
         )
@@ -556,6 +583,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Scope);
         assert!(config.hide_system_processes);
         assert!(!config.confirm_force_kill);
+        assert!(!config.check_for_updates);
         assert!(config.protected_processes.contains(&"docker".to_owned()));
         assert!(config.protected_processes.contains(&"postgres".to_owned()));
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
@@ -574,6 +602,13 @@ label = "web"
     fn broken_toml_is_an_invalid_config_error() {
         let detail = invalid_detail(parse("refresh_interval_seconds = "));
         assert!(!detail.is_empty());
+    }
+
+    #[test]
+    fn update_check_requires_a_boolean() {
+        let detail = invalid_detail(parse("check_for_updates = \"yes\""));
+        assert!(detail.contains("check_for_updates"), "detail: {detail}");
+        assert!(detail.contains("boolean"), "detail: {detail}");
     }
 
     #[test]
