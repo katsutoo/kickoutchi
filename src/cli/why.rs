@@ -196,7 +196,7 @@ fn run_why_with(
     }
 
     let aggregate = aggregate_exit(completed.iter().map(|result| result.verdict.verdict));
-    match render_document(output, &options, &snapshot, &completed)
+    match render_document(output, &options, &snapshot, &completed, aggregate)
         .and_then(|()| output.flush().map_err(PublicOutputError::from))
     {
         Ok(()) => aggregate,
@@ -364,11 +364,12 @@ fn render_document(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
+    aggregate: ExitReason,
 ) -> Result<(), PublicOutputError> {
     if options.json {
-        render_json(output, options, snapshot, results)
+        render_json(output, options, snapshot, results, aggregate)
     } else {
-        render_human(output, options, snapshot, results)
+        render_human(output, options, snapshot, results, aggregate)
     }
 }
 
@@ -377,8 +378,8 @@ fn render_json(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
+    aggregate: ExitReason,
 ) -> Result<(), PublicOutputError> {
-    let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
     let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
     let dto = WhyDto {
         schema: "kickoutchi.why",
@@ -400,9 +401,9 @@ fn render_human(
     options: &WhyOptions,
     snapshot: &NetworkSnapshot,
     results: &[CompletedResult],
+    aggregate: ExitReason,
 ) -> Result<(), PublicOutputError> {
     let capture = CaptureDto::new(snapshot.capture_started_at, snapshot.capture_completed_at)?;
-    let aggregate = aggregate_exit(results.iter().map(|result| result.verdict.verdict));
     writeln!(
         &mut *output,
         "WHY port={} protocols={} addresses={} scope_id={} ipv6_mode={} reuse_address={} snapshot={} ownership={} capture_started_unix_ms={} capture_completed_unix_ms={}",
@@ -1323,7 +1324,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut output = RecordingWriter::default();
 
-        render_document(&mut output, &options, &snapshot(), &completed)
+        let aggregate = aggregate_exit(completed.iter().map(|result| result.verdict.verdict));
+        render_document(&mut output, &options, &snapshot(), &completed, aggregate)
             .expect("maximum legal JSON shape renders");
 
         assert_eq!(completed.len(), WHY_ENDPOINTS_MAX);
@@ -1761,7 +1763,9 @@ mod tests {
         }];
         options.json = true;
         let mut json = Vec::new();
-        render_document(&mut json, &options, &snapshot(), &completed).expect("JSON renders");
+        let aggregate = aggregate_exit(completed.iter().map(|result| result.verdict.verdict));
+        render_document(&mut json, &options, &snapshot(), &completed, aggregate)
+            .expect("JSON renders");
         let value: serde_json::Value =
             serde_json::from_slice(&json).expect("why output is valid JSON");
         let evidence = value["results"][0]["evidence"][0]["message"]
@@ -1783,7 +1787,7 @@ mod tests {
 
         options.json = false;
         let mut human = Vec::new();
-        render_document(&mut human, &options, &snapshot(), &completed)
+        render_document(&mut human, &options, &snapshot(), &completed, aggregate)
             .expect("human output renders");
         let human = String::from_utf8(human).expect("human output is UTF-8");
         assert!(human.contains(evidence));

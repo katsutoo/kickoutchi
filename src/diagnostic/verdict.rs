@@ -79,18 +79,12 @@ impl EndpointRelationship {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(
-    dead_code,
-    reason = "the public evidence vocabulary spans several commands"
-)]
 pub(crate) enum EvidenceSource {
     LinuxProcfs,
     MacosLibproc,
-    MacosSysctl,
     WindowsIpHelper,
     WindowsProcessApi,
     BindProbe,
-    Docker,
     Analysis,
 }
 
@@ -99,11 +93,9 @@ impl EvidenceSource {
         match self {
             Self::LinuxProcfs => "linux_procfs",
             Self::MacosLibproc => "macos_libproc",
-            Self::MacosSysctl => "macos_sysctl",
             Self::WindowsIpHelper => "windows_ip_helper",
             Self::WindowsProcessApi => "windows_process_api",
             Self::BindProbe => "bind_probe",
-            Self::Docker => "docker",
             Self::Analysis => "analysis",
         }
     }

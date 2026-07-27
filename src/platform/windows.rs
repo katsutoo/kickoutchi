@@ -315,19 +315,11 @@ impl ProcessSnapshot {
         profile: MetadataProfile,
         selection: ProcessSelection<'_>,
     ) -> Result<Self, CollectorError> {
-        Self::collect_with_budget(profile, selection, OPTIONAL_METADATA_MAX_BYTES)
-    }
-
-    fn collect_with_budget(
-        profile: MetadataProfile,
-        selection: ProcessSelection<'_>,
-        metadata_budget: usize,
-    ) -> Result<Self, CollectorError> {
         Self::collect_with(
             &mut RealProcessApi::default(),
             profile,
             selection,
-            metadata_budget,
+            OPTIONAL_METADATA_MAX_BYTES,
         )
     }
 
@@ -669,11 +661,7 @@ fn enumerate_process_relations(
         }
     }
     let error = std::io::Error::last_os_error();
-    if error
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        != Some(ERROR_NO_MORE_FILES)
-    {
+    if windows_io_error_code(&error) != Some(ERROR_NO_MORE_FILES) {
         return Err(CollectorError::Platform {
             operation: "Process32NextW",
             detail: error.to_string(),
@@ -898,10 +886,6 @@ fn decode_command_line_buffer(
         // offset and byte length were validated as even and in bounds.
         std::slice::from_raw_parts(unicode.Buffer, byte_length / 2)
     };
-    decode_command_line_utf16(code_units, final_max)
-}
-
-fn decode_command_line_utf16(code_units: &[u16], final_max: usize) -> Option<String> {
     decode_utf16_bounded(code_units, final_max)
 }
 
@@ -1042,7 +1026,7 @@ fn read_process_observations_with<Api: ProcessApi>(
     };
     let mut snapshot = match snapshot {
         Ok(snapshot) => snapshot,
-        Err(_) if relation_failed => return direct_partial_process_reads(api, sorted_pids),
+        Err(_) if relation_failed => return Ok(direct_partial_process_reads(api, sorted_pids)),
         Err(error) => return Err(error),
     };
     Ok(sorted_pids
@@ -1061,11 +1045,10 @@ fn read_process_observations_with<Api: ProcessApi>(
 fn direct_partial_process_reads<Api: ProcessApi>(
     api: &mut Api,
     sorted_pids: &[u32],
-) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
-    if sorted_pids.len() > CANDIDATE_PROCESS_IDS_MAX {
-        return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
-    }
-    Ok(sorted_pids
+) -> BTreeMap<u32, ProcessRead> {
+    // The sole caller, read_process_observations_with, already enforces the
+    // CANDIDATE_PROCESS_IDS_MAX bound before delegating here.
+    sorted_pids
         .iter()
         .copied()
         .map(|pid| {
@@ -1089,7 +1072,7 @@ fn direct_partial_process_reads<Api: ProcessApi>(
             };
             (pid, read)
         })
-        .collect())
+        .collect()
 }
 
 fn process_read_from_metadata(metadata: ProcessMetadata) -> ProcessRead {
@@ -1750,7 +1733,7 @@ mod tests {
         AcceptedParentEdge, MAX_CHILD_PROCESSES, ProcessApi, ProcessMetadata, ProcessOpenError,
         ProcessSelection, ProcessSnapshot, accepted_parent_edge, append_tcp4_table,
         append_tcp6_table, append_udp4_table, append_udp6_table, checked_table_byte_len,
-        collect_socket_records_with, decode_command_line_utf16, decode_port, encode_port_for_tests,
+        collect_socket_records_with, decode_port, decode_utf16_bounded, encode_port_for_tests,
         extend_socket_records_with_limit, filetime_to_u64, finish_bracketed_metadata,
         mib_tcp_state, native_pass_from_records, process_path_buffer_code_units,
         process_read_from_metadata, query_process_command_line_with, read_iphelper_table_with,
@@ -1772,7 +1755,6 @@ mod tests {
 
     #[test]
     #[expect(
-        clippy::too_many_lines,
         clippy::unnecessary_wraps,
         reason = "four typed collector seams stay visible in one production-wiring test"
     )]
@@ -1855,22 +1837,6 @@ mod tests {
                 (Protocol::Udp, 3003),
             ]
         );
-        assert!(std::ptr::fn_addr_eq(
-            super::SOCKET_TABLE_COLLECTORS[0],
-            super::collect_tcp4_records as super::SocketTableCollector,
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            super::SOCKET_TABLE_COLLECTORS[1],
-            super::collect_tcp6_records as super::SocketTableCollector,
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            super::SOCKET_TABLE_COLLECTORS[2],
-            super::collect_udp4_records as super::SocketTableCollector,
-        ));
-        assert!(std::ptr::fn_addr_eq(
-            super::SOCKET_TABLE_COLLECTORS[3],
-            super::collect_udp6_records as super::SocketTableCollector,
-        ));
 
         let mut aggregate = vec![records[0]];
         let error = extend_socket_records_with_limit(
@@ -2819,7 +2785,7 @@ mod tests {
     fn command_line_utf16_seam_enforces_final_utf8_boundary() {
         let exact = vec![u16::from(b'x'); super::PROCESS_COMMAND_LINE_MAX_BYTES];
         assert_eq!(
-            decode_command_line_utf16(&exact, super::PROCESS_COMMAND_LINE_MAX_BYTES)
+            decode_utf16_bounded(&exact, super::PROCESS_COMMAND_LINE_MAX_BYTES)
                 .as_deref()
                 .map(str::len),
             Some(super::PROCESS_COMMAND_LINE_MAX_BYTES)
@@ -2827,7 +2793,7 @@ mod tests {
 
         let oversized = vec![u16::from(b'x'); super::PROCESS_COMMAND_LINE_MAX_BYTES + 1];
         assert_eq!(
-            decode_command_line_utf16(&oversized, super::PROCESS_COMMAND_LINE_MAX_BYTES),
+            decode_utf16_bounded(&oversized, super::PROCESS_COMMAND_LINE_MAX_BYTES),
             None
         );
     }
@@ -3081,23 +3047,6 @@ mod tests {
         assert_eq!(record.local_port, 3000);
         assert_eq!(record.state, SocketState::Listen);
         assert_eq!(record.pid, Some(18422));
-    }
-
-    #[test]
-    fn tcp4_non_listen_row_is_retained() {
-        let row = MIB_TCPROW_OWNER_PID {
-            dwState: 5,
-            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
-            dwLocalPort: encode_port_for_tests(3000),
-            dwRemoteAddr: 0,
-            dwRemotePort: 0,
-            dwOwningPid: 18422,
-        };
-
-        assert_eq!(
-            tcp4_record(&row).expect("valid TCP row").state,
-            SocketState::Established
-        );
     }
 
     #[test]

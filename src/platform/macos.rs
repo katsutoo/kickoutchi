@@ -370,7 +370,6 @@ struct SocketRecord {
     local_addr: IpAddr,
     local_port: u16,
     state: ObservationSocketState,
-    pid: u32,
     socket_id: u64,
 }
 
@@ -1785,7 +1784,7 @@ const fn fd_list_is_complete(count: usize, capacity: usize) -> bool {
 
 fn socket_record_for_fd(pid: u32, fd: libc::c_int) -> std::io::Result<Option<SocketRecord>> {
     let info = read_socket_fdinfo(pid, fd)?;
-    socket_record_from_info(pid, &info)
+    socket_record_from_info(&info)
 }
 
 fn read_socket_fdinfo(pid: u32, fd: libc::c_int) -> std::io::Result<SocketFdinfo> {
@@ -1820,7 +1819,7 @@ fn read_socket_fdinfo(pid: u32, fd: libc::c_int) -> std::io::Result<SocketFdinfo
     Ok(info)
 }
 
-fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> std::io::Result<Option<SocketRecord>> {
+fn socket_record_from_info(info: &SocketFdinfo) -> std::io::Result<Option<SocketRecord>> {
     let socket = &info.psi;
     match socket.soi_protocol {
         protocol if protocol == libc::IPPROTO_TCP && socket.soi_kind == SOCKINFO_TCP => {
@@ -1831,7 +1830,6 @@ fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> std::io::Result<Opt
             };
             let state = darwin_tcp_state(tcp.tcpsi_state)?;
             socket_record_from_in_sockinfo(
-                pid,
                 Protocol::Tcp,
                 state,
                 socket.soi_family,
@@ -1846,7 +1844,6 @@ fn socket_record_from_info(pid: u32, info: &SocketFdinfo) -> std::io::Result<Opt
                 socket.soi_proto.pri_in
             };
             socket_record_from_in_sockinfo(
-                pid,
                 Protocol::Udp,
                 ObservationSocketState::Bound,
                 socket.soi_family,
@@ -1883,7 +1880,6 @@ fn darwin_tcp_state(native: libc::c_int) -> std::io::Result<ObservationSocketSta
 }
 
 fn socket_record_from_in_sockinfo(
-    pid: u32,
     protocol: Protocol,
     state: ObservationSocketState,
     family: libc::c_int,
@@ -1905,7 +1901,6 @@ fn socket_record_from_in_sockinfo(
         local_addr,
         local_port,
         state,
-        pid,
         socket_id,
     }))
 }
@@ -2278,11 +2273,6 @@ fn c_char_slice_to_string_bounded(bytes: &[libc::c_char], max_bytes: usize) -> O
 }
 
 fn c_char_slice_to_parent_name(bytes: &[libc::c_char], max_bytes: usize) -> ParentNameRead {
-    let ptr = bytes.as_ptr();
-    if ptr.is_null() || bytes.first().copied() == Some(0) {
-        return ParentNameRead::Unavailable;
-    }
-
     let Some(nul_index) = bytes.iter().position(|byte| *byte == 0) else {
         return ParentNameRead::Unavailable;
     };
@@ -2290,9 +2280,9 @@ fn c_char_slice_to_parent_name(bytes: &[libc::c_char], max_bytes: usize) -> Pare
         return ParentNameRead::Unavailable;
     }
     let text = unsafe {
-        // SAFETY: nul_index proves there is a NUL terminator inside bytes, and ptr
-        // points to the start of that same live buffer.
-        CStr::from_ptr(ptr)
+        // SAFETY: nul_index proves there is a NUL terminator inside bytes, and
+        // as_ptr points to the start of that same live buffer.
+        CStr::from_ptr(bytes.as_ptr())
     };
     let bytes = text.to_bytes();
     let Some(decoded_len) = crate::observation::lossy_utf8_len(bytes) else {
@@ -2406,8 +2396,6 @@ mod tests {
 
     #[test]
     fn rollback_identity_after_stop_uses_the_immediate_marker() {
-        let prior =
-            crate::observation::ProcessStartMarker::macos(1, 0).expect("test marker is valid");
         let stopped =
             crate::observation::ProcessStartMarker::macos(2, 0).expect("test marker is valid");
 
@@ -2415,7 +2403,6 @@ mod tests {
             super::MacosTreeOps::rollback_identity_after_stop_with(42, |_| Ok(Some(stopped))),
             Some(stopped)
         );
-        assert_ne!(Some(prior), Some(stopped));
     }
 
     #[test]
@@ -2585,7 +2572,7 @@ mod tests {
         ];
         for (native, expected) in (0..=10).zip(expected) {
             assert_eq!(super::darwin_tcp_state(native).unwrap(), expected);
-            let record = socket_record_from_info(42, &tcp_socket_fdinfo(native))
+            let record = socket_record_from_info(&tcp_socket_fdinfo(native))
                 .expect("documented TCP state is valid")
                 .expect("every documented TCP state is retained");
             assert_eq!(record.state, expected);
@@ -2631,7 +2618,7 @@ mod tests {
             },
         };
 
-        let record = socket_record_from_info(18422, &info)
+        let record = socket_record_from_info(&info)
             .expect("valid fdinfo")
             .expect("listen socket is kept");
 
@@ -2639,7 +2626,6 @@ mod tests {
         assert_eq!(record.state, SocketState::Listen);
         assert_eq!(record.local_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(record.local_port, 3000);
-        assert_eq!(record.pid, 18422);
         assert_eq!(record.socket_id, 0xCAFE);
     }
 
@@ -2659,33 +2645,9 @@ mod tests {
         };
 
         assert_eq!(
-            socket_record_from_info(42, &info).expect("unbound socket is valid native data"),
+            socket_record_from_info(&info).expect("unbound socket is valid native data"),
             None
         );
-    }
-
-    #[test]
-    fn tcp_non_listen_socket_info_is_retained() {
-        let mut info = zeroed_socket_fdinfo();
-        info.psi.soi_protocol = libc::IPPROTO_TCP;
-        info.psi.soi_family = libc::AF_INET;
-        info.psi.soi_kind = super::SOCKINFO_TCP;
-        info.psi.soi_proto = SocketProtocolInfo {
-            pri_tcp: TcpSockinfo {
-                tcpsi_ini: in_sockinfo_v4(3000, Ipv4Addr::LOCALHOST),
-                tcpsi_state: 4,
-                tcpsi_timer: [0; 4],
-                tcpsi_mss: 0,
-                tcpsi_flags: 0,
-                rfu_1: 0,
-                tcpsi_tp: 0,
-            },
-        };
-
-        let record = socket_record_from_info(18422, &info)
-            .expect("valid fdinfo")
-            .expect("established socket is retained");
-        assert_eq!(record.state, SocketState::Established);
     }
 
     #[test]
@@ -2699,7 +2661,7 @@ mod tests {
             pri_in: in_sockinfo_v6(5353, Ipv6Addr::LOCALHOST),
         };
 
-        let record = socket_record_from_info(902, &info)
+        let record = socket_record_from_info(&info)
             .expect("valid fdinfo")
             .expect("udp socket is kept");
 
@@ -2707,7 +2669,6 @@ mod tests {
         assert_eq!(record.state, SocketState::Bound);
         assert_eq!(record.local_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert_eq!(record.local_port, 5353);
-        assert_eq!(record.pid, 902);
 
         let pass = native_pass_from_records(
             &[record],
@@ -2754,14 +2715,13 @@ mod tests {
     fn production_orchestration_emits_endpoint_null_ipv6_scope_evidence() {
         let pass = super::MacosCollector::collect_native_pass_with(
             || Ok(vec![902]),
-            |pid, _| {
+            |_pid, _| {
                 Ok((
                     vec![super::SocketRecord {
                         protocol: Protocol::Udp,
                         local_addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
                         local_port: 5353,
                         state: SocketState::Bound,
-                        pid,
                         socket_id: 77,
                     }],
                     BTreeSet::new(),
@@ -2782,7 +2742,6 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
-            pid: 100,
             socket_id: 0xCAFE,
         };
 
@@ -2818,7 +2777,6 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
-            pid: 100,
             socket_id: 0,
         };
         let mut traversed = 0;
@@ -2840,7 +2798,6 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
-            pid: 100,
             socket_id: 0,
         };
         let mut records = Vec::new();
@@ -2868,7 +2825,7 @@ mod tests {
             &mut owner_edges,
             &mut losses,
             &mut omitted,
-            super::SocketRecord { pid: 101, ..record },
+            record,
             101,
         )
         .expect("second tokenless socket is retained");
@@ -2888,12 +2845,10 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             local_port: 3000,
             state: SocketState::Listen,
-            pid: 100,
             socket_id: 0xCAFE,
         };
         let conflicting = super::SocketRecord {
             state: SocketState::Established,
-            pid: 101,
             ..first.clone()
         };
         let mut records = Vec::new();
@@ -2948,7 +2903,6 @@ mod tests {
             local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             local_port: 5353,
             state: SocketState::Bound,
-            pid: 902,
             socket_id: 77,
         };
 
@@ -3025,7 +2979,6 @@ mod tests {
                         local_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                         local_port: 5353,
                         state: SocketState::Bound,
-                        pid,
                         socket_id: 77,
                     }],
                     BTreeSet::new(),
@@ -3146,7 +3099,7 @@ mod tests {
             pri_in: in_sockinfo_v6(3000, Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
         };
 
-        let record = socket_record_from_info(18422, &info)
+        let record = socket_record_from_info(&info)
             .expect("valid fdinfo")
             .expect("mapped socket is kept");
 
@@ -3436,7 +3389,7 @@ mod tests {
         let mut traversed = 0;
 
         let (_, losses) = collect_pid_socket_records_from_fds(42, &fds, &mut traversed, 1, |_| {
-            socket_record_from_info(42, &info)
+            socket_record_from_info(&info)
         })
         .expect("malformed per-FD data is retained as socket-set loss");
 

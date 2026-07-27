@@ -309,7 +309,6 @@ pub(crate) fn pin_root_before_revalidation<Ops: TreeProcessOps>(
 pub(crate) struct ProcessTreeNode {
     pub(crate) pid: u32,
     pub(crate) parent_pid: Option<u32>,
-    parent_process_name: Option<String>,
     pub(crate) process_name: Option<String>,
     pub(crate) owner_uid: Option<u32>,
     pub(crate) protected: bool,
@@ -697,7 +696,6 @@ fn preview_node(
     ProcessTreeNode {
         pid: info.pid,
         parent_pid: info.parent_pid,
-        parent_process_name: info.parent_process_name.clone(),
         process_name: info.process_name.clone(),
         owner_uid: info.owner_uid,
         protected: is_protected(info, protected_names, platform),
@@ -2740,6 +2738,10 @@ mod tests {
             .collect();
         stopped.sort_unstable();
         continued.sort_unstable();
+        assert!(
+            !stopped.is_empty(),
+            "the freeze must stop members before refusing"
+        );
         assert_eq!(stopped, continued);
     }
 
@@ -3298,6 +3300,10 @@ mod tests {
             .collect();
         stopped.sort_unstable();
         continued.sort_unstable();
+        assert!(
+            !stopped.is_empty(),
+            "the freeze must stop members before refusing"
+        );
         assert_eq!(stopped, continued);
     }
 
@@ -3445,6 +3451,10 @@ mod tests {
             .collect();
         stopped.sort_unstable();
         continued.sort_unstable();
+        assert!(
+            !stopped.is_empty(),
+            "the freeze must stop members before refusing"
+        );
         assert_eq!(stopped, continued, "every stopped PID must be thawed");
     }
 
@@ -3667,6 +3677,7 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::Cont(_)))
             .count();
+        assert!(stops > 0, "the freeze must stop members before refusing");
         assert_eq!(stops, conts, "every stopped member must be thawed");
     }
 

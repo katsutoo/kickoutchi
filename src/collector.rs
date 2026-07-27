@@ -126,12 +126,10 @@ pub(crate) fn collect_kill_ports(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn collect_target_ports(
-    pid: Option<u32>,
-    port: Option<u16>,
-) -> Result<Vec<PortEntry>, CollectorError> {
+pub(crate) fn collect_target_ports(pid: u32) -> Result<Vec<PortEntry>, CollectorError> {
     let snapshot = collect_snapshot(MetadataProfile::Display)?;
-    crate::observation::project_legacy_target(&snapshot, pid, port).map_err(CollectorError::from)
+    crate::observation::project_legacy_target(&snapshot, Some(pid), None)
+        .map_err(CollectorError::from)
 }
 
 /// Project the rows a destructive command is allowed to act on, or refuse.

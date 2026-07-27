@@ -11,7 +11,7 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use thiserror::Error;
 
 use crate::model::Protocol;
-use crate::observation::Ipv6Scope;
+use crate::observation::{EndpointIdentity, EndpointIdentityError, Ipv6Scope};
 
 /// Whether the probe explicitly enables address reuse before binding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,35 +50,30 @@ impl ProbeRequest {
         ipv6_mode: Ipv6Mode,
         reuse_address: ReuseAddressMode,
     ) -> Result<Self, ProbeRequestError> {
-        let address = match address {
-            IpAddr::V6(address) => address
-                .to_ipv4_mapped()
-                .map_or(IpAddr::V6(address), IpAddr::V4),
-            address @ IpAddr::V4(_) => address,
-        };
-        let port = u16::try_from(port)
-            .ok()
-            .and_then(NonZeroU16::new)
-            .ok_or(ProbeRequestError::InvalidPort)?;
-
-        let ipv6_scope = match (address, ipv6_scope) {
-            (IpAddr::V4(_), None) => None,
-            (IpAddr::V4(_), Some(_)) => return Err(ProbeRequestError::Ipv4WithScope),
-            (IpAddr::V6(_), None) => return Err(ProbeRequestError::Ipv6WithoutScope),
-            (IpAddr::V6(_), Some(Ipv6Scope::Unavailable)) => {
-                return Err(ProbeRequestError::UnavailableIpv6Scope);
-            }
-            (IpAddr::V6(_), Some(scope)) => Some(scope),
-        };
-        if address.is_ipv4() && ipv6_mode != Ipv6Mode::SystemDefault {
+        // IPv4-mapped normalization, port validation, and address/scope
+        // pairing are the endpoint-identity contract; only the probe-specific
+        // refusals below are added here.
+        let identity = EndpointIdentity::new(protocol, address, port, ipv6_scope)
+            .map_err(ProbeRequestError::from)?;
+        // A probe binds one exact native address, so an unavailable scope has
+        // no bindable representation.
+        if identity.ipv6_scope == Some(Ipv6Scope::Unavailable) {
+            return Err(ProbeRequestError::UnavailableIpv6Scope);
+        }
+        // `EndpointIdentity` forgives a scope on an IPv4-mapped address; a
+        // probe treats that caller contradiction as an error.
+        if identity.address.is_ipv4() && ipv6_scope.is_some() {
+            return Err(ProbeRequestError::Ipv4WithScope);
+        }
+        if identity.address.is_ipv4() && ipv6_mode != Ipv6Mode::SystemDefault {
             return Err(ProbeRequestError::Ipv4WithIpv6Mode);
         }
 
         Ok(Self {
-            protocol,
-            address,
-            port,
-            ipv6_scope,
+            protocol: identity.protocol,
+            address: identity.address,
+            port: identity.port,
+            ipv6_scope: identity.ipv6_scope,
             ipv6_mode,
             reuse_address,
         })
@@ -114,6 +109,19 @@ pub(crate) enum ProbeRequestError {
     UnavailableIpv6Scope,
     #[error("IPv6-only and dual-stack modes are invalid for IPv4 probe targets")]
     Ipv4WithIpv6Mode,
+}
+
+impl From<EndpointIdentityError> for ProbeRequestError {
+    fn from(error: EndpointIdentityError) -> Self {
+        match error {
+            EndpointIdentityError::InvalidPort => Self::InvalidPort,
+            EndpointIdentityError::Ipv4WithScope => Self::Ipv4WithScope,
+            EndpointIdentityError::Ipv6WithoutScope => Self::Ipv6WithoutScope,
+            EndpointIdentityError::InvalidInterfaceIndex => {
+                unreachable!("`EndpointIdentity::new` performs no interface-index validation")
+            }
+        }
+    }
 }
 
 /// Stable result category for one exact bind attempt.

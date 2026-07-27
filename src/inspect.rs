@@ -74,11 +74,7 @@ pub(crate) fn command_line_scope_identities(
         return Vec::new();
     };
     let mut processes = vec![target];
-    processes.extend(
-        ancestor_chain(target, &index)
-            .into_iter()
-            .take(ANCESTORS_DISPLAY_MAX),
-    );
+    processes.extend(capped_ancestors(target, &index).0);
     let mut identities = processes
         .into_iter()
         .filter_map(process_identity)
@@ -114,20 +110,17 @@ pub(crate) fn build_scope(
     };
     let mut pids = BTreeSet::from([target_pid]);
     pids.extend(
-        ancestor_chain(target, &index)
+        capped_ancestors(target, &index)
+            .0
             .into_iter()
-            .take(ANCESTORS_DISPLAY_MAX)
             .map(|info| info.pid),
     );
-    if let Some(parent_pid) = target.parent_pid {
-        let mut siblings = snapshot
-            .iter()
-            .filter(|info| info.parent_pid == Some(parent_pid) && info.pid != target_pid)
-            .map(|info| info.pid)
-            .collect::<Vec<_>>();
-        siblings.sort_unstable();
-        pids.extend(siblings.into_iter().take(SIBLINGS_DISPLAY_MAX));
-    }
+    pids.extend(
+        capped_siblings(target, snapshot)
+            .0
+            .into_iter()
+            .map(|info| info.pid),
+    );
     let tree = plan_process_tree(
         target_pid,
         snapshot,
@@ -145,13 +138,8 @@ pub(crate) fn build_scope(
     if platform != Platform::Windows
         && let Some(group) = target.process_group
     {
-        let mut members = snapshot
-            .iter()
-            .filter(|info| info.process_group == Some(group))
-            .map(|info| info.pid)
-            .collect::<Vec<_>>();
-        members.sort_unstable();
-        pids.extend(members.into_iter().take(GROUP_DISPLAY_MAX));
+        let (members, shown) = capped_group_members(group, snapshot);
+        pids.extend(members[..shown].iter().map(|info| info.pid));
     }
     let port_identities = pids
         .into_iter()
@@ -310,14 +298,14 @@ fn render_ancestors<CommandLine>(
 ) where
     CommandLine: FnMut(u32) -> Option<String>,
 {
-    let ancestors = ancestor_chain(target, index);
-    if ancestors.is_empty() {
+    let (shown, total) = capped_ancestors(target, index);
+    if total == 0 {
         out.push_str("Ancestors: none visible\n");
         return;
     }
 
     out.push_str("Ancestors (nearest first):\n");
-    for ancestor in ancestors.iter().take(ANCESTORS_DISPLAY_MAX) {
+    for ancestor in &shown {
         let _ = write!(
             out,
             "  {}",
@@ -328,12 +316,8 @@ fn render_ancestors<CommandLine>(
         }
         out.push('\n');
     }
-    if ancestors.len() > ANCESTORS_DISPLAY_MAX {
-        let _ = writeln!(
-            out,
-            "  ... and {} more",
-            ancestors.len() - ANCESTORS_DISPLAY_MAX,
-        );
+    if total > shown.len() {
+        let _ = writeln!(out, "  ... and {} more", total - shown.len());
     }
 }
 
@@ -344,26 +328,18 @@ fn render_siblings(
     protected_names: &[String],
     platform: Platform,
 ) {
-    let Some(parent_pid) = target.parent_pid else {
-        return;
-    };
-    let mut siblings: Vec<&TreeProcessInfo> = snapshot
-        .iter()
-        .filter(|info| info.parent_pid == Some(parent_pid) && info.pid != target.pid)
-        .collect();
-    if siblings.is_empty() {
+    let (siblings, total) = capped_siblings(target, snapshot);
+    if total == 0 {
         return;
     }
-    siblings.sort_by_key(|info| info.pid);
 
     let shown = siblings
         .iter()
-        .take(SIBLINGS_DISPLAY_MAX)
         .map(|info| member_label(info, protected_names, platform))
         .collect::<Vec<_>>()
         .join(", ");
-    let suffix = if siblings.len() > SIBLINGS_DISPLAY_MAX {
-        format!(" ... and {} more", siblings.len() - SIBLINGS_DISPLAY_MAX)
+    let suffix = if total > siblings.len() {
+        format!(" ... and {} more", total - siblings.len())
     } else {
         String::new()
     };
@@ -474,11 +450,7 @@ fn render_group(
         return 0;
     };
     let tree_pids = tree_pids.iter().copied().collect::<HashSet<_>>();
-    let mut members: Vec<&TreeProcessInfo> = snapshot
-        .iter()
-        .filter(|info| info.process_group == Some(group))
-        .collect();
-    members.sort_by_key(|info| info.pid);
+    let (members, shown) = capped_group_members(group, snapshot);
 
     // Members outside the descendant tree are the interesting ones: they are
     // exactly what a tree kill from this target would leave alive.
@@ -491,7 +463,7 @@ fn render_group(
         "Process group {group} ({} members, {outside_count} outside the tree):",
         members.len(),
     );
-    for member in members.iter().take(GROUP_DISPLAY_MAX) {
+    for member in &members[..shown] {
         let marker = if tree_pids.contains(&member.pid) {
             ""
         } else {
@@ -503,10 +475,60 @@ fn render_group(
             member_label(member, protected_names, platform),
         );
     }
-    if members.len() > GROUP_DISPLAY_MAX {
-        let _ = writeln!(out, "  ... and {} more", members.len() - GROUP_DISPLAY_MAX);
+    if members.len() > shown {
+        let _ = writeln!(out, "  ... and {} more", members.len() - shown);
     }
     outside_count
+}
+
+/// Ancestors of `target` capped for display: `(shown, total)`, nearest first.
+/// The identity collector, the scope builder, and the renderer all consume
+/// this so the walk and its display cap stay one policy.
+fn capped_ancestors<'snapshot>(
+    target: &TreeProcessInfo,
+    index: &PidIndex<'snapshot>,
+) -> (Vec<&'snapshot TreeProcessInfo>, usize) {
+    let mut ancestors = ancestor_chain(target, index);
+    let total = ancestors.len();
+    ancestors.truncate(ANCESTORS_DISPLAY_MAX);
+    (ancestors, total)
+}
+
+/// Siblings of `target` (same parent, target excluded), PID-ascending, capped
+/// at `SIBLINGS_DISPLAY_MAX`: `(shown, total)`. Shared by the scope builder
+/// and the renderer so filter, order, and cap stay one policy.
+fn capped_siblings<'snapshot>(
+    target: &TreeProcessInfo,
+    snapshot: &'snapshot [TreeProcessInfo],
+) -> (Vec<&'snapshot TreeProcessInfo>, usize) {
+    let Some(parent_pid) = target.parent_pid else {
+        return (Vec::new(), 0);
+    };
+    let mut siblings = snapshot
+        .iter()
+        .filter(|info| info.parent_pid == Some(parent_pid) && info.pid != target.pid)
+        .collect::<Vec<_>>();
+    siblings.sort_by_key(|info| info.pid);
+    let total = siblings.len();
+    siblings.truncate(SIBLINGS_DISPLAY_MAX);
+    (siblings, total)
+}
+
+/// Members of process group `group`, PID-ascending, with the display cap
+/// applied once: `(members, shown)`. The full sorted list is returned because
+/// the group renderer counts members outside the descendant tree before
+/// capping; `members[..shown]` is what reports display.
+fn capped_group_members(
+    group: u32,
+    snapshot: &[TreeProcessInfo],
+) -> (Vec<&TreeProcessInfo>, usize) {
+    let mut members = snapshot
+        .iter()
+        .filter(|info| info.process_group == Some(group))
+        .collect::<Vec<_>>();
+    members.sort_by_key(|info| info.pid);
+    let shown = members.len().min(GROUP_DISPLAY_MAX);
+    (members, shown)
 }
 
 /// Walk the parent map upward: nearest ancestor first. Bounded, and the seen

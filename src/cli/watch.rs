@@ -1439,6 +1439,11 @@ fn write_endpoint_event(
     )
 }
 
+/// Enforce the bounded evidence contract on a watch event. Today
+/// [`write_endpoint_event`] emits at most one evidence item, so the truncation
+/// path is unreachable; the helper future-proofs the NDJSON promise that
+/// `evidence` never exceeds `WATCH_EVENT_EVIDENCE_MAX` and `omitted_evidence_count`
+/// accounts for the rest.
 fn retain_event_evidence(evidence: Vec<EvidenceDto<'static>>) -> (Vec<EvidenceDto<'static>>, u64) {
     let omitted = evidence.len().saturating_sub(WATCH_EVENT_EVIDENCE_MAX);
     (
@@ -1598,13 +1603,11 @@ fn event_gap_dtos<'a>(
             &mut total,
         );
     }
+    // `retain_bounded_gap` already caps `gaps` at WATCH_EVENT_GAPS_MAX.
     let retained = gaps.len();
     let omitted = total.saturating_sub(u64::try_from(retained).unwrap_or(u64::MAX));
     (
-        gaps.into_iter()
-            .take(WATCH_EVENT_GAPS_MAX)
-            .map(EvidenceGapDto::from)
-            .collect(),
+        gaps.into_iter().map(EvidenceGapDto::from).collect(),
         omitted,
     )
 }

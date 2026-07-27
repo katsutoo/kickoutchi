@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indentation reader, public-output errors share one typed implementation, and
   unnecessary crate-wide visibility, serialization implementations, and stale
   license allowances were removed.
+- Consolidated duplicated internal logic so each policy is encoded exactly once,
+  without changing public behavior: the TUI tree-confirmation height budget now
+  measures the rendered prompt lines it guards instead of a second copy of the
+  prose, the Unix tree-freeze revalidation shares one gate helper with the
+  Windows and group paths, exact bind-probe requests build on the shared
+  endpoint-identity validator, inspect reports compute each
+  ancestor/sibling/group selection once, snapshot and watch output share one
+  owner-completeness ordering, and the Linux PID scans and platform
+  command-line readers each collapse to a single bounded implementation.
+- Release workflow contract tests now assert structural security properties —
+  every release job carries a bounded timeout and Linux runner images are
+  full-digest-pinned and identical across architectures — instead of
+  hardcoding a second copy of the exact minutes and digest values.
+
+### Removed
+
+- Removed dead internal code: never-constructed evidence-source variants,
+  unreachable trait defaults and bounds guards, write-only fields, a vestigial
+  platform parameter, and single-caller wrapper functions, plus one unsafe
+  UTF-8 block rewritten with the standard library's safe chunk iterator.
+  Trimmed tautological and duplicate unit tests, and strengthened previously
+  vacuous assertions so tree-thaw, docker-runner, and stale-refresh tests fail
+  under the regressions they exist to catch. No user-visible behavior changed.
 
 ## [1.3.6] - 2026-07-26
 

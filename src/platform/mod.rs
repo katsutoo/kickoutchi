@@ -67,34 +67,45 @@ pub(crate) fn inspect_command_line_reader(
 ) -> impl FnMut(u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let expected = identities
-            .iter()
-            .map(|identity| (identity.pid, identity.start_marker))
-            .collect::<std::collections::HashMap<_, _>>();
-        move |pid| {
-            let marker = expected.get(&pid).copied()?;
-            (linux::process_start_time_marker(pid) == Some(marker)).then_some(())?;
-            let command = linux::process_command_line(pid)?;
-            (linux::process_start_time_marker(pid) == Some(marker)).then_some(command)
-        }
+        marker_checked_command_line_reader(
+            identities,
+            linux::process_start_time_marker,
+            linux::process_command_line,
+        )
     }
 
     #[cfg(target_os = "macos")]
     {
-        let expected = identities
-            .iter()
-            .map(|identity| (identity.pid, identity.start_marker))
-            .collect::<std::collections::HashMap<_, _>>();
-        move |pid| {
-            let marker = expected.get(&pid).copied()?;
-            (macos::process_start_time_marker(pid) == Some(marker)).then_some(())?;
-            let command = macos::process_command_line(pid)?;
-            (macos::process_start_time_marker(pid) == Some(marker)).then_some(command)
-        }
+        marker_checked_command_line_reader(
+            identities,
+            macos::process_start_time_marker,
+            macos::process_command_line,
+        )
     }
 
     #[cfg(windows)]
     {
         windows::process_command_line_reader(identities)
+    }
+}
+
+/// Reads a PID's command line only when its start-time marker matches the
+/// identity captured at observation time, re-checking the marker after the
+/// read so a PID reused mid-read cannot smuggle in another process's command.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn marker_checked_command_line_reader(
+    identities: &[ProcessIdentity],
+    start_time_marker: fn(u32) -> Option<crate::observation::ProcessStartMarker>,
+    command_line: fn(u32) -> Option<String>,
+) -> impl FnMut(u32) -> Option<String> {
+    let expected = identities
+        .iter()
+        .map(|identity| (identity.pid, identity.start_marker))
+        .collect::<std::collections::HashMap<_, _>>();
+    move |pid| {
+        let marker = expected.get(&pid).copied()?;
+        (start_time_marker(pid) == Some(marker)).then_some(())?;
+        let command = command_line(pid)?;
+        (start_time_marker(pid) == Some(marker)).then_some(command)
     }
 }

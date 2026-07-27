@@ -48,12 +48,6 @@ pub(crate) struct QueryIndexResult {
     pub(crate) hidden_system_process_count: usize,
 }
 
-struct MatchingIndices {
-    indices: Vec<usize>,
-    hidden_system_process_count: usize,
-    explicit_filter_active: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum QueryError {
     #[error("filter text is {actual} bytes, maximum is {max}")]
@@ -120,22 +114,6 @@ pub(crate) fn query_view_indices(
     if options.capabilities != QueryCapabilities::LIST {
         return Err(QueryError::FullStateEntriesRequired);
     }
-    let MatchingIndices {
-        indices,
-        hidden_system_process_count,
-        explicit_filter_active,
-    } = matching_indices(entries, options)?;
-    Ok(QueryIndexResult {
-        indices,
-        explicit_filter_active,
-        hidden_system_process_count,
-    })
-}
-
-fn matching_indices(
-    entries: &[PortEntryView<'_>],
-    options: QueryOptions<'_>,
-) -> Result<MatchingIndices, QueryError> {
     if options.port == Some(0) {
         return Err(invalid_value("port", "0", "a TCP/UDP port from 1 to 65535"));
     }
@@ -194,10 +172,10 @@ fn matching_indices(
         )
     });
 
-    Ok(MatchingIndices {
+    Ok(QueryIndexResult {
         indices,
-        hidden_system_process_count,
         explicit_filter_active,
+        hidden_system_process_count,
     })
 }
 
@@ -491,10 +469,10 @@ fn plain_matches<'a>(
     needle_lower: &str,
     metadata: &mut MetadataMatchCache<'a>,
 ) -> bool {
-    scalar_matches(entry.local_port, needle_lower)
+    display_matches(entry.local_port, needle_lower)
         || entry
             .pid
-            .is_some_and(|pid| scalar_matches(pid, needle_lower))
+            .is_some_and(|pid| display_matches(pid, needle_lower))
         || display_matches(entry.local_addr, needle_lower)
         || socket_text_matches(entry, needle_lower)
         || contains_ascii(entry.protocol.label(), needle_lower)
@@ -539,14 +517,10 @@ fn parent_matches<'a>(
 ) -> bool {
     entry
         .parent_pid
-        .is_some_and(|pid| scalar_matches(pid, needle_lower))
+        .is_some_and(|pid| display_matches(pid, needle_lower))
         || entry
             .parent_process_name
             .is_some_and(|value| metadata.contains(value, needle_lower))
-}
-
-fn scalar_matches(value: impl fmt::Display, needle: &str) -> bool {
-    display_matches(value, needle)
 }
 
 fn display_matches(value: impl fmt::Display, needle: &str) -> bool {

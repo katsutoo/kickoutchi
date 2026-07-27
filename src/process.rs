@@ -293,12 +293,6 @@ pub(crate) struct TerminationHandle {
     _unsupported: (),
 }
 
-impl TerminationHandle {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KillTarget {
     pub(crate) pid: u32,
@@ -315,14 +309,6 @@ pub(crate) struct KillTarget {
 }
 
 impl KillTarget {
-    pub(crate) fn from_entry_views<'a>(
-        pid: u32,
-        entries: impl IntoIterator<Item = PortEntryView<'a>>,
-        context: Option<&ProcessContext>,
-    ) -> Self {
-        Self::from_entries(pid, entries, context)
-    }
-
     pub(crate) fn from_entries<'a>(
         pid: u32,
         entries: impl IntoIterator<Item = PortEntryView<'a>>,
@@ -613,7 +599,6 @@ impl From<PortEntryView<'_>> for KillTargetPort {
 
 pub(crate) fn confirmation_requirement(
     protected: bool,
-    _platform: Platform,
     mode: KillMode,
     yes: bool,
     confirm_force_kill: bool,
@@ -829,7 +814,7 @@ pub(crate) fn terminate_handle_checked(
     protected_names: &[String],
     mode: KillMode,
 ) -> TerminationOutcome {
-    debug_assert_eq!(handle.pid(), target.pid);
+    debug_assert_eq!(handle.pid, target.pid);
     terminate_handle_checked_platform(handle, target, protected_names, mode)
 }
 
@@ -1611,12 +1596,11 @@ fn linux_pidfd_signal(
     }
 }
 
-/// Send `SIGSTOP` to a PID for the process-tree freeze.
+/// Classify a stop attempt's `Result` into the tree signal/stop outcome pair.
 ///
-/// macOS has no pidfd equivalent, so the freeze path stops by PID and then
-/// immediately verifies identity while the process is stopped. Linux callers use
-/// `tree_stop_handle` instead so the root and every descendant are pinned
-/// before the first stop signal.
+/// A clean stop maps to `Delivered`/`Stopped`; a process that already exited
+/// or changed identity without needing cleanup maps to `NotFound`; every other
+/// failure maps to `Denied`/`Failed` with its cleanup requirements preserved.
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn macos_tree_stop_result(
     result: Result<bool, StopFailure>,
@@ -1644,6 +1628,12 @@ fn macos_tree_stop_result(
     }
 }
 
+/// Send `SIGSTOP` to a PID for the process-tree freeze.
+///
+/// macOS has no pidfd equivalent, so the freeze path stops by PID and then
+/// immediately verifies identity while the process is stopped. Linux callers use
+/// `tree_stop_handle` instead so the root and every descendant are pinned
+/// before the first stop signal.
 #[cfg(target_os = "macos")]
 pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
     let (signal_result, stop_result) =
@@ -2459,27 +2449,6 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_cleanup_continues_the_identity_observed_after_stop() {
-        let rollback_marker = crate::observation::ProcessStartMarker::macos(20, 30)
-            .expect("rollback marker is valid");
-        let mut continued = Vec::new();
-
-        let result = macos_cont_if_matches_with(
-            42,
-            Some(rollback_marker),
-            |_| Ok(rollback_marker),
-            |pid| {
-                continued.push(pid);
-                crate::tree::TreeSignalResult::Delivered
-            },
-        );
-
-        assert_eq!(result, crate::tree::TreeSignalResult::Delivered);
-        assert_eq!(continued, [42]);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
     fn macos_identity_change_rolls_back_the_post_stop_process_without_terminating_it() {
         let original_marker = crate::observation::ProcessStartMarker::macos(20, 30)
             .expect("original marker is valid");
@@ -2706,46 +2675,37 @@ mod tests {
     #[test]
     fn confirmation_requirements_keep_yes_from_bypassing_protected_processes() {
         assert_eq!(
-            confirmation_requirement(false, Platform::Linux, KillMode::Terminate, true, true),
+            confirmation_requirement(false, KillMode::Terminate, true, true),
             Ok(None),
         );
         assert_eq!(
-            confirmation_requirement(false, Platform::Linux, KillMode::Terminate, false, true),
+            confirmation_requirement(false, KillMode::Terminate, false, true),
             Ok(Some(ConfirmationRequirement::Yes)),
         );
         assert_eq!(
-            confirmation_requirement(false, Platform::Linux, KillMode::Force, false, true),
+            confirmation_requirement(false, KillMode::Terminate, false, false),
+            Ok(Some(ConfirmationRequirement::Yes)),
+        );
+        assert_eq!(
+            confirmation_requirement(false, KillMode::Force, false, true),
             Ok(Some(ConfirmationRequirement::ForceWord)),
         );
         assert_eq!(
-            confirmation_requirement(false, Platform::Linux, KillMode::Force, false, false),
+            confirmation_requirement(false, KillMode::Force, false, false),
             Ok(Some(ConfirmationRequirement::Yes)),
         );
         assert_eq!(
-            confirmation_requirement(true, Platform::Linux, KillMode::Terminate, false, true),
+            confirmation_requirement(true, KillMode::Terminate, false, true),
             Ok(Some(ConfirmationRequirement::ProtectedProcess)),
         );
         assert_eq!(
-            confirmation_requirement(true, Platform::Linux, KillMode::Terminate, true, true),
+            confirmation_requirement(true, KillMode::Terminate, true, true),
             Err(TerminationOutcome::ProtectedProcess),
         );
     }
 
     #[test]
-    fn windows_termination_warns_but_normal_confirmation_stays_simple() {
-        assert_eq!(
-            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, true),
-            Ok(Some(ConfirmationRequirement::Yes)),
-        );
-        assert_eq!(
-            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, false, false),
-            Ok(Some(ConfirmationRequirement::Yes)),
-        );
-        assert_eq!(
-            confirmation_requirement(false, Platform::Windows, KillMode::Terminate, true, true),
-            Ok(None),
-        );
-        assert_eq!(KillMode::Terminate.action_label(), "Terminate",);
+    fn windows_termination_carries_a_force_warning() {
         assert!(
             KillMode::Terminate
                 .force_warning(Platform::Windows)

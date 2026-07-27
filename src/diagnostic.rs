@@ -11,7 +11,7 @@ use crate::display::{REPLACEMENT, is_default_ignorable, sanitize};
 use crate::model::RelatedProcessHint;
 
 const DIAGNOSTIC_COMMAND_DISPLAY_MAX_CHARS: usize = 240;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const RELATED_PROCESS_COMMAND_READS_MAX: usize = 64;
 
 /// Pull a single, unambiguous port to diagnose out of the CLI list filters.
@@ -189,8 +189,8 @@ fn is_socket_port_terminator(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        RELATED_PROCESS_COMMAND_READS_MAX, command_mentions_port, command_tokens_mention_port,
-        diagnostic_message, requested_diagnostic_port,
+        command_mentions_port, command_tokens_mention_port, diagnostic_message,
+        requested_diagnostic_port,
     };
     use crate::model::RelatedProcessHint;
 
@@ -227,11 +227,6 @@ mod tests {
         assert!(!command_mentions_port("IMPORTANT=3000 node", 3000));
         assert!(!command_mentions_port("worker duration:3000ms", 3000));
         assert!(!command_mentions_port("worker host:3000abc", 3000));
-    }
-
-    #[test]
-    fn related_process_scan_has_a_fixed_command_read_budget() {
-        assert_eq!(RELATED_PROCESS_COMMAND_READS_MAX, 64);
     }
 
     #[test]

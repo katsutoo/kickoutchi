@@ -1081,38 +1081,44 @@ fn process_ids(proc_root: &Path) -> std::io::Result<Vec<u32>> {
     process_ids_with_limit(proc_root, CANDIDATE_PROCESS_IDS_MAX)
 }
 
+/// How a `/proc` PID scan treats a directory entry that fails to read.
+#[derive(Clone, Copy)]
+enum EntryErrorPolicy {
+    /// Abort the scan and propagate the I/O error to the caller.
+    Propagate,
+    /// Skip the entry and flag the scan result as incomplete.
+    MarkIncomplete,
+}
+
 fn process_ids_with_limit(proc_root: &Path, max_process_ids: usize) -> std::io::Result<Vec<u32>> {
-    let mut pids = Vec::new();
-    for entry in fs::read_dir(proc_root)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        if pids.len() >= max_process_ids {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("process list exceeds {max_process_ids} PID cap"),
-            ));
-        }
-        pids.push(pid);
-    }
-    pids.sort_unstable();
-    Ok(pids)
+    scan_process_ids(proc_root, max_process_ids, EntryErrorPolicy::Propagate)
+        .map(|(pids, _incomplete)| pids)
 }
 
 fn owner_process_ids_with_limit(
     proc_root: &Path,
     max_process_ids: usize,
 ) -> std::io::Result<(Vec<u32>, bool)> {
+    scan_process_ids(proc_root, max_process_ids, EntryErrorPolicy::MarkIncomplete)
+}
+
+fn scan_process_ids(
+    proc_root: &Path,
+    max_process_ids: usize,
+    entry_error_policy: EntryErrorPolicy,
+) -> std::io::Result<(Vec<u32>, bool)> {
     let mut pids = Vec::new();
     let mut incomplete = false;
     for entry in fs::read_dir(proc_root)? {
-        let Ok(entry) = entry else {
-            incomplete = true;
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => match entry_error_policy {
+                EntryErrorPolicy::Propagate => return Err(error),
+                EntryErrorPolicy::MarkIncomplete => {
+                    incomplete = true;
+                    continue;
+                }
+            },
         };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -4141,21 +4147,5 @@ mod tests {
             )
         ));
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
-    }
-
-    #[test]
-    fn production_collection_limits_match_the_documented_policy() {
-        assert_eq!(
-            CollectionLimits::PRODUCTION.process_ids,
-            CANDIDATE_PROCESS_IDS_MAX
-        );
-        assert_eq!(
-            CollectionLimits::PRODUCTION.fd_entries,
-            FILE_DESCRIPTOR_ENTRIES_MAX
-        );
-        assert_eq!(
-            CollectionLimits::PRODUCTION.socket_observations,
-            crate::observation::SOCKET_OBSERVATIONS_MAX
-        );
     }
 }

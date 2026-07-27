@@ -688,27 +688,26 @@ label = "web"
     }
 
     #[test]
-    fn deprecated_update_check_true_is_accepted_and_ignored() {
-        let config = parse("check_for_updates = true").expect("deprecated bool remains accepted");
+    fn deprecated_update_check_bool_is_accepted_and_ignored() {
+        for input in ["check_for_updates = true", "check_for_updates = false"] {
+            let config = parse(input).expect("deprecated bool remains accepted");
 
-        assert_eq!(config.refresh_interval, Config::default().refresh_interval);
-        assert_eq!(config.default_sort, Config::default().default_sort);
-        assert_eq!(
-            config.protected_processes,
-            Config::default().protected_processes
-        );
-    }
-
-    #[test]
-    fn deprecated_update_check_false_is_accepted_and_ignored() {
-        let config = parse("check_for_updates = false").expect("deprecated bool remains accepted");
-
-        assert_eq!(config.refresh_interval, Config::default().refresh_interval);
-        assert_eq!(config.default_sort, Config::default().default_sort);
-        assert_eq!(
-            config.protected_processes,
-            Config::default().protected_processes
-        );
+            assert_eq!(
+                config.refresh_interval,
+                Config::default().refresh_interval,
+                "input: {input}"
+            );
+            assert_eq!(
+                config.default_sort,
+                Config::default().default_sort,
+                "input: {input}"
+            );
+            assert_eq!(
+                config.protected_processes,
+                Config::default().protected_processes,
+                "input: {input}"
+            );
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::observation::{
     SocketObservation, SocketState, TcpTimerKind, TcpTimerObservation, UnverifiedOwnerReason,
     compare_endpoint_identity,
 };
-use crate::watch::Certainty;
+use crate::watch::{Certainty, owner_completeness_rank};
 
 const SNAPSHOT_SCHEMA: &str = "kickoutchi.snapshot";
 const SNAPSHOT_VERSION: u32 = 1;
@@ -503,7 +503,7 @@ struct ProcessDto<'a> {
 struct SocketIndex {
     source_index: usize,
     owner_indices: Vec<usize>,
-    owner_completeness: &'static str,
+    owner_completeness_rank: u8,
     owner_reasons: Vec<&'static str>,
     omitted_owner_count: u64,
 }
@@ -521,15 +521,14 @@ impl SocketIndex {
             compare_owner_observation(&socket.owners[left], &socket.owners[right])
         });
         owner_indices.truncate(SERIALIZED_OWNERS_MAX);
-        let (owner_completeness, owner_reasons) =
-            owner_completeness_parts(&socket.owner_completeness)?;
+        let (_, owner_reasons) = owner_completeness_parts(&socket.owner_completeness)?;
         let omitted_owner_count =
             u64::try_from(socket.owners.len().saturating_sub(owner_indices.len()))
                 .map_err(|_| PublicOutputError::CountOutOfRange)?;
         Ok(Self {
             source_index,
             owner_indices,
-            owner_completeness,
+            owner_completeness_rank: owner_completeness_rank(&socket.owner_completeness),
             owner_reasons,
             omitted_owner_count,
         })
@@ -838,8 +837,8 @@ fn compare_owner_indices(
     right_socket: &SocketObservation,
     right: &SocketIndex,
 ) -> Ordering {
-    owner_completeness_order(left.owner_completeness)
-        .cmp(&owner_completeness_order(right.owner_completeness))
+    left.owner_completeness_rank
+        .cmp(&right.owner_completeness_rank)
         .then_with(|| left.owner_reasons.cmp(&right.owner_reasons))
         .then_with(|| left.omitted_owner_count.cmp(&right.omitted_owner_count))
         .then_with(|| {
@@ -1066,15 +1065,6 @@ const fn metadata_completeness_name(completeness: MetadataCompleteness) -> &'sta
     match completeness {
         MetadataCompleteness::Complete => "complete",
         MetadataCompleteness::Partial => "partial",
-    }
-}
-
-fn owner_completeness_order(name: &str) -> u8 {
-    match name {
-        "complete" => 0,
-        "partial" => 1,
-        "raced" => 2,
-        _ => unreachable!("owner completeness names are closed"),
     }
 }
 

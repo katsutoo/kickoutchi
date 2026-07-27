@@ -1085,21 +1085,14 @@ fn host_addr_matches(row_addr: IpAddr, docker_addr: Option<IpAddr>) -> bool {
     let Some(docker_addr) = docker_addr else {
         return true;
     };
-    let row_addr = normalize_addr(row_addr);
-    let docker_addr = normalize_addr(docker_addr);
+    let row_addr = crate::labels::normalize_ip_address(row_addr);
+    let docker_addr = crate::labels::normalize_ip_address(docker_addr);
     let same_family = matches!(
         (row_addr, docker_addr),
         (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
     );
     same_family
         && (row_addr == docker_addr || row_addr.is_unspecified() || docker_addr.is_unspecified())
-}
-
-fn normalize_addr(addr: IpAddr) -> IpAddr {
-    match addr {
-        IpAddr::V4(addr) => IpAddr::V4(addr),
-        IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or(IpAddr::V6(addr), IpAddr::V4),
-    }
 }
 
 fn protocol_filter(protocol: Protocol) -> &'static str {
@@ -1409,11 +1402,16 @@ mod tests {
     #[test]
     fn docker_command_removes_ambient_remote_selectors_and_pins_local_host() {
         TEST_ELEVATION_OVERRIDE.with(|override_value| override_value.set(Some(false)));
+        // The command-shape assertions live inside the injected runner, so this
+        // flag proves the product actually invoked it; without it the test
+        // would pass vacuously if the runner were never called.
+        let runner_invoked = std::cell::Cell::new(false);
         let output = docker_container_ls_with_host_and_runner(
             8080,
             Protocol::Tcp,
             Some("ssh://builder.example"),
             |command| {
+                runner_invoked.set(true);
                 let arguments = command
                     .get_args()
                     .map(|argument| argument.to_string_lossy().into_owned())
@@ -1451,6 +1449,7 @@ mod tests {
             },
         );
         TEST_ELEVATION_OVERRIDE.with(|override_value| override_value.set(None));
+        assert!(runner_invoked.get(), "the injected runner must be invoked");
         assert!(output.is_none());
     }
 

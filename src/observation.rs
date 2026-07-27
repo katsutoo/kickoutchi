@@ -5,7 +5,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
 use std::net::IpAddr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::Path;
@@ -513,20 +512,6 @@ impl EvidenceGapCode {
             Self::ObservationRaced => "observation_raced",
         }
     }
-
-    const fn name_order(self) -> u8 {
-        match self {
-            Self::NativeFieldUnavailable => 0,
-            Self::NoncriticalEvidenceTruncated => 1,
-            Self::ObservationRaced => 2,
-            Self::OwnerAttributionIncomplete => 3,
-            Self::OwnerDisappeared => 4,
-            Self::OwnerPermissionDenied => 5,
-            Self::ProcessIdentityUnavailable => 6,
-            Self::ProcessMetadataUnavailable => 7,
-            Self::ScopeExcluded => 8,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -651,7 +636,7 @@ impl OwnerCompleteness {
             return Ok(Self::Complete);
         }
         let mut reasons = reasons.into_iter().collect::<Vec<_>>();
-        reasons.sort_unstable_by_key(|reason| reason.name_order());
+        reasons.sort_unstable_by_key(|reason| reason.name());
         Ok(Self::Partial { reasons })
     }
 
@@ -1181,33 +1166,18 @@ pub(crate) trait ObservationSource {
         &mut self,
         profile: MetadataProfile,
     ) -> Result<NativeObservationPass, ObservationError>;
-    fn read_process(
-        &mut self,
-        pid: u32,
-        profile: MetadataProfile,
-        optional_metadata_bytes_remaining: usize,
-    ) -> Result<ProcessRead, ObservationError> {
-        let _ = (pid, profile, optional_metadata_bytes_remaining);
-        Err(ObservationError::NativeDataMalformed)
-    }
     fn read_processes(
         &mut self,
         sorted_pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<BTreeMap<u32, ProcessRead>, ObservationError> {
-        let mut reads = BTreeMap::new();
-        let mut retained_bytes = 0usize;
-        for &pid in sorted_pids {
-            let remaining = optional_metadata_bytes_remaining.saturating_sub(retained_bytes);
-            let read = self.read_process(pid, profile, remaining)?;
-            retained_bytes = retained_bytes.saturating_add(process_read_metadata_bytes(&read));
-            reads.insert(pid, read);
-        }
-        Ok(reads)
-    }
+    ) -> Result<BTreeMap<u32, ProcessRead>, ObservationError>;
 }
 
+// The sequential metadata-budget reader is the Linux/macOS collection path;
+// Windows accounts for its budget inside its own snapshot reader. Tests on
+// every platform drive the fake source through this accounting.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) fn process_read_metadata_bytes(read: &ProcessRead) -> usize {
     let ProcessRead::Verified { observation, .. } = read else {
         return 0;
@@ -2217,54 +2187,24 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-pub(crate) fn lossy_utf8_len(mut bytes: &[u8]) -> Option<usize> {
+pub(crate) fn lossy_utf8_len(bytes: &[u8]) -> Option<usize> {
     let mut len = 0usize;
-    while !bytes.is_empty() {
-        match std::str::from_utf8(bytes) {
-            Ok(valid) => return len.checked_add(valid.len()),
-            Err(error) => {
-                len = len
-                    .checked_add(error.valid_up_to())?
-                    .checked_add('�'.len_utf8())?;
-                let Some(error_len) = error.error_len() else {
-                    return Some(len);
-                };
-                let consumed = error.valid_up_to().checked_add(error_len)?;
-                bytes = bytes.get(consumed..)?;
-            }
+    for chunk in bytes.utf8_chunks() {
+        len = len.checked_add(chunk.valid().len())?;
+        if !chunk.invalid().is_empty() {
+            len = len.checked_add('�'.len_utf8())?;
         }
     }
     Some(len)
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-pub(crate) fn push_utf8_lossy(output: &mut String, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        match std::str::from_utf8(bytes) {
-            Ok(valid) => {
-                output.push_str(valid);
-                return;
-            }
-            Err(error) => {
-                let valid = &bytes[..error.valid_up_to()];
-                output.push_str(unsafe {
-                    // SAFETY: `valid_up_to` guarantees this prefix is valid UTF-8.
-                    std::str::from_utf8_unchecked(valid)
-                });
-                output.push('�');
-                let Some(error_len) = error.error_len() else {
-                    return;
-                };
-                let consumed = error.valid_up_to() + error_len;
-                bytes = &bytes[consumed..];
-            }
+pub(crate) fn push_utf8_lossy(output: &mut String, bytes: &[u8]) {
+    for chunk in bytes.utf8_chunks() {
+        output.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            output.push('�');
         }
-    }
-}
-
-impl fmt::Display for MetadataProfile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
     }
 }
 
@@ -2373,6 +2313,25 @@ mod tests {
                 step => Ok(step),
             }
         }
+
+        fn read_process(
+            &mut self,
+            pid: u32,
+            profile: MetadataProfile,
+            optional_metadata_bytes_remaining: usize,
+        ) -> Result<ProcessRead, ObservationError> {
+            self.calls.push(format!("process:{pid}:{profile:?}"));
+            self.process_budgets
+                .push((pid, optional_metadata_bytes_remaining));
+            match self.next()? {
+                Step::Process(expected_pid, expected_profile, read) => {
+                    assert_eq!(pid, expected_pid);
+                    assert_eq!(profile, expected_profile);
+                    Ok(read)
+                }
+                step => panic!("expected process, got {step:?}"),
+            }
+        }
     }
 
     impl ObservationSource for FakeSource {
@@ -2399,25 +2358,6 @@ mod tests {
                 step => panic!("expected owners, got {step:?}"),
             };
             Ok(NativeObservationPass { sockets, owners })
-        }
-
-        fn read_process(
-            &mut self,
-            pid: u32,
-            profile: MetadataProfile,
-            optional_metadata_bytes_remaining: usize,
-        ) -> Result<ProcessRead, ObservationError> {
-            self.calls.push(format!("process:{pid}:{profile}"));
-            self.process_budgets
-                .push((pid, optional_metadata_bytes_remaining));
-            match self.next()? {
-                Step::Process(expected_pid, expected_profile, read) => {
-                    assert_eq!(pid, expected_pid);
-                    assert_eq!(profile, expected_profile);
-                    Ok(read)
-                }
-                step => panic!("expected process, got {step:?}"),
-            }
         }
 
         fn read_processes(
@@ -2706,12 +2646,16 @@ mod tests {
             assert!(gaps.is_empty());
         }
 
+        // Each over-limit case pins exactly which field the budget must drop,
+        // as a literal expectation rather than re-deriving it from the limits.
         let over_cases = [
-            (PROCESS_NAME_MAX_BYTES + 1, 0, 0),
-            (0, EXECUTABLE_PATH_MAX_BYTES + 1, 0),
-            (0, 0, PROCESS_COMMAND_LINE_MAX_BYTES + 1),
+            (PROCESS_NAME_MAX_BYTES + 1, 0, 0, true, false, false),
+            (0, EXECUTABLE_PATH_MAX_BYTES + 1, 0, false, true, false),
+            (0, 0, PROCESS_COMMAND_LINE_MAX_BYTES + 1, false, false, true),
         ];
-        for (name_bytes, path_bytes, command_bytes) in over_cases {
+        for (name_bytes, path_bytes, command_bytes, name_dropped, path_dropped, command_dropped) in
+            over_cases
+        {
             let mut processes = HashMap::from([(
                 identity(),
                 ProcessObservation {
@@ -2733,15 +2677,9 @@ mod tests {
                 ObservationLimits::PRODUCTION,
             );
             let process = processes.get(&identity()).unwrap();
-            assert_eq!(process.name.is_none(), name_bytes > PROCESS_NAME_MAX_BYTES);
-            assert_eq!(
-                process.executable_path.is_none(),
-                path_bytes > EXECUTABLE_PATH_MAX_BYTES
-            );
-            assert_eq!(
-                process.command_line.is_none(),
-                command_bytes > PROCESS_COMMAND_LINE_MAX_BYTES
-            );
+            assert_eq!(process.name.is_none(), name_dropped);
+            assert_eq!(process.executable_path.is_none(), path_dropped);
+            assert_eq!(process.command_line.is_none(), command_dropped);
             assert_eq!(process.metadata_completeness, MetadataCompleteness::Partial);
             assert_eq!(gaps.len(), 1);
         }
@@ -3836,7 +3774,7 @@ mod tests {
         process.executable_path = Some(Arc::from(Path::new("/usr/bin/process")));
         process.command_line = Some(Arc::from("process --serve"));
         process.parent_process_name = Some(Arc::from("parent"));
-        let mut projected = project_legacy_with_limit(&snapshot, 2, None, None)
+        let projected = project_legacy_with_limit(&snapshot, 2, None, None)
             .expect("exact projection maximum is accepted");
         assert_eq!(projected.len(), 2);
         for entry in &projected {
@@ -3849,8 +3787,6 @@ mod tests {
             assert_eq!(entry.parent_process_name.as_deref(), Some("parent"));
             assert!(!entry.protected);
         }
-        projected[0].protected = true;
-        assert!(!projected[1].protected);
         assert_eq!(
             project_legacy_with_limit(&snapshot, 1, None, None),
             Err(ObservationError::LegacyProjectionLimitExceeded)

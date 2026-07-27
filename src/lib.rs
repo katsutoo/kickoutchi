@@ -23,7 +23,6 @@ mod input;
 mod labels;
 // The read-only family inspection view. It renders data from the process-tree
 // snapshot; Windows omits POSIX process-group sections.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod inspect;
 mod model;
 mod observation;
@@ -37,7 +36,6 @@ mod public_output;
 mod query;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod tree;
 mod ui;
 mod watch;

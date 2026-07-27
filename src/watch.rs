@@ -43,10 +43,8 @@ impl EventKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Certainty {
     Proven,
-    #[allow(dead_code, reason = "reserved by the frozen evidence vocabulary")]
     Estimated,
     Heuristic,
-    #[allow(dead_code, reason = "collection gaps carry unknown certainty")]
     Unknown,
 }
 
@@ -671,7 +669,9 @@ fn compare_event_owner_sets(left: WatchEvent<'_>, right: WatchEvent<'_>) -> Orde
     }
 }
 
-const fn owner_completeness_rank(completeness: &OwnerCompleteness) -> u8 {
+/// Snapshot and watch outputs share one owner-completeness ordering:
+/// complete before partial before raced.
+pub(crate) const fn owner_completeness_rank(completeness: &OwnerCompleteness) -> u8 {
     match completeness {
         OwnerCompleteness::Complete => 0,
         OwnerCompleteness::Partial { .. } => 1,

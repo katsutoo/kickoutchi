@@ -471,6 +471,23 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
     WindowsTreeKillOutcome::Completed(Box::new(report))
 }
 
+/// The refusal for a protected process name found on `pid`: the root and a
+/// descendant refuse through distinct outcomes so the caller can phrase the
+/// re-confirmation prompt for the right process.
+fn protected_outcome(pid: u32, root_pid: u32, name: &str) -> WindowsTreeKillOutcome {
+    if pid == root_pid {
+        WindowsTreeKillOutcome::ProtectedRoot {
+            pid,
+            name: Some(name.to_owned()),
+        }
+    } else {
+        WindowsTreeKillOutcome::ProtectedDescendant {
+            pid,
+            name: Some(name.to_owned()),
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -529,19 +546,8 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
             return Err(WindowsTreeKillOutcome::TargetChanged { pid });
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = members.entry(pid) {
-            let process =
-                open_verified_process(api, info, marker).map_err(|error| match error {
-                    OpenVerifiedError::NotFound => WindowsTreeKillOutcome::TargetChanged { pid },
-                    OpenVerifiedError::PermissionDenied => {
-                        WindowsTreeKillOutcome::PermissionDenied { pid }
-                    }
-                    OpenVerifiedError::PartialMetadata => {
-                        WindowsTreeKillOutcome::PartialMetadata { pid }
-                    }
-                    OpenVerifiedError::Other(error) => {
-                        WindowsTreeKillOutcome::SnapshotFailed(error)
-                    }
-                })?;
+            let process = open_verified_process(api, info, marker)
+                .map_err(|error| open_error_outcome(pid, error))?;
             entry.insert(process);
         }
         let process = members
@@ -579,33 +585,13 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
         if !old_name.is_empty() && old_name != process.verified_name {
             report.termination_state.withhold();
             if protected {
-                return Err(if pid == root_pid {
-                    WindowsTreeKillOutcome::ProtectedRoot {
-                        pid,
-                        name: Some(process.verified_name.clone()),
-                    }
-                } else {
-                    WindowsTreeKillOutcome::ProtectedDescendant {
-                        pid,
-                        name: Some(process.verified_name.clone()),
-                    }
-                });
+                return Err(protected_outcome(pid, root_pid, &process.verified_name));
             }
             return Err(WindowsTreeKillOutcome::TargetChanged { pid });
         }
         if protected && (pid != root_pid || !protected_root_confirmed) {
             report.termination_state.withhold();
-            return Err(if pid == root_pid {
-                WindowsTreeKillOutcome::ProtectedRoot {
-                    pid,
-                    name: Some(process.verified_name.clone()),
-                }
-            } else {
-                WindowsTreeKillOutcome::ProtectedDescendant {
-                    pid,
-                    name: Some(process.verified_name.clone()),
-                }
-            });
+            return Err(protected_outcome(pid, root_pid, &process.verified_name));
         }
         if prompt_skipped
             && (crate::model::SystemProcessCheck {
@@ -885,19 +871,8 @@ fn pin_preview_members<Api: WindowsTreeApi>(
             info.start_time_marker
                 .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid })?
         };
-        let process =
-            open_verified_process(api, info, expected_marker).map_err(|error| match error {
-                OpenVerifiedError::NotFound => {
-                    WindowsTreeKillOutcome::TargetChanged { pid: info.pid }
-                }
-                OpenVerifiedError::PermissionDenied => {
-                    WindowsTreeKillOutcome::PermissionDenied { pid: info.pid }
-                }
-                OpenVerifiedError::PartialMetadata => {
-                    WindowsTreeKillOutcome::PartialMetadata { pid: info.pid }
-                }
-                OpenVerifiedError::Other(error) => WindowsTreeKillOutcome::SnapshotFailed(error),
-            })?;
+        let process = open_verified_process(api, info, expected_marker)
+            .map_err(|error| open_error_outcome(info.pid, error))?;
         members.insert(info.pid, process);
     }
 
@@ -1165,20 +1140,13 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                     report.already_exited_pids.push(info.pid);
                     continue;
                 }
-                Err(OpenVerifiedError::PermissionDenied) => {
-                    report.not_terminated.push(info.pid);
-                    return Err(WindowsTreeKillOutcome::PermissionDenied { pid: info.pid });
-                }
-                Err(OpenVerifiedError::PartialMetadata) => {
-                    report.not_terminated.push(info.pid);
-                    return Err(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid });
-                }
-                // An unexpected OS error is not a permission problem; report
-                // it as what it is so the user-facing outcome matches
+                // Any other open failure aborts the sweep: record the PID as
+                // not terminated and map the error exactly as the pinning
+                // paths do, so the user-facing outcome matches
                 // `pin_preview_members` for the same failure.
-                Err(OpenVerifiedError::Other(error)) => {
+                Err(error) => {
                     report.not_terminated.push(info.pid);
-                    return Err(WindowsTreeKillOutcome::SnapshotFailed(error));
+                    return Err(open_error_outcome(info.pid, error));
                 }
             };
             let expected = ExpectedProcessEvidence {
@@ -1503,6 +1471,18 @@ enum OpenVerifiedError {
     PermissionDenied,
     PartialMetadata,
     Other(String),
+}
+
+/// Map an [`open_verified_process`] failure on `pid` to the user-facing
+/// outcome. Every open site shares this mapping so the same OS failure can
+/// never surface as different outcomes depending on which phase observed it.
+fn open_error_outcome(pid: u32, error: OpenVerifiedError) -> WindowsTreeKillOutcome {
+    match error {
+        OpenVerifiedError::NotFound => WindowsTreeKillOutcome::TargetChanged { pid },
+        OpenVerifiedError::PermissionDenied => WindowsTreeKillOutcome::PermissionDenied { pid },
+        OpenVerifiedError::PartialMetadata => WindowsTreeKillOutcome::PartialMetadata { pid },
+        OpenVerifiedError::Other(error) => WindowsTreeKillOutcome::SnapshotFailed(error),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

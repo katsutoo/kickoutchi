@@ -655,17 +655,7 @@ where
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
         let root =
             revalidate_portless_tree_root(confirmed, &snapshot, &config.protected_processes)?;
-        let preview = tree::plan_process_tree(
-            root.pid,
-            &snapshot,
-            &config.protected_processes,
-            root.platform,
-            tree::MAX_TREE_PROCESSES,
-        )
-        .map_err(tree::plan_error_outcome)?;
-        tree::preflight_outcome(&preview)?;
-        tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
-        fresh_tree_yes_outcome(&root, &preview, confirmation)?;
+        fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
     } else {
         let root = revalidate_cli_target(args, config, confirmed, collect_context, collect_ports)
@@ -674,20 +664,33 @@ where
         let snapshot = ops
             .snapshot()
             .map_err(tree::TreeKillOutcome::SnapshotFailed)?;
-        let preview = tree::plan_process_tree(
-            root.pid,
-            &snapshot,
-            &config.protected_processes,
-            root.platform,
-            tree::MAX_TREE_PROCESSES,
-        )
-        .map_err(tree::plan_error_outcome)?;
-        tree::preflight_outcome(&preview)?;
-        tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
-        fresh_tree_yes_outcome(&root, &preview, confirmation)?;
+        fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
     };
     Ok(fresh_root)
+}
+
+/// The fresh-scan gates for a freeze-first tree kill: the plan must still
+/// build, and the pre-flight, root-protection, and `--yes`-skip rules must
+/// re-pass against the fresh snapshot.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fresh_tree_gates(
+    root: &KillTarget,
+    snapshot: &[tree::TreeProcessInfo],
+    config: &Config,
+    confirmation: ScopedConfirmationFacts,
+) -> Result<(), tree::TreeKillOutcome> {
+    let preview = tree::plan_process_tree(
+        root.pid,
+        snapshot,
+        &config.protected_processes,
+        root.platform,
+        tree::MAX_TREE_PROCESSES,
+    )
+    .map_err(tree::plan_error_outcome)?;
+    tree::preflight_outcome(&preview)?;
+    tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
+    fresh_tree_yes_outcome(root, &preview, confirmation)
 }
 
 fn fresh_tree_yes_outcome(
@@ -2977,34 +2980,6 @@ mod tests {
                 owner_uid: None,
                 process_group: None,
             },
-        ];
-        let mut ops = RecordingTreeOps::new(vec![clean, warned]);
-
-        let reason = run_tree_kill_with(
-            &kill_pid_tree_yes(18_422),
-            &Config::default(),
-            &[],
-            KillMode::Terminate,
-            &mut ops,
-            TreeKillSeams {
-                collect_context: no_context,
-                prompt: panic_tree_prompt,
-                collect_kill_ports: || panic!("portless tree root must not re-collect ports"),
-                collect_ports: || panic!("portless tree root must not re-collect ports"),
-            },
-        );
-
-        assert_eq!(reason, ExitReason::Failure);
-        assert!(ops.stops.is_empty(), "refusal must precede any stop");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn fresh_tree_owner_warning_after_yes_skip_refuses_before_any_stop() {
-        let clean = vec![tree_info(18_422, Some(500), "node")];
-        let warned = vec![
-            tree_info(18_422, Some(500), "node"),
-            tree_info_owned_by_other_uid(18_423, Some(18_422), "worker"),
         ];
         let mut ops = RecordingTreeOps::new(vec![clean, warned]);
 

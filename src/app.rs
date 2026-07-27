@@ -30,7 +30,6 @@ use crate::query::{self, FILTER_TEXT_MAX_BYTES, QueryOptions};
 use crate::tree;
 
 type RefreshResult = Result<crate::observation::NetworkSnapshot, collector::CollectorError>;
-type ContextResult = ProcessContext;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 type TreePreviewResult = Result<tree::ProcessTreeTarget, String>;
 
@@ -50,7 +49,7 @@ enum PendingRefresh {
 #[derive(Debug)]
 struct ContextWorker {
     key: RowKey,
-    receiver: Receiver<Result<ContextResult, crate::ui::WorkerFailure>>,
+    receiver: Receiver<Result<ProcessContext, crate::ui::WorkerFailure>>,
     stale: bool,
 }
 
@@ -411,7 +410,7 @@ impl App {
         if !stale {
             let updated_target = worker_key
                 .pid
-                .and_then(|pid| self.kill_target_with_context(pid, &result));
+                .and_then(|pid| self.kill_target_with_optional_context(pid, Some(&result)));
 
             if self.selected_row().map(RowKey::from) == Some(worker_key) {
                 self.selected_context_key = Some(worker_key);
@@ -731,21 +730,21 @@ impl App {
         }
     }
 
-    fn request_kill(&mut self, mode: KillMode) {
-        self.search_mode = false;
-        self.kill_status = None;
-
+    /// Resolve the selected row into a kill target, or set `kill_status` with
+    /// the refusal and return `None`. Shared by the single-process and
+    /// tree-kill request paths so their refusal messages stay identical.
+    fn resolve_selected_kill_target(&mut self) -> Option<KillTarget> {
         let Some(entry) = self.selected_row() else {
             self.kill_status = Some("no selected process to terminate".to_owned());
-            return;
+            return None;
         };
         let Some(pid) = entry.pid else {
             self.kill_status = Some("selected row has no PID; cannot terminate".to_owned());
-            return;
+            return None;
         };
         if let Some(reason) = process::unsafe_pid_reason(pid) {
             self.kill_status = Some(format!("unsafe PID blocked: {}", reason.message()));
-            return;
+            return None;
         }
         let context = self.selected_process_context().cloned();
         if context.is_none() {
@@ -755,6 +754,16 @@ impl App {
         let target = self
             .kill_target_with_optional_context(pid, context.as_ref())
             .expect("the selected PID has at least one row");
+        Some(target)
+    }
+
+    fn request_kill(&mut self, mode: KillMode) {
+        self.search_mode = false;
+        self.kill_status = None;
+
+        let Some(target) = self.resolve_selected_kill_target() else {
+            return;
+        };
         // `yes` is always false here: the interactive TUI has no `--yes`, so the
         // shared policy can only ever hand back `Some(_)` (a confirmation to
         // satisfy). The `None` arm is the CLI's `--yes` "skip confirmation" path
@@ -763,7 +772,6 @@ impl App {
         // never "kills without asking".
         let requirement = match process::confirmation_requirement(
             target.protected,
-            target.platform,
             mode,
             false,
             self.force_kill_confirmation.confirm_force_kill(),
@@ -914,28 +922,11 @@ impl App {
             return;
         }
 
-        let Some(entry) = self.selected_row() else {
-            self.kill_status = Some("no selected process to terminate".to_owned());
+        let Some(target) = self.resolve_selected_kill_target() else {
             return;
         };
-        let Some(pid) = entry.pid else {
-            self.kill_status = Some("selected row has no PID; cannot terminate".to_owned());
-            return;
-        };
-        if let Some(reason) = process::unsafe_pid_reason(pid) {
-            self.kill_status = Some(format!("unsafe PID blocked: {}", reason.message()));
-            return;
-        }
-        let platform = entry.platform;
-
-        let context = self.selected_process_context().cloned();
-        if context.is_none() {
-            self.load_selected_process_context();
-        }
-
-        let target = self
-            .kill_target_with_optional_context(pid, context.as_ref())
-            .expect("the selected PID has at least one row");
+        let pid = target.pid;
+        let platform = target.platform;
 
         self.tree_confirmation = Some(TreeKillConfirmation::new(target, mode));
         self.modal = Modal::ConfirmTreeKill;
@@ -1172,7 +1163,7 @@ impl App {
         let mut ops = host_tree_ops();
         self.execute_tree_kill_confirmation_with(
             || collector::collect_kill_ports(Some(pid), None),
-            || collector::collect_target_ports(Some(pid), None),
+            || collector::collect_target_ports(pid),
             platform::collect_process_context,
             &mut ops,
         );
@@ -1606,10 +1597,6 @@ impl App {
         self.load_selected_process_context();
     }
 
-    fn kill_target_with_context(&self, pid: u32, context: &ProcessContext) -> Option<KillTarget> {
-        self.kill_target_with_optional_context(pid, Some(context))
-    }
-
     fn kill_target_with_optional_context(
         &self,
         pid: u32,
@@ -1620,7 +1607,7 @@ impl App {
             .filter(|row| row.pid == Some(pid))
             .peekable();
         rows.peek()?;
-        Some(KillTarget::from_entry_views(pid, rows, context))
+        Some(KillTarget::from_entries(pid, rows, context))
     }
 
     fn apply_context_target_to_confirmations(&mut self, mut target: KillTarget) {
@@ -2655,7 +2642,10 @@ mod tests {
         assert_eq!(fresh_collections, 1);
         assert_eq!(app.pending_refresh, PendingRefresh::None);
         assert!(!app.refresh_in_progress());
-        assert!(app.rows().all(|row| row.local_port != 3000));
+        // The fresh post-kill collection returned zero rows. If the stale
+        // pre-kill snapshot (which still lists port 3000) had been applied,
+        // the table would be non-empty again.
+        assert_eq!(app.rows().len(), 0);
     }
 
     #[test]

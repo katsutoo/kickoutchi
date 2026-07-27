@@ -339,16 +339,12 @@ pub(crate) fn run(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn write_stdout(text: &str) -> Option<ExitReason> {
-    write_stdout_with(|stdout| stdout.write_all(text.as_bytes()))
-}
-
-fn write_stdout_with(
-    write: impl FnOnce(&mut io::StdoutLock<'_>) -> io::Result<()>,
-) -> Option<ExitReason> {
     let mut stdout = io::stdout().lock();
-    match write(&mut stdout).and_then(|()| stdout.flush()) {
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
         Ok(()) => None,
         Err(error) if error.kind() == ErrorKind::BrokenPipe => Some(ExitReason::Success),
         Err(error) => {

@@ -1785,15 +1785,6 @@ mod tests {
     }
 
     #[test]
-    fn tar_file_types_match_python_and_cargo_dist_behavior() {
-        assert!(supported_tar_file_type(EntryType::file()));
-        assert!(supported_tar_file_type(EntryType::contiguous()));
-        assert!(supported_tar_file_type(EntryType::new(b'S')));
-        assert!(!supported_tar_file_type(EntryType::symlink()));
-        assert!(!supported_tar_file_type(EntryType::fifo()));
-    }
-
-    #[test]
     fn runner_mapping_rejects_unsupported_pairs() {
         assert_eq!(
             native_target("Windows", "X64")

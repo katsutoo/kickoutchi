@@ -1068,7 +1068,7 @@ mod tests {
         CUSTOM_SIGNAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn render_frame(app: &mut App, width: u16, height: u16) -> String {
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend must initialize");
         terminal
@@ -1085,10 +1085,6 @@ mod tests {
             text.push('\n');
         }
         text
-    }
-
-    fn render_text(app: &mut App, width: u16, height: u16) -> String {
-        render_frame(app, width, height)
     }
 
     #[test]

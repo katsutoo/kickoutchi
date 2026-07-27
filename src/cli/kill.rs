@@ -105,7 +105,6 @@ where
 
     let requirement = match process::confirmation_requirement(
         target.protected,
-        target.platform,
         mode,
         args.yes,
         config.confirm_force_kill,
@@ -568,12 +567,14 @@ pub(super) fn read_confirmation_line(max_bytes: usize) -> std::io::Result<String
 }
 
 fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<String> {
+    // `usize` is at most 64 bits on every supported target, so widening to the
+    // `u64` `Take` limit is lossless; the sole production limit is the small
+    // constant `CONFIRMATION_INPUT_MAX_BYTES`, so the two bytes of headroom
+    // for a trailing "\r\n" cannot overflow either — `saturating_add` only
+    // guards the theoretical `usize::MAX` limit.
     let limit = u64::try_from(max_bytes)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large"))?
-        .checked_add(2)
-        .ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidInput, "confirmation limit is too large")
-        })?;
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
     let mut bytes = Vec::with_capacity(max_bytes.saturating_add(2));
     (&mut *reader).take(limit).read_until(b'\n', &mut bytes)?;
 
@@ -660,9 +661,9 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX,
-        POST_KILL_VISIBILITY_PROFILE, PostKillPortsStatus, read_confirmation_line_from,
-        resolve_kill_target, run_kill_with, wait_for_confirmed_ports_to_clear,
+        KillCollectors, KillTargetError, POST_KILL_SETTLE_ATTEMPTS_MAX, PostKillPortsStatus,
+        read_confirmation_line_from, resolve_kill_target, run_kill_with,
+        wait_for_confirmed_ports_to_clear,
     };
     use crate::cli::test_support::{entry, entry_with_pid, no_context};
     use crate::cli::{ExitReason, KillArgs};
@@ -739,11 +740,6 @@ mod tests {
             ));
         }
         snapshot
-    }
-
-    #[test]
-    fn post_kill_collection_uses_the_identity_only_profile() {
-        assert_eq!(POST_KILL_VISIBILITY_PROFILE, MetadataProfile::IdentityOnly);
     }
 
     #[test]
@@ -1048,6 +1044,7 @@ mod tests {
     fn target_losing_readable_pid_during_revalidation_exits_permission_denied() {
         let rows = vec![entry(3000)];
         let snapshot = permission_denied_owner_snapshot();
+        let mut prepared = false;
         let mut terminated = false;
 
         let reason = run_kill_with(
@@ -1060,7 +1057,10 @@ mod tests {
                 collect_visibility_ports: || Ok(Vec::new()),
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            Ok::<u32, TerminationOutcome>,
+            |pid| {
+                prepared = true;
+                Ok::<u32, TerminationOutcome>(pid)
+            },
             |_pid: &u32, _target, _protected, _mode| {
                 terminated = true;
                 TerminationOutcome::Success
@@ -1068,6 +1068,9 @@ mod tests {
         );
 
         assert_eq!(reason, ExitReason::PermissionDenied);
+        // The denial surfaces during post-prepare revalidation: the handle was
+        // already prepared, but no signal may be delivered through it.
+        assert!(prepared);
         assert!(!terminated);
     }
 
@@ -1142,38 +1145,6 @@ mod tests {
 
         assert_eq!(reason, ExitReason::Failure);
         assert!(!terminated);
-    }
-
-    #[test]
-    fn port_global_authority_denial_exits_four_after_prepare_without_delivery() {
-        let rows = vec![entry(3000)];
-        let snapshot = permission_denied_owner_snapshot();
-        let mut prepared = false;
-        let mut delivered = false;
-
-        let reason = run_kill_with(
-            &kill_port(3000, false, true),
-            &Config::default(),
-            &entry_views(&rows),
-            KillCollectors {
-                collect_context: no_context,
-                collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
-                collect_visibility_ports: || Ok(Vec::new()),
-            },
-            |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            |_pid| {
-                prepared = true;
-                Ok::<u32, TerminationOutcome>(18_422)
-            },
-            |_handle: &u32, _target, _protected, _mode| {
-                delivered = true;
-                TerminationOutcome::Success
-            },
-        );
-
-        assert_eq!(reason, ExitReason::PermissionDenied);
-        assert!(prepared);
-        assert!(!delivered);
     }
 
     #[test]

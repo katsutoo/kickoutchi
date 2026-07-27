@@ -15,9 +15,9 @@ use crate::process::ConfirmationRequirement;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::tree_scope_warning_text;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::wrapped_rows;
 use super::{field, theme::Theme};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::{rendered_rows, wrapped_rows};
 
 /// Ceiling on the node preview inside the tree confirmation modal. The actual
 /// number of preview rows is budgeted per render from the modal height, so the
@@ -97,8 +97,12 @@ fn tree_confirmation_lines(
     content_rows: usize,
     content_cols: usize,
 ) -> Option<Vec<Line<'static>>> {
-    let preview_budget = tree_preview_budget(confirmation, content_rows, content_cols)?;
-    let mut lines = vec![
+    // Every mandatory line is built exactly once, then measured to compute the
+    // preview budget. Measuring the rendered lines themselves — rather than
+    // re-typed copies of their prose — is what guarantees the typed-word
+    // instruction, the input echo, and the Esc hint can never fall below the
+    // fold: a confirmation must not accept input it is not showing.
+    let mut head = vec![
         Line::styled(tree_header_text(confirmation), theme.title()),
         field(
             "Ports",
@@ -110,171 +114,121 @@ fn tree_confirmation_lines(
             theme,
         ),
     ];
-
     let preview_ready = confirmation.preview.is_some();
     match &confirmation.preview {
         // The background worker is still walking the process table; the modal
         // must say so instead of showing a count it does not have or accepting
         // a word before the user can review that count.
-        None => lines.push(Line::styled(
+        None => head.push(Line::styled(
             "Enumerating the process tree...",
             theme.muted(),
         )),
-        Some(preview) => {
-            lines.push(field(
-                "Scope",
-                format!("tree ({} processes)", preview.len()),
-                theme,
-            ));
-            for node in preview.preview_nodes(preview_budget) {
-                lines.push(Line::raw(tree_node_text(node)));
-            }
-            if preview_budget > 0 && preview.len() > preview_budget {
-                lines.push(Line::raw(format!(
-                    "  ... and {} more",
-                    preview.len() - preview_budget,
-                )));
-            }
-            if preview.has_system_process() {
-                lines.push(Line::styled(
-                    "Warning: tree includes system/service processes; verify this is safe to terminate.",
-                    theme.warning(),
-                ));
-            }
-            if preview.has_owner_mismatch() {
-                lines.push(Line::styled(
-                    "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
-                    theme.warning(),
-                ));
-            }
-        }
+        Some(preview) => head.push(field(
+            "Scope",
+            format!("tree ({} processes)", preview.len()),
+            theme,
+        )),
     }
 
+    // Everything after the budgeted preview nodes: scoped preview warnings,
+    // mode and target warnings, and the actionable prompt block.
+    let mut tail: Vec<Line<'static>> = Vec::new();
+    if let Some(preview) = &confirmation.preview {
+        if preview.has_system_process() {
+            tail.push(Line::styled(
+                "Warning: tree includes system/service processes; verify this is safe to terminate.",
+                theme.warning(),
+            ));
+        }
+        if preview.has_owner_mismatch() {
+            tail.push(Line::styled(
+                "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
+                theme.warning(),
+            ));
+        }
+    }
     if let Some(warning) = confirmation
         .mode
         .force_warning(confirmation.target.platform)
     {
-        lines.push(Line::styled(format!("Warning: {warning}"), theme.warning()));
+        tail.push(Line::styled(format!("Warning: {warning}"), theme.warning()));
     }
     for warning in confirmation.target.warning_lines() {
-        lines.push(Line::styled(
+        tail.push(Line::styled(
             format!("Warning: {}.", sanitize(&tree_scope_warning_text(&warning))),
             theme.warning(),
         ));
     }
-
-    lines.push(Line::raw(""));
-    lines.push(tree_instruction_line(confirmation, theme));
+    tail.push(Line::raw(""));
+    tail.push(tree_instruction_line(confirmation, theme));
     if preview_ready {
-        lines.push(field("Input", confirmation.input.clone(), theme));
+        tail.push(field("Input", confirmation.input.clone(), theme));
     }
     if let Some(error) = &confirmation.error {
-        lines.push(Line::styled(format!("Error: {error}"), theme.warning()));
+        tail.push(Line::styled(format!("Error: {error}"), theme.warning()));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
+    tail.push(Line::raw(""));
+    tail.push(Line::from(vec![
         Span::styled("Esc", theme.key()),
         Span::raw(" cancels."),
     ]));
 
+    let fixed_rows =
+        rendered_rows(&head, content_cols).saturating_add(rendered_rows(&tail, content_cols));
+    // A modal too small for the mandatory rows must refuse to be actionable
+    // instead of rendering a prompt the user cannot fully review.
+    let preview_rows = content_rows.checked_sub(fixed_rows)?;
+
+    let mut lines = head;
+    if let Some(preview) = &confirmation.preview {
+        let node_lines = preview
+            .preview_nodes(preview.len().min(TREE_MODAL_PREVIEW_MAX))
+            .iter()
+            .map(|node| Line::raw(tree_node_text(node)))
+            .collect::<Vec<_>>();
+        let fitting_nodes =
+            fitting_preview_nodes(&node_lines, preview.len(), preview_rows, content_cols);
+        lines.extend(node_lines.into_iter().take(fitting_nodes));
+        if fitting_nodes > 0 && preview.len() > fitting_nodes {
+            lines.push(Line::raw(omitted_count_text(preview.len() - fitting_nodes)));
+        }
+    }
+    lines.extend(tail);
     Some(lines)
 }
 
-/// How many preview nodes fit once every rendered row outside the preview is
-/// accounted for. Node names are charged by wrapped terminal height rather
-/// than logical line count, so a long name cannot push the actionable prompt
-/// below the modal.
+/// How many preview node lines fit in `preview_rows`. Node names are charged
+/// by wrapped terminal height rather than logical line count, so a long name
+/// cannot push the actionable prompt below the modal. Each candidate count
+/// also reserves room for the omitted-count line it would leave behind.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tree_preview_budget(
-    confirmation: &TreeKillConfirmation,
-    content_rows: usize,
+fn fitting_preview_nodes(
+    node_lines: &[Line<'_>],
+    preview_len: usize,
+    preview_rows: usize,
     content_cols: usize,
-) -> Option<usize> {
-    let preview_overhead = match &confirmation.preview {
-        // Loading state renders one placeholder line and no nodes.
-        None => wrapped_rows("Enumerating the process tree...", content_cols),
-        Some(preview) => {
-            // Scope and scoped preview warnings when they apply. Preview nodes
-            // and the omitted-count line are budgeted below.
-            wrapped_rows(
-                &format!("Scope: tree ({} processes)", preview.len()),
-                content_cols,
-            ) + if preview.has_system_process() {
-                wrapped_rows(
-                    "Warning: tree includes system/service processes; verify this is safe to terminate.",
-                    content_cols,
-                )
-            } else {
-                0
-            } + if preview.has_owner_mismatch() {
-                wrapped_rows(
-                    "Warning: tree includes processes owned by another uid; verify this is safe to terminate.",
-                    content_cols,
-                )
-            } else {
-                0
-            }
-        }
-    };
-    let force_warning_rows = confirmation
-        .mode
-        .force_warning(confirmation.target.platform)
-        .map_or(0, |warning| {
-            wrapped_rows(&format!("Warning: {warning}"), content_cols)
-        });
-    let target_warning_rows = confirmation
-        .target
-        .warning_lines()
-        .into_iter()
-        .map(|warning| {
-            wrapped_rows(
-                &format!("Warning: {}.", sanitize(&tree_scope_warning_text(&warning))),
-                content_cols,
-            )
-        })
-        .sum::<usize>();
-    let error_rows = confirmation.error.as_ref().map_or(0, |error| {
-        wrapped_rows(&format!("Error: {error}"), content_cols)
-    });
-    let input_rows = if confirmation.preview.is_some() {
-        wrapped_rows(&format!("Input: {}", confirmation.input), content_cols)
-    } else {
-        0
-    };
-    let fixed_rows = wrapped_rows(&tree_header_text(confirmation), content_cols)
-        + 1
-        + preview_overhead
-        + force_warning_rows
-        + target_warning_rows
-        + 2
-        + wrapped_rows(&tree_instruction_text(confirmation), content_cols)
-        + input_rows
-        + error_rows
-        + wrapped_rows("Esc cancels.", content_cols);
-    let available_rows = content_rows.checked_sub(fixed_rows)?;
-    let Some(preview) = confirmation.preview.as_ref() else {
-        return Some(0);
-    };
-    let max_nodes = preview.len().min(TREE_MODAL_PREVIEW_MAX);
-    let mut rendered_node_rows = 0;
+) -> usize {
+    let mut node_rows = 0;
     let mut fitting_nodes = 0;
-    for (index, node) in preview.preview_nodes(max_nodes).iter().enumerate() {
-        rendered_node_rows += wrapped_rows(&tree_node_text(node), content_cols);
+    for (index, line) in node_lines.iter().enumerate() {
+        node_rows += wrapped_rows(&line.to_string(), content_cols);
         let count = index + 1;
-        let omitted_rows = if preview.len() > count {
-            wrapped_rows(
-                &format!("  ... and {} more", preview.len() - count),
-                content_cols,
-            )
+        let omitted_rows = if preview_len > count {
+            wrapped_rows(&omitted_count_text(preview_len - count), content_cols)
         } else {
             0
         };
-        if rendered_node_rows + omitted_rows > available_rows {
+        if node_rows + omitted_rows > preview_rows {
             break;
         }
         fitting_nodes = count;
     }
-    Some(fitting_nodes)
+    fitting_nodes
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn omitted_count_text(omitted: usize) -> String {
+    format!("  ... and {omitted} more")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -291,27 +245,6 @@ fn tree_header_text(confirmation: &TreeKillConfirmation) -> String {
         confirmation.mode.action_label(),
         confirmation.target.identity(),
     )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tree_instruction_text(confirmation: &TreeKillConfirmation) -> String {
-    if confirmation.preview.is_none() {
-        return "Wait for the process count before typing confirmation.".to_owned();
-    }
-    match confirmation.stage {
-        TreeConfirmStage::ProtectedRoot => format!(
-            "Protected root: type {} or {}, press Enter, then confirm the tree word.",
-            confirmation.target.pid,
-            sanitize(confirmation.target.process_name_or_unknown()),
-        ),
-        TreeConfirmStage::Word => format!(
-            "Type {} and press Enter to send {} to all processes above.",
-            confirmation.scope_word(),
-            confirmation
-                .mode
-                .delivery_label(confirmation.target.platform),
-        ),
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
