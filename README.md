@@ -79,8 +79,7 @@ Stable releases publish their generated Homebrew formula to
 [`nuggocto/homebrew-tap`](https://github.com/nuggocto/homebrew-tap) after formula
 validation. [`nuggocto/scoop-bucket`](https://github.com/nuggocto/scoop-bucket)
 checks GitHub Releases every four hours with Scoop Excavator. Those repositories
-are the package-manager sources of truth; the Scoop files under `packaging/` are
-only a bootstrap reference.
+are the package-manager sources of truth.
 
 Arch packages are maintained from `packaging/arch/` and pushed to the AUR after
 a GitHub Release exists, because their `pkgver` and checksums are taken from the

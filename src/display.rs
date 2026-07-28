@@ -6,7 +6,43 @@
 //! sees — tables, details panels, kill confirmations — should pass through here
 //! first so a funky process can't move the cursor, hide text, or fake a prompt.
 
+use std::net::IpAddr;
+
+use crate::observation::Ipv6Scope;
+
 pub(crate) const REPLACEMENT: char = '�';
+
+/// Render an address for a human without discarding IPv6 interface identity.
+pub(crate) fn human_address_text(address: IpAddr, ipv6_scope: Option<Ipv6Scope>) -> String {
+    debug_assert!(
+        address.is_ipv6() || ipv6_scope.is_none(),
+        "IPv4 endpoints never carry IPv6 scope state"
+    );
+    match (address, ipv6_scope) {
+        (IpAddr::V4(address), _) => address.to_string(),
+        (IpAddr::V6(address), Some(Ipv6Scope::Unscoped)) => address.to_string(),
+        (IpAddr::V6(address), Some(Ipv6Scope::InterfaceIndex(index))) => {
+            format!("{address}%{index}")
+        }
+        (IpAddr::V6(address), Some(Ipv6Scope::Unavailable) | None) => {
+            format!("{address}%unavailable")
+        }
+    }
+}
+
+/// Render an address and port using brackets where IPv6 requires them.
+pub(crate) fn human_endpoint_text(
+    address: IpAddr,
+    port: u16,
+    ipv6_scope: Option<Ipv6Scope>,
+) -> String {
+    let address_text = human_address_text(address, ipv6_scope);
+    if address.is_ipv6() {
+        format!("[{address_text}]:{port}")
+    } else {
+        format!("{address_text}:{port}")
+    }
+}
 
 /// Make an untrusted string safe to print where humans read it.
 ///
@@ -159,7 +195,46 @@ pub(crate) const fn is_default_ignorable(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize, sanitize_multiline};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::{human_address_text, human_endpoint_text, sanitize, sanitize_multiline};
+    use crate::observation::Ipv6Scope;
+
+    #[test]
+    fn human_endpoint_text_preserves_every_ipv6_scope_state() {
+        let link_local = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
+        let interface = Ipv6Scope::interface_index(3).expect("test scope is valid");
+
+        assert_eq!(
+            human_address_text(IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            human_endpoint_text(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000, None),
+            "127.0.0.1:3000"
+        );
+        assert_eq!(
+            human_address_text(IpAddr::V6(Ipv6Addr::LOCALHOST), Some(Ipv6Scope::Unscoped)),
+            "::1"
+        );
+        assert_eq!(
+            human_endpoint_text(
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                3000,
+                Some(Ipv6Scope::Unscoped)
+            ),
+            "[::1]:3000"
+        );
+        assert_eq!(human_address_text(link_local, Some(interface)), "fe80::1%3");
+        assert_eq!(
+            human_endpoint_text(link_local, 3000, Some(interface)),
+            "[fe80::1%3]:3000"
+        );
+        assert_eq!(
+            human_address_text(link_local, Some(Ipv6Scope::Unavailable)),
+            "fe80::1%unavailable"
+        );
+    }
 
     #[test]
     fn leaves_clean_text_unchanged() {

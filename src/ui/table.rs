@@ -6,7 +6,7 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::widgets::{Block, Row, Table, TableState};
 
 use crate::app::App;
-use crate::display::sanitize;
+use crate::display::{human_address_text, sanitize};
 use crate::labels::label_display_text;
 use crate::model::{PermissionStatus, PortEntryView};
 
@@ -85,7 +85,7 @@ fn visible_range(total: usize, selected: Option<usize>, capacity: usize) -> (usi
 fn row(entry: PortEntryView<'_>, theme: Theme, show_labels: bool) -> Row<'static> {
     let mut cells = vec![
         entry.protocol.label().to_owned(),
-        entry.local_addr.to_string(),
+        human_address_text(entry.local_addr, entry.ipv6_scope),
         entry.local_port.to_string(),
         pid_text(entry),
         process_text(entry),

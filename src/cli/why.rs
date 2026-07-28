@@ -10,7 +10,7 @@ use serde::{Serialize, Serializer};
 use crate::collector::{self, CollectorError};
 use crate::config::Config;
 use crate::diagnostic::verdict::{Verdict, VerdictResult, WHY_ENDPOINTS_MAX, analyze};
-use crate::display::{sanitize, sanitize_bounded};
+use crate::display::{human_endpoint_text, sanitize, sanitize_bounded};
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
 use crate::model::Protocol;
 use crate::observation::{EndpointIdentity, Ipv6Scope, MetadataProfile, NetworkSnapshot};
@@ -645,32 +645,11 @@ fn result_dto(result: &CompletedResult) -> ResultDto<'_> {
 }
 
 fn endpoint_text(endpoint: &EndpointIdentity) -> String {
-    match (endpoint.address, endpoint.ipv6_scope) {
-        (IpAddr::V4(address), None) => format!(
-            "{}://{address}:{}",
-            protocol_name(endpoint.protocol),
-            endpoint.port
-        ),
-        (IpAddr::V6(address), Some(Ipv6Scope::Unscoped)) => {
-            format!(
-                "{}://[{address}]:{}",
-                protocol_name(endpoint.protocol),
-                endpoint.port
-            )
-        }
-        (IpAddr::V6(address), Some(Ipv6Scope::InterfaceIndex(index))) => format!(
-            "{}://[{address}%{}]:{}",
-            protocol_name(endpoint.protocol),
-            index,
-            endpoint.port
-        ),
-        (IpAddr::V6(address), Some(Ipv6Scope::Unavailable)) => format!(
-            "{}://[{address}%unavailable]:{}",
-            protocol_name(endpoint.protocol),
-            endpoint.port
-        ),
-        _ => unreachable!("validated endpoint address and scope agree"),
-    }
+    format!(
+        "{}://{}",
+        protocol_name(endpoint.protocol),
+        human_endpoint_text(endpoint.address, endpoint.port.get(), endpoint.ipv6_scope,)
+    )
 }
 
 const fn probe_outcome_name(outcome: crate::probe::ProbeOutcome) -> &'static str {

@@ -26,7 +26,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::display::sanitize;
+use crate::display::{human_endpoint_text, sanitize};
 use crate::model::{PermissionStatus, Platform, PortEntryView, ProcessContext, Protocol};
 use crate::observation::{Ipv6Scope, ProcessIdentity, ProcessStartMarker};
 use crate::process_evidence::{
@@ -574,10 +574,9 @@ impl PartialOrd for KillTargetPort {
 impl KillTargetPort {
     fn label(&self) -> String {
         format!(
-            "{} {}:{}",
+            "{} {}",
             self.protocol.label(),
-            self.local_addr,
-            self.local_port,
+            human_endpoint_text(self.local_addr, self.local_port, self.ipv6_scope),
         )
     }
 }
@@ -2644,6 +2643,19 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("direct child")),
         );
+    }
+
+    #[test]
+    fn kill_target_port_labels_preserve_ipv6_scope() {
+        let mut row = entry(3000, Protocol::Tcp);
+        row.local_addr = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
+        row.ipv6_scope =
+            Some(crate::observation::Ipv6Scope::interface_index(3).expect("test scope is valid"));
+
+        let target =
+            KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
+
+        assert_eq!(target.ports_text(), "TCP [fe80::1%3]:3000");
     }
 
     #[test]

@@ -334,7 +334,8 @@ intentionally a substring search over both parent PID text and parent name.
 For list and TUI rows, each plain term can match any of:
 
 - local port or owner PID;
-- local address, `address:port`, or `[address]:port` text;
+- local address, `address:port`, `[address]:port`, or scoped
+  `[address%scope]:port` text (`%unavailable` when the interface is unknown);
 - protocol, visible legacy state (`listen` or `bound`), or bind scope;
 - resolved label;
 - process name, executable path, or complete bounded command line;
@@ -350,8 +351,8 @@ space is a legitimate substring of a process title.
 Watch deliberately collects the `Display` metadata profile rather than the
 legacy list/TUI profile. Watch plain search includes:
 
-- endpoint port, address, both endpoint text forms, protocol, full state, scope,
-  and label;
+- endpoint port, address, unscoped and scoped endpoint text forms, protocol, full
+  state, scope, and label;
 - verified or unverified owner PID;
 - available process name and executable path;
 - parent PID and parent process name;

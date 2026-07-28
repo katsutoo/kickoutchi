@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 // discarding a Result that cannot be Err.
 use std::fmt::Write as _;
 
-use crate::display::sanitize;
+use crate::display::{human_endpoint_text, sanitize};
 use crate::model::{Platform, PortEntryView};
 use crate::observation::ProcessIdentity;
 use crate::protection::is_protected_process_name;
@@ -574,10 +574,9 @@ fn ports_by_pid(
             continue;
         }
         ports.entry(identity.pid).or_default().push(format!(
-            "{} {}:{}",
+            "{} {}",
             entry.protocol.label(),
-            entry.local_addr,
-            entry.local_port,
+            human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope),
         ));
     }
     ports
@@ -721,6 +720,31 @@ mod tests {
         assert!(matching_report.contains("Ports: TCP 127.0.0.1:3000"));
         assert!(recycled_report.contains("Ports: none visible"));
         assert!(!recycled_report.contains("127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn report_distinguishes_ipv6_interface_scopes() {
+        let snapshot = family_snapshot();
+        let mut scope_three = port_entry(400, 3000);
+        scope_three.local_addr = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
+        scope_three.ipv6_scope =
+            Some(crate::observation::Ipv6Scope::interface_index(3).expect("test scope is valid"));
+        let mut scope_four = scope_three.clone();
+        scope_four.ipv6_scope =
+            Some(crate::observation::Ipv6Scope::interface_index(4).expect("test scope is valid"));
+
+        let report = render_family_report(
+            400,
+            &snapshot,
+            &entry_views(&[scope_three, scope_four]),
+            &[],
+            Platform::Linux,
+            |_| None,
+        )
+        .expect("target is present");
+
+        assert!(report.contains("TCP [fe80::1%3]:3000"), "{report}");
+        assert!(report.contains("TCP [fe80::1%4]:3000"), "{report}");
     }
 
     #[test]

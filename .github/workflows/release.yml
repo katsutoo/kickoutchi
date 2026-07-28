@@ -21,6 +21,7 @@ permissions:
   contents: read
 
 env:
+  AXOUPDATER_VERSION: "0.10.0"
   DIST_VERSION: "0.32.0"
   RUST_VERSION: "1.95.0"
 
@@ -292,6 +293,17 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build $TAG_FLAG --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Rebuild Linux updater at supported ABI floor
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          UPDATER_TARGET: ${{ join(matrix.targets, '') }}
+        run: |
+          set -euo pipefail
+          RUST_HOST="$(rustc -vV | grep '^host: ' | cut -d' ' -f2)"
+          test "$RUST_HOST" = "$UPDATER_TARGET"
+          cargo install --locked axoupdater-cli --version "$AXOUPDATER_VERSION" --root target/axoupdater
+          install -m 0755 target/axoupdater/bin/axoupdater "target/distrib/kickoutchi-${UPDATER_TARGET}-update"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -387,6 +399,66 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+
+  validate-installers:
+    name: Validate installer (${{ matrix.name }})
+    needs:
+      - plan
+      - verify
+      - build-global-artifacts
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-22.04
+            installer: kickoutchi-installer.sh
+            targets_json: '["x86_64-unknown-linux-gnu"]'
+          - name: macOS ARM64
+            runner: macos-14
+            installer: kickoutchi-installer.sh
+            targets_json: '["aarch64-apple-darwin"]'
+          - name: Windows x64
+            runner: windows-2022
+            installer: kickoutchi-installer.ps1
+            targets_json: '["x86_64-pc-windows-msvc"]'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install and select Rust 1.95.0 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install and select Rust 1.95.0 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
+          rustup default $env:RUST_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
+      - name: Fetch same-run release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Execute generated installer and updater
+        env:
+          KICKOUTCHI_RELEASE_DISTRIB: target/distrib
+          KICKOUTCHI_RELEASE_INSTALLER: target/distrib/${{ matrix.installer }}
+          KICKOUTCHI_RELEASE_TARGETS_JSON: ${{ matrix.targets_json }}
+          KICKOUTCHI_RELEASE_RUNNER_OS: ${{ runner.os }}
+          KICKOUTCHI_RELEASE_RUNNER_ARCH: ${{ runner.arch }}
+        run: cargo test --locked --test release_artifact_validator validate_generated_native_installer -- --exact --ignored --nocapture
+
   # Determines if we should publish/announce
   host:
     needs:
@@ -394,8 +466,9 @@ jobs:
       - verify
       - build-local-artifacts
       - build-global-artifacts
+      - validate-installers
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.validate-installers.result == 'success' }}
     runs-on: "ubuntu-22.04"
     timeout-minutes: 20
     permissions:
@@ -471,6 +544,49 @@ jobs:
           test "$TAG_COMMIT" = "$RELEASE_COMMIT"
           gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  validate-published-release:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install and select Rust 1.95.0
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Fetch same-run release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Download published installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/published"
+          gh release download "$RELEASE_TAG" --pattern kickoutchi-installer.sh --dir "$RUNNER_TEMP/published"
+      - name: Execute published installer and updater
+        env:
+          KICKOUTCHI_RELEASE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KICKOUTCHI_RELEASE_DISTRIB: target/distrib
+          KICKOUTCHI_RELEASE_INSTALLER: ${{ runner.temp }}/published/kickoutchi-installer.sh
+          KICKOUTCHI_RELEASE_PUBLIC: "1"
+          KICKOUTCHI_RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          KICKOUTCHI_RELEASE_TARGETS_JSON: '["x86_64-unknown-linux-gnu"]'
+          KICKOUTCHI_RELEASE_RUNNER_OS: Linux
+          KICKOUTCHI_RELEASE_RUNNER_ARCH: X64
+        run: cargo test --locked --test release_artifact_validator validate_generated_native_installer -- --exact --ignored --nocapture
+
   # Publish the dist-generated Homebrew formula to the tap repo. The push
   # authenticates with HOMEBREW_TAP_TOKEN (a PAT scoped to the tap repo), so this
   # job needs only read on this repo. The token exists only in the final push
@@ -480,6 +596,7 @@ jobs:
     needs:
       - plan
       - host
+      - validate-published-release
     runs-on: "ubuntu-22.04"
     timeout-minutes: 30
     permissions:
@@ -489,7 +606,7 @@ jobs:
       GITHUB_USER: "github-actions[bot]"
       GITHUB_EMAIL: "github-actions[bot]@users.noreply.github.com"
       HOMEBREW_IMAGE: "homebrew/brew@sha256:b0072bfdebf5934ae24b93b44a1928a88057399b3283ffa0177bb86084fdedfd"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    if: ${{ needs.validate-published-release.result == 'success' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -559,14 +676,13 @@ jobs:
       - plan
       - host
       - publish-homebrew-formula
+      - validate-published-release
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && needs.validate-published-release.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          submodules: recursive
+      - name: Confirm publication gates
+        run: "true"

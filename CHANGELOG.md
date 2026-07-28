@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a copy-ready root `config.example.toml`, covered by the real config
   parser tests so its settings and endpoint-label examples cannot drift from the
   accepted schema.
+- Release validation now executes every native updater, runs generated shell and
+  PowerShell installers with isolated install, config, and temporary roots on
+  Linux, macOS, and Windows before
+  publication, and repeats the Linux install/update journey through the final
+  public GitHub Release URLs. Arch metadata is also compared exactly with native
+  `makepkg --printsrcinfo` output in a digest-pinned container. Linux updater
+  artifacts are rebuilt from the locked `axoupdater-cli 0.10.0` source inside the
+  Debian 11 release containers so they retain the documented glibc 2.31 floor.
 
 ### Changed
 
@@ -33,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every release job carries a bounded timeout and Linux runner images are
   full-digest-pinned and identical across architectures — instead of
   hardcoding a second copy of the exact minutes and digest values.
+- Human endpoint output now uses one formatter that retains IPv6 interface scope
+  in list tables, TUI rows and details, inspect reports, watch and Why output,
+  search text, ambiguity diagnostics, and kill confirmations. Legacy list JSON
+  remains unchanged; versioned structured output continues to carry scope as a
+  separate field.
 
 ### Removed
 
@@ -43,6 +56,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trimmed tautological and duplicate unit tests, and strengthened previously
   vacuous assertions so tree-thaw, docker-runner, and stale-refresh tests fail
   under the regressions they exist to catch. No user-visible behavior changed.
+- Removed the inactive in-repository Scoop bootstrap mirror; the live
+  `nuggocto/scoop-bucket` remains the only Scoop source of truth. Removed an
+  opportunistic kernel-race integration test whose normal success path duplicated
+  the mandatory group-kill journey without deterministically exercising a race.
+
+### Fixed
+
+- Concurrent embedded watch sessions now fail immediately instead of sharing and
+  corrupting process-global Ctrl-C handler state. Handler ownership is reserved
+  before cancellation state changes, released only after successful restoration,
+  and retained fail-closed if restoration itself fails. Once observed, Ctrl-C
+  cancellation remains latched for the process lifetime so a delayed callback
+  cannot cancel a later embedded watch owner.
 
 ## [1.3.6] - 2026-07-26
 

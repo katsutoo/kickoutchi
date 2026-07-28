@@ -93,7 +93,9 @@ unsupported metadata, and bounded omission; it must not be interpreted as an
 Linux `/proc/net/*6` rows do not expose an IPv6 scope identifier in the selected
 format. Every observed IPv6 endpoint therefore has unavailable scope. Such a row
 cannot support exact scoped-IPv6 matching or an exact-address proven observation,
-although wildcard selectors can still match without scope equality.
+although wildcard selectors can still match without scope equality. Human output
+renders the missing identity as `%unavailable` rather than collapsing it into an
+apparently unscoped address.
 
 Root may make more procfs process descriptors and metadata readable, but it does
 not widen the current network namespace, escape the PID namespace, repair an

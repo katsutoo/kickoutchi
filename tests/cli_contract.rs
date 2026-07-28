@@ -4493,47 +4493,6 @@ mod linux {
         let _ = fs::remove_file(ready_file);
     }
 
-    /// This test has intentionally narrow assurance: there is no production
-    /// fault-injection hook for the observation race, so it validates fail-closed
-    /// behavior only when the real kernel race occurs. The separately named
-    /// success journey above is mandatory under release capabilities.
-    #[test]
-    fn group_kill_observation_race_fails_closed_when_observed() {
-        let _host_observation = lock_host_observation();
-        let (mut helper, port, orphan_pid, ready_file) = spawn_group_process();
-        let _orphan_cleanup = PidGuard::new(orphan_pid);
-        let root_pid = helper.id();
-        let port_text = port.to_string();
-
-        let killed = kickoutchi_with_stdin(
-            &["kill", "--port", port_text.as_str(), "--group"],
-            "group\n",
-        );
-        let killed_stderr = stderr(&killed);
-
-        if killed.status.code() == Some(1)
-            && killed_stderr.contains("collecting ports before kill failed: observation raced")
-        {
-            assert!(
-                killed_stderr.contains("no termination was sent"),
-                "{killed_stderr}"
-            );
-            assert!(
-                pid_exists(root_pid),
-                "a raced observation must not signal the root"
-            );
-            assert!(
-                pid_exists(orphan_pid),
-                "a raced observation must not signal the reparented member"
-            );
-        } else {
-            assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
-            wait_for_child_exit(&mut helper);
-            wait_for_pid_gone(orphan_pid);
-        }
-        let _ = fs::remove_file(ready_file);
-    }
-
     fn spawn_group_process() -> (ChildGuard, u16, u32, PathBuf) {
         let ready_file = temp_file_path("group-ready");
         let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))

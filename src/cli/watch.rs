@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::collector::{self, CollectorError};
 use crate::config::Config;
-use crate::display::{sanitize, sanitize_bounded};
+use crate::display::{human_endpoint_text, sanitize, sanitize_bounded};
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, label_display_text, normalize_ip_address};
 use crate::model::{BindScope, Protocol};
 use crate::observation::{
@@ -159,9 +159,8 @@ impl WatchOptions {
 pub(super) fn run_watch(
     args: &WatchArgs,
     config: &Config,
-    mut signal_guard: WatchSignalGuard,
+    _signal_guard: WatchSignalGuard,
 ) -> ExitReason {
-    signal_guard.activate_loop();
     let options = match WatchOptions::parse(args) {
         Ok(options) => options,
         Err(error) => {
@@ -1197,6 +1196,9 @@ fn common_plain_match(socket: &SocketObservation, label: Option<&str>, needle: &
         || format!("[{}]:{}", endpoint.address, endpoint.port)
             .to_lowercase()
             .contains(needle)
+        || human_endpoint_text(endpoint.address, endpoint.port.get(), endpoint.ipv6_scope)
+            .to_lowercase()
+            .contains(needle)
         || endpoint
             .protocol
             .label()
@@ -1637,7 +1639,8 @@ fn write_human_event(
         let _ = std::fmt::Write::write_fmt(&mut owners, format_args!(",+{omitted_owners}"));
     }
     let label = config.labels.resolve(endpoint).map(label_display_text);
-    let endpoint_text = human_endpoint_text(endpoint);
+    let endpoint_text =
+        human_endpoint_text(endpoint.address, endpoint.port.get(), endpoint.ipv6_scope);
     writeln!(
         writer,
         "{} {} {} {} owners={}{} filter={} certainty={} observed={}..{} previous_completed={}",
@@ -1658,22 +1661,6 @@ fn write_human_event(
             .map_or_else(|| "-".to_owned(), |value| value.to_string()),
     )
     .map_err(OutputError::from)
-}
-
-fn human_endpoint_text(endpoint: &EndpointIdentity) -> String {
-    match (endpoint.address, endpoint.ipv6_scope) {
-        (IpAddr::V4(address), None) => format!("{address}:{}", endpoint.port),
-        (IpAddr::V6(address), Some(Ipv6Scope::Unscoped)) => {
-            format!("[{address}]:{}", endpoint.port)
-        }
-        (IpAddr::V6(address), Some(Ipv6Scope::InterfaceIndex(index))) => {
-            format!("[{address}%{index}]:{}", endpoint.port)
-        }
-        (IpAddr::V6(address), Some(Ipv6Scope::Unavailable)) => {
-            format!("[{address}%unavailable]:{}", endpoint.port)
-        }
-        _ => unreachable!("validated endpoint address and scope agree"),
-    }
 }
 
 fn write_gap(
@@ -1969,32 +1956,62 @@ const fn observation_error_code(error: &ObservationError) -> &'static str {
 }
 
 static WATCH_CANCELLED: AtomicBool = AtomicBool::new(false);
-static WATCH_STARTING: AtomicBool = AtomicBool::new(false);
+static WATCH_SIGNAL_RESERVED: AtomicBool = AtomicBool::new(false);
+
+struct WatchSignalReservation<'a> {
+    slot: &'a AtomicBool,
+    release_on_drop: bool,
+}
+
+impl<'a> WatchSignalReservation<'a> {
+    fn acquire(slot: &'a AtomicBool) -> io::Result<Self> {
+        slot.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "another watch session already owns the process signal handler",
+                )
+            })?;
+        Ok(Self {
+            slot,
+            release_on_drop: true,
+        })
+    }
+
+    fn keep_reserved(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for WatchSignalReservation<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.slot.store(false, Ordering::Release);
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct WatchSignalGuard {
     previous: libc::sigaction,
-    startup: bool,
+    reservation: WatchSignalReservation<'static>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C" fn handle_sigint(_: libc::c_int) {
-    if WATCH_STARTING.load(Ordering::Relaxed) {
-        // SAFETY: `_exit` is async-signal-safe and startup has not emitted output
-        // or acquired resources that require process-local cleanup.
-        unsafe { libc::_exit(0) }
-    }
     WATCH_CANCELLED.store(true, Ordering::Relaxed);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WatchSignalGuard {
+    pub(crate) fn cancelled() -> bool {
+        WATCH_CANCELLED.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn install() -> io::Result<Self> {
-        WATCH_CANCELLED.store(false, Ordering::Relaxed);
-        WATCH_STARTING.store(true, Ordering::Relaxed);
+        let reservation = WatchSignalReservation::acquire(&WATCH_SIGNAL_RESERVED)?;
         // SAFETY: sigaction structures are initialized before use, the handler only
-        // uses lock-free atomics or async-signal-safe `_exit`, and the previous
-        // process action is retained.
+        // uses a lock-free atomic, and the previous process action is retained.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handle_sigint as *const () as usize;
@@ -2006,43 +2023,35 @@ impl WatchSignalGuard {
             }
             Ok(Self {
                 previous,
-                startup: true,
+                reservation,
             })
         }
-    }
-
-    fn activate_loop(&mut self) {
-        debug_assert!(self.startup, "watch signal startup mode changes only once");
-        self.startup = false;
-        WATCH_STARTING.store(false, Ordering::Relaxed);
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for WatchSignalGuard {
     fn drop(&mut self) {
-        WATCH_STARTING.store(false, Ordering::Relaxed);
         // SAFETY: `previous` came from a successful sigaction call and remains valid.
-        unsafe {
-            libc::sigaction(libc::SIGINT, &raw const self.previous, std::ptr::null_mut());
+        if unsafe { libc::sigaction(libc::SIGINT, &raw const self.previous, std::ptr::null_mut()) }
+            != 0
+        {
+            let error = io::Error::last_os_error();
+            self.reservation.keep_reserved();
+            tracing::warn!(%error, "failed to restore watch signal handler");
         }
     }
 }
 
 #[cfg(windows)]
 pub(crate) struct WatchSignalGuard {
-    startup: bool,
+    reservation: WatchSignalReservation<'static>,
 }
 
 #[cfg(windows)]
 unsafe extern "system" fn handle_console_control(control: u32) -> i32 {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
     if matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
-        if WATCH_STARTING.load(Ordering::Relaxed) {
-            // SAFETY: startup has not emitted output or acquired resources that
-            // require process-local cleanup.
-            unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) }
-        }
         WATCH_CANCELLED.store(true, Ordering::Relaxed);
         1
     } else {
@@ -2052,21 +2061,18 @@ unsafe extern "system" fn handle_console_control(control: u32) -> i32 {
 
 #[cfg(windows)]
 impl WatchSignalGuard {
+    pub(crate) fn cancelled() -> bool {
+        WATCH_CANCELLED.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn install() -> io::Result<Self> {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-        WATCH_CANCELLED.store(false, Ordering::Relaxed);
-        WATCH_STARTING.store(true, Ordering::Relaxed);
+        let reservation = WatchSignalReservation::acquire(&WATCH_SIGNAL_RESERVED)?;
         // SAFETY: the handler has static lifetime and performs only an atomic store.
         if unsafe { SetConsoleCtrlHandler(Some(handle_console_control), 1) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { startup: true })
-    }
-
-    fn activate_loop(&mut self) {
-        debug_assert!(self.startup, "watch signal startup mode changes only once");
-        self.startup = false;
-        WATCH_STARTING.store(false, Ordering::Relaxed);
+        Ok(Self { reservation })
     }
 }
 
@@ -2074,28 +2080,28 @@ impl WatchSignalGuard {
 impl Drop for WatchSignalGuard {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-        WATCH_STARTING.store(false, Ordering::Relaxed);
         // SAFETY: unregisters the exact static handler installed by this guard.
-        unsafe {
-            SetConsoleCtrlHandler(Some(handle_console_control), 0);
+        if unsafe { SetConsoleCtrlHandler(Some(handle_console_control), 0) } == 0 {
+            let error = io::Error::last_os_error();
+            self.reservation.keep_reserved();
+            tracing::warn!(%error, "failed to unregister watch signal handler");
         }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) struct WatchSignalGuard {
-    startup: bool,
+    _private: (),
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl WatchSignalGuard {
-    pub(crate) fn install() -> io::Result<Self> {
-        Ok(Self { startup: true })
+    pub(crate) const fn cancelled() -> bool {
+        false
     }
 
-    fn activate_loop(&mut self) {
-        debug_assert!(self.startup, "watch signal startup mode changes only once");
-        self.startup = false;
+    pub(crate) fn install() -> io::Result<Self> {
+        Ok(Self { _private: () })
     }
 }
 
@@ -2103,7 +2109,6 @@ impl WatchSignalGuard {
 mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Write};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, SystemTime};
 
     use super::{
@@ -2111,18 +2116,117 @@ mod tests {
         ObservationTimes, OwnerPidConstraint, Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN,
         WATCH_INTERVAL_DEFAULT_TOKEN, WATCH_INTERVAL_MAX, WATCH_INTERVAL_MIN, WatchArgs,
         WatchOptions, WatchRuntime, evaluate_event, evaluate_side, event_order_rank,
-        human_endpoint_text, parse_duration_token, run_watch_loop, write_human_event,
-        write_ordered_events,
+        parse_duration_token, run_watch_loop, write_human_event, write_ordered_events,
     };
     use crate::cli::ExitReason;
     use crate::collector::{Collector, CollectorError, FakeCollector};
     use crate::config::Config;
+
+    #[test]
+    fn watch_signal_reservation_rejects_overlap_and_fails_closed() {
+        let slot = std::sync::atomic::AtomicBool::new(false);
+        let first = super::WatchSignalReservation::acquire(&slot).unwrap();
+        let overlap = super::WatchSignalReservation::acquire(&slot)
+            .err()
+            .expect("overlapping reservation must be refused");
+        assert_eq!(overlap.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
+
+        let mut stranded = super::WatchSignalReservation::acquire(&slot).unwrap();
+        stranded.keep_reserved();
+        drop(stranded);
+        assert!(slot.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            super::WatchSignalReservation::acquire(&slot)
+                .err()
+                .expect("a failed restoration must retain ownership")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn watch_signal_guard_rejects_overlap_without_mutating_the_owner() {
+        use std::process::Command;
+        use std::sync::atomic::Ordering;
+
+        const CHILD_ENV: &str = "KICKOUTCHI_TEST_WATCH_SIGNAL_OWNERSHIP";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            #[cfg(unix)]
+            unsafe {
+                // SAFETY: this isolated child owns its SIGINT disposition.
+                let mut ignored: libc::sigaction = std::mem::zeroed();
+                ignored.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&raw mut ignored.sa_mask);
+                assert_eq!(
+                    libc::sigaction(libc::SIGINT, &raw const ignored, std::ptr::null_mut()),
+                    0,
+                );
+            }
+
+            let first = super::WatchSignalGuard::install().unwrap();
+            super::WATCH_CANCELLED.store(true, Ordering::Relaxed);
+            let overlap = super::WatchSignalGuard::install()
+                .err()
+                .expect("overlapping watch guard must be refused");
+            assert_eq!(overlap.kind(), io::ErrorKind::WouldBlock);
+            assert!(super::WATCH_CANCELLED.load(Ordering::Relaxed));
+
+            #[cfg(unix)]
+            unsafe {
+                // SAFETY: a null action queries this isolated child's disposition.
+                let mut current: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(libc::SIGINT, std::ptr::null(), &raw mut current),
+                    0,
+                );
+                assert_eq!(
+                    current.sa_sigaction,
+                    super::handle_sigint as *const () as usize
+                );
+            }
+
+            drop(first);
+
+            #[cfg(unix)]
+            unsafe {
+                // SAFETY: a null action queries this isolated child's disposition.
+                let mut restored: libc::sigaction = std::mem::zeroed();
+                assert_eq!(
+                    libc::sigaction(libc::SIGINT, std::ptr::null(), &raw mut restored),
+                    0,
+                );
+                assert_eq!(restored.sa_sigaction, libc::SIG_IGN);
+            }
+
+            let final_guard = super::WatchSignalGuard::install().unwrap();
+            assert!(
+                super::WatchSignalGuard::cancelled(),
+                "process-wide cancellation must not reset for a later owner"
+            );
+            drop(final_guard);
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().expect("test executable must exist"))
+            .args([
+                "--exact",
+                "cli::watch::tests::watch_signal_guard_rejects_overlap_without_mutating_the_owner",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("watch ownership child must start");
+        assert!(
+            status.success(),
+            "watch ownership child exited with {status}"
+        );
+    }
     use crate::labels::{LabelInput, LabelRegistry};
     use crate::observation::{
-        EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact, Ipv6Scope,
-        MetadataCompleteness, MetadataProfile, NetworkSnapshot, ObservationError,
-        OwnerCompleteness, OwnerObservation, ProcessIdentity, ProcessObservation,
-        ProcessStartMarker, Protocol, SnapshotCompleteness, UnverifiedOwnerReason,
+        EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataCompleteness, MetadataProfile,
+        NetworkSnapshot, ObservationError, OwnerCompleteness, OwnerObservation, ProcessIdentity,
+        ProcessObservation, ProcessStartMarker, SnapshotCompleteness, UnverifiedOwnerReason,
     };
     use crate::query::QueryCapabilities;
     use crate::watch::{Certainty, EventKind, WatchEvent, baseline_events, diff_snapshots};
@@ -3834,40 +3938,6 @@ mod tests {
         assert!(output.contains("64,+1"));
         assert!(!output.contains(",65"));
         assert!(output.contains(&format!("label={}…", "x".repeat(31))));
-    }
-
-    #[test]
-    fn human_endpoint_text_preserves_ipv6_scope() {
-        let endpoint = |address, ipv6_scope| {
-            EndpointIdentity::new(Protocol::Tcp, address, 3000, ipv6_scope)
-                .expect("test endpoint is valid")
-        };
-
-        assert_eq!(
-            human_endpoint_text(&endpoint(IpAddr::V4(Ipv4Addr::LOCALHOST), None)),
-            "127.0.0.1:3000"
-        );
-        assert_eq!(
-            human_endpoint_text(&endpoint(
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                Some(Ipv6Scope::Unscoped)
-            )),
-            "[::1]:3000"
-        );
-        assert_eq!(
-            human_endpoint_text(&endpoint(
-                IpAddr::V6("fe80::1".parse().expect("valid IPv6 address")),
-                Some(Ipv6Scope::interface_index(3).expect("valid scope"))
-            )),
-            "[fe80::1%3]:3000"
-        );
-        assert_eq!(
-            human_endpoint_text(&endpoint(
-                IpAddr::V6("fe80::1".parse().expect("valid IPv6 address")),
-                Some(Ipv6Scope::Unavailable)
-            )),
-            "[fe80::1%unavailable]:3000"
-        );
     }
 
     #[test]

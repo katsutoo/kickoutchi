@@ -126,7 +126,12 @@ Rust target parses generated native archives with explicit member, compressed,
 expanded, binary, output, and execution-time bounds. It rejects unsafe paths,
 links, special files, encryption, unexpected layouts, mismatched checksums,
 wrong executable permissions, wrong versions, and missing binary entry points,
-then runs the real CLI journeys against the extracted binaries.
+then runs the real CLI journeys against the extracted binaries. The same target
+executes every native updater and installs same-run artifacts through generated
+shell and PowerShell installers on native Linux, macOS, and Windows runners before
+publication. Linux updater artifacts are rebuilt from the locked
+`axoupdater-cli 0.10.0` crate in the same Debian 11 containers as the application
+archives, then rejected if either binary requires symbols above glibc 2.31.
 
 Release planning has read-only repository permission; checkout never persists
 GitHub credentials, and no write-scoped token is exported to release-tool
@@ -134,7 +139,8 @@ installation. Explicit repository `GH_TOKEN` values exist only on the dist
 planning, hosting, and GitHub Release steps that require them. The Homebrew token
 exists only on the final tap push step. GitHub permissions remain job-scoped, so
 pinned actions in the host job still execute where `contents: write` is
-available. A manual workflow dispatch exercises the artifact graph without tag
+available. Post-publication updater validation receives a read-only repository
+token only when it invokes the updater. A manual workflow dispatch exercises the artifact graph without tag
 publication; tag runs repeat verification on their exact commit before any
 release is created.
 
@@ -171,16 +177,20 @@ artifacts. They detect accidental corruption but are not an independent
 signature or provenance channel. Release verification builds the native binaries
 for the exact workflow commit, then validates each native binary archive's
 checksum, layout, executable permissions where applicable, both binary entry
-points, and runtime version before upload. Source archives, installers, updater
-artifacts, and the final public download path do not receive that same executable
-archive journey; post-publication smoke tests remain a separate release step.
+points, runtime version, and updater before upload. Generated installers execute
+against those same-run artifacts before publication. After a GitHub Release is
+created, a separate bounded Linux journey downloads the published installer,
+installs from its public artifact URLs, and executes the published updater against
+the release tag from a deliberately stale isolated installation. Homebrew
+publication waits for that public journey. Source archives do not receive an executable journey, and the
+post-publication check cannot make GitHub publication atomic.
 Users must still decide whether they trust the GitHub repository and each
 package-manager publisher boundary.
 
 Read-only inspect reports join socket owners, process-table rows, and optional
 command lines only when PID and process start identity agree. A port owner that
 changes between network and process collection is refused rather than attached
-to the replacement process. Human watch output retains IPv6 interface scope;
+to the replacement process. Human endpoint output retains IPv6 interface scope;
 `%unavailable` means the collector could not establish an interface index.
 
 The canonical contracts and privacy distinctions are documented in the

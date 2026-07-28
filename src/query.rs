@@ -11,6 +11,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use thiserror::Error;
 
+use crate::display::human_endpoint_text;
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
 use crate::model::{BindScope, PortEntryView, Protocol, SortMode};
 use crate::observation::Ipv6Scope;
@@ -508,6 +509,9 @@ fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
     let mut bracketed = StackText::new();
     let _ = write!(bracketed, "[{}]:{}", entry.local_addr, entry.local_port);
     contains_ascii(bracketed.as_str(), needle_lower)
+        || human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope)
+            .to_ascii_lowercase()
+            .contains(needle_lower)
 }
 
 fn parent_matches<'a>(
@@ -790,6 +794,8 @@ mod tests {
         assert_eq!(matching("address:::1"), [5353]);
         assert_eq!(matching("family:ipv4"), [3000]);
         assert_eq!(matching("family:ipv6 scope_id:7"), [5353]);
+        assert_eq!(matching("[::1%7]:5353"), [5353]);
+        assert!(matching("[::1%8]:5353").is_empty());
         assert!(matching("scope_id:8").is_empty());
     }
 

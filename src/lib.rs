@@ -59,6 +59,11 @@ use crate::display::sanitize_multiline;
 /// On Unix, embedded callers with pre-existing non-Kickoutchi threads must
 /// block `SIGTERM` and `SIGHUP` in those threads while the TUI owns its temporary
 /// process-wide handlers. The standalone binaries mask every worker they create.
+/// Concurrent embedded watch sessions are refused because one process-global
+/// Ctrl-C handler cannot have two independent owners. On Unix, an embedder must
+/// not replace the `SIGINT` disposition while an active watch owns it. Ctrl-C
+/// cancellation remains latched for the process lifetime, so embedders should
+/// treat it as a process-wide shutdown request.
 #[must_use]
 pub fn run() -> ExitCode {
     init_tracing();
@@ -102,6 +107,9 @@ pub fn run() -> ExitCode {
     let mut config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(error) => {
+            if watch_signal_guard.is_some() && WatchSignalGuard::cancelled() {
+                return ExitReason::Success.into();
+            }
             eprintln!("error: {}", error.render_terminal());
             return ExitReason::Failure.into();
         }

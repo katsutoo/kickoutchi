@@ -791,6 +791,180 @@ fn native_archives_are_validated_before_upload_and_publication() {
 }
 
 #[test]
+fn arch_metadata_is_compared_with_native_makepkg_output() {
+    let ci = parsed_workflow(CI_WORKFLOW);
+    let image = yaml_mapping(workflow_root(&ci), "env")
+        .into_iter()
+        .find_map(|(key, value)| (key == "ARCHLINUX_IMAGE").then_some(value))
+        .expect("CI must pin the Arch validation image");
+    let (_, digest) = image
+        .rsplit_once("@sha256:")
+        .expect("Arch image must use a digest");
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let supply_chain = workflow_job(&ci, "supply-chain");
+    let step = named_job_step(supply_chain, "Verify regenerated Arch metadata");
+    let script = script_lines(step).join("\n");
+    assert!(script.contains("$ARCHLINUX_IMAGE"));
+    assert!(script.contains("$GITHUB_WORKSPACE:/workspace:ro"));
+    assert!(script.contains("chown -R nobody:nobody /tmp/arch"));
+    assert!(script.contains("for package in kickoutchi kickoutchi-bin"));
+    assert!(script.contains("runuser -u nobody"));
+    assert!(script.contains("diff -u .SRCINFO <(makepkg --printsrcinfo)"));
+}
+
+#[test]
+fn linux_updater_is_rebuilt_from_pinned_source_before_validation() {
+    let release = parsed_workflow(RELEASE_WORKFLOW);
+    assert_eq!(
+        yaml_mapping(workflow_root(&release), "env")
+            .into_iter()
+            .find_map(|(key, value)| (key == "AXOUPDATER_VERSION").then_some(value))
+            .as_deref(),
+        Some("0.10.0"),
+    );
+
+    let local = workflow_job(&release, "build-local-artifacts");
+    let rebuild = named_job_step(local, "Rebuild Linux updater at supported ABI floor");
+    assert_eq!(
+        yaml_scalar(rebuild, "if").as_deref(),
+        Some("runner.os == 'Linux'")
+    );
+    assert_eq!(
+        step_env(rebuild, "UPDATER_TARGET").as_deref(),
+        Some("${{ join(matrix.targets, '') }}")
+    );
+    let rebuild_script = step_script(rebuild);
+    assert!(rebuild_script.contains("test \"$RUST_HOST\" = \"$UPDATER_TARGET\""));
+    assert!(
+        rebuild_script
+            .contains("cargo install --locked axoupdater-cli --version \"$AXOUPDATER_VERSION\"")
+    );
+    assert!(rebuild_script.contains(
+        "install -m 0755 target/axoupdater/bin/axoupdater \"target/distrib/kickoutchi-${UPDATER_TARGET}-update\""
+    ));
+    let steps = job_steps(local);
+    let position = |name| {
+        steps
+            .iter()
+            .position(|step| step_name(step) == Some(name))
+            .unwrap_or_else(|| panic!("missing workflow step {name}"))
+    };
+    assert!(position("Build artifacts") < position("Rebuild Linux updater at supported ABI floor"));
+    assert!(
+        position("Rebuild Linux updater at supported ABI floor")
+            < position("Validate native release archive")
+    );
+    assert!(position("Validate native release archive") < position("Upload artifacts"));
+}
+
+#[test]
+fn installers_and_updater_are_executed_before_and_after_publication() {
+    let release = parsed_workflow(RELEASE_WORKFLOW);
+    let installers = workflow_job(&release, "validate-installers");
+    assert!(
+        yaml_sequence(installers, "needs")
+            .iter()
+            .any(|job| job == "build-global-artifacts")
+    );
+    let strategy = mapping_value(installers, "strategy")
+        .map(|value| required_mapping(value, "installer strategy"))
+        .expect("installer job must define a strategy");
+    let matrix = mapping_value(strategy, "matrix")
+        .map(|value| required_mapping(value, "installer matrix"))
+        .expect("installer strategy must define a matrix");
+    let include = required_sequence(matrix, "include");
+    assert_eq!(
+        include.len(),
+        3,
+        "Linux, macOS, and Windows installers must run"
+    );
+    let runners = include
+        .iter()
+        .map(|entry| {
+            yaml_scalar(required_mapping(entry, "installer matrix entry"), "runner")
+                .expect("installer matrix entry must name a runner")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runners, ["ubuntu-22.04", "macos-14", "windows-2022"]);
+
+    let execute = named_job_step(installers, "Execute generated installer and updater");
+    assert_eq!(
+        step_env(execute, "KICKOUTCHI_RELEASE_INSTALLER").as_deref(),
+        Some("target/distrib/${{ matrix.installer }}")
+    );
+    assert!(
+        step_script(execute)
+            .contains("validate_generated_native_installer -- --exact --ignored --nocapture")
+    );
+    assert!(mapping_value(execute, "continue-on-error").is_none());
+
+    let host = workflow_job(&release, "host");
+    assert!(
+        yaml_sequence(host, "needs")
+            .iter()
+            .any(|job| job == "validate-installers")
+    );
+    assert!(yaml_scalar(host, "if").is_some_and(|condition| {
+        condition.contains("needs.validate-installers.result == 'success'")
+    }));
+
+    let published = workflow_job(&release, "validate-published-release");
+    assert!(
+        yaml_sequence(published, "needs")
+            .iter()
+            .any(|job| job == "host")
+    );
+    assert!(
+        yaml_scalar(published, "if")
+            .is_some_and(|condition| condition.contains("needs.host.result == 'success'"))
+    );
+    let download = named_job_step(published, "Download published installer");
+    assert_eq!(
+        step_env(download, "RELEASE_TAG").as_deref(),
+        Some("${{ needs.plan.outputs.tag }}")
+    );
+    assert!(step_script(download).contains("gh release download \"$RELEASE_TAG\""));
+    let smoke = named_job_step(published, "Execute published installer and updater");
+    assert_eq!(
+        step_env(smoke, "KICKOUTCHI_RELEASE_PUBLIC").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        step_env(smoke, "KICKOUTCHI_RELEASE_TAG").as_deref(),
+        Some("${{ needs.plan.outputs.tag }}")
+    );
+    assert_eq!(
+        step_env(smoke, "KICKOUTCHI_RELEASE_GITHUB_TOKEN").as_deref(),
+        Some("${{ secrets.GITHUB_TOKEN }}")
+    );
+
+    let homebrew = workflow_job(&release, "publish-homebrew-formula");
+    assert!(
+        yaml_sequence(homebrew, "needs")
+            .iter()
+            .any(|job| job == "validate-published-release")
+    );
+    assert!(yaml_scalar(homebrew, "if").is_some_and(|condition| {
+        condition.contains("needs.validate-published-release.result == 'success'")
+    }));
+
+    let complete = workflow_job(&release, "publication-complete");
+    assert!(
+        yaml_sequence(complete, "needs")
+            .iter()
+            .any(|job| job == "validate-published-release")
+    );
+    assert!(yaml_scalar(complete, "if").is_some_and(|condition| {
+        condition.contains("needs.validate-published-release.result == 'success'")
+    }));
+    let confirm = named_job_step(complete, "Confirm publication gates");
+    assert_eq!(step_script(confirm), "true");
+    assert!(action_reference(confirm).is_none());
+}
+
+#[test]
 fn structured_workflow_accessors_cover_all_jobs_and_yaml_forms() {
     let fixture = parsed_workflow(
         r#"

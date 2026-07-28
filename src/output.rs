@@ -11,7 +11,7 @@ use std::io::Write;
 use serde::ser::{SerializeSeq, Serializer};
 use unicode_width::UnicodeWidthStr;
 
-use crate::display::sanitize;
+use crate::display::{human_address_text, sanitize};
 use crate::labels::label_display_text;
 use crate::model::PortEntryView;
 
@@ -121,7 +121,7 @@ pub(crate) fn write_view_json(
 
 fn update_widths(entry: &PortEntryView<'_>, widths: &mut [usize]) {
     widths[0] = widths[0].max(entry.protocol.label().width());
-    widths[1] = widths[1].max(entry.local_addr.to_string().width());
+    widths[1] = widths[1].max(human_address_text(entry.local_addr, entry.ipv6_scope).width());
     widths[2] = widths[2].max(entry.local_port.to_string().width());
     widths[3] = widths[3].max(entry.pid.map_or(1, |pid| pid.to_string().width()));
     widths[4] = widths[4].max(entry.process_name.map_or(1, |name| sanitize(name).width()));
@@ -133,7 +133,7 @@ fn write_entry(
     entry: &PortEntryView<'_>,
     widths: &[usize; COLUMN_COUNT],
 ) -> std::io::Result<()> {
-    let address = entry.local_addr.to_string();
+    let address = human_address_text(entry.local_addr, entry.ipv6_scope);
     let port = entry.local_port.to_string();
     let pid = entry.pid.map(|pid| pid.to_string());
     let process = entry.process_name.map(sanitize);
@@ -156,7 +156,7 @@ fn write_labeled_entry(
     entry: &PortEntryView<'_>,
     widths: &[usize; LABELED_COLUMN_COUNT],
 ) -> std::io::Result<()> {
-    let address = entry.local_addr.to_string();
+    let address = human_address_text(entry.local_addr, entry.ipv6_scope);
     let port = entry.local_port.to_string();
     let pid = entry.pid.map(|pid| pid.to_string());
     let process = entry.process_name.map(sanitize);
@@ -267,8 +267,21 @@ mod tests {
         assert!(lines[1].contains("node"));
         assert!(lines[1].contains("18422"));
         // Withheld metadata renders as "-" and the row still appears.
-        assert!(lines[2].contains("::"));
+        assert!(lines[2].contains("::%unavailable"));
         assert!(lines[2].contains('-'));
+    }
+
+    #[test]
+    fn table_distinguishes_scoped_ipv6_without_changing_legacy_json() {
+        let mut scoped = entry(3000, Some(1), Some("node"));
+        scoped.local_addr = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
+        scoped.ipv6_scope =
+            Some(crate::observation::Ipv6Scope::interface_index(3).expect("test scope is valid"));
+
+        assert!(table(&[scoped.clone()]).contains("fe80::1%3"));
+        let value: serde_json::Value = serde_json::from_str(&json(&[scoped])).unwrap();
+        assert_eq!(value[0]["local_addr"], "fe80::1");
+        assert!(value[0].get("ipv6_scope").is_none());
     }
 
     #[test]

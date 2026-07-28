@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::display::sanitize;
+use crate::display::{human_address_text, human_endpoint_text, sanitize};
 use crate::model::{
     ChildProcessSnapshot, DockerContainerPort, DockerPortContext, PermissionStatus, PortEntryView,
     ProcessContext, Protocol,
@@ -152,10 +152,9 @@ fn panel_lines(
         field(
             "Bind",
             format!(
-                "{} {}:{} {} | {}",
+                "{} {} {} | {}",
                 entry.protocol.label(),
-                entry.local_addr,
-                entry.local_port,
+                human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope),
                 entry.state.label(),
                 entry.scope_label()
             ),
@@ -190,7 +189,11 @@ fn modal_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         field("Protocol", entry.protocol.label().to_owned(), theme),
-        field("Address", entry.local_addr.to_string(), theme),
+        field(
+            "Address",
+            human_address_text(entry.local_addr, entry.ipv6_scope),
+            theme,
+        ),
         field("Port", entry.local_port.to_string(), theme),
         field("Scope", entry.scope_label().to_owned(), theme),
         field("State", entry.state.label().to_owned(), theme),
@@ -440,6 +443,27 @@ mod tests {
         );
 
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn panel_bind_text_preserves_ipv6_interface_scope() {
+        let mut row = entry();
+        row.local_addr = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
+        row.ipv6_scope =
+            Some(crate::observation::Ipv6Scope::interface_index(3).expect("test scope is valid"));
+        let lines = panel_lines(
+            PortEntryView::from(&row),
+            None,
+            false,
+            Theme::from_environment(),
+            7,
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("TCP [fe80::1%3]:3000"))
+        );
     }
 
     #[test]

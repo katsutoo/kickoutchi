@@ -16,12 +16,15 @@ use zip::ZipArchive;
 
 const ARCHIVE_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const BINARY_BYTES_MAX: u64 = 256 * 1024 * 1024;
+const INSTALLER_BYTES_MAX: u64 = 4 * 1024 * 1024;
+const RECEIPT_BYTES_MAX: usize = 64 * 1024;
 const ARCHIVE_MEMBERS_MAX: usize = 64;
 const ARCHIVE_EXPANDED_BYTES_MAX: u64 = 512 * 1024 * 1024;
 const XZ_DICTIONARY_BYTES_INITIAL: usize = 8 * 1024 * 1024;
 const XZ_DICTIONARY_BYTES_MAX: usize = 64 * 1024 * 1024;
 const XZ_INPUT_BUFFER_BYTES: usize = 8192;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const INSTALLER_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_OUTPUT_BYTES_MAX: usize = 4096;
 const READELF_OUTPUT_BYTES_MAX: usize = 64 * 1024;
@@ -917,6 +920,15 @@ fn run_bounded_command(
     description: &str,
     output_limit: usize,
 ) -> ValidationResult<BoundedCommandOutput> {
+    run_bounded_command_with_timeout(command, description, output_limit, COMMAND_TIMEOUT)
+}
+
+fn run_bounded_command_with_timeout(
+    command: &mut Command,
+    description: &str,
+    output_limit: usize,
+    timeout: Duration,
+) -> ValidationResult<BoundedCommandOutput> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -956,7 +968,7 @@ fn run_bounded_command(
         }
         let _result = stderr_sender.send(result);
     });
-    let status_result = wait_with_deadline(&mut child, COMMAND_TIMEOUT, Some(&overflow));
+    let status_result = wait_with_deadline(&mut child, timeout, Some(&overflow));
     let stdout = stdout_receiver
         .recv_timeout(CHILD_CLEANUP_TIMEOUT)
         .map_err(|error| format!("{description} stdout reader did not stop: {error}"))??;
@@ -990,6 +1002,77 @@ fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
         ));
     }
     Ok(())
+}
+
+fn run_updater_help(updater: &Path) -> ValidationResult<()> {
+    let description = format!("{} --help", updater.display());
+    let output = run_bounded_command(
+        Command::new(updater).arg("--help"),
+        &description,
+        VERSION_OUTPUT_BYTES_MAX,
+    )?;
+    let stdout = str::from_utf8(&output.stdout)
+        .map_err(|_| format!("updater help was not UTF-8 for {}", updater.display()))?;
+    if !output.status.success() || !stdout.contains("Usage:") || !stdout.contains("--tag") {
+        return Err(format!(
+            "unexpected updater help from {}: status={}, stdout={stdout:?}, stderr={:?}",
+            updater.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_updater_artifact(
+    distrib: &Path,
+    target: NativeTarget,
+    destination: &Path,
+    runner_os: &str,
+) -> ValidationResult<(PathBuf, String)> {
+    let source = distrib.join(format!("kickoutchi-{}-update", target.triple));
+    let metadata = fs::symlink_metadata(&source)
+        .map_err(|error| format!("missing native updater {}: {error}", source.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "native updater must be a regular file: {}",
+            source.display()
+        ));
+    }
+    if !(1..=BINARY_BYTES_MAX).contains(&metadata.len()) {
+        return Err(format!(
+            "native updater size is outside the approved bound: {}",
+            source.display()
+        ));
+    }
+    let updater_name = if target.windows {
+        "kickoutchi-update.exe"
+    } else {
+        "kickoutchi-update"
+    };
+    let updater = destination.join(updater_name);
+    let copied = fs::copy(&source, &updater).map_err(|error| {
+        format!(
+            "could not copy native updater {}: {error}",
+            source.display()
+        )
+    })?;
+    require_exact_read(copied, metadata.len(), updater_name)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&updater, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "could not make updater executable {}: {error}",
+                updater.display()
+            )
+        })?;
+    }
+    if runner_os == "Linux" {
+        inspect_glibc_abi(&updater)?;
+    }
+    run_updater_help(&updater)?;
+    Ok((updater, sha256(&source)?))
 }
 
 fn inspect_glibc_abi(binary: &Path) -> ValidationResult<()> {
@@ -1091,6 +1174,347 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+fn file_url_text(path: &str, windows: bool) -> ValidationResult<String> {
+    let normalized = if windows {
+        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+        if path.starts_with(r"UNC\") || path.starts_with(r"\\") {
+            return Err("UNC artifact directories are not supported by this validator".to_owned());
+        }
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    let mut url = if windows {
+        String::from("file:///")
+    } else {
+        String::from("file://")
+    };
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    Ok(url)
+}
+
+fn percent_encode_file_path(path: &Path, windows: bool) -> ValidationResult<String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("artifact directory could not be resolved: {error}"))?;
+    let text = canonical
+        .to_str()
+        .ok_or_else(|| "artifact directory path must be UTF-8".to_owned())?;
+    file_url_text(text, windows)
+}
+
+fn copy_exact_file(source: &Path, destination: &Path) -> ValidationResult<()> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("missing installer input {}: {error}", source.display()))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "installer input must be a regular file: {}",
+            source.display()
+        ));
+    }
+    let copied = fs::copy(source, destination).map_err(|error| {
+        format!(
+            "could not copy installer input {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    require_exact_read(
+        copied,
+        metadata.len(),
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("installer input"),
+    )
+}
+
+fn configure_installer_environment(
+    command: &mut Command,
+    temporary: &Path,
+    install_root: &Path,
+    download_url: Option<&str>,
+) {
+    for variable in [
+        "GITHUB_PATH",
+        "CARGO_DIST_FORCE_INSTALL_DIR",
+        "INSTALLER_DOWNLOAD_URL",
+        "INSTALLER_NO_MODIFY_PATH",
+        "KICKOUTCHI_UNMANAGED_INSTALL",
+        "KICKOUTCHI_DISABLE_UPDATE",
+        "KICKOUTCHI_DOWNLOAD_URL",
+        "KICKOUTCHI_INSTALLER_GITHUB_BASE_URL",
+        "KICKOUTCHI_INSTALLER_GHE_BASE_URL",
+        "KICKOUTCHI_GITHUB_TOKEN",
+        "KICKOUTCHI_RELEASE_GITHUB_TOKEN",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+        .env("HOME", temporary.join("home"))
+        .env("USERPROFILE", temporary.join("home"))
+        .env("XDG_CONFIG_HOME", temporary.join("config"))
+        .env("LOCALAPPDATA", temporary.join("local"))
+        .env("APPDATA", temporary.join("roaming"))
+        .env("TMPDIR", temporary.join("tmp"))
+        .env("TEMP", temporary.join("tmp"))
+        .env("TMP", temporary.join("tmp"))
+        .env("KICKOUTCHI_INSTALL_DIR", install_root)
+        .env("KICKOUTCHI_NO_MODIFY_PATH", "1")
+        .env("KICKOUTCHI_PRINT_QUIET", "1");
+    if let Some(download_url) = download_url {
+        command.env("KICKOUTCHI_DOWNLOAD_URL", download_url);
+    }
+}
+
+fn require_installed_binary(path: &Path) -> ValidationResult<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("installed binary is missing {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || !(1..=BINARY_BYTES_MAX).contains(&metadata.len())
+    {
+        return Err(format!(
+            "installed binary is not a bounded regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_installer_receipt(
+    path: &Path,
+    install_root: &Path,
+    expected_version: &str,
+) -> ValidationResult<()> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("installer receipt is missing {}: {error}", path.display()))?;
+    let bytes = read_bounded(&mut file, RECEIPT_BYTES_MAX)?;
+    let receipt: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("installer receipt is invalid JSON: {error}"))?;
+    if receipt["version"] != expected_version
+        || receipt["provider"]["source"] != "cargo-dist"
+        || receipt["install_prefix"] != install_root.to_string_lossy().as_ref()
+    {
+        return Err(format!(
+            "installer receipt has unexpected contents: {receipt}"
+        ));
+    }
+    Ok(())
+}
+
+fn rewrite_installer_receipt_version(path: &Path, version: &str) -> ValidationResult<()> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("installer receipt is missing {}: {error}", path.display()))?;
+    let bytes = read_bounded(&mut file, RECEIPT_BYTES_MAX)?;
+    let mut receipt: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("installer receipt is invalid JSON: {error}"))?;
+    receipt["version"] = serde_json::Value::String(version.to_owned());
+    let bytes = serde_json::to_vec(&receipt)
+        .map_err(|error| format!("installer receipt could not be encoded: {error}"))?;
+    if bytes.len() > RECEIPT_BYTES_MAX {
+        return Err("rewritten installer receipt exceeds its byte bound".to_owned());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| format!("installer receipt could not be rewritten: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("installer receipt could not be rewritten: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("installer receipt could not be synced: {error}"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the native installer journey keeps setup, execution, and postconditions in order"
+)]
+fn validate_generated_installer(
+    distrib_path: &Path,
+    installer_path: &Path,
+    targets_json: &str,
+    runner_os: &str,
+    runner_arch: &str,
+    public_release: bool,
+    release_tag: Option<&str>,
+) -> ValidationResult<()> {
+    let targets = parse_targets(targets_json)?;
+    let target = native_target(runner_os, runner_arch)?;
+    require_single_native_target(&targets, target.triple)?;
+    let distrib = distrib_path
+        .canonicalize()
+        .map_err(|error| format!("distribution path could not be resolved: {error}"))?;
+    let installer = if installer_path.is_absolute() {
+        installer_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("working directory could not be resolved: {error}"))?
+            .join(installer_path)
+    };
+    let installer_name = if target.windows {
+        "kickoutchi-installer.ps1"
+    } else {
+        "kickoutchi-installer.sh"
+    };
+    if installer.file_name().and_then(|name| name.to_str()) != Some(installer_name) {
+        return Err(format!(
+            "unexpected installer filename: {}",
+            installer.display()
+        ));
+    }
+    let installer_metadata = fs::symlink_metadata(&installer)
+        .map_err(|error| format!("installer metadata is unavailable: {error}"))?;
+    if !installer_metadata.file_type().is_file()
+        || installer_metadata.file_type().is_symlink()
+        || !(1..=INSTALLER_BYTES_MAX).contains(&installer_metadata.len())
+    {
+        return Err("installer must be a bounded regular file".to_owned());
+    }
+    if public_release {
+        let generated = distrib.join(installer_name);
+        if sha256(&installer)? != sha256(&generated)? {
+            return Err(
+                "published installer differs from the same-run generated installer".to_owned(),
+            );
+        }
+    }
+
+    let temporary = TemporaryDirectory::new("kickoutchi-installer-e2e")?;
+    for directory in ["home", "config", "local", "roaming", "tmp"] {
+        fs::create_dir(temporary.path.join(directory))
+            .map_err(|error| format!("could not create isolated {directory} directory: {error}"))?;
+    }
+    let install_root = temporary.path.join("install");
+    let artifact_source = temporary.path.join("artifacts");
+    fs::create_dir(&artifact_source)
+        .map_err(|error| format!("could not create local artifact directory: {error}"))?;
+    let archive_suffix = if target.windows { ".zip" } else { ".tar.xz" };
+    let archive_name = format!("kickoutchi-{}{archive_suffix}", target.triple);
+    let updater_name = format!("kickoutchi-{}-update", target.triple);
+    copy_exact_file(
+        &distrib.join(&archive_name),
+        &artifact_source.join(&archive_name),
+    )?;
+    copy_exact_file(
+        &distrib.join(&updater_name),
+        &artifact_source.join(&updater_name),
+    )?;
+    let local_url = (!public_release)
+        .then(|| percent_encode_file_path(&artifact_source, target.windows))
+        .transpose()?;
+
+    let mut command = if target.windows {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ]);
+        command.arg(&installer);
+        command
+    } else {
+        let mut command = Command::new("sh");
+        command.arg(&installer);
+        command
+    };
+    configure_installer_environment(
+        &mut command,
+        &temporary.path,
+        &install_root,
+        local_url.as_deref(),
+    );
+    let output = run_bounded_command_with_timeout(
+        &mut command,
+        "generated release installer",
+        READELF_OUTPUT_BYTES_MAX,
+        INSTALLER_COMMAND_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "generated installer failed: status={}, stdout={:?}, stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let suffix = if target.windows { ".exe" } else { "" };
+    let bin = install_root.join("bin");
+    let canonical = bin.join(format!("kickoutchi{suffix}"));
+    let short = bin.join(format!("kick{suffix}"));
+    let updater = bin.join(format!("kickoutchi-update{suffix}"));
+    for path in [&canonical, &short, &updater] {
+        require_installed_binary(path)?;
+    }
+    run_version(&canonical, env!("CARGO_PKG_VERSION"))?;
+    run_version(&short, env!("CARGO_PKG_VERSION"))?;
+    run_updater_help(&updater)?;
+    let receipt = temporary
+        .path
+        .join("config/kickoutchi/kickoutchi-receipt.json");
+    validate_installer_receipt(&receipt, &install_root, env!("CARGO_PKG_VERSION"))?;
+
+    if public_release {
+        let release_tag = release_tag
+            .ok_or_else(|| "public installer validation requires a release tag".to_owned())?;
+        let expected_updater = distrib.join(&updater_name);
+        if sha256(&updater)? != sha256(&expected_updater)? {
+            return Err("published updater differs from the same-run updater".to_owned());
+        }
+        rewrite_installer_receipt_version(&receipt, "0.0.0")?;
+        fs::write(&canonical, b"stale kickoutchi binary")
+            .map_err(|error| format!("could not stage stale canonical binary: {error}"))?;
+        fs::write(&short, b"stale kick binary")
+            .map_err(|error| format!("could not stage stale short binary: {error}"))?;
+        let mut update = Command::new(&updater);
+        update.args(["--tag", release_tag]);
+        configure_installer_environment(&mut update, &temporary.path, &install_root, None);
+        let github_token = std::env::var("KICKOUTCHI_RELEASE_GITHUB_TOKEN")
+            .map_err(|_| "public updater validation requires a GitHub token".to_owned())?;
+        update.env("AXOUPDATER_GITHUB_TOKEN", github_token);
+        let output = run_bounded_command_with_timeout(
+            &mut update,
+            "published updater",
+            READELF_OUTPUT_BYTES_MAX,
+            INSTALLER_COMMAND_TIMEOUT,
+        )?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || !stderr.contains("New release") {
+            return Err(format!(
+                "published updater failed: status={}, stdout={:?}, stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                stderr,
+            ));
+        }
+        run_version(&canonical, env!("CARGO_PKG_VERSION"))?;
+        run_version(&short, env!("CARGO_PKG_VERSION"))?;
+        if sha256(&updater)? != sha256(&expected_updater)? {
+            return Err("updated public updater differs from the same-run updater".to_owned());
+        }
+        validate_installer_receipt(&receipt, &install_root, env!("CARGO_PKG_VERSION"))?;
+    }
+
+    println!(
+        "validated release installer: target={}, installer={}, public_release={public_release}",
+        target.triple,
+        installer.display(),
+    );
+    Ok(())
+}
+
 fn validate_release_artifact(
     distrib_path: &Path,
     targets_json: &str,
@@ -1131,6 +1555,8 @@ fn validate_release_artifact(
         format!("kick{executable_suffix}"),
     ]);
     let temporary = TemporaryDirectory::new("kickoutchi-release-e2e")?;
+    let (updater, updater_sha256) =
+        validate_updater_artifact(&distrib, target, &temporary.path, runner_os)?;
     let binaries = if target.windows {
         extract_zip_binaries(&archive, &temporary.path, target.triple, &expected_binaries)?
     } else {
@@ -1158,10 +1584,12 @@ fn validate_release_artifact(
     run_version(short, env!("CARGO_PKG_VERSION"))?;
     run_archive_journeys(canonical, short, runner_os)?;
     println!(
-        "validated native release archive: target={}, archive={}, bytes={}, sha256={archive_sha256}",
+        "validated native release archive and updater: target={}, archive={}, bytes={}, \
+         archive_sha256={archive_sha256}, updater={}, updater_sha256={updater_sha256}",
         target.triple,
         archive.display(),
-        metadata.len()
+        metadata.len(),
+        updater.display(),
     );
     Ok(())
 }
@@ -1180,6 +1608,35 @@ fn validate_generated_native_archive() {
         .expect("KICKOUTCHI_RELEASE_RUNNER_ARCH must identify the native runner architecture");
     validate_release_artifact(&distrib, &targets, &runner_os, &runner_arch)
         .expect("generated native release archive must satisfy the release contract");
+}
+
+#[test]
+#[ignore = "requires cargo-dist installers and an explicit native runner contract"]
+fn validate_generated_native_installer() {
+    let distrib = std::env::var_os("KICKOUTCHI_RELEASE_DISTRIB")
+        .map(PathBuf::from)
+        .expect("KICKOUTCHI_RELEASE_DISTRIB must identify cargo-dist output");
+    let installer = std::env::var_os("KICKOUTCHI_RELEASE_INSTALLER")
+        .map(PathBuf::from)
+        .expect("KICKOUTCHI_RELEASE_INSTALLER must identify the generated installer");
+    let targets = std::env::var("KICKOUTCHI_RELEASE_TARGETS_JSON")
+        .expect("KICKOUTCHI_RELEASE_TARGETS_JSON must contain the matrix targets");
+    let runner_os = std::env::var("KICKOUTCHI_RELEASE_RUNNER_OS")
+        .expect("KICKOUTCHI_RELEASE_RUNNER_OS must identify the native runner OS");
+    let runner_arch = std::env::var("KICKOUTCHI_RELEASE_RUNNER_ARCH")
+        .expect("KICKOUTCHI_RELEASE_RUNNER_ARCH must identify the native runner architecture");
+    let public_release = std::env::var("KICKOUTCHI_RELEASE_PUBLIC").as_deref() == Ok("1");
+    let release_tag = std::env::var("KICKOUTCHI_RELEASE_TAG").ok();
+    validate_generated_installer(
+        &distrib,
+        &installer,
+        &targets,
+        &runner_os,
+        &runner_arch,
+        public_release,
+        release_tag.as_deref(),
+    )
+    .expect("generated native installer must satisfy the release contract");
 }
 
 #[cfg(test)]
@@ -1213,6 +1670,16 @@ mod tests {
 
     fn temporary_directory(prefix: &str) -> TemporaryDirectory {
         TemporaryDirectory::new(prefix).expect("test temporary directory must be created")
+    }
+
+    #[test]
+    fn windows_file_urls_strip_verbatim_prefix_and_reject_unc_paths() {
+        assert_eq!(
+            file_url_text(r"\\?\D:\a path\artifacts", true).unwrap(),
+            "file:///D:/a%20path/artifacts"
+        );
+        assert!(file_url_text(r"\\?\UNC\server\share", true).is_err());
+        assert!(file_url_text(r"\\server\share", true).is_err());
     }
 
     fn write_tar(path: &Path, executable_mode: u32) {

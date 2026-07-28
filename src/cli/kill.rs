@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::collector;
 use crate::command;
 use crate::config::Config;
-use crate::display::sanitize;
+use crate::display::{human_endpoint_text, sanitize};
 use crate::model::{PortEntry, PortEntryView, ProcessContext};
 use crate::observation::MetadataProfile;
 use crate::platform;
@@ -473,10 +473,9 @@ fn candidate_labels(rows: &[PortEntryView<'_>]) -> Vec<String> {
             let pid = entry.pid?;
             let name = sanitize(entry.process_name.unwrap_or("<unknown>"));
             Some(format!(
-                "PID {pid} ({name}) {} {}:{}",
+                "PID {pid} ({name}) {} {}",
                 entry.protocol.label(),
-                entry.local_addr,
-                entry.local_port,
+                human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope),
             ))
         })
         .collect::<Vec<_>>();

@@ -393,6 +393,11 @@ Each array element has exactly these fields:
 
 Process names and command lines preserve the established lossy decoding behavior: invalid Unix bytes or Windows UTF-16 sequences become U+FFFD. Executable paths do not use lossy conversion; invalid UTF-8 becomes `null` and makes metadata partial.
 
+Human output appends `%<interface-index>` or `%unavailable` to IPv6 addresses so
+distinct endpoint identities remain visible. That display convention does not
+change this legacy JSON contract: `local_addr` remains bare canonical IP text,
+and consumers that need structured scope identity should use snapshot JSON.
+
 The array order follows the selected `--sort` mode, or the configured default sort when `--sort` is absent. Filtering occurs before serialization. An empty result is exactly `[]\n`. An empty result from an explicit selection or filter exits `3`; an unfiltered empty host is successful.
 
 `label` is the only additive field introduced into this legacy contract. Exact protocol/address/port label selectors take precedence over explicit wildcard-address selectors. Exact IPv6 labels include scope identity; wildcard selectors deliberately ignore scope. Labels are validated visible Unicode, at most 128 UTF-8 bytes, and are not clipped in JSON.

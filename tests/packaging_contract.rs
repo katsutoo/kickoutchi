@@ -21,14 +21,12 @@ fn nix_is_linux_only_and_derives_the_cargo_version() {
     assert!(flake.contains("version = cargoPackage.package.version;"));
 }
 
-/// `.SRCINFO` is generated from its `PKGBUILD` and is what the AUR actually
-/// indexes, so the two drifting apart publishes a version and checksum set that
-/// nobody built. The check is deliberately `PKGBUILD` against its own
-/// `.SRCINFO` and never against `Cargo.toml`: package metadata is pinned to the
-/// latest *published* release on purpose, so it legitimately lags a version
-/// bump until that release's assets exist.
+/// Fast host-side coverage for the release fields most often updated together.
+/// CI separately compares complete `makepkg --printsrcinfo` output in Arch.
+/// Package metadata is deliberately compared with its own PKGBUILD rather than
+/// Cargo.toml because it remains pinned to the latest published release.
 #[test]
-fn arch_srcinfo_matches_its_regenerated_pkgbuild() {
+fn arch_srcinfo_version_and_checksums_match_pkgbuild() {
     for package in ["kickoutchi", "kickoutchi-bin"] {
         let directory = format!("packaging/arch/{package}");
         let pkgbuild = read(format!("{directory}/PKGBUILD"));
