@@ -1413,7 +1413,7 @@ fn validate_generated_installer(
         .transpose()?;
 
     let mut command = if target.windows {
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new("pwsh.exe");
         command.args([
             "-NoLogo",
             "-NoProfile",
