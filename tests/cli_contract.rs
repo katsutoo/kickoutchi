@@ -4640,6 +4640,7 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -4661,6 +4662,13 @@ mod windows {
     /// How long a parked helper may outlive its test before self-destructing.
     const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
     static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
+        HOST_OBSERVATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     struct ChildGuard {
         child: Child,
@@ -5097,6 +5105,7 @@ mod windows {
 
     #[test]
     fn windows_interactive_normal_kill_accepts_y_and_port_disappears() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
         let pid_text = helper.id().to_string();
@@ -5137,6 +5146,7 @@ mod windows {
 
     #[test]
     fn windows_inspect_shows_family_read_only_with_kill_hint() {
+        let _host_observation = lock_host_observation();
         let (helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
         let _child_cleanup = PidGuard::new(child_pid);
         let root_pid_text = helper.id().to_string();
@@ -5173,6 +5183,7 @@ mod windows {
 
     #[test]
     fn windows_tree_kill_by_port_removes_root_and_child() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
@@ -5209,6 +5220,7 @@ mod windows {
 
     #[test]
     fn windows_tree_kill_removes_child_spawned_after_job_assignment() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, late_file, ready_file) = spawn_late_spawner_tree();
         let port_text = port.to_string();
         let root_pid_text = helper.id().to_string();
@@ -5249,6 +5261,7 @@ mod windows {
 
     #[test]
     fn windows_tree_kill_by_pid_allows_portless_parent_when_child_owns_port() {
+        let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("child-owns-port");
         let _child_cleanup = PidGuard::new(child_pid);
         let port_text = port.to_string();
