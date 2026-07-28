@@ -1259,17 +1259,16 @@ fn configure_installer_environment(
         command.env_remove(variable);
     }
     command
-        .env("HOME", temporary.join("home"))
-        .env("USERPROFILE", temporary.join("home"))
         .env("XDG_CONFIG_HOME", temporary.join("config"))
-        .env("LOCALAPPDATA", temporary.join("local"))
-        .env("APPDATA", temporary.join("roaming"))
         .env("TMPDIR", temporary.join("tmp"))
         .env("TEMP", temporary.join("tmp"))
         .env("TMP", temporary.join("tmp"))
         .env("KICKOUTCHI_INSTALL_DIR", install_root)
         .env("KICKOUTCHI_NO_MODIFY_PATH", "1")
         .env("KICKOUTCHI_PRINT_QUIET", "1");
+    if !cfg!(windows) {
+        command.env("HOME", temporary.join("home"));
+    }
     if let Some(download_url) = download_url {
         command.env("KICKOUTCHI_DOWNLOAD_URL", download_url);
     }
@@ -1389,7 +1388,7 @@ fn validate_generated_installer(
     }
 
     let temporary = TemporaryDirectory::new("kickoutchi-installer-e2e")?;
-    for directory in ["home", "config", "local", "roaming", "tmp"] {
+    for directory in ["home", "config", "tmp"] {
         fs::create_dir(temporary.path.join(directory))
             .map_err(|error| format!("could not create isolated {directory} directory: {error}"))?;
     }
