@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.7] - 2026-07-28
+
 ### Added
 
 - Added a copy-ready root `config.example.toml`, covered by the real config
@@ -1243,7 +1245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...HEAD
+[1.3.7]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...v1.3.7
 [1.3.6]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...v1.3.6
 [1.3.5]: https://github.com/nuggocto/kickoutchi/compare/v1.3.1...v1.3.5
 [1.3.1]: https://github.com/nuggocto/kickoutchi/compare/v1.3.0...v1.3.1
