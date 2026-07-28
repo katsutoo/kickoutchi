@@ -1260,14 +1260,15 @@ fn configure_installer_environment(
     }
     command
         .env("XDG_CONFIG_HOME", temporary.join("config"))
-        .env("TMPDIR", temporary.join("tmp"))
-        .env("TEMP", temporary.join("tmp"))
-        .env("TMP", temporary.join("tmp"))
         .env("KICKOUTCHI_INSTALL_DIR", install_root)
         .env("KICKOUTCHI_NO_MODIFY_PATH", "1")
         .env("KICKOUTCHI_PRINT_QUIET", "1");
     if !cfg!(windows) {
-        command.env("HOME", temporary.join("home"));
+        command
+            .env("HOME", temporary.join("home"))
+            .env("TMPDIR", temporary.join("tmp"))
+            .env("TEMP", temporary.join("tmp"))
+            .env("TMP", temporary.join("tmp"));
     }
     if let Some(download_url) = download_url {
         command.env("KICKOUTCHI_DOWNLOAD_URL", download_url);
