@@ -127,7 +127,7 @@ the package manager commands above when you choose to check for an update.
 
 An unqualified Git or Linux Nix GitHub source follows the repository's default branch,
 which can contain changes newer than the latest stable release. For a
-reproducible stable source install, select an explicit tag such as `v1.3.6` and
+reproducible stable source install, select an explicit tag such as `v1.3.9` and
 replace that tag deliberately when upgrading. Direct-archive installs must be
 replaced manually after verifying the new archive.
 
@@ -259,6 +259,36 @@ sharing it. Schema details live in
 | 4 | Permissions prevented a reliable answer |
 | 5 | Kill was cancelled |
 | 6 | A protected process requires confirmation |
+
+## Performance
+
+The 2026-07-29 same-machine snapshot compares the v1.3.8 release with candidate
+implementation `b4af784`. Lower is better.
+
+| Workload | Candidate p50 | p90 | p95 | p99 | p99 vs. v1.3.8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold startup | 1.145 ms | 1.170 ms | 1.182 ms | 1.222 ms | +0.27% |
+| Warm startup | 1.146 ms | 1.174 ms | 1.184 ms | 1.215 ms | -0.09% |
+| `list` | 12.799 ms | 17.156 ms | 18.466 ms | 22.435 ms | +3.84% |
+| `list --json` | 12.774 ms | 17.106 ms | 18.137 ms | 21.275 ms | -0.30% |
+
+This 2026-07-29 Linux run used an AMD Ryzen AI Max+ 395 with 32 logical CPUs:
+three independent fixed-seed sessions, 3,000 observations per build and
+workload, and 24,000 timed process executions in total. Every execution exited
+successfully without a timeout, and every independently evaluated workload
+remained within measured noise. Candidate peak-RSS p99 was at most 25.9 MiB;
+the pre-strip candidate binary and Linux package grew by 0.14% and 0.09%,
+respectively.
+
+The 1.3.9 distribution profile subsequently removed symbol tables without
+changing runtime code or panic unwinding. On the same x86_64 Linux build, each
+executable fell from 4,046,488 to 3,289,136 bytes (-18.72%), and the complete
+archive fell by about 11% to roughly 1.17 MB.
+
+These are directional results from one machine, not portable latency
+guarantees. See the [full performance snapshot](docs/performance.md) for
+baseline values, CPU and memory distributions, hardware, methodology, and
+limitations.
 
 ## Platform Support
 

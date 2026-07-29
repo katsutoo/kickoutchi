@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-07-30
+
 ### Added
 
 - Release assets now receive GitHub artifact attestations in a dedicated
@@ -24,11 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed `CI Complete` result after every lane finishes. Push CI is limited
   to the default `shrek` branch while pull-request and scheduled coverage remain
   enabled; the existing cancellation policy and cache-free builds are unchanged.
-- Added a dependency-free, fixed-seed Linux benchmark harness for interleaved
-  release-build comparisons of cold/warm startup, `list`, `list --json`, CPU,
-  peak RSS, binary/package size, and exit correctness. The recorded v1.3.8
-  comparison found no meaningful latency or memory regression in the current
-  candidate; noisy latency measurements remain outside required pull-request CI.
+- Recorded a dated, same-machine Linux performance snapshot for cold/warm
+  startup, `list`, `list --json`, CPU, peak RSS, binary/package size, and exit
+  correctness. Three fixed-seed interleaved sessions provide 3,000 observations
+  per build and workload, including a higher-confidence p99; the v1.3.8
+  comparison found no meaningful regression, and noisy latency measurements
+  remain outside required pull-request CI.
+- Distribution builds now strip symbol tables while retaining Rust's unwind
+  strategy and cleanup behavior, reducing shipped and installed binary size
+  without changing runtime code paths.
 - Added three pure, bounded parser campaigns for configuration, synthetic Linux
   process data, and release-archive member paths. Small saved corpora replay in
   ordinary tests, while exact-toolchain 60-second campaigns run only weekly or
@@ -53,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent process, including the invoking shell, while PID 0, PID 1, Windows
   System PID 4, Kickoutchi itself, and scoped kills containing Kickoutchi remain
   refused.
+
+### Removed
+
+- Removed the temporary local benchmark harness and its harness-only tests after
+  recording the reproducible performance snapshot. The bounded parser fuzzing
+  campaigns and saved regression corpora remain part of normal and scheduled
+  verification.
 
 ## [1.3.8] - 2026-07-29
 
@@ -1325,7 +1338,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...HEAD
+[1.3.9]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...v1.3.9
 [1.3.8]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...v1.3.8
 [1.3.7]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...v1.3.7
 [1.3.6]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...v1.3.6

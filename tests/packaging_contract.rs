@@ -21,6 +21,28 @@ fn nix_is_linux_only_and_derives_the_cargo_version() {
     assert!(flake.contains("version = cargoPackage.package.version;"));
 }
 
+#[test]
+fn distribution_profile_strips_symbols_and_preserves_unwinding() {
+    let manifest = toml::from_str::<toml::Value>(&read("Cargo.toml"))
+        .expect("Cargo.toml must remain valid TOML");
+    let distribution = manifest
+        .get("profile")
+        .and_then(|profile| profile.get("dist"))
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml must define profile.dist");
+
+    assert_eq!(
+        distribution.get("strip").and_then(toml::Value::as_str),
+        Some("symbols"),
+        "distribution binaries must not retain symbol tables",
+    );
+    assert_eq!(
+        distribution.get("panic").and_then(toml::Value::as_str),
+        Some("unwind"),
+        "distribution binaries must preserve panic cleanup and TUI restoration",
+    );
+}
+
 /// Fast host-side coverage for the release fields most often updated together.
 /// CI separately compares complete `makepkg --printsrcinfo` output in Arch.
 /// Package metadata is deliberately compared with its own PKGBUILD rather than

@@ -2,10 +2,10 @@
 
 Audit date: 2026-07-29
 
-This audit covers the explicit native operating-system boundary in Kickoutchi
-1.3.8 plus the current unreleased changes. It is a finite review of ownership,
-buffer contracts, identity stability, and error handling. It is not a mandate
-to replace working native integrations.
+This audit covers the explicit native operating-system boundary in the
+Kickoutchi 1.3.9 release candidate. It is a finite review of ownership, buffer
+contracts, identity stability, and error handling. It is not a mandate to
+replace working native integrations.
 
 ## Inventory
 
