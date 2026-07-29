@@ -35,4 +35,4 @@ deterministic bounded-size checks independently of these comparative results.
 
 Recorded baselines:
 
-- [v1.3.8 versus candidate `0faad5c`](results/2026-07-29-v1.3.8-vs-0faad5c.md)
+- [v1.3.8 versus candidate `b4af784`](results/2026-07-29-v1.3.8-vs-b4af784.md)
