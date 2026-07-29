@@ -175,10 +175,14 @@ assets exist.
 Release checksums are published through the same repository authority as their
 artifacts. They detect accidental corruption but are not an independent
 signature channel. After archive and installer validation, a dedicated
-least-privileged job creates GitHub artifact attestations for every file that
-the release host will publish. Those attestations bind each file digest to the
-repository, workflow, commit, and triggering event. The host cannot publish
-unless attestation and same-run verification succeed.
+least-privileged job creates GitHub artifact attestations for every prepared
+publication asset. Those attestations bind each file digest to the repository,
+workflow, commit, and triggering event. The host cannot publish those assets
+unless attestation and same-run verification succeed. Because cargo-dist creates
+the final `dist-manifest.json` while preparing the hosted release, a second
+least-privileged job downloads and attests that exact manifest after hosting;
+the public installer journey and package-manager publication remain blocked
+until its attestation verifies.
 
 Release verification builds the native binaries for the exact workflow commit,
 then validates each native binary archive's checksum, layout, executable

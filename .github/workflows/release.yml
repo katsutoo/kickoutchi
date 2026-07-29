@@ -600,7 +600,8 @@ jobs:
     needs:
       - plan
       - host
-    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+      - attest-published-manifest
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest-published-manifest.result == 'success' }}
     runs-on: "ubuntu-22.04"
     timeout-minutes: 15
     permissions:
@@ -647,6 +648,48 @@ jobs:
           KICKOUTCHI_RELEASE_RUNNER_OS: Linux
           KICKOUTCHI_RELEASE_RUNNER_ARCH: X64
         run: cargo test --locked --test release_artifact_validator validate_generated_native_installer -- --exact --ignored --nocapture
+
+  # cargo-dist creates the final dist-manifest only while preparing the hosted
+  # release, after the other publication assets have already been attested.
+  # Attest that host-generated file before any public installer is executed or
+  # package-manager metadata is published.
+  attest-published-manifest:
+    name: Attest published release manifest
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download published release manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/published-manifest"
+          gh release download "$RELEASE_TAG" \
+            --pattern dist-manifest.json \
+            --dir "$RUNNER_TEMP/published-manifest"
+          test -f "$RUNNER_TEMP/published-manifest/dist-manifest.json"
+      - name: Generate release-manifest attestation
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ runner.temp }}/published-manifest/dist-manifest.json
+      - name: Verify release-manifest attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify \
+            "$RUNNER_TEMP/published-manifest/dist-manifest.json" \
+            --repo "$GITHUB_REPOSITORY"
 
   # Publish the dist-generated Homebrew formula to the tap repo. The push
   # authenticates with HOMEBREW_TAP_TOKEN (a PAT scoped to the tap repo), so this

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release publication now attests cargo-dist's host-generated
+  `dist-manifest.json` before the public installer journey or package-manager
+  publication. This closes the provenance-gate mismatch found while publishing
+  1.3.9, where the verifier correctly checked the manifest but the
+  pre-publication attestation job could not yet include it.
+
 ## [1.3.9] - 2026-07-30
 
 ### Added

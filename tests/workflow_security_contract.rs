@@ -269,6 +269,15 @@ fn assert_release_job_permissions(workflow: &Value) {
                 ]),
                 "only the attestation job may mint release provenance"
             ),
+            "attest-published-manifest" => assert_eq!(
+                permissions,
+                Some(vec![
+                    ("contents".to_owned(), "read".to_owned()),
+                    ("id-token".to_owned(), "write".to_owned()),
+                    ("attestations".to_owned(), "write".to_owned()),
+                ]),
+                "only the manifest-attestation job may mint post-publication provenance"
+            ),
             _ => {
                 if let Some(permissions) = permissions {
                     assert!(
@@ -933,7 +942,7 @@ fn release_publication_requires_successful_same_run_verification() {
 }
 
 #[test]
-fn every_release_asset_is_attested_before_publication_and_verified_afterward() {
+fn prepared_release_assets_are_pre_attested_and_host_manifest_is_attested_afterward() {
     let release = parsed_workflow(RELEASE_WORKFLOW);
     let attest = workflow_job(&release, "attest-release-artifacts");
     let needs = yaml_sequence(attest, "needs");
@@ -1023,6 +1032,47 @@ fn every_release_asset_is_attested_before_publication_and_verified_afterward() {
         step_script(steps[verify]).contains("gh attestation verify"),
         "every downloaded asset must be verified with the GitHub CLI"
     );
+
+    assert!(
+        yaml_sequence(published, "needs")
+            .iter()
+            .any(|job| job == "attest-published-manifest"),
+        "published validation must wait for the host-generated manifest attestation"
+    );
+    assert!(
+        yaml_scalar(published, "if").is_some_and(|condition| {
+            condition.contains("needs.attest-published-manifest.result == 'success'")
+        }),
+        "published validation must fail closed when manifest attestation fails"
+    );
+
+    let manifest_attest = workflow_job(&release, "attest-published-manifest");
+    assert_eq!(
+        yaml_sequence(manifest_attest, "needs"),
+        ["plan", "host"],
+        "manifest provenance must be created only after the release host succeeds"
+    );
+    let manifest_condition =
+        yaml_scalar(manifest_attest, "if").expect("manifest attestation must be conditional");
+    assert!(
+        manifest_condition.contains("needs.plan.outputs.publishing == 'true'")
+            && manifest_condition.contains("needs.host.result == 'success'"),
+        "manifest attestation must run only for a successfully hosted release"
+    );
+    let download_manifest = named_job_step(manifest_attest, "Download published release manifest");
+    let download_script = step_script(download_manifest);
+    assert!(download_script.contains("--pattern dist-manifest.json"));
+    assert!(!download_script.contains("|| true"));
+    let generate_manifest =
+        named_job_step(manifest_attest, "Generate release-manifest attestation");
+    assert!(
+        action_reference(generate_manifest)
+            .is_some_and(|action| action.starts_with("actions/attest@")),
+        "the host-generated manifest must use the official attestation action"
+    );
+    let verify_manifest = named_job_step(manifest_attest, "Verify release-manifest attestation");
+    assert!(step_script(verify_manifest).contains("gh attestation verify"));
+    assert!(!step_script(verify_manifest).contains("|| true"));
 }
 
 #[test]
