@@ -1,0 +1,26 @@
+# Bounded parser campaigns
+
+These Linux-only targets exercise pure byte-to-data adapters:
+
+- `config`: bounded config reads, UTF-8 decoding, TOML parsing, and semantic
+  validation;
+- `linux_proc`: synthetic process-stat, process-status, and socket-table text;
+- `archive_member_path`: release-archive member-path canonicalization.
+
+They do not terminate processes, inspect the host, invoke Docker, or use the
+network. Each entry point rejects input beyond its stated byte limit before
+parsing, and the workflow also enforces per-input time, total campaign time, and
+resident-memory limits.
+
+The small checked-in corpora are replayed by ordinary Rust tests on every CI
+run. Longer mutation campaigns run weekly or through manual workflow dispatch:
+
+```console
+cargo +nightly-2026-07-01 fuzz run config fuzz/corpus/config -- \
+  -max_total_time=60 -max_len=65537 -timeout=5 -rss_limit_mb=1024
+```
+
+The auxiliary crate and its exact dependency lock are checked by cargo-deny in
+ordinary CI. Campaign build output, coverage, and failure artifacts are ignored;
+only a minimized input that becomes an intentional regression fixture should be
+added to the saved corpus.

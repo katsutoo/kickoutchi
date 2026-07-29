@@ -1,0 +1,66 @@
+name: Parser robustness
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 * * 4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_NIGHTLY: nightly-2026-07-01
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  parser-campaign:
+    name: Parser campaign (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: config
+            max_input_bytes: 65537
+          - target: linux_proc
+            max_input_bytes: 65537
+          - target: archive_member_path
+            max_input_bytes: 4097
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        run: rustup toolchain install "$RUST_NIGHTLY" --profile minimal
+
+      - name: Use pinned nightly toolchain
+        run: rustup default "$RUST_NIGHTLY"
+
+      - name: Install pinned campaign runner
+        run: cargo install --locked cargo-fuzz --version "$CARGO_FUZZ_VERSION"
+
+      - name: Verify campaign dependency lock
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
+
+      - name: Run bounded parser campaign
+        env:
+          PARSER_TARGET: ${{ matrix.target }}
+          MAX_INPUT_BYTES: ${{ matrix.max_input_bytes }}
+        run: |
+          cargo +"$RUST_NIGHTLY" fuzz run \
+            "$PARSER_TARGET" \
+            "fuzz/corpus/$PARSER_TARGET" \
+            -- \
+            -max_total_time=60 \
+            -max_len="$MAX_INPUT_BYTES" \
+            -timeout=5 \
+            -rss_limit_mb=1024

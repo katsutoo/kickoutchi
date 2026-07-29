@@ -174,16 +174,27 @@ assets exist.
 
 Release checksums are published through the same repository authority as their
 artifacts. They detect accidental corruption but are not an independent
-signature or provenance channel. Release verification builds the native binaries
-for the exact workflow commit, then validates each native binary archive's
-checksum, layout, executable permissions where applicable, both binary entry
-points, runtime version, and updater before upload. Generated installers execute
-against those same-run artifacts before publication. After a GitHub Release is
-created, a separate bounded Linux journey downloads the published installer,
-installs from its public artifact URLs, and executes the published updater against
-the release tag from a deliberately stale isolated installation. Homebrew
-publication waits for that public journey. Source archives do not receive an executable journey, and the
-post-publication check cannot make GitHub publication atomic.
+signature channel. After archive and installer validation, a dedicated
+least-privileged job creates GitHub artifact attestations for every file that
+the release host will publish. Those attestations bind each file digest to the
+repository, workflow, commit, and triggering event. The host cannot publish
+unless attestation and same-run verification succeed.
+
+Release verification builds the native binaries for the exact workflow commit,
+then validates each native binary archive's checksum, layout, executable
+permissions where applicable, both binary entry points, runtime version, and
+updater before upload. Generated installers execute against those same-run
+artifacts before publication. After a GitHub Release is created, a separate
+bounded Linux journey downloads every published asset, verifies its attestation,
+then installs from the public artifact URLs and executes the published updater
+against the release tag from a deliberately stale isolated installation.
+Homebrew publication waits for that public journey. Source archives do not
+receive an executable journey, and the post-publication check cannot make GitHub
+publication atomic.
+
+GitHub remains the identity and storage trust anchor for both release assets and
+their attestations. The attestations provide verifiable build provenance, but
+they are not an independent publisher outside GitHub.
 Users must still decide whether they trust the GitHub repository and each
 package-manager publisher boundary.
 
@@ -197,4 +208,6 @@ The canonical contracts and privacy distinctions are documented in the
 [structured output reference](docs/structured-output.md). Configuration labels
 and filters are documented in the [configuration reference](docs/configuration.md),
 and permanent scope, polling, WSL, and bind-probe limitations are documented in
-[platform support](docs/platform-support.md).
+[platform support](docs/platform-support.md). The finite native-call inventory,
+reviewed invariants, and re-audit triggers are recorded in the
+[native API boundary audit](docs/native-api-audit.md).

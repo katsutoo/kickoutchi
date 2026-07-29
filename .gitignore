@@ -1,4 +1,8 @@
 /target
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/
+/benchmarks/__pycache__/
 /result
 /artifacts/
 /dist-manifest.json

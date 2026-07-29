@@ -1,4 +1,5 @@
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const FUZZ_WORKFLOW: &str = include_str!("../.github/workflows/fuzz.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const DIST_WORKSPACE: &str = include_str!("../dist-workspace.toml");
 
@@ -253,17 +254,29 @@ fn assert_release_job_permissions(workflow: &Value) {
         let permissions =
             mapping_value(job, "permissions").map(|_| yaml_mapping(job, "permissions"));
 
-        if name == "host" {
-            assert_eq!(
+        match name.as_str() {
+            "host" => assert_eq!(
                 permissions,
                 Some(vec![("contents".to_owned(), "write".to_owned())]),
                 "only the GitHub release host job may write repository contents"
-            );
-        } else if let Some(permissions) = permissions {
-            assert!(
-                permissions.iter().all(|(_, access)| access == "read"),
-                "release job {name} must not gain write permissions"
-            );
+            ),
+            "attest-release-artifacts" => assert_eq!(
+                permissions,
+                Some(vec![
+                    ("contents".to_owned(), "read".to_owned()),
+                    ("id-token".to_owned(), "write".to_owned()),
+                    ("attestations".to_owned(), "write".to_owned()),
+                ]),
+                "only the attestation job may mint release provenance"
+            ),
+            _ => {
+                if let Some(permissions) = permissions {
+                    assert!(
+                        permissions.iter().all(|(_, access)| access == "read"),
+                        "release job {name} must not gain write permissions"
+                    );
+                }
+            }
         }
     }
 }
@@ -355,25 +368,31 @@ fn assert_release_binary_journey(
 #[test]
 fn actions_are_sha_pinned_and_checkout_never_persists_credentials() {
     assert_action_pins_and_checkout_credentials(CI_WORKFLOW);
+    assert_action_pins_and_checkout_credentials(FUZZ_WORKFLOW);
     assert_action_pins_and_checkout_credentials(RELEASE_WORKFLOW);
 }
 
 #[test]
 fn workflow_permissions_follow_least_privilege() {
     assert_read_only_default(CI_WORKFLOW);
+    assert_read_only_default(FUZZ_WORKFLOW);
     assert_read_only_default(RELEASE_WORKFLOW);
     let ci = parsed_workflow(CI_WORKFLOW);
+    let fuzz = parsed_workflow(FUZZ_WORKFLOW);
     let release = parsed_workflow(RELEASE_WORKFLOW);
     assert_no_permission_shorthands(&ci);
+    assert_no_permission_shorthands(&fuzz);
     assert_no_permission_shorthands(&release);
-    for name in workflow_job_names(&ci) {
-        if let Some(permissions) = mapping_value(workflow_job(&ci, &name), "permissions") {
-            assert!(
-                required_mapping(permissions, "CI job permissions")
-                    .values()
-                    .all(|access| access.as_str() == Some("read")),
-                "CI job {name} must remain read-only"
-            );
+    for (workflow_name, workflow) in [("CI", &ci), ("parser robustness", &fuzz)] {
+        for name in workflow_job_names(workflow) {
+            if let Some(permissions) = mapping_value(workflow_job(workflow, &name), "permissions") {
+                assert!(
+                    required_mapping(permissions, "job permissions")
+                        .values()
+                        .all(|access| access.as_str() == Some("read")),
+                    "{workflow_name} job {name} must remain read-only"
+                );
+            }
         }
     }
     assert_release_job_permissions(&release);
@@ -465,6 +484,88 @@ fn formatting_and_doctests_run_once_while_native_quality_checks_remain() {
             "{platform} must not duplicate doctests"
         );
     }
+}
+
+#[test]
+fn parser_campaigns_are_bounded_scheduled_and_keep_saved_corpora_in_ci() {
+    let workflow = parsed_workflow(FUZZ_WORKFLOW);
+    let root = workflow_root(&workflow);
+    let triggers = mapping_value(root, "on")
+        .map(|value| required_mapping(value, "parser campaign triggers"))
+        .expect("parser campaign workflow must define triggers");
+    assert!(mapping_value(triggers, "workflow_dispatch").is_some());
+    assert!(mapping_value(triggers, "schedule").is_some());
+    assert!(mapping_value(triggers, "push").is_none());
+    assert!(mapping_value(triggers, "pull_request").is_none());
+
+    let environment = yaml_mapping(root, "env");
+    assert!(
+        environment
+            .iter()
+            .any(|(name, value)| name == "RUST_NIGHTLY" && value.starts_with("nightly-2026-")),
+        "parser campaigns must pin a dated nightly toolchain"
+    );
+    assert!(
+        environment
+            .iter()
+            .any(|(name, value)| name == "CARGO_FUZZ_VERSION" && value == "0.13.2"),
+        "parser campaign runner must use the reviewed exact version"
+    );
+
+    let job = workflow_job(&workflow, "parser-campaign");
+    assert_eq!(yaml_scalar(job, "timeout-minutes").as_deref(), Some("15"));
+    let strategy = mapping_value(job, "strategy")
+        .map(|value| required_mapping(value, "parser campaign strategy"))
+        .expect("parser campaign must define a strategy");
+    let matrix = mapping_value(strategy, "matrix")
+        .map(|value| required_mapping(value, "parser campaign matrix"))
+        .expect("parser campaign must define a matrix");
+    let include = required_sequence(matrix, "include");
+    assert_eq!(include.len(), 3);
+    let mut targets = include
+        .iter()
+        .map(|entry| {
+            let entry = required_mapping(entry, "parser campaign entry");
+            (
+                yaml_scalar(entry, "target").expect("campaign target"),
+                yaml_scalar(entry, "max_input_bytes").expect("campaign input limit"),
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    assert_eq!(
+        targets,
+        [
+            ("archive_member_path".to_owned(), "4097".to_owned()),
+            ("config".to_owned(), "65537".to_owned()),
+            ("linux_proc".to_owned(), "65537".to_owned()),
+        ]
+    );
+
+    let campaign = named_job_step(job, "Run bounded parser campaign");
+    let script = step_script(campaign);
+    for required in [
+        "fuzz/corpus/$PARSER_TARGET",
+        "-max_total_time=60",
+        "-max_len=\"$MAX_INPUT_BYTES\"",
+        "-timeout=5",
+        "-rss_limit_mb=1024",
+    ] {
+        assert!(
+            script.contains(required),
+            "parser campaign is missing bound {required}"
+        );
+    }
+    assert!(mapping_value(campaign, "continue-on-error").is_none());
+    let lock = named_job_step(job, "Verify campaign dependency lock");
+    assert!(step_script(lock).contains("--locked"));
+
+    let ci = parsed_workflow(CI_WORKFLOW);
+    let dependency_check = named_job_step(workflow_job(&ci, "supply-chain"), "Run cargo-deny");
+    assert!(
+        step_script(dependency_check).contains("--manifest-path fuzz/Cargo.toml"),
+        "ordinary CI must validate the parser-campaign dependency lock"
+    );
 }
 
 #[test]
@@ -809,6 +910,18 @@ fn release_publication_requires_successful_same_run_verification() {
             .is_some_and(|condition| condition.contains("needs.verify.result == 'success'")),
         "GitHub release publication must require successful verification"
     );
+    assert!(
+        yaml_sequence(host, "needs")
+            .iter()
+            .any(|job| job == "attest-release-artifacts"),
+        "GitHub release publication must depend on artifact attestation"
+    );
+    assert!(
+        yaml_scalar(host, "if").is_some_and(|condition| {
+            condition.contains("needs.attest-release-artifacts.result == 'success'")
+        }),
+        "GitHub release publication must require artifact attestation to succeed"
+    );
 
     let homebrew = workflow_job(&release, "publish-homebrew-formula");
     assert!(
@@ -816,6 +929,99 @@ fn release_publication_requires_successful_same_run_verification() {
             .iter()
             .any(|job| job == "host"),
         "Homebrew publication must remain downstream of verified GitHub publication"
+    );
+}
+
+#[test]
+fn every_release_asset_is_attested_before_publication_and_verified_afterward() {
+    let release = parsed_workflow(RELEASE_WORKFLOW);
+    let attest = workflow_job(&release, "attest-release-artifacts");
+    let needs = yaml_sequence(attest, "needs");
+    for prerequisite in [
+        "plan",
+        "verify",
+        "build-local-artifacts",
+        "build-global-artifacts",
+        "validate-installers",
+    ] {
+        assert!(
+            needs.iter().any(|job| job == prerequisite),
+            "attestation must depend on {prerequisite}"
+        );
+    }
+    let condition = yaml_scalar(attest, "if").expect("attestation job must be conditional");
+    assert!(
+        condition.contains("needs.plan.outputs.publishing == 'true'")
+            && condition.contains("github.event_name == 'workflow_dispatch'"),
+        "tag releases and manual dry runs must exercise attestation"
+    );
+    for prerequisite in [
+        "plan",
+        "verify",
+        "build-local-artifacts",
+        "build-global-artifacts",
+        "validate-installers",
+    ] {
+        assert!(
+            condition.contains(&format!("needs.{prerequisite}.result == 'success'")),
+            "attestation must fail closed when {prerequisite} fails"
+        );
+    }
+
+    let stage = named_job_step(attest, "Stage publication assets");
+    let stage_script = step_script(stage);
+    assert!(stage_script.contains("target/distrib/*"));
+    assert!(stage_script.contains("*-dist-manifest.json) continue"));
+    assert!(stage_script.contains("target/attestation-subjects/"));
+    assert!(
+        !stage_script.contains("|| true"),
+        "publication-asset staging must fail closed"
+    );
+
+    let generate = named_job_step(attest, "Generate artifact attestations");
+    assert!(
+        action_reference(generate).is_some_and(|action| action.starts_with("actions/attest@")),
+        "the dedicated job must use the official attestation action"
+    );
+    let options = mapping_value(generate, "with")
+        .map(|value| required_mapping(value, "attestation options"))
+        .expect("attestation action must define its subjects");
+    assert_eq!(
+        yaml_scalar(options, "subject-path").as_deref(),
+        Some("target/attestation-subjects/*")
+    );
+
+    let generated_verify = named_job_step(attest, "Verify generated attestations");
+    assert!(
+        step_script(generated_verify).contains("gh attestation verify"),
+        "the generated provenance must be verified in the same run"
+    );
+    assert!(
+        !step_script(generated_verify).contains("|| true"),
+        "generated-provenance verification must fail closed"
+    );
+
+    let published = workflow_job(&release, "validate-published-release");
+    let steps = job_steps(published);
+    let download = steps
+        .iter()
+        .position(|step| step_name(step) == Some("Download published assets"))
+        .expect("published assets must be downloaded");
+    let verify = steps
+        .iter()
+        .position(|step| step_name(step) == Some("Verify published artifact attestations"))
+        .expect("published artifact provenance must be verified");
+    let execute = steps
+        .iter()
+        .position(|step| step_name(step) == Some("Execute published installer and updater"))
+        .expect("published installer journey must remain enabled");
+    assert!(
+        download < verify && verify < execute,
+        "published provenance must be checked before executing the installer"
+    );
+    assert!(
+        step_script(steps[verify]).contains("gh attestation verify"),
+        "every downloaded asset must be verified with the GitHub CLI"
     );
 }
 
@@ -1023,7 +1229,7 @@ fn installers_and_updater_are_executed_before_and_after_publication() {
         yaml_scalar(published, "if")
             .is_some_and(|condition| condition.contains("needs.host.result == 'success'"))
     );
-    let download = named_job_step(published, "Download published installer");
+    let download = named_job_step(published, "Download published assets");
     assert_eq!(
         step_env(download, "RELEASE_TAG").as_deref(),
         Some("${{ needs.plan.outputs.tag }}")

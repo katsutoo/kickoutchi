@@ -98,6 +98,11 @@ pedantic = "warn"
 # would fire `unfulfilled_lint_expectations` on the others.
 allow_attributes_without_reason = "warn"
 
+[lints.rust]
+# cargo-fuzz sets this cfg across the instrumented dependency graph. Declaring
+# it keeps ordinary builds strict without exposing a production Cargo feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

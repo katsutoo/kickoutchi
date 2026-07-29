@@ -1,0 +1,7 @@
+refresh_interval_seconds = 0
+
+[[ports]]
+protocol = "udp"
+address = "::1"
+port = 65536
+label = ""

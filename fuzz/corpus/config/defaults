@@ -1,0 +1,4 @@
+refresh_interval_seconds = 3
+default_sort = "port"
+hide_system_processes = false
+confirm_force_kill = true

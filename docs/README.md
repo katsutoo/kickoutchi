@@ -7,6 +7,8 @@
   probe semantics.
 - [Structured output](structured-output.md): stable JSON and NDJSON schemas,
   exit codes, compatibility, bounds, and privacy guidance.
+- [Native API boundary audit](native-api-audit.md): finite native-call
+  inventory, reviewed invariants, and re-audit triggers.
 - [Security policy](../SECURITY.md): private vulnerability reporting, sensitive
   output, process authority, trust boundaries, and release controls.
 

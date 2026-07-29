@@ -34,6 +34,8 @@ mod process_evidence;
 mod protection;
 mod public_output;
 mod query;
+#[cfg(fuzzing)]
+mod release_archive_path;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
 mod tree;
@@ -41,6 +43,10 @@ mod ui;
 mod watch;
 #[cfg(windows)]
 mod windows_tree;
+
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

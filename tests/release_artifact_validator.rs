@@ -14,6 +14,10 @@ use tar::Archive;
 use xz4rust::{XzDecoder, XzNextBlockResult};
 use zip::ZipArchive;
 
+#[path = "../src/release_archive_path.rs"]
+mod release_archive_path;
+use release_archive_path::safe_member_name;
+
 const ARCHIVE_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const BINARY_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const INSTALLER_BYTES_MAX: u64 = 4 * 1024 * 1024;
@@ -195,37 +199,6 @@ fn verify_checksum(archive: &Path, digest: &str) -> ValidationResult<()> {
         ));
     }
     Ok(())
-}
-
-fn safe_member_name(raw: &[u8], directory: bool) -> ValidationResult<String> {
-    let original =
-        str::from_utf8(raw).map_err(|_| "archive member path is not UTF-8".to_owned())?;
-    let name = if directory {
-        if original.ends_with("//") {
-            return Err(format!("noncanonical archive directory path: {original:?}"));
-        }
-        original.strip_suffix('/').unwrap_or(original)
-    } else {
-        if original.ends_with('/') {
-            return Err(format!("noncanonical archive file path: {original:?}"));
-        }
-        original
-    };
-    let mut parts = name.split('/');
-    let first = parts.next().unwrap_or_default();
-    if name.is_empty()
-        || name.starts_with('/')
-        || name.contains('\\')
-        || name.contains('\0')
-        || first.ends_with(':')
-        || first.is_empty()
-        || first == "."
-        || first == ".."
-        || parts.any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return Err(format!("unsafe archive member path: {original:?}"));
-    }
-    Ok(name.to_owned())
 }
 
 fn expected_archive_paths(target: &str, windows: bool) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -2000,6 +1973,20 @@ mod tests {
         );
         assert!(safe_member_name(b"folder//", true).is_err());
         assert!(safe_member_name(b"bad\xff", false).is_err());
+    }
+
+    #[test]
+    fn saved_archive_path_corpus_remains_bounded_and_panic_free() {
+        for input in [
+            include_bytes!("../fuzz/corpus/archive_member_path/canonical-directory").as_slice(),
+            include_bytes!("../fuzz/corpus/archive_member_path/canonical-file").as_slice(),
+            include_bytes!("../fuzz/corpus/archive_member_path/unicode-file").as_slice(),
+        ] {
+            let Some((&kind, raw)) = input.split_first() else {
+                continue;
+            };
+            let _ = safe_member_name(raw, kind == b'd');
+        }
     }
 
     #[test]

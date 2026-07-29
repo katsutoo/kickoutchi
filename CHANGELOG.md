@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release assets now receive GitHub artifact attestations in a dedicated
+  least-privileged job after native archive and installer validation. Release
+  publication requires successful attestation, and the post-publication journey
+  verifies every downloaded asset before executing the installer.
+- Added a finite native API boundary audit covering all 119 platform-call
+  blocks, their ownership and buffer invariants, process-identity protections,
+  error handling, native validation, and explicit re-audit triggers.
+
 ### Changed
 
 - CI now starts supply-chain, Linux, Windows, macOS, and both Nix lanes
@@ -14,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed `CI Complete` result after every lane finishes. Push CI is limited
   to the default `shrek` branch while pull-request and scheduled coverage remain
   enabled; the existing cancellation policy and cache-free builds are unchanged.
+- Added a dependency-free, fixed-seed Linux benchmark harness for interleaved
+  release-build comparisons of cold/warm startup, `list`, `list --json`, CPU,
+  peak RSS, binary/package size, and exit correctness. The recorded v1.3.8
+  comparison found no meaningful latency or memory regression in the current
+  candidate; noisy latency measurements remain outside required pull-request CI.
+- Added three pure, bounded parser campaigns for configuration, synthetic Linux
+  process data, and release-archive member paths. Small saved corpora replay in
+  ordinary tests, while exact-toolchain 60-second campaigns run only weekly or
+  on manual request; the auxiliary dependency lock receives the same advisory,
+  license, ban, and source checks as the main crate.
 - Windows tree preparation, containment, and post-commit reporting now share the
   same refusal vocabulary and semantic exit classification used by Unix tree
   handling. CLI and TUI renderers share stable tree-refusal causes and direct

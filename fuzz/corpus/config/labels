@@ -1,0 +1,7 @@
+protected_processes = ["postgres", "dockerd", "日本語"]
+
+[[ports]]
+protocol = "tcp"
+address = "127.0.0.1"
+port = 3000
+label = "web"

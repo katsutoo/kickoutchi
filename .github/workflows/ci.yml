@@ -60,7 +60,9 @@ jobs:
             '
 
       - name: Run cargo-deny
-        run: cargo deny check
+        run: |
+          cargo deny --locked check --allow license-not-encountered
+          cargo deny --manifest-path fuzz/Cargo.toml --locked check
 
   linux:
     name: Linux

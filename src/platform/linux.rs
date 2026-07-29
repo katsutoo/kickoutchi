@@ -1954,6 +1954,41 @@ fn parse_status_u32(value: &str) -> std::io::Result<u32> {
         .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))
 }
 
+#[cfg(any(test, fuzzing))]
+pub(crate) fn exercise_proc_parser(bytes: &[u8]) {
+    const FUZZ_INPUT_BYTES_MAX: usize = 64 * 1024;
+    let Some((&selector, payload)) = bytes.split_first() else {
+        return;
+    };
+    if payload.len() > FUZZ_INPUT_BYTES_MAX {
+        return;
+    }
+    match selector % 3 {
+        0 => {
+            let _ = parse_process_start_time_ticks(payload);
+            let _ = parse_process_group_id(payload);
+        }
+        1 => {
+            if let Ok(text) = std::str::from_utf8(payload) {
+                let _ = parse_process_status(text);
+            }
+        }
+        2 => {
+            if let Ok(text) = std::str::from_utf8(payload) {
+                for (protocol, address_family) in [
+                    (Protocol::Tcp, AddressFamily::Ipv4),
+                    (Protocol::Tcp, AddressFamily::Ipv6),
+                    (Protocol::Udp, AddressFamily::Ipv4),
+                    (Protocol::Udp, AddressFamily::Ipv6),
+                ] {
+                    let _ = parse_socket_table(text, protocol, address_family, Some(100), 64);
+                }
+            }
+        }
+        _ => unreachable!("selector modulo three must be in 0..3"),
+    }
+}
+
 fn trimmed_non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim_end_matches(['\n', '\r']);
     if trimmed.is_empty() {
@@ -2773,6 +2808,17 @@ mod tests {
             None,
         );
         assert!(parse_process_status("PPid:\tnot-a-pid\n").is_err());
+    }
+
+    #[test]
+    fn saved_proc_parser_corpus_remains_bounded_and_panic_free() {
+        for input in [
+            include_bytes!("../../fuzz/corpus/linux_proc/stat").as_slice(),
+            include_bytes!("../../fuzz/corpus/linux_proc/status").as_slice(),
+            include_bytes!("../../fuzz/corpus/linux_proc/socket-table").as_slice(),
+        ] {
+            super::exercise_proc_parser(input);
+        }
     }
 
     #[test]

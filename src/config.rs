@@ -340,6 +340,18 @@ fn read_config_from(mut reader: impl Read, path: &Path) -> Result<String, Config
     })
 }
 
+#[cfg(any(test, fuzzing))]
+pub(crate) fn exercise_config_parser(bytes: &[u8]) {
+    const FUZZ_INPUT_BYTES_MAX: usize = CONFIG_FILE_MAX_BYTES + 1;
+    if bytes.len() > FUZZ_INPUT_BYTES_MAX {
+        return;
+    }
+    let path = Path::new("/synthetic/kickoutchi-fuzz/config.toml");
+    if let Ok(text) = read_config_from(std::io::Cursor::new(bytes), path) {
+        let _ = Config::parse(&text, path);
+    }
+}
+
 /// Make sure a refresh interval from the config file is actually in range.
 fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
     if !(REFRESH_INTERVAL_SECONDS_MIN..=REFRESH_INTERVAL_SECONDS_MAX).contains(&seconds) {
@@ -458,6 +470,17 @@ mod tests {
             config.hide_system_processes,
             Config::default().hide_system_processes
         );
+    }
+
+    #[test]
+    fn saved_config_corpus_remains_bounded_and_panic_free() {
+        for input in [
+            include_bytes!("../fuzz/corpus/config/defaults").as_slice(),
+            include_bytes!("../fuzz/corpus/config/labels").as_slice(),
+            include_bytes!("../fuzz/corpus/config/invalid-range").as_slice(),
+        ] {
+            super::exercise_config_parser(input);
+        }
     }
 
     #[test]
