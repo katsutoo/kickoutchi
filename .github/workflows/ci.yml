@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - shrek
   pull_request:
   schedule:
     - cron: "23 4 * * 1"
@@ -64,7 +64,6 @@ jobs:
 
   linux:
     name: Linux
-    needs: supply-chain
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -113,7 +112,6 @@ jobs:
 
   nix:
     name: Nix (${{ matrix.system }})
-    needs: supply-chain
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -146,7 +144,6 @@ jobs:
 
   windows:
     name: Windows
-    needs: supply-chain
     runs-on: windows-latest
     timeout-minutes: 35
 
@@ -158,23 +155,17 @@ jobs:
 
       - name: Install Rust toolchain
         shell: bash
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
 
       - name: Use pinned Rust toolchain
         shell: bash
         run: rustup default "$RUST_VERSION"
-
-      - name: Check formatting
-        run: cargo fmt --all --check
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --locked --all-features
-
-      - name: Run doctests
-        run: cargo test --locked --all-features --doc
 
       - name: Build release binaries
         run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
@@ -190,7 +181,6 @@ jobs:
 
   macos:
     name: macOS
-    needs: supply-chain
     runs-on: macos-latest
     timeout-minutes: 35
 
@@ -201,22 +191,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
 
       - name: Use pinned Rust toolchain
         run: rustup default "$RUST_VERSION"
-
-      - name: Check formatting
-        run: cargo fmt --all --check
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --locked --all-features
-
-      - name: Run doctests
-        run: cargo test --locked --all-features --doc
 
       - name: Build release binaries
         run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
@@ -229,3 +213,35 @@ jobs:
         run: |
           cargo test --locked --all-features --test cli_contract
           cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
+
+  ci-complete:
+    name: CI Complete
+    if: ${{ always() }}
+    needs:
+      - supply-chain
+      - linux
+      - nix
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every CI lane
+        env:
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          NIX_RESULT: ${{ needs.nix.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "$SUPPLY_CHAIN_RESULT" \
+            "$LINUX_RESULT" \
+            "$NIX_RESULT" \
+            "$WINDOWS_RESULT" \
+            "$MACOS_RESULT"
+          do
+            test "$result" = "success"
+          done

@@ -108,6 +108,10 @@ fn step_name(step: &Mapping) -> Option<&str> {
     mapping_value(step, "name").and_then(Value::as_str)
 }
 
+fn job_step_names(job: &Mapping) -> Vec<&str> {
+    job_steps(job).into_iter().filter_map(step_name).collect()
+}
+
 fn named_job_step<'a>(job: &'a Mapping, name: &str) -> &'a Mapping {
     job_steps(job)
         .into_iter()
@@ -373,6 +377,94 @@ fn workflow_permissions_follow_least_privilege() {
         }
     }
     assert_release_job_permissions(&release);
+}
+
+#[test]
+fn ci_runs_one_push_branch_and_keeps_pull_request_coverage() {
+    let ci = parsed_workflow(CI_WORKFLOW);
+    let triggers = mapping_value(workflow_root(&ci), "on")
+        .map(|value| required_mapping(value, "CI triggers"))
+        .expect("CI workflow must define triggers");
+    let push = mapping_value(triggers, "push")
+        .map(|value| required_mapping(value, "CI push trigger"))
+        .expect("CI workflow must define a push trigger");
+
+    assert_eq!(yaml_sequence(push, "branches"), ["shrek"]);
+    assert!(
+        mapping_value(triggers, "pull_request").is_some(),
+        "pull request CI must remain enabled"
+    );
+    assert!(
+        mapping_value(triggers, "schedule").is_some(),
+        "scheduled CI must remain enabled"
+    );
+}
+
+#[test]
+fn ci_lanes_run_independently_and_feed_one_required_completion_gate() {
+    const LANES: [&str; 5] = ["supply-chain", "linux", "nix", "windows", "macos"];
+
+    let ci = parsed_workflow(CI_WORKFLOW);
+    for lane in LANES {
+        assert!(
+            mapping_value(workflow_job(&ci, lane), "needs").is_none(),
+            "CI lane {lane} must start independently"
+        );
+    }
+
+    let complete = workflow_job(&ci, "ci-complete");
+    let mut needs = yaml_sequence(complete, "needs");
+    needs.sort_unstable();
+    let mut expected = LANES.map(str::to_owned).to_vec();
+    expected.sort_unstable();
+    assert_eq!(needs, expected, "CI completion must depend on every lane");
+    assert!(
+        yaml_scalar(complete, "if").is_some_and(|condition| condition.contains("always()")),
+        "CI completion must run even when an upstream lane fails"
+    );
+
+    let gate = named_job_step(complete, "Require every CI lane");
+    let script = step_script(gate);
+    for lane in ["SUPPLY_CHAIN", "LINUX", "NIX", "WINDOWS", "MACOS"] {
+        let expected_result = format!(
+            "${{{{ needs.{}.result }}}}",
+            lane.to_ascii_lowercase().replace('_', "-")
+        );
+        assert_eq!(
+            step_env(gate, &format!("{lane}_RESULT")).as_deref(),
+            Some(expected_result.as_str()),
+            "aggregate gate must receive the {lane} result"
+        );
+    }
+    assert!(
+        script.contains("test \"$result\" = \"success\""),
+        "aggregate gate must fail closed on any non-success result"
+    );
+}
+
+#[test]
+fn formatting_and_doctests_run_once_while_native_quality_checks_remain() {
+    let ci = parsed_workflow(CI_WORKFLOW);
+    let linux_steps = job_step_names(workflow_job(&ci, "linux"));
+    assert!(linux_steps.contains(&"Check formatting"));
+    assert!(linux_steps.contains(&"Run doctests"));
+
+    for platform in ["linux", "windows", "macos"] {
+        let steps = job_step_names(workflow_job(&ci, platform));
+        assert!(steps.contains(&"Run Clippy"), "{platform} must run Clippy");
+        assert!(steps.contains(&"Run tests"), "{platform} must run tests");
+    }
+    for platform in ["windows", "macos"] {
+        let steps = job_step_names(workflow_job(&ci, platform));
+        assert!(
+            !steps.contains(&"Check formatting"),
+            "{platform} must not duplicate formatting"
+        );
+        assert!(
+            !steps.contains(&"Run doctests"),
+            "{platform} must not duplicate doctests"
+        );
+    }
 }
 
 #[test]

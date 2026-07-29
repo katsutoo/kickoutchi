@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI now starts supply-chain, Linux, Windows, macOS, and both Nix lanes
+  concurrently, runs formatting and doctests once on Linux, and reports one
+  fail-closed `CI Complete` result after every lane finishes. Push CI is limited
+  to the default `shrek` branch while pull-request and scheduled coverage remain
+  enabled; the existing cancellation policy and cache-free builds are unchanged.
 - Windows tree preparation, containment, and post-commit reporting now share the
   same refusal vocabulary and semantic exit classification used by Unix tree
   handling. CLI and TUI renderers share stable tree-refusal causes and direct
