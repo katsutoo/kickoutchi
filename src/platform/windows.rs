@@ -57,9 +57,8 @@ use crate::observation::{
 };
 use crate::tree::TreeProcessInfo;
 
-const MAX_CHILD_PROCESSES: usize = 64;
-const MAX_RELATED_PROCESS_HINTS: usize = 8;
-const MAX_PROCESS_ANCESTORS: usize = 64;
+use super::{MAX_CHILD_PROCESSES, MAX_PROCESS_ANCESTORS, MAX_RELATED_PROCESS_HINTS};
+
 const WINDOWS_PROCESS_PATH_CODE_UNITS_MAX: usize = 32 * 1024;
 
 pub(crate) struct WindowsCollector;
@@ -1242,20 +1241,7 @@ fn accepted_parent_edge(
 }
 
 pub(crate) fn process_start_time_marker(pid: u32) -> Option<ProcessStartMarker> {
-    let handle = unsafe {
-        // SAFETY: OpenProcess takes only value arguments here. The returned handle
-        // is checked before being wrapped for owned close-on-drop handling.
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    };
-    if handle.is_null() {
-        return None;
-    }
-
-    let process_handle = unsafe {
-        // SAFETY: OpenProcess returned a non-null process handle that this scope
-        // owns. OwnedHandle closes it exactly once when Donkey leaves the room.
-        OwnedHandle::from_raw_handle(handle)
-    };
+    let process_handle = open_query_process(pid).ok()?;
     process_start_time_marker_from_handle(&process_handle)
 }
 

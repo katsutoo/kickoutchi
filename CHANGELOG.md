@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-07-29
+
+### Changed
+
+- Consolidated small internal policies without changing public behavior:
+  optional process-context limits now live in one platform-neutral location,
+  snapshot and watch sorting use one owner-completeness comparator, and Unix
+  signal and tree-stop deadline mappings each have one implementation.
+- Integration-test configuration directories now use exclusive creation with a
+  process-local monotonic counter, preventing parallel tests from sharing and
+  deleting one another's live directories. The Windows PID-existence probe also
+  reports wait failures instead of treating them as a live process, and bounded
+  synthetic tree fixtures avoid colliding with the running test process.
+- Simplified bounded platform adapters and watch output handling while retaining
+  their existing fail-closed limits, error classifications, and public output.
+
+### Removed
+
+- Removed a byte-for-byte duplicate ownership-authority test and stale internal
+  branches, annotations, derives, and assignments that carried no behavior.
+
+### Fixed
+
+- A Windows port-selected `--tree` kill whose root exits during final preparation
+  now reports `already exited` with the no-match exit status instead of
+  misreporting a changed process identity as a failure.
+- Linux protected-process matching now reproduces the kernel's raw 15-byte
+  `/proc/<pid>/comm` truncation when it splits a UTF-8 code point, so configured
+  non-ASCII protected names cannot silently lose protection after lossy decoding.
+- The TUI details panel now renders one protected-process warning in its reserved
+  row and retains the selected process's permission status at the minimum
+  supported terminal size.
+
 ## [1.3.7] - 2026-07-28
 
 ### Added
@@ -1245,7 +1278,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...HEAD
+[1.3.8]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...v1.3.8
 [1.3.7]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...v1.3.7
 [1.3.6]: https://github.com/nuggocto/kickoutchi/compare/v1.3.5...v1.3.6
 [1.3.5]: https://github.com/nuggocto/kickoutchi/compare/v1.3.1...v1.3.5

@@ -148,6 +148,17 @@ pub(crate) enum TreeStopError {
     ObservationFailed(String),
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_deadline_expired() -> TreeStopResult {
+    TreeStopResult::Failed {
+        cleanup_required: false,
+        rollback_start_time_marker: None,
+        error: TreeStopError::ObservationFailed(
+            "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
+        ),
+    }
+}
+
 /// What portion of the process table a platform snapshot should prove.
 ///
 /// Linux already reads a complete `/proc` table cheaply. macOS uses this during
@@ -202,13 +213,7 @@ pub(crate) trait TreeProcessOps {
     /// assumption that a delivered fake stop made the transition.
     fn stop_checked(&mut self, pid: u32, deadline: std::time::Instant) -> TreeStopResult {
         if self.stop_acknowledgement_now() >= deadline {
-            return TreeStopResult::Failed {
-                cleanup_required: false,
-                rollback_start_time_marker: None,
-                error: TreeStopError::ObservationFailed(
-                    "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
-                ),
-            };
+            return stop_deadline_expired();
         }
         let result = crate::process::with_tree_stop_deadline(deadline, || self.stop(pid));
         crate::process::take_tree_stop_result(pid).unwrap_or(match result {
@@ -1095,10 +1100,12 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
                     resume_on_cleanup: root_transitioned,
                     depth: 0,
                 },
-                |node| *node,
+                |node| {
+                    let mut node = *node;
+                    node.resume_on_cleanup = root_transitioned;
+                    node
+                },
             );
-            let mut root_node = root_node;
-            root_node.resume_on_cleanup = root_transitioned;
             return refuse_after_thaw(outcome, &[root_node], ops);
         }
     };
@@ -1132,13 +1139,7 @@ fn stop_before_deadline<Ops: TreeProcessOps>(
     ops: &mut Ops,
 ) -> TreeStopResult {
     if ops.stop_acknowledgement_now() >= deadline {
-        return TreeStopResult::Failed {
-            cleanup_required: false,
-            rollback_start_time_marker: None,
-            error: TreeStopError::ObservationFailed(
-                "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
-            ),
-        };
+        return stop_deadline_expired();
     }
     ops.stop_checked(pid, deadline)
 }
@@ -1675,7 +1676,7 @@ mod tests {
         MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ScopeAuthorization,
         TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
         TreeStopError, TreeStopResult, execute_group_kill, execute_tree_kill, plan_process_group,
-        plan_process_tree, verify_frozen_identities,
+        plan_process_tree, stop_deadline_expired, verify_frozen_identities,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
@@ -1770,13 +1771,7 @@ mod tests {
             self.stop_deadlines.push(deadline);
             self.stop_clock += self.stop_elapsed;
             if self.stop_clock >= deadline {
-                return TreeStopResult::Failed {
-                    cleanup_required: false,
-                    rollback_start_time_marker: None,
-                    error: TreeStopError::ObservationFailed(
-                        "the operation-wide SIGSTOP acknowledgement deadline expired".to_owned(),
-                    ),
-                };
+                return stop_deadline_expired();
             }
             match self.stop(pid) {
                 TreeSignalResult::Delivered if self.uncertain_stop.contains(&pid) => {
@@ -2697,7 +2692,13 @@ mod tests {
     fn cap_exceeded_during_freeze_thaws_and_refuses() {
         let root = root_target(100, "root", 10);
         let mut snapshot = vec![info(100, Some(1), "root", 10)];
-        for pid in 200..(200 + u32::try_from(MAX_TREE_PROCESSES).unwrap() + 5) {
+        let child_pid_start = std::process::id()
+            .checked_add(1_000)
+            .expect("test PID range must fit u32");
+        let child_pid_end = child_pid_start
+            .checked_add(u32::try_from(MAX_TREE_PROCESSES).unwrap() + 5)
+            .expect("bounded test PID range must fit u32");
+        for pid in child_pid_start..child_pid_end {
             snapshot.push(info(pid, Some(100), "child", u64::from(pid)));
         }
         let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);

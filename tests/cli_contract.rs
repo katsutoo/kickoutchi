@@ -1,6 +1,9 @@
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +16,23 @@ const TRACING_HELPER_ENV: &str = "KICKOUTCHI_TEST_TRACING_HELPER";
 const RELEASE_E2E_REQUIRED_ENV: &str = "KICKOUTCHI_RELEASE_E2E_REQUIRED";
 const KICKOUTCHI_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICKOUTCHI";
 const KICK_BINARY_ENV: &str = "KICKOUTCHI_E2E_KICK";
+static UNIQUE_TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_temp_directory(label: &str) -> PathBuf {
+    for _ in 0..u16::MAX {
+        let counter = UNIQUE_TEMP_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kickoutchi-cli-contract-{label}-{}-{counter}",
+            std::process::id(),
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("isolated temporary directory must be created: {error}"),
+        }
+    }
+    panic!("isolated temporary directory collision limit exceeded");
+}
 
 fn product_binary(variable: &str, fallback: &str) -> OsString {
     let required = std::env::var_os(RELEASE_E2E_REQUIRED_ENV).is_some();
@@ -1694,16 +1714,7 @@ mod linux {
     }
 
     fn isolated_config_home() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "kickoutchi-cli-contract-{}-{unique}",
-            std::process::id(),
-        ));
-        fs::create_dir_all(&path).expect("isolated config directory must be created");
-        path
+        super::create_unique_temp_directory("linux-config")
     }
 
     fn spawn_related_process(port: u16) -> ChildGuard {
@@ -4634,7 +4645,10 @@ mod linux {
 
 #[cfg(windows)]
 mod windows {
-    use super::{REAL_BINARY_EXIT_WAIT, kickoutchi_binary, run_command_with_deadline};
+    use super::{
+        REAL_BINARY_EXIT_WAIT, create_unique_temp_directory, kickoutchi_binary,
+        run_command_with_deadline,
+    };
     use std::fs;
     use std::net::TcpListener;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
@@ -4645,7 +4659,7 @@ mod windows {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -4739,13 +4753,7 @@ mod windows {
     }
 
     fn isolated_config_home() -> PathBuf {
-        let unique = unique_suffix();
-        let path = std::env::temp_dir().join(format!(
-            "kickoutchi-cli-contract-windows-config-{}-{unique}",
-            std::process::id(),
-        ));
-        fs::create_dir_all(&path).expect("isolated config directory must be created");
-        path
+        create_unique_temp_directory("windows-config")
     }
 
     fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
@@ -4952,7 +4960,15 @@ mod windows {
             // SAFETY: handle is live and was opened with synchronize access.
             WaitForSingleObject(handle.as_raw_handle(), 0)
         };
-        matches!(wait, WAIT_TIMEOUT) || !matches!(wait, WAIT_OBJECT_0)
+        match wait {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            WAIT_FAILED => panic!(
+                "WaitForSingleObject failed while probing PID {pid}: {}",
+                std::io::Error::last_os_error(),
+            ),
+            result => panic!("WaitForSingleObject returned unexpected status {result:#x}"),
+        }
     }
 
     fn stdout(output: &Output) -> String {
@@ -5453,13 +5469,7 @@ mod macos {
     }
 
     fn isolated_config_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "kickoutchi-cli-contract-macos-config-{}-{}",
-            std::process::id(),
-            unique_suffix(),
-        ));
-        fs::create_dir_all(&path).expect("isolated config directory must be created");
-        path
+        super::create_unique_temp_directory("macos-config")
     }
 
     fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {

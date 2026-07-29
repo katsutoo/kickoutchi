@@ -1405,16 +1405,28 @@ fn collect_pass<S: ObservationSource>(
     })
 }
 
-fn compare_owner_completeness(left: &OwnerCompleteness, right: &OwnerCompleteness) -> Ordering {
-    match (left, right) {
-        (OwnerCompleteness::Complete, OwnerCompleteness::Complete)
-        | (OwnerCompleteness::Raced, OwnerCompleteness::Raced) => Ordering::Equal,
-        (OwnerCompleteness::Complete, _) | (_, OwnerCompleteness::Raced) => Ordering::Less,
-        (OwnerCompleteness::Raced, _) | (_, OwnerCompleteness::Complete) => Ordering::Greater,
-        (
-            OwnerCompleteness::Partial { reasons: left },
-            OwnerCompleteness::Partial { reasons: right },
-        ) => owner_reason_names(left).cmp(owner_reason_names(right)),
+pub(crate) fn compare_owner_completeness(
+    left: &OwnerCompleteness,
+    right: &OwnerCompleteness,
+) -> Ordering {
+    owner_completeness_rank(left)
+        .cmp(&owner_completeness_rank(right))
+        .then_with(|| match (left, right) {
+            (
+                OwnerCompleteness::Partial { reasons: left },
+                OwnerCompleteness::Partial { reasons: right },
+            ) => owner_reason_names(left).cmp(owner_reason_names(right)),
+            _ => Ordering::Equal,
+        })
+}
+
+/// Snapshot and watch outputs share one owner-completeness ordering:
+/// complete before partial before raced.
+pub(crate) const fn owner_completeness_rank(completeness: &OwnerCompleteness) -> u8 {
+    match completeness {
+        OwnerCompleteness::Complete => 0,
+        OwnerCompleteness::Partial { .. } => 1,
+        OwnerCompleteness::Raced => 2,
     }
 }
 

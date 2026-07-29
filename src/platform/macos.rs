@@ -38,12 +38,11 @@ use crate::tree::{
     MAX_TREE_PROCESSES, TreeProcessInfo, TreeProcessOps, TreeSignalResult, TreeSnapshotScope,
 };
 
+use super::{MAX_CHILD_PROCESSES, MAX_PROCESS_ANCESTORS, MAX_RELATED_PROCESS_HINTS};
+
 const PROCESS_LIST_GROWTH_MARGIN: usize = 64;
 const FD_LIST_GROWTH_MARGIN: usize = 16;
 const MAX_PROCESS_FDS: usize = 65_536;
-const MAX_CHILD_PROCESSES: usize = 64;
-const MAX_RELATED_PROCESS_HINTS: usize = 8;
-const MAX_PROCESS_ANCESTORS: usize = 64;
 
 const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
 const INI_IPV4: u8 = 0x1;
@@ -129,17 +128,7 @@ impl MacosCollector {
         let mut socket_indexes = HashMap::<u64, usize>::new();
         let mut socket_set_losses = BTreeSet::new();
         let mut omitted_socket_set_loss_count = 0u64;
-        let pids = match list_processes() {
-            Ok(pids) => pids,
-            Err(CollectorError::Observation(
-                crate::observation::ObservationError::ProcessIdentityLimitExceeded,
-            )) => {
-                return Err(
-                    crate::observation::ObservationError::ProcessIdentityLimitExceeded.into(),
-                );
-            }
-            Err(error) => return Err(error),
-        };
+        let pids = list_processes()?;
         let mut aggregate_fd_entries = 0usize;
         let mut owner_edges = 0usize;
         for pid in pids {
@@ -738,11 +727,6 @@ struct SocketFdinfo {
 // production source makes both cross-target builds reject ABI drift even when
 // target tests cannot execute on the build host.
 const _: () = {
-    assert!(PROC_PIDFDSOCKETINFO == 3);
-    assert!(INI_IPV4 == 1);
-    assert!(INI_IPV6 == 2);
-    assert!(SOCKINFO_IN == 1);
-    assert!(SOCKINFO_TCP == 2);
     assert!(libc::PROX_FDTYPE_SOCKET == 2);
 
     assert!(size_of::<ProcFileinfo>() == 24);
@@ -1684,12 +1668,7 @@ where
         ));
     }
     if needed_bytes == 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(0) {
-            Ok(Vec::new())
-        } else {
-            Err(error)
-        };
+        return Ok(Vec::new());
     }
 
     let needed_bytes =

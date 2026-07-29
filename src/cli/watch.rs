@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Write};
 use std::net::IpAddr;
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -123,14 +123,7 @@ impl WatchOptions {
         if scope_id.is_some() && !matches!(address, Some(IpAddr::V6(_))) {
             return Err("--scope-id requires one explicit IPv6 --address".to_owned());
         }
-        let port = args
-            .port
-            .map(|value| {
-                NonZeroU16::new(value)
-                    .map(NonZeroU16::get)
-                    .ok_or_else(|| "--port must be in 1..=65535".to_owned())
-            })
-            .transpose()?;
+        let port = args.port;
         let terms = crate::query::parse_filter_text(
             args.filter.as_deref().unwrap_or_default(),
             QueryCapabilities::WATCH,
@@ -1873,7 +1866,6 @@ fn flush_exit(
 ) -> ExitReason {
     match output.flush() {
         Ok(()) => reason,
-        Err(error) if error.kind() == ErrorKind::BrokenPipe => ExitReason::Success,
         Err(error) => io_failure(diagnostics, &error),
     }
 }

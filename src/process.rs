@@ -168,6 +168,14 @@ pub(crate) enum KillMode {
     Force,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const fn unix_signal(mode: KillMode) -> libc::c_int {
+    match mode {
+        KillMode::Terminate => libc::SIGTERM,
+        KillMode::Force => libc::SIGKILL,
+    }
+}
+
 impl KillMode {
     pub(crate) fn action_label(self) -> &'static str {
         match self {
@@ -1157,10 +1165,7 @@ fn terminate_handle_checked_platform(
         transitioned,
         fresh,
         |mode| {
-            let signal = match mode {
-                KillMode::Terminate => libc::SIGTERM,
-                KillMode::Force => libc::SIGKILL,
-            };
+            let signal = unix_signal(mode);
             let result = unsafe {
                 // SAFETY: pid is range checked and signal is one of two fixed values.
                 libc::kill(pid, signal)
@@ -1366,10 +1371,7 @@ fn terminate_handle_checked_platform(
             |_, _| tree_signal_result_from_outcome(&linux_pidfd_signal(handle, libc::SIGCONT)),
         );
     }
-    let signal = match mode {
-        KillMode::Terminate => libc::SIGTERM,
-        KillMode::Force => libc::SIGKILL,
-    };
+    let signal = unix_signal(mode);
     finish_stopped_termination(
         handle.pid,
         mode,
@@ -1669,11 +1671,7 @@ pub(crate) fn tree_prepare_delivery_probe(pid: u32) -> crate::tree::TreeSignalRe
 /// and `MacosTreeOps::recheck_marker` for the layered reuse defense).
 #[cfg(target_os = "macos")]
 pub(crate) fn tree_deliver_by_pid(pid: u32, mode: KillMode) -> crate::tree::TreeSignalResult {
-    let signal = match mode {
-        KillMode::Terminate => libc::SIGTERM,
-        KillMode::Force => libc::SIGKILL,
-    };
-    tree_send_signal(pid, signal)
+    tree_send_signal(pid, unix_signal(mode))
 }
 
 #[cfg(target_os = "linux")]
@@ -1759,11 +1757,7 @@ pub(crate) fn tree_deliver_handle(
     handle: &TreeDeliveryHandle,
     mode: KillMode,
 ) -> crate::tree::TreeSignalResult {
-    let signal = match mode {
-        KillMode::Terminate => libc::SIGTERM,
-        KillMode::Force => libc::SIGKILL,
-    };
-    tree_send_pidfd_signal(handle, signal)
+    tree_send_pidfd_signal(handle, unix_signal(mode))
 }
 
 #[cfg(target_os = "linux")]

@@ -38,6 +38,8 @@ use crate::process::{
 use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 use crate::tree::{TreeProcessInfo, TreeProcessOps, TreeSignalResult};
 
+use super::{MAX_CHILD_PROCESSES, MAX_PROCESS_ANCESTORS, MAX_RELATED_PROCESS_HINTS};
+
 const PROC_ROOT: &str = "/proc";
 
 // Shared limits and their rationale live in `observation.rs`; the constants
@@ -60,12 +62,6 @@ const MAX_CMDLINE_BYTES: usize = crate::observation::PROCESS_COMMAND_LINE_MAX_BY
 /// common case.
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
 const MAX_STAT_BYTES: usize = 4 * 1024;
-
-/// Display and traversal bounds for the optional selected-row and diagnostic
-/// views. All three degrade — these are hints, never authority.
-const MAX_CHILD_PROCESSES: usize = 64;
-const MAX_RELATED_PROCESS_HINTS: usize = 8;
-const MAX_PROCESS_ANCESTORS: usize = 64;
 
 /// The `/proc/<pid>/fd` symlink shape that identifies a socket descriptor.
 const SOCKET_LINK_PREFIX: &str = "socket:[";
@@ -221,7 +217,7 @@ impl LinuxCollector {
             self.limits.process_ids,
             self.limits.fd_entries,
         )?;
-        native_pass_from_records(&records, owner_scan)
+        native_pass_from_records(&records, &owner_scan)
     }
 
     #[cfg(test)]
@@ -507,7 +503,7 @@ fn owner_evidence(
 
 fn native_pass_from_records(
     records: &[SocketRecord],
-    owner_scan: OwnerScanResult,
+    owner_scan: &OwnerScanResult,
 ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
     let mut sockets = Vec::with_capacity(records.len());
     let mut owners_by_socket = Vec::with_capacity(records.len());
@@ -546,7 +542,7 @@ fn native_pass_from_records(
         .losses
         .contains(&OwnerScanLoss::AncestorPidOwnersInvisible);
     let (global_completeness, evidence_gaps, omitted_evidence_gap_count) =
-        owner_evidence(&owner_scan)?;
+        owner_evidence(owner_scan)?;
     // Ordinary PID/fd traversal losses have no endpoint provenance and reduce
     // only global authority. Nested PID namespaces are different: an invisible
     // ancestor-namespace process may share any socket visible in the current
@@ -559,7 +555,6 @@ fn native_pass_from_records(
     } else {
         vec![OwnerCompleteness::Complete; records.len()]
     };
-    drop(owner_scan);
     Ok(crate::observation::NativeObservationPass {
         sockets,
         owners: OwnerAssociations {
@@ -1359,10 +1354,6 @@ fn read_process_metadata_bounded(
     )
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "deterministic metadata field order and one aggregate budget stay together"
-)]
 fn read_process_metadata_bounded_with_parent_cache(
     proc_root: &Path,
     pid: u32,
@@ -1390,18 +1381,12 @@ fn read_process_metadata_bounded_with_parent_cache(
     }
 
     let path_budget = remaining.min(crate::observation::EXECUTABLE_PATH_MAX_BYTES);
-    match read_link_bounded(&process_dir.join("exe"), path_budget) {
-        Ok(path)
-            if path.as_os_str().as_encoded_bytes().len()
-                <= remaining.min(crate::observation::EXECUTABLE_PATH_MAX_BYTES) =>
-        {
-            remaining = remaining.saturating_sub(path.as_os_str().as_encoded_bytes().len());
-            metadata.executable_path = Some(path);
-        }
-        Err(_) | Ok(_) => {
-            metadata.partial = true;
-            metadata.budget_omitted |= path_budget < crate::observation::EXECUTABLE_PATH_MAX_BYTES;
-        }
+    if let Ok(path) = read_link_bounded(&process_dir.join("exe"), path_budget) {
+        remaining = remaining.saturating_sub(path.as_os_str().as_encoded_bytes().len());
+        metadata.executable_path = Some(path);
+    } else {
+        metadata.partial = true;
+        metadata.budget_omitted |= path_budget < crate::observation::EXECUTABLE_PATH_MAX_BYTES;
     }
 
     match read_process_status(&process_dir.join("status")) {
@@ -2903,7 +2888,7 @@ mod tests {
         let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([7]), 4, 4)
             .expect("restricted empty scan remains evidence");
         assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
-        let pass = native_pass_from_records(&[], scan).expect("loss is representable");
+        let pass = native_pass_from_records(&[], &scan).expect("loss is representable");
         assert!(matches!(
             pass.owners.global_completeness,
             OwnerCompleteness::Partial { .. }
@@ -2982,7 +2967,7 @@ mod tests {
             .expect("empty inode scan skips PID enumeration");
         assert_eq!(scan.losses.len(), 1);
         assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
-        let pass = native_pass_from_records(&[], scan).expect("global loss is representable");
+        let pass = native_pass_from_records(&[], &scan).expect("global loss is representable");
         assert!(matches!(
             pass.owners.global_completeness,
             OwnerCompleteness::Partial { .. }
@@ -3011,7 +2996,7 @@ mod tests {
             scan.losses
                 .contains(&OwnerScanLoss::AncestorPidOwnersInvisible)
         );
-        let pass = native_pass_from_records(&[], scan).expect("global losses are representable");
+        let pass = native_pass_from_records(&[], &scan).expect("global losses are representable");
         assert!(matches!(
             pass.owners.global_completeness,
             OwnerCompleteness::Partial { .. }
@@ -3029,7 +3014,7 @@ mod tests {
         let scan = collect_socket_owners_detailed(&proc_root, &HashSet::new(), 0, 0)
             .expect("empty inode scan skips PID enumeration");
         assert!(scan.losses.is_empty());
-        let pass = native_pass_from_records(&[], scan).expect("complete scan is representable");
+        let pass = native_pass_from_records(&[], &scan).expect("complete scan is representable");
         assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
         assert!(pass.owners.evidence_gaps.is_empty());
 
@@ -3475,7 +3460,7 @@ mod tests {
             [OwnerScanLoss::PermissionDenied(42)].into_iter().collect(),
             false,
         );
-        let pass = native_pass_from_records(&[record], scan)
+        let pass = native_pass_from_records(&[record], &scan)
             .expect("denied scan is retained as partial evidence");
 
         assert_eq!(
@@ -3512,7 +3497,7 @@ mod tests {
             false,
         );
         let pass =
-            native_pass_from_records(&[record], scan).expect("proven ownership remains usable");
+            native_pass_from_records(&[record], &scan).expect("proven ownership remains usable");
 
         assert!(!pass.owners.global_completeness.is_complete());
         assert_eq!(
@@ -3537,7 +3522,7 @@ mod tests {
 
             let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([77]), count, 0)
                 .expect("production owner scan remains bounded");
-            let pass = native_pass_from_records(&[], scan)
+            let pass = native_pass_from_records(&[], &scan)
                 .expect("aggregate owner losses remain representable");
             assert_eq!(pass.owners.evidence_gaps.len(), usize::from(count != 0));
             assert_eq!(
@@ -3571,7 +3556,7 @@ mod tests {
         let scan = collect_socket_owners_detailed(&proc_root, &HashSet::from([77]), 1, 2)
             .expect("production owner scan remains representable");
 
-        let pass = native_pass_from_records(&[record], scan)
+        let pass = native_pass_from_records(&[record], &scan)
             .expect("target-relevant loss remains representable");
         assert_eq!(pass.owners.evidence_gaps.len(), 1);
         assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));

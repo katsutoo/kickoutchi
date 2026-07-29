@@ -1855,7 +1855,7 @@ fn process_name_from_handle(
     process: &RealProcessHandle,
 ) -> Result<Option<String>, WindowsApiError> {
     let mut capacity = 260usize;
-    while capacity <= PROCESS_IMAGE_PATH_CODE_UNITS_MAX {
+    loop {
         let mut path = vec![0u16; capacity];
         let mut length = u32::try_from(path.len()).expect("bounded image path fits u32");
         let result = unsafe {
@@ -1886,7 +1886,6 @@ fn process_name_from_handle(
         }
         return Err(windows_api_error("QueryFullProcessImageNameW", &error));
     }
-    Ok(None)
 }
 
 fn last_windows_api_error(operation: &str) -> WindowsApiError {

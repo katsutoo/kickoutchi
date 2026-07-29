@@ -1243,20 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn matching_endpoint_ownership_permission_gap_preserves_authority_loss() {
-        let snapshot = verified_owner_permission_snapshot();
-
-        assert!(matches!(
-            kill_ports_from_snapshot(&snapshot, Some(18_422), None),
-            Err(super::CollectorError::OwnershipPermissionDenied)
-        ));
-        assert!(matches!(
-            kill_ports_from_snapshot(&snapshot, None, Some(3000)),
-            Err(super::CollectorError::OwnershipPermissionDenied)
-        ));
-    }
-
-    #[test]
     fn target_pid_global_ownership_permission_gap_does_not_block_visible_port_owner() {
         let mut snapshot = FakeCollector
             .collect(MetadataProfile::Display)

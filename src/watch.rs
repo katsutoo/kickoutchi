@@ -6,9 +6,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::observation::{
-    EndpointIdentity, EvidenceImpact, NetworkSnapshot, OwnerCompleteness, OwnerObservation,
-    PlatformSocketToken, SOCKET_OBSERVATIONS_MAX, SocketObservation, compare_endpoint_identity,
-    owner_reason_names,
+    EndpointIdentity, EvidenceImpact, NetworkSnapshot, OwnerObservation, PlatformSocketToken,
+    SOCKET_OBSERVATIONS_MAX, SocketObservation, compare_endpoint_identity,
+    compare_owner_completeness,
 };
 
 const WATCH_EVENTS_PER_POLL_MAX: usize = match SOCKET_OBSERVATIONS_MAX.checked_mul(2) {
@@ -608,18 +608,6 @@ fn compare_owner_set(left: &SocketObservation, right: &SocketObservation) -> Ord
         })
 }
 
-fn compare_owner_completeness(left: &OwnerCompleteness, right: &OwnerCompleteness) -> Ordering {
-    owner_completeness_rank(left)
-        .cmp(&owner_completeness_rank(right))
-        .then_with(|| match (left, right) {
-            (
-                OwnerCompleteness::Partial { reasons: left },
-                OwnerCompleteness::Partial { reasons: right },
-            ) => owner_reason_names(left).cmp(owner_reason_names(right)),
-            _ => Ordering::Equal,
-        })
-}
-
 pub(crate) fn compare_event_prefix(left: WatchEvent<'_>, right: WatchEvent<'_>) -> Ordering {
     compare_endpoint_identity(left.endpoint(), right.endpoint())
         .then_with(|| left.event_socket().state.cmp(&right.event_socket().state))
@@ -666,16 +654,6 @@ fn compare_event_owner_sets(left: WatchEvent<'_>, right: WatchEvent<'_>) -> Orde
             )
         }),
         _ => compare_owner_set(left.event_socket(), right.event_socket()),
-    }
-}
-
-/// Snapshot and watch outputs share one owner-completeness ordering:
-/// complete before partial before raced.
-pub(crate) const fn owner_completeness_rank(completeness: &OwnerCompleteness) -> u8 {
-    match completeness {
-        OwnerCompleteness::Complete => 0,
-        OwnerCompleteness::Partial { .. } => 1,
-        OwnerCompleteness::Raced => 2,
     }
 }
 

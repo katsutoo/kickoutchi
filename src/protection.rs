@@ -5,6 +5,8 @@
 //! are load-bearing, and you really don't want them wandering off because of a
 //! stray keypress.
 
+use std::borrow::Cow;
+
 use crate::model::{Platform, PortEntry};
 
 const LINUX_COMM_MAX_BYTES: usize = 15;
@@ -81,7 +83,7 @@ pub(crate) fn is_protected_process_name(
         Platform::Linux => {
             protected == process_name
                 || (protected.len() > LINUX_COMM_MAX_BYTES
-                    && linux_comm_prefix(protected) == process_name)
+                    && linux_comm_prefix(protected).as_ref() == process_name)
         }
         Platform::Macos => macos_process_name_matches(protected, process_name),
     })
@@ -116,15 +118,11 @@ pub(crate) fn windows_process_name_eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
-fn linux_comm_prefix(name: &str) -> &str {
+fn linux_comm_prefix(name: &str) -> Cow<'_, str> {
     if name.len() <= LINUX_COMM_MAX_BYTES {
-        return name;
+        return Cow::Borrowed(name);
     }
-    let mut end = LINUX_COMM_MAX_BYTES;
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
+    String::from_utf8_lossy(&name.as_bytes()[..LINUX_COMM_MAX_BYTES])
 }
 
 #[cfg(test)]
@@ -210,6 +208,30 @@ mod tests {
             Platform::Linux,
             "postgres",
             &protected
+        ));
+    }
+
+    #[test]
+    fn linux_matching_reproduces_lossy_kernel_comm_truncation_mid_utf8() {
+        let protected = vec![format!("{}é-helper", "a".repeat(14))];
+        let kernel_comm = format!("{}�", "a".repeat(14));
+        let boundary_protected = vec![format!("{}é-helper", "a".repeat(13))];
+        let boundary_comm = format!("{}é", "a".repeat(13));
+
+        assert!(is_protected_process_name(
+            Platform::Linux,
+            &kernel_comm,
+            &protected,
+        ));
+        assert!(!is_protected_process_name(
+            Platform::Linux,
+            &"a".repeat(14),
+            &protected,
+        ));
+        assert!(is_protected_process_name(
+            Platform::Linux,
+            &boundary_comm,
+            &boundary_protected,
         ));
     }
 

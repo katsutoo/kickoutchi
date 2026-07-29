@@ -722,8 +722,8 @@ fn tree_outcome_from_termination(
         TerminationOutcome::OwnershipUnavailable => {
             tree::TreeKillOutcome::OwnershipUnavailable { pid: confirmed.pid }
         }
-        TerminationOutcome::AlreadyExited
-        | TerminationOutcome::TargetChanged
+        TerminationOutcome::AlreadyExited => tree::TreeKillOutcome::RootAlreadyExited,
+        TerminationOutcome::TargetChanged
         | TerminationOutcome::Success
         | TerminationOutcome::Cancelled => {
             tree::TreeKillOutcome::TargetChanged { pid: confirmed.pid }
@@ -1996,6 +1996,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::rc::Rc;
 
+    use super::tree_outcome_from_termination;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::{
         GROUP_YES_SKIP_MAX_PROCESSES, TreeConfirmDecision, TreeKillSeams, group_confirmation,
@@ -2023,12 +2024,33 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::process::KillMode;
     use crate::process::KillTarget;
-    #[cfg(windows)]
     use crate::process::TerminationOutcome;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::tree::{ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult};
     #[cfg(windows)]
     use crate::windows_tree::WindowsTreeTerminationState;
+
+    #[test]
+    fn already_exited_single_outcome_maps_to_root_already_exited() {
+        let confirmed = KillTarget {
+            pid: 18_422,
+            process_name: Some("node".to_owned()),
+            platform: Platform::Linux,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: Some(1_000),
+            process_start_time_marker: None,
+            child_count: 0,
+            children_truncated: false,
+        };
+
+        assert_eq!(
+            tree_outcome_from_termination(&confirmed, TerminationOutcome::AlreadyExited),
+            crate::tree::TreeKillOutcome::RootAlreadyExited,
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn locally_incomplete_kill_snapshot() -> NetworkSnapshot {
@@ -2119,6 +2141,56 @@ mod tests {
         );
 
         assert_eq!(reason, ExitReason::Failure);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_port_tree_root_exit_during_preparation_is_no_match() {
+        let process_snapshot = vec![crate::tree::TreeProcessInfo {
+            pid: 18_422,
+            parent_pid: Some(500),
+            unverified_parent_pid: None,
+            parent_process_name: None,
+            process_name: Some("node".to_owned()),
+            start_time_marker: crate::observation::ProcessStartMarker::windows(55).ok(),
+            owner_uid: None,
+            process_group: None,
+        }];
+        let events = RefCell::new(Vec::new());
+
+        let reason = super::run_windows_tree_kill_with(
+            &KillArgs {
+                pid: None,
+                port: Some(3000),
+                force: false,
+                yes: true,
+                tree: true,
+            },
+            &Config::default(),
+            &entry_views(&[entry(3000)]),
+            crate::process::KillMode::Terminate,
+            super::WindowsTreeKillSeams {
+                collect_tree: || Ok(process_snapshot.clone()),
+                collect_context: no_context,
+                prompt: confirm_windows_tree_prompt,
+                collect_kill_ports: || {
+                    panic!("root preparation refusal must precede final endpoint collection")
+                },
+                collect_ports: || {
+                    events.borrow_mut().push("visibility");
+                    Ok(Vec::new())
+                },
+                prepare_root: |pid| -> Result<u32, TerminationOutcome> {
+                    assert_eq!(pid, 18_422);
+                    events.borrow_mut().push("prepare");
+                    Err(TerminationOutcome::AlreadyExited)
+                },
+                execute: panic_windows_tree_execute,
+            },
+        );
+
+        assert_eq!(reason, ExitReason::NoMatch);
+        assert_eq!(*events.borrow(), ["prepare", "visibility"]);
     }
 
     #[cfg(windows)]

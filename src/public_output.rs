@@ -27,9 +27,9 @@ use crate::observation::{
     PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessStartMarker,
     SCOPE_IDENTIFIER_MAX_BYTES, SERIALIZED_OWNERS_MAX, ScopeLimitation, SnapshotCompleteness,
     SocketObservation, SocketState, TcpTimerKind, TcpTimerObservation, UnverifiedOwnerReason,
-    compare_endpoint_identity,
+    compare_endpoint_identity, owner_completeness_rank,
 };
-use crate::watch::{Certainty, owner_completeness_rank};
+use crate::watch::Certainty;
 
 const SNAPSHOT_SCHEMA: &str = "kickoutchi.snapshot";
 const SNAPSHOT_VERSION: u32 = 1;

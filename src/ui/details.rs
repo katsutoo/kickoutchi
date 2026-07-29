@@ -18,26 +18,13 @@ const MISSING: &str = "-";
 const CHILDREN_DISPLAY_MAX: usize = 8;
 
 pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
-    let content_rows = usize::from(area.height.saturating_sub(2));
-    let lines = app.selected_row().map_or_else(
-        || empty_lines(theme),
-        |entry| {
-            panel_lines(
-                entry,
-                app.selected_process_context(),
-                app.selected_process_context_loading(),
-                theme,
-                content_rows,
-            )
-        },
-    );
     let block = Block::bordered()
         .title("Details")
         .title_style(theme.title())
         .border_style(theme.border());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if app.selected_row().is_some_and(|entry| entry.protected) {
+    if let Some(entry) = app.selected_row().filter(|entry| entry.protected) {
         let warning = Line::styled(
             "Warning: protected process; stronger confirmation required.",
             theme.protected(),
@@ -50,12 +37,31 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
                 Constraint::Length(u16::try_from(warning_rows).unwrap_or(u16::MAX)),
             ])
             .split(inner);
+        let lines = panel_lines(
+            entry,
+            app.selected_process_context(),
+            app.selected_process_context_loading(),
+            theme,
+            usize::from(chunks[0].height),
+        );
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
         frame.render_widget(
             Paragraph::new(warning).wrap(Wrap { trim: false }),
             chunks[1],
         );
     } else {
+        let lines = app.selected_row().map_or_else(
+            || empty_lines(theme),
+            |entry| {
+                panel_lines(
+                    entry,
+                    app.selected_process_context(),
+                    app.selected_process_context_loading(),
+                    theme,
+                    usize::from(inner.height),
+                )
+            },
+        );
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 }
@@ -130,15 +136,6 @@ fn panel_lines(
     theme: Theme,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
-    let warning_or_permission = if entry.protected {
-        Line::styled(
-            "Warning: protected process, stronger confirmation required before termination.",
-            theme.protected(),
-        )
-    } else {
-        field("Permission", permission_text(entry.permission), theme)
-    };
-
     let mut lines = vec![
         field(
             "PID",
@@ -160,6 +157,7 @@ fn panel_lines(
             ),
             theme,
         ),
+        field("Permission", permission_text(entry.permission), theme),
     ];
     lines.extend([
         field("Parent", parent_text(entry), theme),
@@ -170,7 +168,6 @@ fn panel_lines(
         ),
         field("Path", path_text(entry), theme),
         field("Command", sanitize_optional_str(entry.command_line), theme),
-        warning_or_permission,
     ]);
     if lines.len() < max_rows
         && let Some(text) = docker_panel_text(context)
@@ -443,6 +440,27 @@ mod tests {
         );
 
         assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn protected_panel_keeps_permission_and_leaves_warning_to_the_reserved_row() {
+        let mut row = entry();
+        row.protected = true;
+        let lines = panel_lines(
+            PortEntryView::from(&row),
+            Some(&ProcessContext::default()),
+            false,
+            Theme::from_environment(),
+            6,
+        );
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Permission: full"), "{text}");
+        assert!(!text.contains("Warning: protected process"), "{text}");
     }
 
     #[test]

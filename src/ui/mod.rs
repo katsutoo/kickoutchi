@@ -1106,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn protected_details_render_one_warning_and_keep_permission_at_minimum_size() {
+        let config = Config {
+            protected_processes: vec!["node".to_owned()],
+            ..Config::default()
+        };
+        let mut app = App::new_fake(&config);
+
+        let text = render_text(&mut app, 80, 20);
+
+        assert_eq!(
+            text.matches("Warning: protected process").count(),
+            1,
+            "{text}",
+        );
+        assert!(text.contains("Permission: full"), "{text}");
+    }
+
+    #[test]
     fn configured_labels_render_only_when_table_width_can_preserve_legacy_layout() {
         let config = Config {
             labels: LabelRegistry::from_inputs(vec![LabelInput {

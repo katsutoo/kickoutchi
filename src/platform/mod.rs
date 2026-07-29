@@ -4,6 +4,13 @@ use crate::model::{ProcessContext, RelatedProcessHint};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::observation::ProcessIdentity;
 
+/// Display and traversal bounds for optional process context. These hints
+/// never participate in termination authority, so every platform degrades by
+/// truncating at the same policy limits.
+const MAX_CHILD_PROCESSES: usize = 64;
+const MAX_RELATED_PROCESS_HINTS: usize = 8;
+const MAX_PROCESS_ANCESTORS: usize = 64;
+
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
