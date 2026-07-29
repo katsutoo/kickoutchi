@@ -267,6 +267,49 @@ pub(crate) enum TerminationOutcome {
 }
 
 impl TerminationOutcome {
+    /// Stable, interface-neutral wording for one direct termination outcome.
+    ///
+    /// CLI and TUI callers may add interface-specific recovery guidance, but
+    /// the underlying event is described here so their wording cannot drift.
+    pub(crate) fn status_description(&self, target: &KillTarget, mode: KillMode) -> String {
+        let delivery = mode.delivery_label(target.platform);
+        match self {
+            Self::Success => format!("sent {delivery} to {}", target.identity()),
+            Self::PermissionDenied => {
+                format!(
+                    "permission denied sending {delivery} to {}",
+                    target.identity()
+                )
+            }
+            Self::OwnershipUnavailable => format!(
+                "ownership for {} became unavailable before {delivery}; no termination was sent",
+                target.identity(),
+            ),
+            Self::AlreadyExited => {
+                format!(
+                    "{} already exited before termination was sent",
+                    target.identity()
+                )
+            }
+            Self::Cancelled => "kill cancelled".to_owned(),
+            Self::ProtectedProcess => format!("{} is protected", target.identity()),
+            Self::TargetChanged => format!(
+                "{} no longer owns the confirmed port target; no termination was sent",
+                target.identity(),
+            ),
+            Self::UnsafePid(reason) => format!("unsafe PID blocked: {}", reason.message()),
+            Self::UnknownFailure(error) => format!(
+                "sending {delivery} to {} failed: {}",
+                target.identity(),
+                sanitize(error),
+            ),
+            Self::ThawFailed { pid, prior } => format!(
+                "{}; cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
+                sanitize(&prior.failure_cause_text()),
+            ),
+        }
+    }
+
     pub(crate) fn failure_cause_text(&self) -> String {
         match self {
             Self::Success => "the termination signal was accepted".to_owned(),
@@ -790,7 +833,9 @@ pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
     // Three PIDs we'll never signal, no matter how nicely you ask: 0 (a whole
     // process group, not a single process), 1 (init — the load-bearing ogre;
     // pull it out and the whole swamp comes down), and our own PID (Kickoutchi
-    // doesn't get to kick itself out of its own swamp).
+    // doesn't get to kick itself out of its own swamp). An ordinary parent PID
+    // is deliberately allowed: direct PID targeting is explicit, and killing a
+    // stuck invoking shell does not interrupt Kickoutchi's safety pipeline.
     if pid == 0 {
         return Some(UnsafePidReason::Zero);
     }
@@ -2308,6 +2353,69 @@ mod tests {
             outcome.failure_cause_text(),
             "the confirmed process identity changed; cleanup could not continue PID 42"
         );
+    }
+
+    #[test]
+    fn direct_termination_descriptions_are_stable_across_interfaces() {
+        let target = KillTarget {
+            pid: 42,
+            process_name: Some("node".to_owned()),
+            platform: Platform::Linux,
+            permission: PermissionStatus::Full,
+            protected: false,
+            system_process: false,
+            ports: Vec::new(),
+            owner_uid: None,
+            process_start_time_marker: None,
+            child_count: 0,
+            children_truncated: false,
+        };
+        let cases = [
+            (TerminationOutcome::Success, "sent SIGTERM to PID 42 (node)"),
+            (
+                TerminationOutcome::PermissionDenied,
+                "permission denied sending SIGTERM to PID 42 (node)",
+            ),
+            (
+                TerminationOutcome::OwnershipUnavailable,
+                "ownership for PID 42 (node) became unavailable before SIGTERM; no termination was sent",
+            ),
+            (
+                TerminationOutcome::AlreadyExited,
+                "PID 42 (node) already exited before termination was sent",
+            ),
+            (TerminationOutcome::Cancelled, "kill cancelled"),
+            (
+                TerminationOutcome::ProtectedProcess,
+                "PID 42 (node) is protected",
+            ),
+            (
+                TerminationOutcome::TargetChanged,
+                "PID 42 (node) no longer owns the confirmed port target; no termination was sent",
+            ),
+            (
+                TerminationOutcome::UnsafePid(UnsafePidReason::CurrentProcess),
+                "unsafe PID blocked: Kickoutchi cannot terminate itself",
+            ),
+            (
+                TerminationOutcome::UnknownFailure("\x1b[31mboom\nnext".to_owned()),
+                "sending SIGTERM to PID 42 (node) failed: boom next",
+            ),
+            (
+                TerminationOutcome::ThawFailed {
+                    pid: 43,
+                    prior: Box::new(TerminationOutcome::TargetChanged),
+                },
+                "the confirmed process identity changed; cleanup could not continue PID 43; it may remain stopped and require SIGCONT",
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            assert_eq!(
+                outcome.status_description(&target, KillMode::Terminate),
+                expected,
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Windows tree preparation, containment, and post-commit reporting now share the
+  same refusal vocabulary and semantic exit classification used by Unix tree
+  handling. CLI and TUI renderers share stable tree-refusal causes and direct
+  termination descriptions while retaining their interface-specific recovery
+  details.
+- Docker output-drain and child-cleanup workers now use one bounded capacity
+  primitive with atomic multi-slot reservations and independently owned permits.
+  Scoped tree/group confirmation shares only its identical prompt execution;
+  the safety-critical revalidation, freeze/commit, and termination ordering
+  remains explicit.
+- Host-sensitive CLI tests no longer reserve and release an ephemeral port
+  before launching a competing process. Linux no-match diagnostics run in an
+  isolated user/network namespace, and workflow security tests assert native
+  platform coverage and unprivileged metadata generation without pinning
+  incidental runner labels or setup commands.
+- Documented that direct PID termination intentionally permits an ordinary
+  parent process, including the invoking shell, while PID 0, PID 1, Windows
+  System PID 4, Kickoutchi itself, and scoped kills containing Kickoutchi remain
+  refused.
+
 ## [1.3.8] - 2026-07-29
 
 ### Changed

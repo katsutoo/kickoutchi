@@ -133,6 +133,16 @@ fn step_script(step: &Mapping) -> &str {
     optional_step_script(step).expect("workflow step must define a run script")
 }
 
+fn installer_target(entry: &Value) -> String {
+    let entry = required_mapping(entry, "installer matrix entry");
+    assert!(
+        yaml_scalar(entry, "runner").is_some(),
+        "every installer journey must name a native runner"
+    );
+    yaml_scalar(entry, "targets_json")
+        .expect("installer matrix entry must name its validated target")
+}
+
 fn script_lines(step: &Mapping) -> Vec<&str> {
     step_script(step).lines().filter_map(active_line).collect()
 }
@@ -808,7 +818,6 @@ fn arch_metadata_is_compared_with_native_makepkg_output() {
     let script = script_lines(step).join("\n");
     assert!(script.contains("$ARCHLINUX_IMAGE"));
     assert!(script.contains("$GITHUB_WORKSPACE:/workspace:ro"));
-    assert!(script.contains("chown -R nobody:nobody /tmp/arch"));
     assert!(script.contains("for package in kickoutchi kickoutchi-bin"));
     assert!(script.contains("runuser -u nobody"));
     assert!(script.contains("diff -u .SRCINFO <(makepkg --printsrcinfo)"));
@@ -880,14 +889,16 @@ fn installers_and_updater_are_executed_before_and_after_publication() {
         3,
         "Linux, macOS, and Windows installers must run"
     );
-    let runners = include
-        .iter()
-        .map(|entry| {
-            yaml_scalar(required_mapping(entry, "installer matrix entry"), "runner")
-                .expect("installer matrix entry must name a runner")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(runners, ["ubuntu-22.04", "macos-14", "windows-2022"]);
+    let targets = include.iter().map(installer_target).collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        [
+            "[\"x86_64-unknown-linux-gnu\"]",
+            "[\"aarch64-apple-darwin\"]",
+            "[\"x86_64-pc-windows-msvc\"]",
+        ],
+        "Linux, macOS, and Windows installer artifacts must each run natively"
+    );
 
     let execute = named_job_step(installers, "Execute generated installer and updater");
     assert_eq!(

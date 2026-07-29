@@ -30,14 +30,14 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::model::Platform;
 use crate::observation::{ProcessIdentity, ProcessStartMarker};
-use crate::process::{KillTarget, UnsafePidReason, unsafe_pid_reason};
+use crate::process::{KillTarget, unsafe_pid_reason};
 use crate::process_evidence::{
     ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
 };
 use crate::protection::is_protected_process_name;
 use crate::tree::{
     self, MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ProcessTreeTarget,
-    TreeKillOutcome, TreePlanError, TreeProcessInfo,
+    TreeKillOutcome as TreeRefusal, TreePlanError, TreeProcessInfo,
 };
 
 // Same finite convergence budget as the Unix freeze sweep. Windows containment
@@ -129,92 +129,16 @@ pub(crate) enum WindowsTreeCleanupIssue {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WindowsTreePostCommitIssue {
-    RootAlreadyExited,
-    PermissionDenied { pid: u32 },
-    TargetChanged { pid: u32 },
-    Truncated { limit: usize },
-    SweepPassLimit { limit: usize },
-    UnsafePid { pid: u32, reason: UnsafePidReason },
-    ProtectedDescendant { pid: u32, name: Option<String> },
-    ProtectedRoot { pid: u32, name: Option<String> },
-    FreshConfirmationRequired,
-    PartialMetadata { pid: u32 },
-    SnapshotFailed(String),
-}
-
-impl WindowsTreePostCommitIssue {
-    fn from_outcome(outcome: WindowsTreeKillOutcome) -> Option<Self> {
-        match outcome {
-            WindowsTreeKillOutcome::Completed(_)
-            | WindowsTreeKillOutcome::OwnershipUnavailable { .. }
-            | WindowsTreeKillOutcome::CommitFailed { .. }
-            | WindowsTreeKillOutcome::FreezeCapabilityUnavailable { .. }
-            | WindowsTreeKillOutcome::JobTerminateFailed { .. } => None,
-            WindowsTreeKillOutcome::RootAlreadyExited => Some(Self::RootAlreadyExited),
-            WindowsTreeKillOutcome::PermissionDenied { pid } => {
-                Some(Self::PermissionDenied { pid })
-            }
-            WindowsTreeKillOutcome::TargetChanged { pid } => Some(Self::TargetChanged { pid }),
-            WindowsTreeKillOutcome::Truncated { limit } => Some(Self::Truncated { limit }),
-            WindowsTreeKillOutcome::SweepPassLimit { limit } => {
-                Some(Self::SweepPassLimit { limit })
-            }
-            WindowsTreeKillOutcome::UnsafePid { pid, reason } => {
-                Some(Self::UnsafePid { pid, reason })
-            }
-            WindowsTreeKillOutcome::ProtectedDescendant { pid, name } => {
-                Some(Self::ProtectedDescendant { pid, name })
-            }
-            WindowsTreeKillOutcome::ProtectedRoot { pid, name } => {
-                Some(Self::ProtectedRoot { pid, name })
-            }
-            WindowsTreeKillOutcome::FreshConfirmationRequired => {
-                Some(Self::FreshConfirmationRequired)
-            }
-            WindowsTreeKillOutcome::PartialMetadata { pid } => Some(Self::PartialMetadata { pid }),
-            WindowsTreeKillOutcome::SnapshotFailed(error) => Some(Self::SnapshotFailed(error)),
-        }
-    }
-}
+/// A refusal discovered after Windows Job Object containment was committed.
+///
+/// The report field supplies the post-commit phase; the underlying fact reuses
+/// the pre-commit tree vocabulary, so there is no second mapping table to drift.
+pub(crate) type WindowsTreePostCommitIssue = TreeRefusal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WindowsTreeKillOutcome {
     Completed(Box<WindowsTreeKillReport>),
-    RootAlreadyExited,
-    PermissionDenied {
-        pid: u32,
-    },
-    TargetChanged {
-        pid: u32,
-    },
-    Truncated {
-        limit: usize,
-    },
-    SweepPassLimit {
-        limit: usize,
-    },
-    UnsafePid {
-        pid: u32,
-        reason: UnsafePidReason,
-    },
-    ProtectedDescendant {
-        pid: u32,
-        name: Option<String>,
-    },
-    ProtectedRoot {
-        pid: u32,
-        name: Option<String>,
-    },
-    FreshConfirmationRequired,
-    OwnershipUnavailable {
-        pid: u32,
-    },
-    PartialMetadata {
-        pid: u32,
-    },
-    SnapshotFailed(String),
+    Refused(TreeRefusal),
     CommitFailed {
         pid: u32,
         error: String,
@@ -229,35 +153,28 @@ pub(crate) enum WindowsTreeKillOutcome {
 }
 
 impl WindowsTreeKillOutcome {
-    pub(crate) fn from_precommit_outcome(outcome: TreeKillOutcome) -> Self {
-        match outcome {
-            TreeKillOutcome::RootAlreadyExited => Self::RootAlreadyExited,
-            TreeKillOutcome::PermissionDenied { pid } => Self::PermissionDenied { pid },
-            TreeKillOutcome::TargetChanged { pid } => Self::TargetChanged { pid },
-            TreeKillOutcome::Truncated { limit } => Self::Truncated { limit },
-            TreeKillOutcome::UnsafePid { pid, reason } => Self::UnsafePid { pid, reason },
-            TreeKillOutcome::ProtectedDescendant { pid, name } => {
-                Self::ProtectedDescendant { pid, name }
-            }
-            TreeKillOutcome::ProtectedRoot { pid, name } => Self::ProtectedRoot { pid, name },
-            TreeKillOutcome::FreshConfirmationRequired => Self::FreshConfirmationRequired,
-            TreeKillOutcome::OwnershipUnavailable { pid } => Self::OwnershipUnavailable { pid },
-            TreeKillOutcome::PartialMetadata { pid } => Self::PartialMetadata { pid },
-            TreeKillOutcome::SnapshotFailed(error) => Self::SnapshotFailed(error),
-            TreeKillOutcome::ThawFailed { .. } => Self::SnapshotFailed(
-                "unexpected Unix thaw outcome in Windows tree planning".to_owned(),
-            ),
+    pub(crate) const fn from_precommit_outcome(outcome: TreeRefusal) -> Self {
+        Self::Refused(outcome)
+    }
+
+    pub(crate) fn snapshot_failed(error: String) -> Self {
+        Self::Refused(TreeRefusal::SnapshotFailed(error))
+    }
+
+    fn into_post_commit_issue(self) -> Option<WindowsTreePostCommitIssue> {
+        match self {
+            Self::Refused(TreeRefusal::OwnershipUnavailable { .. })
+            | Self::Completed(_)
+            | Self::CommitFailed { .. }
+            | Self::FreezeCapabilityUnavailable { .. }
+            | Self::JobTerminateFailed { .. } => None,
+            Self::Refused(refusal) => Some(refusal),
         }
     }
 }
 
 fn windows_plan_error(error: TreePlanError) -> WindowsTreeKillOutcome {
-    match error {
-        TreePlanError::RootMissing => WindowsTreeKillOutcome::RootAlreadyExited,
-        TreePlanError::SnapshotLimitExceeded { limit } => {
-            WindowsTreeKillOutcome::Truncated { limit }
-        }
-    }
+    WindowsTreeKillOutcome::Refused(tree::plan_error_outcome(error))
 }
 
 pub(crate) fn execute_tree_kill(
@@ -288,20 +205,20 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
     api: &mut Api,
 ) -> WindowsTreeKillOutcome {
     if let Some(reason) = unsafe_pid_reason(root.pid) {
-        return WindowsTreeKillOutcome::UnsafePid {
+        return WindowsTreeKillOutcome::Refused(TreeRefusal::UnsafePid {
             pid: root.pid,
             reason,
-        };
+        });
     }
 
     let snapshot = match api.snapshot() {
         Ok(snapshot) => snapshot,
-        Err(error) => return WindowsTreeKillOutcome::SnapshotFailed(error),
+        Err(error) => return WindowsTreeKillOutcome::snapshot_failed(error),
     };
     let snapshot_index = match ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX) {
         Ok(index) => index,
         Err(TreePlanError::SnapshotLimitExceeded { limit }) => {
-            return WindowsTreeKillOutcome::Truncated { limit };
+            return WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated { limit });
         }
         Err(TreePlanError::RootMissing) => {
             unreachable!("index construction does not resolve roots")
@@ -342,7 +259,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
     }
     let job = match api.create_job() {
         Ok(job) => job,
-        Err(error) => return WindowsTreeKillOutcome::SnapshotFailed(error),
+        Err(error) => return WindowsTreeKillOutcome::snapshot_failed(error),
     };
 
     match commit_root_to_job(api, &job, root.pid, &mut members) {
@@ -409,7 +326,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
                 report.termination_state.withhold();
                 record_post_commit_issue(
                     &mut report,
-                    WindowsTreeKillOutcome::SnapshotFailed(format!(
+                    WindowsTreeKillOutcome::snapshot_failed(format!(
                         "freezing committed Job Object failed: {error}"
                     )),
                 );
@@ -476,15 +393,15 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
 /// re-confirmation prompt for the right process.
 fn protected_outcome(pid: u32, root_pid: u32, name: &str) -> WindowsTreeKillOutcome {
     if pid == root_pid {
-        WindowsTreeKillOutcome::ProtectedRoot {
+        WindowsTreeKillOutcome::Refused(TreeRefusal::ProtectedRoot {
             pid,
             name: Some(name.to_owned()),
-        }
+        })
     } else {
-        WindowsTreeKillOutcome::ProtectedDescendant {
+        WindowsTreeKillOutcome::Refused(TreeRefusal::ProtectedDescendant {
             pid,
             name: Some(name.to_owned()),
-        }
+        })
     }
 }
 
@@ -508,11 +425,11 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
     let exact_member_set = exact_members.iter().copied().collect::<HashSet<_>>();
     let snapshot = api
         .snapshot()
-        .map_err(WindowsTreeKillOutcome::SnapshotFailed)?;
+        .map_err(WindowsTreeKillOutcome::snapshot_failed)?;
     if snapshot.len() > PROCESS_TREE_INDEX_MAX {
-        return Err(WindowsTreeKillOutcome::Truncated {
+        return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated {
             limit: PROCESS_TREE_INDEX_MAX,
-        });
+        }));
     }
 
     let snapshot_by_pid = snapshot_by_pid(&snapshot)?;
@@ -522,9 +439,9 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
         .copied()
         .collect::<Vec<_>>();
     if final_pids.len() > MAX_TREE_PROCESSES {
-        return Err(WindowsTreeKillOutcome::Truncated {
+        return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated {
             limit: MAX_TREE_PROCESSES,
-        });
+        }));
     }
     final_pids.sort_unstable();
 
@@ -532,18 +449,27 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
         let info = snapshot_by_pid
             .get(&pid)
             .copied()
-            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+            .ok_or(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid },
+            ))?;
         if let Some(reason) = unsafe_pid_reason(pid) {
-            return Err(WindowsTreeKillOutcome::UnsafePid { pid, reason });
+            return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::UnsafePid {
+                pid,
+                reason,
+            }));
         }
         let marker = info
             .start_time_marker
-            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+            .ok_or(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid },
+            ))?;
         if members
             .get(&pid)
             .is_some_and(|process| process.start_marker != marker)
         {
-            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid },
+            ));
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = members.entry(pid) {
             let process = open_verified_process(api, info, marker)
@@ -556,13 +482,17 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
         if process.status == PinnedProcessStatus::AlreadyExited
             || api.process_start_marker(&process.handle) != Some(marker)
         {
-            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid },
+            ));
         }
         let old_name = process.verified_name.clone();
         let fresh_name = api
             .process_name(&process.handle)
             .map_err(|error| windows_evidence_outcome(windows_api_evidence_error(pid, &error)))?
-            .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?;
+            .ok_or(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid },
+            ))?;
         let mut evidence = ProcessEvidenceScope::new(1).map_err(windows_evidence_outcome)?;
         process.verified_name = evidence
             .observe(
@@ -587,7 +517,9 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
             if protected {
                 return Err(protected_outcome(pid, root_pid, &process.verified_name));
             }
-            return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid },
+            ));
         }
         if protected && (pid != root_pid || !protected_root_confirmed) {
             report.termination_state.withhold();
@@ -604,22 +536,24 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
             .is_system_process()
         {
             report.termination_state.withhold();
-            return Err(WindowsTreeKillOutcome::FreshConfirmationRequired);
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::FreshConfirmationRequired,
+            ));
         }
         if !exact_member_set.contains(&pid) {
-            return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+            return Err(WindowsTreeKillOutcome::snapshot_failed(format!(
                 "live graph descendant PID {pid} was absent from exact frozen Job membership"
             )));
         }
         match api.process_in_job(job, &process.handle) {
             Ok(true) => {}
             Ok(false) => {
-                return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                return Err(WindowsTreeKillOutcome::snapshot_failed(format!(
                     "exact frozen Job membership disagreed with the handle query for PID {pid}"
                 )));
             }
             Err(error) => {
-                return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+                return Err(WindowsTreeKillOutcome::snapshot_failed(format!(
                     "reading frozen Job membership for PID {pid} failed: {}",
                     windows_api_error_text(&error)
                 )));
@@ -649,7 +583,7 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
             report.already_exited_pids.push(pid);
             assigned.remove(&pid);
         } else {
-            return Err(WindowsTreeKillOutcome::SnapshotFailed(format!(
+            return Err(WindowsTreeKillOutcome::snapshot_failed(format!(
                 "previously contained live PID {pid} was absent from exact frozen Job membership"
             )));
         }
@@ -657,7 +591,7 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
 
     let stable_members = api.job_process_ids(job).map_err(job_membership_outcome)?;
     if stable_members != exact_members {
-        return Err(WindowsTreeKillOutcome::SnapshotFailed(
+        return Err(WindowsTreeKillOutcome::snapshot_failed(
             "frozen Job Object membership changed during final reconciliation".to_owned(),
         ));
     }
@@ -667,12 +601,14 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
 
 fn job_membership_outcome(error: JobMembershipError) -> WindowsTreeKillOutcome {
     match error {
-        JobMembershipError::Oversized { limit } => WindowsTreeKillOutcome::Truncated { limit },
-        JobMembershipError::Raced => WindowsTreeKillOutcome::SnapshotFailed(
+        JobMembershipError::Oversized { limit } => {
+            WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated { limit })
+        }
+        JobMembershipError::Raced => WindowsTreeKillOutcome::snapshot_failed(
             "frozen Job Object membership did not stabilize within the bounded query budget"
                 .to_owned(),
         ),
-        JobMembershipError::Unreadable(error) => WindowsTreeKillOutcome::SnapshotFailed(error),
+        JobMembershipError::Unreadable(error) => WindowsTreeKillOutcome::snapshot_failed(error),
     }
 }
 
@@ -682,7 +618,9 @@ fn snapshot_by_pid(
     let mut by_pid = HashMap::with_capacity(snapshot.len());
     for info in snapshot {
         if by_pid.insert(info.pid, info).is_some() {
-            return Err(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid: info.pid },
+            ));
         }
     }
     Ok(by_pid)
@@ -737,7 +675,9 @@ fn generation_qualified_descendants<Handle>(
         if let Some(children) = unverified_by_parent.get(&parent.pid)
             && let Some(child) = children.first()
         {
-            return Err(WindowsTreeKillOutcome::PartialMetadata { pid: child.pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid: child.pid },
+            ));
         }
         for child in children_by_parent
             .get(&parent.pid)
@@ -745,18 +685,22 @@ fn generation_qualified_descendants<Handle>(
         {
             let marker = child
                 .start_time_marker
-                .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid: child.pid })?;
+                .ok_or(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::PartialMetadata { pid: child.pid },
+                ))?;
             if members
                 .get(&child.pid)
                 .is_some_and(|process| process.start_marker != marker)
             {
-                return Err(WindowsTreeKillOutcome::TargetChanged { pid: child.pid });
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::TargetChanged { pid: child.pid },
+                ));
             }
             if reachable.insert(child.pid) {
                 if reachable.len() > MAX_TREE_PROCESSES {
-                    return Err(WindowsTreeKillOutcome::Truncated {
+                    return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated {
                         limit: MAX_TREE_PROCESSES,
-                    });
+                    }));
                 }
                 frontier.push(ProcessIdentity {
                     pid: child.pid,
@@ -789,10 +733,14 @@ fn build_precommit_preview(
     tree::root_protection_outcome(&preview, protected_root_confirmed)
         .map_err(WindowsTreeKillOutcome::from_precommit_outcome)?;
     if prompt_skipped && preview.has_warnings() {
-        return Err(WindowsTreeKillOutcome::FreshConfirmationRequired);
+        return Err(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::FreshConfirmationRequired,
+        ));
     }
     if let Some(pid) = first_partial_metadata_pid(snapshot, snapshot_index, &preview) {
-        return Err(WindowsTreeKillOutcome::PartialMetadata { pid });
+        return Err(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::PartialMetadata { pid },
+        ));
     }
     Ok((preview, confirmed_root_marker))
 }
@@ -801,22 +749,42 @@ fn verify_snapshot_root_identity(
     root: &KillTarget,
     snapshot_index: &ProcessTreeIndex<'_>,
 ) -> Result<ProcessStartMarker, WindowsTreeKillOutcome> {
-    let confirmed_marker = root
-        .process_start_time_marker
-        .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid: root.pid })?;
+    let confirmed_marker =
+        root.process_start_time_marker
+            .ok_or(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid: root.pid },
+            ))?;
     let info = snapshot_index
         .process(root.pid)
-        .ok_or(WindowsTreeKillOutcome::RootAlreadyExited)?;
+        .ok_or(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::RootAlreadyExited,
+        ))?;
     match info.start_time_marker {
         Some(marker) if marker == confirmed_marker => {}
-        Some(_) => return Err(WindowsTreeKillOutcome::TargetChanged { pid: root.pid }),
-        None => return Err(WindowsTreeKillOutcome::PartialMetadata { pid: root.pid }),
+        Some(_) => {
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid: root.pid },
+            ));
+        }
+        None => {
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid: root.pid },
+            ));
+        }
     }
     if let Some(confirmed_name) = root.process_name.as_deref() {
         match info.process_name.as_deref() {
             Some(fresh_name) if fresh_name == confirmed_name => {}
-            Some(_) => return Err(WindowsTreeKillOutcome::TargetChanged { pid: root.pid }),
-            None => return Err(WindowsTreeKillOutcome::PartialMetadata { pid: root.pid }),
+            Some(_) => {
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::TargetChanged { pid: root.pid },
+                ));
+            }
+            None => {
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::PartialMetadata { pid: root.pid },
+                ));
+            }
         }
     }
     Ok(confirmed_marker)
@@ -863,13 +831,17 @@ fn pin_preview_members<Api: WindowsTreeApi>(
     let mut members = HashMap::new();
     for node in preview.preview_nodes(preview.len()) {
         let Some(info) = snapshot_index.process(node.pid) else {
-            return Err(WindowsTreeKillOutcome::TargetChanged { pid: node.pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid: node.pid },
+            ));
         };
         let expected_marker = if info.pid == root_pid {
             confirmed_root_marker
         } else {
             info.start_time_marker
-                .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid })?
+                .ok_or(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::PartialMetadata { pid: info.pid },
+                ))?
         };
         let process = open_verified_process(api, info, expected_marker)
             .map_err(|error| open_error_outcome(info.pid, error))?;
@@ -883,12 +855,16 @@ fn pin_preview_members<Api: WindowsTreeApi>(
     for pid in pids {
         let info = snapshot_index
             .process(pid)
-            .ok_or(WindowsTreeKillOutcome::TargetChanged { pid })?;
+            .ok_or(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::TargetChanged { pid },
+            ))?;
         let expected_marker = if pid == root_pid {
             confirmed_root_marker
         } else {
             info.start_time_marker
-                .ok_or(WindowsTreeKillOutcome::PartialMetadata { pid })?
+                .ok_or(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::PartialMetadata { pid },
+                ))?
         };
         let expected = ExpectedProcessEvidence {
             pid,
@@ -936,16 +912,20 @@ fn check_pinned_protection<Handle>(
         }
         if pid == root_pid {
             if !protected_root_confirmed {
-                return Err(WindowsTreeKillOutcome::ProtectedRoot {
-                    pid,
-                    name: Some(name.clone()),
-                });
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::ProtectedRoot {
+                        pid,
+                        name: Some(name.clone()),
+                    },
+                ));
             }
         } else {
-            return Err(WindowsTreeKillOutcome::ProtectedDescendant {
-                pid,
-                name: Some(name.clone()),
-            });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::ProtectedDescendant {
+                    pid,
+                    name: Some(name.clone()),
+                },
+            ));
         }
     }
     Ok(())
@@ -969,23 +949,7 @@ fn windows_api_error_text(error: &WindowsApiError) -> &str {
 }
 
 fn windows_evidence_outcome(error: ProcessEvidenceError) -> WindowsTreeKillOutcome {
-    match error {
-        ProcessEvidenceError::PermissionDenied { pid } => {
-            WindowsTreeKillOutcome::PermissionDenied { pid }
-        }
-        ProcessEvidenceError::IdentityChanged { pid }
-        | ProcessEvidenceError::NameChanged { pid }
-        | ProcessEvidenceError::Missing { pid } => WindowsTreeKillOutcome::TargetChanged { pid },
-        ProcessEvidenceError::NameMissing { pid }
-        | ProcessEvidenceError::NameOversized { pid, .. } => {
-            WindowsTreeKillOutcome::PartialMetadata { pid }
-        }
-        ProcessEvidenceError::IncompleteScope { .. }
-        | ProcessEvidenceError::MemberLimitExceeded { .. }
-        | ProcessEvidenceError::ByteLimitExceeded { .. } => WindowsTreeKillOutcome::SnapshotFailed(
-            "fresh process evidence exceeded its bounded scope".to_owned(),
-        ),
-    }
+    WindowsTreeKillOutcome::from_precommit_outcome(tree::evidence_tree_outcome(error))
 }
 
 fn record_post_commit_issue(report: &mut WindowsTreeKillReport, outcome: WindowsTreeKillOutcome) {
@@ -993,10 +957,13 @@ fn record_post_commit_issue(report: &mut WindowsTreeKillReport, outcome: Windows
     // After root assignment, every sweep/evidence failure means the contained
     // membership is uncertain. Terminating the job could then kill an unknown
     // or newly protected process, so uncertainty always withholds it.
-    if !matches!(outcome, WindowsTreeKillOutcome::ProtectedDescendant { .. }) {
+    if !matches!(
+        outcome,
+        WindowsTreeKillOutcome::Refused(TreeRefusal::ProtectedDescendant { .. })
+    ) {
         report.termination_state.withhold();
     }
-    let Some(issue) = WindowsTreePostCommitIssue::from_outcome(outcome) else {
+    let Some(issue) = outcome.into_post_commit_issue() else {
         return;
     };
     if report.post_commit_issue.is_none() {
@@ -1020,17 +987,21 @@ fn commit_root_to_job<Api: WindowsTreeApi>(
     members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
 ) -> Result<(), WindowsTreeKillOutcome> {
     let Some(root) = members.get_mut(&root_pid) else {
-        return Err(WindowsTreeKillOutcome::RootAlreadyExited);
+        return Err(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::RootAlreadyExited,
+        ));
     };
     match api.assign_process(job, &root.handle) {
         Ok(()) => {
             root.status = PinnedProcessStatus::AssignedToJob;
             Ok(())
         }
-        Err(WindowsApiError::NotFound) => Err(WindowsTreeKillOutcome::RootAlreadyExited),
-        Err(WindowsApiError::PermissionDenied) => {
-            Err(WindowsTreeKillOutcome::PermissionDenied { pid: root_pid })
-        }
+        Err(WindowsApiError::NotFound) => Err(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::RootAlreadyExited,
+        )),
+        Err(WindowsApiError::PermissionDenied) => Err(WindowsTreeKillOutcome::Refused(
+            TreeRefusal::PermissionDenied { pid: root_pid },
+        )),
         Err(WindowsApiError::Other(error)) => Err(WindowsTreeKillOutcome::CommitFailed {
             pid: root_pid,
             error,
@@ -1077,7 +1048,7 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
         *sweep_passes_remaining -= 1;
         let snapshot = api
             .snapshot()
-            .map_err(WindowsTreeKillOutcome::SnapshotFailed)?;
+            .map_err(WindowsTreeKillOutcome::snapshot_failed)?;
         let snapshot_by_pid = snapshot_by_pid(&snapshot)?;
         for (&pid, process) in &*members {
             if snapshot_by_pid
@@ -1085,7 +1056,9 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                 .and_then(|info| info.start_time_marker)
                 .is_some_and(|marker| marker != process.start_marker)
             {
-                return Err(WindowsTreeKillOutcome::TargetChanged { pid });
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::TargetChanged { pid },
+                ));
             }
         }
         let snapshot_index =
@@ -1099,15 +1072,19 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
         )
         .map_err(windows_plan_error)?;
         if preview.truncated() {
-            return Err(WindowsTreeKillOutcome::Truncated {
+            return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated {
                 limit: MAX_TREE_PROCESSES,
-            });
+            }));
         }
         if prompt_skipped && preview.has_warnings() {
-            return Err(WindowsTreeKillOutcome::FreshConfirmationRequired);
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::FreshConfirmationRequired,
+            ));
         }
         if let Some(pid) = first_partial_metadata_pid(&snapshot, &snapshot_index, &preview) {
-            return Err(WindowsTreeKillOutcome::PartialMetadata { pid });
+            return Err(WindowsTreeKillOutcome::Refused(
+                TreeRefusal::PartialMetadata { pid },
+            ));
         }
 
         let mut discovered = false;
@@ -1116,23 +1093,25 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
                 continue;
             }
             if members.len() >= MAX_TREE_PROCESSES {
-                return Err(WindowsTreeKillOutcome::Truncated {
+                return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::Truncated {
                     limit: MAX_TREE_PROCESSES,
-                });
+                }));
             }
             let Some(info) = snapshot_index.process(node.pid) else {
                 continue;
             };
             if let Some(reason) = unsafe_pid_reason(node.pid) {
                 report.not_terminated.push(node.pid);
-                return Err(WindowsTreeKillOutcome::UnsafePid {
+                return Err(WindowsTreeKillOutcome::Refused(TreeRefusal::UnsafePid {
                     pid: node.pid,
                     reason,
-                });
+                }));
             }
             let Some(expected_marker) = info.start_time_marker else {
                 report.not_terminated.push(info.pid);
-                return Err(WindowsTreeKillOutcome::PartialMetadata { pid: info.pid });
+                return Err(WindowsTreeKillOutcome::Refused(
+                    TreeRefusal::PartialMetadata { pid: info.pid },
+                ));
             };
             let mut process = match open_verified_process(api, info, expected_marker) {
                 Ok(process) => process,
@@ -1221,9 +1200,11 @@ fn sweep_committed_tree<Api: WindowsTreeApi>(
             }
         }
     }
-    Err(WindowsTreeKillOutcome::SweepPassLimit {
-        limit: WINDOWS_TREE_SWEEP_PASSES,
-    })
+    Err(WindowsTreeKillOutcome::Refused(
+        TreeRefusal::SweepPassLimit {
+            limit: WINDOWS_TREE_SWEEP_PASSES,
+        },
+    ))
 }
 
 fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
@@ -1253,10 +1234,10 @@ fn handle_protected_post_commit_child<Api: WindowsTreeApi>(
             report.not_terminated.push(pid);
         }
     }
-    WindowsTreeKillOutcome::ProtectedDescendant {
+    WindowsTreeKillOutcome::Refused(TreeRefusal::ProtectedDescendant {
         pid,
         name: Some(name),
-    }
+    })
 }
 
 #[expect(
@@ -1478,10 +1459,16 @@ enum OpenVerifiedError {
 /// never surface as different outcomes depending on which phase observed it.
 fn open_error_outcome(pid: u32, error: OpenVerifiedError) -> WindowsTreeKillOutcome {
     match error {
-        OpenVerifiedError::NotFound => WindowsTreeKillOutcome::TargetChanged { pid },
-        OpenVerifiedError::PermissionDenied => WindowsTreeKillOutcome::PermissionDenied { pid },
-        OpenVerifiedError::PartialMetadata => WindowsTreeKillOutcome::PartialMetadata { pid },
-        OpenVerifiedError::Other(error) => WindowsTreeKillOutcome::SnapshotFailed(error),
+        OpenVerifiedError::NotFound => {
+            WindowsTreeKillOutcome::Refused(TreeRefusal::TargetChanged { pid })
+        }
+        OpenVerifiedError::PermissionDenied => {
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PermissionDenied { pid })
+        }
+        OpenVerifiedError::PartialMetadata => {
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PartialMetadata { pid })
+        }
+        OpenVerifiedError::Other(error) => WindowsTreeKillOutcome::snapshot_failed(error),
     }
 }
 
@@ -1918,7 +1905,7 @@ mod tests {
     };
     use crate::model::{PermissionStatus, Platform};
     use crate::process::KillTarget;
-    use crate::tree::TreeProcessInfo;
+    use crate::tree::{TreeKillOutcome as TreeRefusal, TreeProcessInfo};
     use std::collections::{HashMap, HashSet, VecDeque};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2265,7 +2252,10 @@ mod tests {
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 
-        assert_eq!(outcome, WindowsTreeKillOutcome::TargetChanged { pid: 100 });
+        assert_eq!(
+            outcome,
+            WindowsTreeKillOutcome::Refused(TreeRefusal::TargetChanged { pid: 100 })
+        );
         assert!(api.events.is_empty());
     }
 
@@ -2279,7 +2269,10 @@ mod tests {
 
         let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
 
-        assert_eq!(outcome, WindowsTreeKillOutcome::TargetChanged { pid: 100 });
+        assert_eq!(
+            outcome,
+            WindowsTreeKillOutcome::Refused(TreeRefusal::TargetChanged { pid: 100 })
+        );
         assert!(api.events.is_empty());
     }
 
@@ -2292,7 +2285,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            WindowsTreeKillOutcome::PartialMetadata { pid: 101 }
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PartialMetadata { pid: 101 })
         );
         assert!(api.events.is_empty());
         assert!(!api.job_terminated);
@@ -2307,7 +2300,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            WindowsTreeKillOutcome::PermissionDenied { pid: 101 }
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PermissionDenied { pid: 101 })
         );
         assert!(api.events.is_empty());
         assert!(!api.job_terminated);
@@ -2326,7 +2319,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            WindowsTreeKillOutcome::PartialMetadata { pid: 101 }
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PartialMetadata { pid: 101 })
         );
         assert!(api.events.is_empty());
         assert!(!api.job_terminated);
@@ -3236,7 +3229,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            WindowsTreeKillOutcome::PartialMetadata { pid: 101 }
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PartialMetadata { pid: 101 })
         );
         assert!(api.events.is_empty());
     }
@@ -3252,7 +3245,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            WindowsTreeKillOutcome::PartialMetadata { pid: 101 }
+            WindowsTreeKillOutcome::Refused(TreeRefusal::PartialMetadata { pid: 101 })
         );
         assert!(api.events.is_empty());
     }

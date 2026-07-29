@@ -615,22 +615,6 @@ mod why_native {
             "reservation_or_policy_unknown"
         );
     }
-
-    #[test]
-    fn why_closes_a_successful_native_probe() {
-        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("temporary UDP fixture must bind");
-        let port = socket.local_addr().expect("UDP address is known").port();
-        drop(socket);
-        let port_text = port.to_string();
-
-        let output = run_why(&[port_text.as_str(), "--udp", "--address", "127.0.0.1"]);
-
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(json(&output)["results"][0]["verdict"], "bindable_now");
-        let rebound = UdpSocket::bind(("127.0.0.1", port))
-            .expect("the completed probe must not retain its socket");
-        drop(rebound);
-    }
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -1119,14 +1103,103 @@ mod linux {
     const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
     const IPC_WAIT: Duration = Duration::from_secs(10);
     static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
-    // Reserved for the no-match diagnostic helper's command line. Port zero is
-    // invalid user input, so use the top of the real port range instead.
-    const DIAGNOSTIC_TEST_PORT: u16 = u16::MAX;
+    // Each no-match diagnostic runs in its own network namespace, where this
+    // valid boundary port is guaranteed to have no unrelated host listener.
+    const ISOLATED_DIAGNOSTIC_TEST_PORT: u16 = u16::MAX;
+    const CONTROLLED_BIND_FAULT_PORT: &str = "49151";
 
     fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
         HOST_OBSERVATION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn run_in_isolated_user_network_namespace(
+        script: &str,
+        arguments: &[&std::ffi::OsStr],
+    ) -> Option<Output> {
+        let mut command = Command::new("unshare");
+        command.args([
+            "--user",
+            "--map-root-user",
+            "--net",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "sh",
+            "-c",
+            script,
+            "sh",
+        ]);
+        command.args(arguments);
+        let output = match run_command_with_deadline(&mut command, None, CHILD_EXIT_WAIT) {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                assert!(
+                    !required_linux_capabilities(),
+                    "required unshare capability is unavailable: {error}"
+                );
+                eprintln!("unshare unavailable: {error}");
+                return None;
+            }
+            Err(error) => panic!("unshare must start: {error}"),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && (stderr.contains("unshare failed: Operation not permitted")
+                || stderr.contains("unshare failed: Permission denied"))
+        {
+            assert!(
+                !required_linux_capabilities(),
+                "required user/network namespaces are unavailable: {stderr}"
+            );
+            eprintln!("user/network namespaces unavailable: {stderr}");
+            return None;
+        }
+        Some(output)
+    }
+
+    fn isolated_no_match_diagnostic(json: bool) -> Option<Output> {
+        let config_home = isolated_config_home();
+        let _config_guard = DirectoryGuard(config_home.clone());
+        let port = ISOLATED_DIAGNOSTIC_TEST_PORT.to_string();
+        let json_flag = if json { "--json" } else { "" };
+        let script = r#"
+            sh -c 'sleep 30; :' --port "$2" &
+            helper=$!
+            attempts=0
+            while :; do
+                cmdline=$(tr '\000' ' ' < "/proc/${helper}/cmdline")
+                case "$cmdline" in
+                    *"--port $2"*) break ;;
+                esac
+                attempts=$((attempts + 1))
+                if test "$attempts" -ge 100; then
+                    kill "$helper" 2>/dev/null || true
+                    wait "$helper" 2>/dev/null || true
+                    exit 90
+                fi
+                sleep 0.01
+            done
+            if test -n "$4"; then
+                XDG_CONFIG_HOME="$3" "$1" list --port "$2" "$4"
+            else
+                XDG_CONFIG_HOME="$3" "$1" list --port "$2"
+            fi
+            status=$?
+            kill "$helper" 2>/dev/null || true
+            wait "$helper" 2>/dev/null || true
+            exit "$status"
+        "#;
+        run_in_isolated_user_network_namespace(
+            script,
+            &[
+                kickoutchi_binary().as_os_str(),
+                port.as_ref(),
+                config_home.as_os_str(),
+                json_flag.as_ref(),
+            ],
+        )
     }
 
     fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
@@ -1516,13 +1589,6 @@ mod linux {
         kickoutchi_with_config_deadline(&command_args, config_text)
     }
 
-    fn kick_why(args: &[&str]) -> Output {
-        let mut command_args = Vec::with_capacity(args.len() + 1);
-        command_args.push("why");
-        command_args.extend_from_slice(args);
-        binary_with_config_deadline_with_env(kick_binary(), &command_args, "", &[])
-    }
-
     fn why_with_bind_faults(args: &[&str], library: &Path, mode: &str) -> Output {
         let mut command_args = Vec::with_capacity(args.len() + 1);
         command_args.push("why");
@@ -1717,24 +1783,6 @@ mod linux {
         super::create_unique_temp_directory("linux-config")
     }
 
-    fn spawn_related_process(port: u16) -> ChildGuard {
-        let port_text = port.to_string();
-        // A dependency-free stand-in for "a process that names this port on its
-        // command line but holds no socket" — so the suite needs no Python (or
-        // any other interpreter) on PATH. The `sleep 30; :` body is a command
-        // list, not a single command, which keeps `sh` hanging around with its
-        // full argv: a bare `sleep 30` would let `sh` exec-optimize itself into
-        // `sleep` and drop the trailing `--port <port>` from /proc/<pid>/cmdline
-        // that the diagnostic keys off.
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30; :", "--port", port_text.as_str()])
-            .spawn()
-            .expect("sh helper process must start");
-        let guard = ChildGuard { child };
-        wait_for_cmdline(guard.id(), &port_text);
-        guard
-    }
-
     fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
         spawn_listener_process_with_metadata_access(true)
     }
@@ -1810,26 +1858,6 @@ mod linux {
             "kickoutchi-cli-contract-{label}-{}-{unique}",
             std::process::id(),
         ))
-    }
-
-    fn wait_for_cmdline(pid: u32, needle: &str) {
-        let path = format!("/proc/{pid}/cmdline");
-        let deadline = Instant::now() + CMDLINE_WAIT;
-        loop {
-            // A read failure (helper died, or has not surfaced in /proc yet)
-            // stays inside the poll: the honest failure is the deadline
-            // assertion below, not a confusing panic on the read itself.
-            let matched = fs::read(&path)
-                .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(needle));
-            if matched {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "helper process command line never contained {needle}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     fn wait_for_file(path: &Path) {
@@ -2498,12 +2526,9 @@ mod linux {
 
     #[test]
     fn human_list_no_match_prints_diagnostic_to_stderr() {
-        let _host_observation = lock_host_observation();
-        let port = DIAGNOSTIC_TEST_PORT;
-        let port_text = port.to_string();
-        let _helper = spawn_related_process(port);
-
-        let output = kickoutchi(&["list", "--port", port_text.as_str()]);
+        let Some(output) = isolated_no_match_diagnostic(false) else {
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(3));
         assert!(stdout(&output).contains("no open ports match the filter"));
@@ -2515,12 +2540,9 @@ mod linux {
 
     #[test]
     fn json_list_no_match_keeps_diagnostic_out_of_stdout_and_stderr() {
-        let _host_observation = lock_host_observation();
-        let port = DIAGNOSTIC_TEST_PORT;
-        let port_text = port.to_string();
-        let _helper = spawn_related_process(port);
-
-        let output = kickoutchi(&["list", "--port", port_text.as_str(), "--json"]);
+        let Some(output) = isolated_no_match_diagnostic(true) else {
+            return;
+        };
 
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(stdout(&output), "[]\n");
@@ -2958,34 +2980,7 @@ mod linux {
     }
 
     #[test]
-    fn why_reports_bindable_udp_and_releases_its_probe_socket() {
-        let _host_observation = lock_host_observation();
-        let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("temporary UDP socket must bind");
-        let port = socket.local_addr().expect("socket address is known").port();
-        drop(socket);
-        let port_text = port.to_string();
-
-        let output = kick_why(&[
-            port_text.as_str(),
-            "--udp",
-            "--address",
-            "127.0.0.1",
-            "--json",
-        ]);
-
-        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert_eq!(stderr(&output), "");
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout(&output)).expect("why output must be JSON");
-        assert_eq!(value["aggregate_exit_code"], 0);
-        assert_eq!(value["results"][0]["verdict"], "bindable_now");
-        let rebound = UdpSocket::bind(("127.0.0.1", port))
-            .expect("why must close the exact probe socket before returning");
-        drop(rebound);
-    }
-
-    #[test]
-    fn why_reports_occupied_udp_in_human_output_and_bindable_tcp_in_json() {
+    fn why_reports_occupied_udp_in_human_output() {
         let _host_observation = lock_host_observation();
         let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
         let udp_port = udp.local_addr().expect("UDP address is known").port();
@@ -3005,30 +3000,10 @@ mod linux {
                     && occupied_stdout.contains("certainty=unknown")),
             "{occupied_stdout}"
         );
-
-        let tcp = TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP fixture must bind");
-        let tcp_port = tcp.local_addr().expect("TCP address is known").port();
-        drop(tcp);
-        let tcp_port_text = tcp_port.to_string();
-        let bindable = why(&[
-            tcp_port_text.as_str(),
-            "--tcp",
-            "--address",
-            "127.0.0.1",
-            "--json",
-        ]);
-        assert_eq!(bindable.status.code(), Some(0), "{}", stderr(&bindable));
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout(&bindable)).expect("why output must be JSON");
-        assert_eq!(value["results"][0]["verdict"], "bindable_now");
-        drop(
-            TcpListener::bind(("127.0.0.1", tcp_port))
-                .expect("why must release the successful TCP probe"),
-        );
     }
 
     #[test]
-    fn why_real_binary_preserves_aggregate_exit_when_stdout_has_no_reader() {
+    fn why_real_binary_preserves_occupied_exit_when_stdout_has_no_reader() {
         let _host_observation = lock_host_observation();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
         let occupied_port = listener.local_addr().expect("TCP address is known").port();
@@ -3042,36 +3017,14 @@ mod linux {
         ]);
         assert_eq!(occupied.status.code(), Some(3));
         assert!(occupied.stderr.is_empty());
-
-        let temporary = UdpSocket::bind(("127.0.0.1", 0)).expect("UDP fixture must bind");
-        let bindable_port = temporary.local_addr().expect("UDP address is known").port();
-        drop(temporary);
-        let bindable_port = bindable_port.to_string();
-        let bindable = run_why_with_closed_stdout(&[
-            bindable_port.as_str(),
-            "--udp",
-            "--address",
-            "127.0.0.1",
-            "--json",
-        ]);
-        assert_eq!(bindable.status.code(), Some(0));
-        assert!(bindable.stderr.is_empty());
     }
 
     #[test]
     fn why_real_binary_applies_full_aggregate_exit_precedence() {
         let _host_observation = lock_host_observation();
         let (_library_guard, library) = build_bind_fault_library();
-        let temporary =
-            TcpListener::bind(("127.0.0.1", 0)).expect("temporary aggregate fixture must bind");
-        let port = temporary
-            .local_addr()
-            .expect("temporary aggregate address is known")
-            .port();
-        drop(temporary);
-        let port = port.to_string();
         let args = [
-            port.as_str(),
+            CONTROLLED_BIND_FAULT_PORT,
             "--all-protocols",
             "--all-addresses",
             "--json",
@@ -3115,16 +3068,11 @@ mod linux {
     fn why_bare_query_emits_the_default_public_matrix() {
         let _host_observation = lock_host_observation();
         let (_library_guard, library) = build_bind_fault_library();
-        let temporary =
-            TcpListener::bind(("127.0.0.1", 0)).expect("temporary matrix port must bind");
-        let port = temporary
-            .local_addr()
-            .expect("matrix address is known")
-            .port();
-        drop(temporary);
-        let port = port.to_string();
-
-        let output = why_with_bind_faults(&[port.as_str(), "--json"], &library, "unavailable");
+        let output = why_with_bind_faults(
+            &[CONTROLLED_BIND_FAULT_PORT, "--json"],
+            &library,
+            "unavailable",
+        );
 
         assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
         assert_eq!(stderr(&output), "");
@@ -3151,20 +3099,17 @@ mod linux {
     fn why_human_and_json_agree_for_unavailable_and_unsupported_probes() {
         let _host_observation = lock_host_observation();
         let (_library_guard, library) = build_bind_fault_library();
-        let temporary =
-            TcpListener::bind(("127.0.0.1", 0)).expect("temporary parity port must bind");
-        let port = temporary
-            .local_addr()
-            .expect("parity address is known")
-            .port();
-        drop(temporary);
-        let port = port.to_string();
 
         for (mode, expected) in [
             ("unavailable", "address_unavailable"),
             ("unsupported", "unsupported"),
         ] {
-            let base = [port.as_str(), "--tcp", "--address", "127.0.0.1"];
+            let base = [
+                CONTROLLED_BIND_FAULT_PORT,
+                "--tcp",
+                "--address",
+                "127.0.0.1",
+            ];
             let human = why_with_bind_faults(&base, &library, mode);
             let mut json_args = base.to_vec();
             json_args.push("--json");

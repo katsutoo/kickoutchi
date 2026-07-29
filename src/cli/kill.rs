@@ -594,45 +594,23 @@ fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> i
 }
 
 fn print_termination_outcome(target: &KillTarget, mode: KillMode, outcome: &TerminationOutcome) {
-    let delivery = mode.delivery_label(target.platform);
+    let description = outcome.status_description(target, mode);
     match outcome {
-        TerminationOutcome::Success => eprintln!("sent {delivery} to {}", target.identity()),
+        TerminationOutcome::Success
+        | TerminationOutcome::AlreadyExited
+        | TerminationOutcome::Cancelled => eprintln!("{description}"),
         TerminationOutcome::PermissionDenied => eprintln!(
-            "error: permission denied sending {delivery} to {}; {}",
-            target.identity(),
+            "error: {description}; {}",
             process::permission_denied_hint(target.platform),
         ),
-        TerminationOutcome::OwnershipUnavailable => eprintln!(
-            "error: ownership for {} became unavailable before {delivery}; no termination was sent",
-            target.identity(),
-        ),
-        TerminationOutcome::AlreadyExited => {
-            eprintln!(
-                "{} already exited before termination was sent",
-                target.identity()
-            );
+        TerminationOutcome::ProtectedProcess => {
+            eprintln!("error: {description}; --yes cannot bypass protected-process confirmation");
         }
-        TerminationOutcome::Cancelled => eprintln!("kill cancelled"),
-        TerminationOutcome::ProtectedProcess => eprintln!(
-            "error: {} is protected; --yes cannot bypass protected-process confirmation",
-            target.identity(),
-        ),
-        TerminationOutcome::TargetChanged => eprintln!(
-            "error: {} no longer owns the confirmed port target; no termination was sent",
-            target.identity(),
-        ),
-        TerminationOutcome::UnsafePid(reason) => {
-            eprintln!("error: unsafe PID blocked: {}", reason.message());
-        }
-        TerminationOutcome::UnknownFailure(error) => eprintln!(
-            "error: sending {delivery} to {} failed: {}",
-            target.identity(),
-            sanitize(error),
-        ),
-        TerminationOutcome::ThawFailed { pid, prior } => eprintln!(
-            "error: {}; cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
-            sanitize(&prior.failure_cause_text()),
-        ),
+        TerminationOutcome::OwnershipUnavailable
+        | TerminationOutcome::TargetChanged
+        | TerminationOutcome::UnsafePid(_)
+        | TerminationOutcome::UnknownFailure(_)
+        | TerminationOutcome::ThawFailed { .. } => eprintln!("error: {description}"),
     }
 }
 

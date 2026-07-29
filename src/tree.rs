@@ -38,9 +38,10 @@ use crate::process::current_user_id;
 use crate::process::{KillMode, UnsafePidReason, unsafe_pid_reason};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{KillTarget, UNIX_STOP_ACKNOWLEDGEMENT_MAX};
+use crate::process_evidence::ProcessEvidenceError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_evidence::{
-    ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceError, ProcessEvidenceScope,
+    ExpectedProcessEvidence, FreshProcessEvidence, ProcessEvidenceScope,
 };
 use crate::protection::is_protected_process_name;
 
@@ -886,7 +887,6 @@ pub(crate) enum TreeKillOutcome {
     Truncated {
         limit: usize,
     },
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     SweepPassLimit {
         limit: usize,
     },
@@ -910,16 +910,61 @@ pub(crate) enum TreeKillOutcome {
         pid: u32,
     },
     SnapshotFailed(String),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ThawFailed {
         pids: Vec<u32>,
         cause: Box<TreeKillOutcome>,
     },
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Presentation-neutral exit class for a refusal.
+///
+/// CLI and TUI renderers add their own scope and phase context, but the
+/// semantic class lives here so a refusal cannot silently acquire a different
+/// exit meaning on another interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeRefusalClass {
+    NoMatch,
+    PermissionDenied,
+    ProtectedNeedsConfirmation,
+    Failure,
+}
+
 impl TreeKillOutcome {
+    // Windows compiles out the two non-refusal Unix variants, but keeping one
+    // cross-platform signature lets every renderer consume the same semantic
+    // classification without a platform-specific adapter.
+    #[cfg_attr(
+        windows,
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "the cross-platform semantic classifier must retain one signature"
+        )
+    )]
+    pub(crate) const fn refusal_class(&self) -> Option<TreeRefusalClass> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Completed(_) | Self::ThawFailed { .. } => None,
+            Self::RootAlreadyExited => Some(TreeRefusalClass::NoMatch),
+            Self::PermissionDenied { .. } | Self::OwnershipUnavailable { .. } => {
+                Some(TreeRefusalClass::PermissionDenied)
+            }
+            Self::ProtectedDescendant { .. } | Self::ProtectedRoot { .. } => {
+                Some(TreeRefusalClass::ProtectedNeedsConfirmation)
+            }
+            Self::TargetChanged { .. }
+            | Self::Truncated { .. }
+            | Self::SweepPassLimit { .. }
+            | Self::UnsafePid { .. }
+            | Self::FreshConfirmationRequired
+            | Self::PartialMetadata { .. }
+            | Self::SnapshotFailed(_) => Some(TreeRefusalClass::Failure),
+        }
+    }
+
     pub(crate) fn failure_cause_text(&self) -> String {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Completed(_) => "scoped signal delivery was incomplete".to_owned(),
             Self::RootAlreadyExited => "the root process already exited".to_owned(),
             Self::PermissionDenied { pid } => format!("permission denied for PID {pid}"),
@@ -936,7 +981,7 @@ impl TreeKillOutcome {
                 name.as_deref().unwrap_or("<unknown>")
             ),
             Self::ProtectedRoot { pid, name } => format!(
-                "root PID {pid} ({}) became protected",
+                "protected root PID {pid} ({})",
                 name.as_deref().unwrap_or("<unknown>")
             ),
             Self::FreshConfirmationRequired => {
@@ -949,6 +994,7 @@ impl TreeKillOutcome {
                 format!("process metadata for PID {pid} was incomplete")
             }
             Self::SnapshotFailed(error) => error.clone(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::ThawFailed { pids, cause } => format!(
                 "{}; cleanup could not continue PID(s) {}",
                 cause.failure_cause_text(),
@@ -1430,8 +1476,7 @@ fn verify_fresh_delivery_evidence<Ops: TreeProcessOps>(
     scope.finish().map_err(evidence_tree_outcome)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn evidence_tree_outcome(error: ProcessEvidenceError) -> TreeKillOutcome {
+pub(crate) fn evidence_tree_outcome(error: ProcessEvidenceError) -> TreeKillOutcome {
     match error {
         ProcessEvidenceError::PermissionDenied { pid } => TreeKillOutcome::PermissionDenied { pid },
         ProcessEvidenceError::IdentityChanged { pid }
@@ -1674,14 +1719,14 @@ mod tests {
     use super::{
         FrozenNode, GROUP_YES_SKIP_MAX_PROCESSES, GroupPlanError, MAX_GROUP_PROCESSES,
         MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ScopeAuthorization,
-        TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
-        TreeStopError, TreeStopResult, execute_group_kill, execute_tree_kill, plan_process_group,
-        plan_process_tree, stop_deadline_expired, verify_frozen_identities,
+        TreeKillOutcome, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeRefusalClass,
+        TreeSignalResult, TreeStopError, TreeStopResult, execute_group_kill, execute_tree_kill,
+        plan_process_group, plan_process_tree, stop_deadline_expired, verify_frozen_identities,
     };
     use crate::model::{
         PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
     };
-    use crate::process::{KillMode, KillTarget};
+    use crate::process::{KillMode, KillTarget, UnsafePidReason};
     use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1689,6 +1734,86 @@ mod tests {
         Stop(u32),
         Cont(u32),
         Deliver(u32, KillMode),
+    }
+
+    #[test]
+    fn refusal_semantics_have_one_stable_class_and_cause() {
+        let cases = [
+            (
+                TreeKillOutcome::RootAlreadyExited,
+                TreeRefusalClass::NoMatch,
+                "the root process already exited",
+            ),
+            (
+                TreeKillOutcome::PermissionDenied { pid: 101 },
+                TreeRefusalClass::PermissionDenied,
+                "permission denied for PID 101",
+            ),
+            (
+                TreeKillOutcome::TargetChanged { pid: 102 },
+                TreeRefusalClass::Failure,
+                "process identity changed at PID 102",
+            ),
+            (
+                TreeKillOutcome::Truncated { limit: 256 },
+                TreeRefusalClass::Failure,
+                "the process scope exceeded 256 members",
+            ),
+            (
+                TreeKillOutcome::SweepPassLimit { limit: 8 },
+                TreeRefusalClass::Failure,
+                "the process scope did not converge after 8 freeze passes",
+            ),
+            (
+                TreeKillOutcome::UnsafePid {
+                    pid: 103,
+                    reason: UnsafePidReason::CurrentProcess,
+                },
+                TreeRefusalClass::Failure,
+                "unsafe PID 103: Kickoutchi cannot terminate itself",
+            ),
+            (
+                TreeKillOutcome::ProtectedDescendant {
+                    pid: 104,
+                    name: Some("postgres".to_owned()),
+                },
+                TreeRefusalClass::ProtectedNeedsConfirmation,
+                "protected process PID 104 (postgres) entered the scope",
+            ),
+            (
+                TreeKillOutcome::ProtectedRoot {
+                    pid: 105,
+                    name: Some("sshd".to_owned()),
+                },
+                TreeRefusalClass::ProtectedNeedsConfirmation,
+                "protected root PID 105 (sshd)",
+            ),
+            (
+                TreeKillOutcome::FreshConfirmationRequired,
+                TreeRefusalClass::Failure,
+                "the process scope changed after confirmation",
+            ),
+            (
+                TreeKillOutcome::OwnershipUnavailable { pid: 106 },
+                TreeRefusalClass::PermissionDenied,
+                "ownership for PID 106 became unavailable",
+            ),
+            (
+                TreeKillOutcome::PartialMetadata { pid: 107 },
+                TreeRefusalClass::Failure,
+                "process metadata for PID 107 was incomplete",
+            ),
+            (
+                TreeKillOutcome::SnapshotFailed("snapshot unavailable".to_owned()),
+                TreeRefusalClass::Failure,
+                "snapshot unavailable",
+            ),
+        ];
+
+        for (outcome, class, cause) in cases {
+            assert_eq!(outcome.refusal_class(), Some(class));
+            assert_eq!(outcome.failure_cause_text(), cause);
+        }
     }
 
     /// A scripted process table plus a recorded call log.

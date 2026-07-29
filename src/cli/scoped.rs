@@ -20,6 +20,8 @@ use crate::process::{
     TerminationOutcome,
 };
 use crate::tree;
+#[cfg(windows)]
+use crate::tree::TreeKillOutcome as TreeRefusal;
 
 #[cfg(windows)]
 use super::kill::post_kill_refresh_status_message;
@@ -410,7 +412,7 @@ where
 {
     let fresh_root = if confirmed.ports.is_empty() {
         let snapshot = collect_tree().map_err(|error| {
-            crate::windows_tree::WindowsTreeKillOutcome::SnapshotFailed(error.to_string())
+            crate::windows_tree::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
         })?;
         let root = revalidate_portless_tree_root(confirmed, &snapshot, &config.protected_processes)
             .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
@@ -423,7 +425,7 @@ where
             crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(outcome)
         })?;
         let snapshot = collect_tree().map_err(|error| {
-            crate::windows_tree::WindowsTreeKillOutcome::SnapshotFailed(error.to_string())
+            crate::windows_tree::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
         })?;
         windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
@@ -461,7 +463,9 @@ fn windows_fresh_tree_gates(
             (info.process_name.is_none() || info.start_time_marker.is_none()).then_some(info.pid)
         })
     {
-        return Err(crate::windows_tree::WindowsTreeKillOutcome::PartialMetadata { pid });
+        return Err(crate::windows_tree::WindowsTreeKillOutcome::Refused(
+            TreeRefusal::PartialMetadata { pid },
+        ));
     }
     Ok(())
 }
@@ -480,33 +484,58 @@ fn confirm_tree_kill<Prompt>(
 where
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
 {
-    match tree_confirmation(root, preview, mode, yes) {
+    confirm_scoped_kill(
+        root,
+        preview,
+        tree_confirmation(root, preview, mode, yes),
+        || print_tree_kill_banner(root, preview, mode),
+        prompt,
+    )
+}
+
+/// Execute the confirmation decision shared by tree and group scope.
+///
+/// Scope-specific policy chooses the decision and banner before this point;
+/// this helper only preserves the identical prompt ordering and records the
+/// exact authorization facts consumed by fresh revalidation.
+fn confirm_scoped_kill<Prompt, PrintBanner>(
+    root: &KillTarget,
+    members: &tree::ProcessTreeTarget,
+    decision: TreeConfirmDecision,
+    print_banner: PrintBanner,
+    prompt: &mut Prompt,
+) -> Result<ScopedConfirmationFacts, ExitReason>
+where
+    Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
+    PrintBanner: FnOnce(),
+{
+    if decision == TreeConfirmDecision::RefuseProtectedYes {
+        eprintln!(
+            "error: {} is protected; --yes cannot bypass protected-process confirmation",
+            root.identity(),
+        );
+        return Err(ExitReason::ProtectedNeedsConfirmation);
+    }
+
+    print_banner();
+    match decision {
         TreeConfirmDecision::RefuseProtectedYes => {
-            eprintln!(
-                "error: {} is protected; --yes cannot bypass protected-process confirmation",
-                root.identity(),
-            );
-            Err(ExitReason::ProtectedNeedsConfirmation)
+            unreachable!("protected --yes refusal returned before printing a banner")
         }
-        TreeConfirmDecision::Skip => {
-            print_tree_kill_banner(root, preview, mode);
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: false,
-                skipped_prompt: true,
-            })
-        }
+        TreeConfirmDecision::Skip => Ok(ScopedConfirmationFacts {
+            protected_confirmed: false,
+            skipped_prompt: true,
+        }),
         TreeConfirmDecision::PromptWord(word) => {
-            print_tree_kill_banner(root, preview, mode);
-            prompt_tree_step(root, preview, TreeConfirmation::TypedWord(word), prompt)?;
+            prompt_tree_step(root, members, TreeConfirmation::TypedWord(word), prompt)?;
             Ok(ScopedConfirmationFacts {
                 protected_confirmed: false,
                 skipped_prompt: false,
             })
         }
         TreeConfirmDecision::PromptProtectedThenWord(word) => {
-            print_tree_kill_banner(root, preview, mode);
-            prompt_tree_step(root, preview, TreeConfirmation::ProtectedRoot, prompt)?;
-            prompt_tree_step(root, preview, TreeConfirmation::TypedWord(word), prompt)?;
+            prompt_tree_step(root, members, TreeConfirmation::ProtectedRoot, prompt)?;
+            prompt_tree_step(root, members, TreeConfirmation::TypedWord(word), prompt)?;
             Ok(ScopedConfirmationFacts {
                 protected_confirmed: true,
                 skipped_prompt: false,
@@ -732,10 +761,22 @@ fn tree_outcome_from_termination(
             tree::TreeKillOutcome::PermissionDenied { pid: confirmed.pid }
         }
         TerminationOutcome::UnknownFailure(error) => tree::TreeKillOutcome::SnapshotFailed(error),
-        TerminationOutcome::ThawFailed { pid, prior } => tree::TreeKillOutcome::ThawFailed {
-            pids: vec![pid],
-            cause: Box::new(tree_outcome_from_termination(confirmed, *prior)),
-        },
+        TerminationOutcome::ThawFailed { pid, prior } => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                tree::TreeKillOutcome::ThawFailed {
+                    pids: vec![pid],
+                    cause: Box::new(tree_outcome_from_termination(confirmed, *prior)),
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = (pid, prior);
+                tree::TreeKillOutcome::SnapshotFailed(
+                    "unexpected thaw failure in Windows tree preparation".to_owned(),
+                )
+            }
+        }
     }
 }
 
@@ -1164,6 +1205,9 @@ fn windows_post_commit_issue_text(
         WindowsTreePostCommitIssue::FreshConfirmationRequired => {
             "tree gained warnings after --yes; rerun without --yes to review them".to_owned()
         }
+        WindowsTreePostCommitIssue::OwnershipUnavailable { pid } => {
+            format!("ownership for PID {pid} became unavailable after containment was committed")
+        }
         WindowsTreePostCommitIssue::PartialMetadata { pid } => {
             format!("process metadata for PID {pid} became incomplete during the containment sweep")
         }
@@ -1185,7 +1229,8 @@ fn windows_post_commit_issue_exit_reason(
         | WindowsTreePostCommitIssue::ProtectedRoot { .. } => {
             ExitReason::ProtectedNeedsConfirmation
         }
-        WindowsTreePostCommitIssue::PermissionDenied { .. } => ExitReason::PermissionDenied,
+        WindowsTreePostCommitIssue::PermissionDenied { .. }
+        | WindowsTreePostCommitIssue::OwnershipUnavailable { .. } => ExitReason::PermissionDenied,
         WindowsTreePostCommitIssue::RootAlreadyExited
         | WindowsTreePostCommitIssue::TargetChanged { .. }
         | WindowsTreePostCommitIssue::Truncated { .. }
@@ -1210,86 +1255,69 @@ where
 
     match outcome {
         WindowsTreeKillOutcome::Completed(_) => unreachable!("completed outcome handled above"),
-        WindowsTreeKillOutcome::RootAlreadyExited => {
-            eprintln!(
-                "{} already exited before containment was committed",
-                root.identity(),
-            );
-            print_post_kill_refresh_status(root, collect_ports);
-            ExitReason::NoMatch
+        WindowsTreeKillOutcome::Refused(refusal) => {
+            map_windows_tree_refusal(root, refusal, collect_ports)
         }
-        WindowsTreeKillOutcome::PermissionDenied { pid } => {
-            eprintln!(
-                "error: permission denied for PID {pid}; no Windows Job Object containment was committed; {}",
-                process::permission_denied_hint(root.platform),
-            );
-            ExitReason::PermissionDenied
-        }
-        WindowsTreeKillOutcome::TargetChanged { pid } => {
-            eprintln!(
-                "error: process tree identity changed at PID {pid}; no Windows Job Object containment was committed",
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::Truncated { limit } => {
-            eprintln!(
-                "error: the Windows process tree exceeded {limit} processes before containment; refusing to commit a partial tree",
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::SweepPassLimit { limit } => {
-            eprintln!(
-                "error: the Windows process tree did not converge after {limit} containment sweeps",
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::UnsafePid { pid, reason } => {
-            eprintln!(
-                "error: unsafe PID {pid} in tree: {}; no Windows Job Object containment was committed",
-                reason.message(),
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::ProtectedDescendant { pid, name } => {
-            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
-            eprintln!(
-                "error: protected process PID {pid} ({name}) in tree; no Windows Job Object containment was committed",
-            );
-            ExitReason::ProtectedNeedsConfirmation
-        }
-        WindowsTreeKillOutcome::ProtectedRoot { pid, name } => {
-            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
-            eprintln!(
-                "error: root PID {pid} ({name}) is protected and requires PID/name confirmation before Windows containment",
-            );
-            ExitReason::ProtectedNeedsConfirmation
-        }
-        WindowsTreeKillOutcome::FreshConfirmationRequired => {
-            eprintln!(
-                "error: Windows process tree changed after --yes; rerun without --yes to review fresh warnings; no containment was committed",
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::OwnershipUnavailable { pid } => {
-            eprintln!(
-                "error: ownership for PID {pid} became unavailable before Windows containment; no termination was sent",
-            );
-            ExitReason::PermissionDenied
-        }
-        WindowsTreeKillOutcome::PartialMetadata { pid } => {
-            eprintln!(
-                "error: process metadata for PID {pid} was incomplete before Windows containment; no termination was sent",
-            );
-            ExitReason::Failure
-        }
-        WindowsTreeKillOutcome::SnapshotFailed(_)
-        | WindowsTreeKillOutcome::CommitFailed { .. }
+        WindowsTreeKillOutcome::CommitFailed { .. }
         | WindowsTreeKillOutcome::FreezeCapabilityUnavailable { .. }
         | WindowsTreeKillOutcome::JobTerminateFailed { .. } => {
             let mut stderr = io::stderr().lock();
             map_windows_tree_system_failure(root, outcome, collect_ports, &mut stderr)
         }
     }
+}
+
+#[cfg(windows)]
+fn map_windows_tree_refusal(
+    root: &KillTarget,
+    refusal: &TreeRefusal,
+    collect_ports: &mut impl FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+) -> ExitReason {
+    let cause = sanitize(&refusal.failure_cause_text());
+    match refusal {
+        TreeRefusal::RootAlreadyExited => {
+            eprintln!(
+                "{} already exited before containment was committed",
+                root.identity(),
+            );
+            print_post_kill_refresh_status(root, collect_ports);
+        }
+        TreeRefusal::PermissionDenied { .. } => {
+            eprintln!(
+                "error: {cause}; no Windows Job Object containment was committed; {}",
+                process::permission_denied_hint(root.platform),
+            );
+        }
+        TreeRefusal::TargetChanged { .. }
+        | TreeRefusal::SweepPassLimit { .. }
+        | TreeRefusal::UnsafePid { .. }
+        | TreeRefusal::ProtectedDescendant { .. } => {
+            eprintln!("error: {cause}; no Windows Job Object containment was committed");
+        }
+        TreeRefusal::Truncated { .. } => {
+            eprintln!("error: {cause}; refusing to commit a partial Windows process tree");
+        }
+        TreeRefusal::ProtectedRoot { .. } => {
+            eprintln!(
+                "error: {cause} and requires PID/name confirmation before Windows containment",
+            );
+        }
+        TreeRefusal::FreshConfirmationRequired => {
+            eprintln!(
+                "error: {cause}; rerun without --yes to review fresh warnings; no containment was committed",
+            );
+        }
+        TreeRefusal::OwnershipUnavailable { .. } | TreeRefusal::PartialMetadata { .. } => {
+            eprintln!("error: {cause} before Windows containment; no termination was sent");
+        }
+        TreeRefusal::SnapshotFailed(_) => {
+            eprintln!(
+                "error: enumerating the Windows process tree failed: {cause}; no termination was sent",
+            );
+        }
+    }
+
+    tree_refusal_exit_reason(refusal)
 }
 
 #[cfg(windows)]
@@ -1302,14 +1330,6 @@ fn map_windows_tree_system_failure(
     use crate::windows_tree::WindowsTreeKillOutcome;
 
     match outcome {
-        WindowsTreeKillOutcome::SnapshotFailed(error) => {
-            let _ = writeln!(
-                stderr,
-                "error: enumerating the Windows process tree failed: {}; no termination was sent",
-                sanitize(error),
-            );
-            ExitReason::Failure
-        }
         WindowsTreeKillOutcome::CommitFailed { pid, error } => {
             let _ = writeln!(
                 stderr,
@@ -1338,7 +1358,9 @@ fn map_windows_tree_system_failure(
             }
             ExitReason::Failure
         }
-        _ => unreachable!("non-system Windows tree outcome handled above"),
+        WindowsTreeKillOutcome::Completed(_) | WindowsTreeKillOutcome::Refused(_) => {
+            unreachable!("non-system Windows tree outcome handled above")
+        }
     }
 }
 
@@ -1442,79 +1464,84 @@ where
                 root.identity(),
             );
             print_post_kill_refresh_status(root, collect_ports);
-            ExitReason::NoMatch
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::PermissionDenied { pid } => {
+        TreeKillOutcome::PermissionDenied { .. } => {
             eprintln!(
-                "error: permission denied for PID {pid}; any frozen process was thawed and no termination was sent; {}",
+                "error: {}; any frozen process was thawed and no termination was sent; {}",
+                sanitize(&outcome.failure_cause_text()),
                 process::permission_denied_hint(root.platform),
             );
-            ExitReason::PermissionDenied
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::TargetChanged { pid } => {
+        TreeKillOutcome::TargetChanged { .. } | TreeKillOutcome::SweepPassLimit { .. } => {
             eprintln!(
-                "error: process {scope_noun} identity changed at PID {pid}; any frozen process was thawed and no termination was sent",
+                "error: {}; the process {scope_noun} was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::Truncated { limit } => {
+        TreeKillOutcome::Truncated { .. } | TreeKillOutcome::ProtectedDescendant { .. } => {
             eprintln!(
-                "error: the process {scope_noun} exceeded {limit} processes; any frozen process was thawed and no termination was sent",
+                "error: {}; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::SweepPassLimit { limit } => {
+        TreeKillOutcome::UnsafePid { .. } => {
             eprintln!(
-                "error: the process {scope_noun} did not converge after {limit} freeze passes; it was thawed and no termination was sent",
+                "error: {} in {scope_noun}; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::UnsafePid { pid, reason } => {
+        TreeKillOutcome::ProtectedRoot { .. } => {
             eprintln!(
-                "error: unsafe PID {pid} in {scope_noun}: {}; any frozen process was thawed and no termination was sent",
-                reason.message(),
+                "error: {} and requires PID/name confirmation; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
-        }
-        TreeKillOutcome::ProtectedDescendant { pid, name } => {
-            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
-            eprintln!(
-                "error: protected process PID {pid} ({name}) in {scope_noun}; any frozen process was thawed and no termination was sent",
-            );
-            ExitReason::ProtectedNeedsConfirmation
-        }
-        TreeKillOutcome::ProtectedRoot { pid, name } => {
-            let name = sanitize(name.as_deref().unwrap_or("<unknown>"));
-            eprintln!(
-                "error: root PID {pid} ({name}) is protected and requires PID/name confirmation; any frozen process was thawed and no termination was sent",
-            );
-            ExitReason::ProtectedNeedsConfirmation
+            tree_refusal_exit_reason(outcome)
         }
         TreeKillOutcome::FreshConfirmationRequired => {
             eprintln!(
-                "error: process {scope_noun} changed after --yes; rerun without --yes to review fresh warnings; any frozen process was thawed and no termination was sent",
+                "error: {}; rerun without --yes to review fresh warnings; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::OwnershipUnavailable { pid } => {
+        TreeKillOutcome::OwnershipUnavailable { .. } => {
             eprintln!(
-                "error: ownership for PID {pid} became unavailable before {delivery}; any frozen process was thawed and no termination was sent",
+                "error: {} before {delivery}; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::PermissionDenied
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::PartialMetadata { pid } => {
+        TreeKillOutcome::PartialMetadata { .. } => {
             eprintln!(
-                "error: process metadata for PID {pid} was incomplete during {scope_noun} verification; any frozen process was thawed and no termination was sent",
+                "error: {} during {scope_noun} verification; any frozen process was thawed and no termination was sent",
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
-        TreeKillOutcome::SnapshotFailed(error) => {
+        TreeKillOutcome::SnapshotFailed(_) => {
             eprintln!(
                 "error: enumerating the process {scope_noun} during termination failed: {}; no termination was sent",
-                sanitize(error),
+                sanitize(&outcome.failure_cause_text()),
             );
-            ExitReason::Failure
+            tree_refusal_exit_reason(outcome)
         }
+    }
+}
+
+fn tree_refusal_exit_reason(outcome: &tree::TreeKillOutcome) -> ExitReason {
+    match outcome.refusal_class() {
+        Some(tree::TreeRefusalClass::NoMatch) => ExitReason::NoMatch,
+        Some(tree::TreeRefusalClass::PermissionDenied) => ExitReason::PermissionDenied,
+        Some(tree::TreeRefusalClass::ProtectedNeedsConfirmation) => {
+            ExitReason::ProtectedNeedsConfirmation
+        }
+        Some(tree::TreeRefusalClass::Failure) => ExitReason::Failure,
+        None => unreachable!("completed or cleanup outcomes are not refusals"),
     }
 }
 
@@ -1691,54 +1718,13 @@ fn confirm_group_kill<Prompt>(
 where
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
 {
-    match group_confirmation(root, group, mode, yes) {
-        TreeConfirmDecision::RefuseProtectedYes => {
-            eprintln!(
-                "error: {} is protected; --yes cannot bypass protected-process confirmation",
-                root.identity(),
-            );
-            Err(ExitReason::ProtectedNeedsConfirmation)
-        }
-        TreeConfirmDecision::Skip => {
-            print_group_kill_banner(root, group, mode);
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: false,
-                skipped_prompt: true,
-            })
-        }
-        TreeConfirmDecision::PromptWord(word) => {
-            print_group_kill_banner(root, group, mode);
-            prompt_tree_step(
-                root,
-                group.members(),
-                TreeConfirmation::TypedWord(word),
-                prompt,
-            )?;
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: false,
-                skipped_prompt: false,
-            })
-        }
-        TreeConfirmDecision::PromptProtectedThenWord(word) => {
-            print_group_kill_banner(root, group, mode);
-            prompt_tree_step(
-                root,
-                group.members(),
-                TreeConfirmation::ProtectedRoot,
-                prompt,
-            )?;
-            prompt_tree_step(
-                root,
-                group.members(),
-                TreeConfirmation::TypedWord(word),
-                prompt,
-            )?;
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: true,
-                skipped_prompt: false,
-            })
-        }
-    }
+    confirm_scoped_kill(
+        root,
+        group.members(),
+        group_confirmation(root, group, mode, yes),
+        || print_group_kill_banner(root, group, mode),
+        prompt,
+    )
 }
 
 /// The confirmation gate for a group kill.
@@ -2046,9 +2032,12 @@ mod tests {
             children_truncated: false,
         };
 
+        let refusal = tree_outcome_from_termination(&confirmed, TerminationOutcome::AlreadyExited);
+        assert_eq!(refusal, crate::tree::TreeKillOutcome::RootAlreadyExited);
+        #[cfg(windows)]
         assert_eq!(
-            tree_outcome_from_termination(&confirmed, TerminationOutcome::AlreadyExited),
-            crate::tree::TreeKillOutcome::RootAlreadyExited,
+            crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(refusal.clone()),
+            crate::windows_tree::WindowsTreeKillOutcome::Refused(refusal),
         );
     }
 

@@ -427,12 +427,12 @@ struct BoundedOutput {
 }
 
 #[derive(Debug)]
-struct DrainCapacity {
+struct WorkerCapacity {
     active: AtomicUsize,
     maximum: usize,
 }
 
-impl DrainCapacity {
+impl WorkerCapacity {
     const fn new(maximum: usize) -> Self {
         Self {
             active: AtomicUsize::new(0),
@@ -440,21 +440,24 @@ impl DrainCapacity {
         }
     }
 
-    fn reserve_pair(self: &Arc<Self>) -> Option<[DrainPermit; 2]> {
+    fn reserve<const COUNT: usize>(self: &Arc<Self>) -> Option<[WorkerPermit; COUNT]> {
+        assert!(
+            COUNT > 0,
+            "worker reservation must contain at least one slot"
+        );
         let mut active = self.active.load(Ordering::Acquire);
         loop {
-            if active.checked_add(2)? > self.maximum {
+            let reserved = active.checked_add(COUNT)?;
+            if reserved > self.maximum {
                 return None;
             }
             match self.active.compare_exchange_weak(
                 active,
-                active + 2,
+                reserved,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    return Some([DrainPermit(Arc::clone(self)), DrainPermit(Arc::clone(self))]);
-                }
+                Ok(_) => return Some(std::array::from_fn(|_| WorkerPermit(Arc::clone(self)))),
                 Err(current) => active = current,
             }
         }
@@ -462,63 +465,20 @@ impl DrainCapacity {
 }
 
 #[derive(Debug)]
-struct DrainPermit(Arc<DrainCapacity>);
+struct WorkerPermit(Arc<WorkerCapacity>);
 
-impl Drop for DrainPermit {
+impl Drop for WorkerPermit {
     fn drop(&mut self) {
         let previous = self.0.active.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "drain worker reservation underflow");
+        debug_assert!(previous > 0, "worker capacity reservation underflow");
     }
 }
 
-fn global_drain_capacity() -> Arc<DrainCapacity> {
-    static CAPACITY: OnceLock<Arc<DrainCapacity>> = OnceLock::new();
+fn global_drain_capacity() -> Arc<WorkerCapacity> {
+    static CAPACITY: OnceLock<Arc<WorkerCapacity>> = OnceLock::new();
     Arc::clone(
-        CAPACITY.get_or_init(|| Arc::new(DrainCapacity::new(DOCKER_OUTPUT_DRAIN_WORKERS_MAX))),
+        CAPACITY.get_or_init(|| Arc::new(WorkerCapacity::new(DOCKER_OUTPUT_DRAIN_WORKERS_MAX))),
     )
-}
-
-#[derive(Debug)]
-struct ChildCleanupCapacity {
-    active: AtomicUsize,
-    maximum: usize,
-}
-
-impl ChildCleanupCapacity {
-    const fn new(maximum: usize) -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            maximum,
-        }
-    }
-
-    fn reserve(self: &Arc<Self>) -> Option<ChildCleanupPermit> {
-        let mut active = self.active.load(Ordering::Acquire);
-        loop {
-            if active >= self.maximum {
-                return None;
-            }
-            match self.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(ChildCleanupPermit(Arc::clone(self))),
-                Err(current) => active = current,
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ChildCleanupPermit(Arc<ChildCleanupCapacity>);
-
-impl Drop for ChildCleanupPermit {
-    fn drop(&mut self) {
-        let previous = self.0.active.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "child cleanup worker reservation underflow");
-    }
 }
 
 struct ChildCleanup {
@@ -535,16 +495,15 @@ impl ChildCleanup {
     }
 }
 
-fn global_child_cleanup_capacity() -> Arc<ChildCleanupCapacity> {
-    static CAPACITY: OnceLock<Arc<ChildCleanupCapacity>> = OnceLock::new();
+fn global_child_cleanup_capacity() -> Arc<WorkerCapacity> {
+    static CAPACITY: OnceLock<Arc<WorkerCapacity>> = OnceLock::new();
     Arc::clone(
-        CAPACITY
-            .get_or_init(|| Arc::new(ChildCleanupCapacity::new(DOCKER_CHILD_CLEANUP_WORKERS_MAX))),
+        CAPACITY.get_or_init(|| Arc::new(WorkerCapacity::new(DOCKER_CHILD_CLEANUP_WORKERS_MAX))),
     )
 }
 
-fn spawn_child_cleanup(capacity: &Arc<ChildCleanupCapacity>) -> io::Result<ChildCleanup> {
-    let permit = capacity.reserve().ok_or_else(|| {
+fn spawn_child_cleanup(capacity: &Arc<WorkerCapacity>) -> io::Result<ChildCleanup> {
+    let [permit] = capacity.reserve::<1>().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::WouldBlock,
             "docker child cleanup worker capacity exhausted",
@@ -590,9 +549,9 @@ fn run_command_bounded_with_capacity(
     command: &mut Command,
     timeout: Duration,
     output_max_bytes: usize,
-    drain_capacity: &Arc<DrainCapacity>,
+    drain_capacity: &Arc<WorkerCapacity>,
 ) -> Option<std::process::Output> {
-    let [stdout_permit, stderr_permit] = drain_capacity.reserve_pair()?;
+    let [stdout_permit, stderr_permit] = drain_capacity.reserve::<2>()?;
     let cleanup = match spawn_child_cleanup(&global_child_cleanup_capacity()) {
         Ok(cleanup) => cleanup,
         Err(error) => {
@@ -712,7 +671,7 @@ fn spawn_output_drain<Reader>(
     name: &'static str,
     reader: Reader,
     output_max_bytes: usize,
-    permit: DrainPermit,
+    permit: WorkerPermit,
 ) -> io::Result<mpsc::Receiver<io::Result<BoundedOutput>>>
 where
     Reader: Read + Send + 'static,
@@ -1108,15 +1067,15 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
-        ChildCleanupCapacity, DEFAULT_LOCAL_DOCKER_HOST, DOCKER_HOST_MAX_BYTES, DOCKER_MATCHES_MAX,
-        DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, DrainCapacity, ReapChild, ReapOutcome,
-        TEST_ELEVATION_OVERRIDE, docker_container_ls_with_host_and_runner,
+        DEFAULT_LOCAL_DOCKER_HOST, DOCKER_HOST_MAX_BYTES, DOCKER_MATCHES_MAX,
+        DOCKER_OUTPUT_MAX_BYTES, DOCKER_PORT_SEGMENTS_MAX, ReapChild, ReapOutcome,
+        TEST_ELEVATION_OVERRIDE, WorkerCapacity, docker_container_ls_with_host_and_runner,
         docker_container_ls_with_runner, docker_context_from_ps_output, docker_host_is_local,
         finish_output_drain_before, host_addr_matches, local_docker_host, looks_like_docker_owner,
         normalize_windows_npipe_host, parse_published_ports, read_output_bounded,
@@ -1521,10 +1480,87 @@ mod tests {
     }
 
     #[test]
+    fn worker_capacity_reserves_exact_slots_and_releases_them_independently() {
+        let capacity = Arc::new(WorkerCapacity::new(3));
+        let [first, second] = capacity.reserve::<2>().expect("two slots must fit");
+        let [third] = capacity.reserve::<1>().expect("the final slot must fit");
+
+        assert_eq!(capacity.active.load(Ordering::Acquire), 3);
+        assert!(
+            capacity.reserve::<1>().is_none(),
+            "limit plus one must fail"
+        );
+
+        drop(second);
+        assert_eq!(capacity.active.load(Ordering::Acquire), 2);
+        let [replacement] = capacity
+            .reserve::<1>()
+            .expect("dropping one permit must restore exactly one slot");
+        assert_eq!(capacity.active.load(Ordering::Acquire), 3);
+
+        drop(first);
+        drop(third);
+        drop(replacement);
+        assert_eq!(capacity.active.load(Ordering::Acquire), 0);
+        assert!(
+            Arc::new(WorkerCapacity::new(0)).reserve::<1>().is_none(),
+            "zero capacity must refuse the first slot"
+        );
+    }
+
+    #[test]
+    fn worker_capacity_never_admits_more_than_its_limit_under_contention() {
+        const MAXIMUM: usize = 4;
+        const CONTENDERS: usize = 16;
+
+        let capacity = Arc::new(WorkerCapacity::new(MAXIMUM));
+        let start = Arc::new(Barrier::new(CONTENDERS + 1));
+        let release = Arc::new(Barrier::new(MAXIMUM + 1));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut workers = Vec::with_capacity(CONTENDERS);
+        for _ in 0..CONTENDERS {
+            let capacity = Arc::clone(&capacity);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let sender = sender.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                let permit = capacity.reserve::<1>();
+                sender
+                    .send(permit.is_some())
+                    .expect("contention result receiver must remain connected");
+                if let Some([permit]) = permit {
+                    release.wait();
+                    drop(permit);
+                }
+            }));
+        }
+        drop(sender);
+
+        start.wait();
+        let admitted = (0..CONTENDERS)
+            .map(|_| {
+                receiver
+                    .recv()
+                    .expect("every contender must report its reservation")
+            })
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, MAXIMUM);
+        assert_eq!(capacity.active.load(Ordering::Acquire), MAXIMUM);
+
+        release.wait();
+        for worker in workers {
+            worker.join().expect("capacity contender must not panic");
+        }
+        assert_eq!(capacity.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn drain_capacity_is_bounded_and_recovers_when_workers_exit() {
-        let capacity = Arc::new(DrainCapacity::new(2));
+        let capacity = Arc::new(WorkerCapacity::new(2));
         let [first_permit, second_permit] =
-            capacity.reserve_pair().expect("two slots are available");
+            capacity.reserve::<2>().expect("two slots are available");
         let (first_sender, first_reader) = std::sync::mpsc::channel();
         let (second_sender, second_reader) = std::sync::mpsc::channel();
         let first_worker = spawn_output_drain(
@@ -1567,12 +1603,12 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(capacity.active.load(Ordering::Acquire), 0);
-        assert!(capacity.reserve_pair().is_some());
+        assert!(capacity.reserve::<2>().is_some());
     }
 
     #[test]
     fn inherited_grandchild_pipes_bound_latency_and_release_capacity() {
-        let capacity = Arc::new(DrainCapacity::new(2));
+        let capacity = Arc::new(WorkerCapacity::new(2));
         let mut command = Command::new(std::env::current_exe().expect("test binary must resolve"));
         command.env(INHERITED_PIPE_PARENT_ENV, "1").args([
             "--exact",
@@ -1670,7 +1706,7 @@ mod tests {
 
     #[test]
     fn docker_cleanup_worker_capacity_refuses_spawn_until_ownership_returns() {
-        let capacity = Arc::new(ChildCleanupCapacity::new(1));
+        let capacity = Arc::new(WorkerCapacity::new(1));
         let cleanup = spawn_child_cleanup(&capacity).expect("first cleanup worker must start");
 
         let error = spawn_child_cleanup(&capacity)
@@ -1690,7 +1726,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn docker_cleanup_reaps_a_real_direct_child() {
-        let capacity = Arc::new(ChildCleanupCapacity::new(1));
+        let capacity = Arc::new(WorkerCapacity::new(1));
         let cleanup = spawn_child_cleanup(&capacity).expect("cleanup worker must start");
         let child = Command::new(std::env::current_exe().expect("test binary must resolve"))
             .env(REAP_CHILD_HELPER_ENV, "1")

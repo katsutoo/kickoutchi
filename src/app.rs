@@ -1820,42 +1820,37 @@ fn tree_kill_status_line(
             "{} already exited before termination was sent",
             root.identity(),
         ),
-        TreeKillOutcome::PermissionDenied { pid } => format!(
-            "permission denied stopping PID {pid}; the tree was thawed and no termination was sent",
+        TreeKillOutcome::PermissionDenied { .. }
+        | TreeKillOutcome::TargetChanged { .. }
+        | TreeKillOutcome::SweepPassLimit { .. } => format!(
+            "{}; the tree was thawed and no termination was sent",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::TargetChanged { pid } => format!(
-            "process tree identity changed at PID {pid}; it was thawed and no termination was sent",
+        TreeKillOutcome::Truncated { .. } => format!(
+            "{}; refusing to kill a partial tree",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::Truncated { limit } => {
-            format!("process tree exceeds {limit} processes; refusing to kill a partial tree")
-        }
-        TreeKillOutcome::SweepPassLimit { limit } => format!(
-            "process tree did not converge after {limit} freeze passes; it was thawed and no termination was sent",
+        TreeKillOutcome::UnsafePid { .. }
+        | TreeKillOutcome::ProtectedDescendant { .. }
+        | TreeKillOutcome::FreshConfirmationRequired => format!(
+            "{}; no termination was sent",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::UnsafePid { pid, reason } => format!(
-            "unsafe PID {pid} in tree: {}; no termination was sent",
-            reason.message(),
+        TreeKillOutcome::ProtectedRoot { .. } => format!(
+            "{} and requires PID/name confirmation; no termination was sent",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::ProtectedDescendant { pid, name } => format!(
-            "protected process PID {pid} ({}) in tree; no termination was sent",
-            sanitize(name.as_deref().unwrap_or("<unknown>")),
+        TreeKillOutcome::OwnershipUnavailable { .. } => format!(
+            "{} before {delivery}; no termination was sent",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::ProtectedRoot { pid, name } => format!(
-            "protected root PID {pid} ({}) requires PID/name confirmation; no termination was sent",
-            sanitize(name.as_deref().unwrap_or("<unknown>")),
+        TreeKillOutcome::PartialMetadata { .. } => format!(
+            "{} during tree verification; the tree was thawed and no termination was sent",
+            sanitize(&outcome.failure_cause_text()),
         ),
-        TreeKillOutcome::FreshConfirmationRequired => {
-            "process tree changed after --yes; no termination was sent".to_owned()
-        }
-        TreeKillOutcome::OwnershipUnavailable { pid } => format!(
-            "ownership for PID {pid} became unavailable before {delivery}; no termination was sent",
-        ),
-        TreeKillOutcome::PartialMetadata { pid } => format!(
-            "process metadata for PID {pid} was incomplete during tree verification; it was thawed and no termination was sent",
-        ),
-        TreeKillOutcome::SnapshotFailed(error) => format!(
+        TreeKillOutcome::SnapshotFailed(_) => format!(
             "enumerating the process tree during termination failed: {}; no termination was sent",
-            sanitize(error),
+            sanitize(&outcome.failure_cause_text()),
         ),
     }
 }
@@ -1883,47 +1878,23 @@ fn termination_status_line(
     mode: KillMode,
     outcome: &TerminationOutcome,
 ) -> String {
-    let delivery = mode.delivery_label(target.platform);
+    let description = outcome.status_description(target, mode);
     match outcome {
-        TerminationOutcome::Success => {
-            format!("sent {delivery} to {}", target.identity())
-        }
         TerminationOutcome::PermissionDenied => format!(
-            "permission denied sending {delivery} to {}; {}",
-            target.identity(),
+            "{description}; {}",
             process::permission_denied_hint(target.platform),
         ),
-        TerminationOutcome::OwnershipUnavailable => format!(
-            "ownership for {} became unavailable before {delivery}; no termination was sent",
-            target.identity(),
-        ),
-        TerminationOutcome::AlreadyExited => {
-            format!(
-                "{} already exited before termination was sent",
-                target.identity()
-            )
+        TerminationOutcome::ProtectedProcess => {
+            format!("{description} and requires stronger confirmation")
         }
-        TerminationOutcome::Cancelled => "kill cancelled".to_owned(),
-        TerminationOutcome::ProtectedProcess => format!(
-            "{} is protected and requires stronger confirmation",
-            target.identity(),
-        ),
-        TerminationOutcome::TargetChanged => format!(
-            "{} no longer owns the confirmed port target; no termination was sent",
-            target.identity(),
-        ),
-        TerminationOutcome::UnsafePid(reason) => {
-            format!("unsafe PID blocked: {}", reason.message())
-        }
-        TerminationOutcome::UnknownFailure(error) => format!(
-            "sending {delivery} to {} failed: {}",
-            target.identity(),
-            sanitize(error),
-        ),
-        TerminationOutcome::ThawFailed { pid, prior } => format!(
-            "{}; cleanup could not continue PID {pid}; it may remain stopped and require SIGCONT",
-            sanitize(&prior.failure_cause_text()),
-        ),
+        TerminationOutcome::Success
+        | TerminationOutcome::OwnershipUnavailable
+        | TerminationOutcome::AlreadyExited
+        | TerminationOutcome::Cancelled
+        | TerminationOutcome::TargetChanged
+        | TerminationOutcome::UnsafePid(_)
+        | TerminationOutcome::UnknownFailure(_)
+        | TerminationOutcome::ThawFailed { .. } => description,
     }
 }
 

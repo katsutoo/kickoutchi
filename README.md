@@ -150,6 +150,18 @@ kick kill --pid 12345 --group            # Linux/macOS process group
 `kick` and `kickoutchi` expose the same commands. Running either without a
 subcommand opens the TUI.
 
+### Direct PID safety policy
+
+A direct `--pid` kill may intentionally target an ordinary parent process,
+including the shell that launched Kickoutchi. For example,
+`kick kill --pid "$PPID" --yes` terminates the invoking Unix shell without an
+additional parent-specific override. Treat `--yes` as authorization for exactly
+the PID you supplied and inspect an unfamiliar target before using it.
+
+Kickoutchi always refuses PID 0, PID 1, Windows System PID 4, and its own current
+PID. Tree and group kills also refuse a scope containing Kickoutchi itself so
+the safety pipeline cannot terminate midway through revalidation or cleanup.
+
 ## Watch Changes
 
 `kick watch` polls full-state native snapshots and reports deterministic changes:

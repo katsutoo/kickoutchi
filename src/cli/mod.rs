@@ -231,7 +231,8 @@ pub(crate) struct ListArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
 pub(crate) struct KillArgs {
-    /// PID of the process to terminate.
+    /// PID of the process to terminate. Ordinary parent processes are allowed;
+    /// PID 0, PID 1, Windows System PID 4, and Kickoutchi itself are refused.
     #[arg(long)]
     pid: Option<u32>,
 
