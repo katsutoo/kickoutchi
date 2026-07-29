@@ -36,9 +36,15 @@ jobs:
               ;;
           esac
 
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = false
+          test "$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )" = false
           mkdir -p "$RUNNER_TEMP/published-manifest"
           gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --pattern dist-manifest.json \
             --dir "$RUNNER_TEMP/published-manifest"
           test -f "$RUNNER_TEMP/published-manifest/dist-manifest.json"

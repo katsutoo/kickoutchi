@@ -1062,6 +1062,7 @@ fn prepared_release_assets_are_pre_attested_and_host_manifest_is_attested_afterw
     let download_manifest = named_job_step(manifest_attest, "Download published release manifest");
     let download_script = step_script(download_manifest);
     assert!(download_script.contains("--pattern dist-manifest.json"));
+    assert!(download_script.contains("--repo \"$GITHUB_REPOSITORY\""));
     assert!(!download_script.contains("|| true"));
     let generate_manifest =
         named_job_step(manifest_attest, "Generate release-manifest attestation");
