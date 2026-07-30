@@ -2296,7 +2296,9 @@ mod tests {
             None,
         );
 
-        let pre_epoch = epoch.checked_sub(Duration::from_nanos(1)).unwrap();
+        let pre_epoch = epoch
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond is representable before the Unix epoch");
         assert!(matches!(
             observation_times(None, pre_epoch, epoch),
             Err(super::OutputError::Public(
