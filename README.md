@@ -309,6 +309,24 @@ Published archives target:
 - Tree kill is supported on all three platforms. Process-group kill is available
   only on Linux and macOS.
 
+### Reading addresses and scope
+
+- `127.0.0.1` and `::1` are IPv4 and IPv6 loopback addresses.
+- `0.0.0.0` and `::` are wildcard addresses that bind every applicable
+  interface. Kickoutchi labels these `public`, but that classification alone
+  does not prove Internet reachability; firewall and network policy still apply.
+- `fe80::/10` addresses are IPv6 link-local and stay on their local network
+  link.
+- An IPv6 suffix such as `%3` is an interface index. `%unavailable` means the
+  native collector could not report that index, which is expected for IPv6
+  observations on Linux and macOS. It is not part of the literal IP address or
+  an error.
+- `-` in the PID or process columns means ownership metadata was unavailable;
+  it does not mean the socket has no owner.
+
+The `SCOPE` column labels wildcard addresses `public`, loopback addresses
+`loopback`, and other concrete addresses `local`.
+
 Completeness is always relative to the declared native observation scope. See
 [`docs/platform-support.md`](docs/platform-support.md) for permanent limitations,
 permissions, WSL, polling, IPv6 scope, and certainty semantics.
