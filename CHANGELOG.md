@@ -10,9 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Simplified internal maintenance code without changing public behavior:
-  removed a stale license allowance, documented four module boundaries, reduced
-  configuration-reader preallocation, and replaced three infallible sequence
-  serializers with their direct iterator form.
+  documented four module boundaries, reduced configuration-reader
+  preallocation, replaced three infallible sequence serializers with their
+  direct iterator form, and aligned local dependency-policy checks with CI's
+  main and fuzz workspace coverage.
 
 ### Fixed
 
