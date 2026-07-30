@@ -287,23 +287,23 @@ fn run_watch_loop(
         }
         Err(_) => unreachable!("initial collection errors return before snapshot validation"),
     };
-    if runtime.cancelled() || deadline.is_some_and(|deadline| runtime.monotonic_now() >= deadline) {
+    if should_stop(
+        runtime.cancelled(),
+        deadline.map(|end| (runtime.monotonic_now(), end)),
+    ) {
         return flush_exit(output, diagnostics, ExitReason::Success);
     }
     let mut sequence = 0_u64;
     let mut batch_count = 0usize;
     let mut previous_gap_index = GapIndex::new(&previous);
     let mut previous_filter_cache = FilterCache::default();
-    let initial_times = ObservationTimes {
-        previous_completed_unix_ms: None,
-        attempt_started_unix_ms: match unix_milliseconds(previous.capture_started_at) {
-            Ok(value) => value,
-            Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-        },
-        attempt_completed_unix_ms: match unix_milliseconds(previous.capture_completed_at) {
-            Ok(value) => value,
-            Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-        },
+    let initial_times = match observation_times(
+        None,
+        previous.capture_started_at,
+        previous.capture_completed_at,
+    ) {
+        Ok(times) => times,
+        Err(error) => return output_failure(diagnostics, &error),
     };
     let baseline = match baseline_events(&previous) {
         Ok(events) => events,
@@ -337,7 +337,7 @@ fn run_watch_loop(
     }
 
     let mut consecutive_failures = 0u8;
-    let Some(mut next_poll) = runtime.monotonic_now().checked_add(options.interval) else {
+    let Some(mut next_poll) = next_poll_after(runtime.monotonic_now(), options.interval) else {
         write_diagnostic(diagnostics, "watch poll deadline overflowed");
         return ExitReason::Failure;
     };
@@ -364,19 +364,13 @@ fn run_watch_loop(
         if let Some(error) = collector_clock_error(&collected) {
             return clock_failure(diagnostics, error);
         }
-        let gap_times = ObservationTimes {
-            previous_completed_unix_ms: match unix_milliseconds(previous.capture_completed_at) {
-                Ok(value) => Some(value),
-                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-            },
-            attempt_started_unix_ms: match unix_milliseconds(attempt_started) {
-                Ok(value) => value,
-                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-            },
-            attempt_completed_unix_ms: match unix_milliseconds(attempt_completed) {
-                Ok(value) => value,
-                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-            },
+        let gap_times = match observation_times(
+            Some(previous.capture_completed_at),
+            attempt_started,
+            attempt_completed,
+        ) {
+            Ok(times) => times,
+            Err(error) => return output_failure(diagnostics, &error),
         };
 
         let current = match collected {
@@ -408,12 +402,13 @@ fn run_watch_loop(
                 if consecutive_failures == WATCH_FAILURES_MAX {
                     return ExitReason::Failure;
                 }
-                if runtime.cancelled()
-                    || deadline.is_some_and(|deadline| runtime.monotonic_now() >= deadline)
-                {
+                if should_stop(
+                    runtime.cancelled(),
+                    deadline.map(|end| (runtime.monotonic_now(), end)),
+                ) {
                     return flush_exit(output, diagnostics, ExitReason::Success);
                 }
-                next_poll = match runtime.monotonic_now().checked_add(options.interval) {
+                next_poll = match next_poll_after(runtime.monotonic_now(), options.interval) {
                     Some(value) => value,
                     None => {
                         write_diagnostic(diagnostics, "watch poll deadline overflowed");
@@ -428,25 +423,23 @@ fn run_watch_loop(
         {
             return clock_failure(diagnostics, &error);
         }
-        if runtime.cancelled()
-            || deadline.is_some_and(|deadline| runtime.monotonic_now() >= deadline)
-        {
+        if should_stop(
+            runtime.cancelled(),
+            deadline.map(|end| (runtime.monotonic_now(), end)),
+        ) {
             return flush_exit(output, diagnostics, ExitReason::Success);
         }
 
         consecutive_failures = 0;
         let current_gap_index = GapIndex::new(&current);
         let mut current_filter_cache = FilterCache::default();
-        let event_times = ObservationTimes {
-            previous_completed_unix_ms: gap_times.previous_completed_unix_ms,
-            attempt_started_unix_ms: match unix_milliseconds(current.capture_started_at) {
-                Ok(value) => value,
-                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-            },
-            attempt_completed_unix_ms: match unix_milliseconds(current.capture_completed_at) {
-                Ok(value) => value,
-                Err(error) => return output_failure(diagnostics, &OutputError::from(error)),
-            },
+        let event_times = match observation_times(
+            Some(previous.capture_completed_at),
+            current.capture_started_at,
+            current.capture_completed_at,
+        ) {
+            Ok(times) => times,
+            Err(error) => return output_failure(diagnostics, &error),
         };
         let diff = match diff_snapshots(&previous, &current) {
             Ok(diff) => diff,
@@ -482,7 +475,7 @@ fn run_watch_loop(
         previous = current;
         previous_gap_index = current_gap_index;
         previous_filter_cache = current_filter_cache;
-        next_poll = match attempt_monotonic.checked_add(options.interval) {
+        next_poll = match next_poll_after(attempt_monotonic, options.interval) {
             Some(value) => value,
             None => {
                 write_diagnostic(diagnostics, "watch poll deadline overflowed");
@@ -490,6 +483,26 @@ fn run_watch_loop(
             }
         };
     }
+}
+
+fn observation_times(
+    previous_completed_at: Option<SystemTime>,
+    attempt_started_at: SystemTime,
+    attempt_completed_at: SystemTime,
+) -> Result<ObservationTimes, OutputError> {
+    Ok(ObservationTimes {
+        previous_completed_unix_ms: previous_completed_at.map(unix_milliseconds).transpose()?,
+        attempt_started_unix_ms: unix_milliseconds(attempt_started_at)?,
+        attempt_completed_unix_ms: unix_milliseconds(attempt_completed_at)?,
+    })
+}
+
+fn next_poll_after(anchor: Duration, interval: Duration) -> Option<Duration> {
+    anchor.checked_add(interval)
+}
+
+fn should_stop(cancelled: bool, deadline_check: Option<(Duration, Duration)>) -> bool {
+    cancelled || deadline_check.is_some_and(|(now, deadline)| now >= deadline)
 }
 
 #[expect(
@@ -560,9 +573,10 @@ where
             }
             scanned_since_check += 1;
             if scanned_since_check == WATCH_EVENT_BATCH_MAX {
-                if runtime.cancelled()
-                    || deadline.is_some_and(|deadline| runtime.monotonic_now() >= deadline)
-                {
+                if should_stop(
+                    runtime.cancelled(),
+                    deadline.map(|end| (runtime.monotonic_now(), end)),
+                ) {
                     return Some(flush_exit(output, diagnostics, ExitReason::Success));
                 }
                 scanned_since_check = 0;
@@ -583,9 +597,10 @@ where
             }
             let mut pass = group_start.clone();
             loop {
-                if runtime.cancelled()
-                    || deadline.is_some_and(|deadline| runtime.monotonic_now() >= deadline)
-                {
+                if should_stop(
+                    runtime.cancelled(),
+                    deadline.map(|end| (runtime.monotonic_now(), end)),
+                ) {
                     return Some(flush_exit(output, diagnostics, ExitReason::Success));
                 }
                 let Some(result) = pass.next() else { break };
@@ -2113,7 +2128,8 @@ mod tests {
         ObservationTimes, OwnerPidConstraint, Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN,
         WATCH_INTERVAL_DEFAULT_TOKEN, WATCH_INTERVAL_MAX, WATCH_INTERVAL_MIN, WatchArgs,
         WatchOptions, WatchRuntime, evaluate_event, evaluate_side, event_order_rank,
-        parse_duration_token, run_watch_loop, write_human_event, write_ordered_events,
+        next_poll_after, observation_times, parse_duration_token, run_watch_loop, should_stop,
+        write_human_event, write_ordered_events,
     };
     use crate::cli::ExitReason;
     use crate::collector::{Collector, CollectorError, FakeCollector};
@@ -2254,6 +2270,61 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn observation_times_preserve_optional_previous_and_reject_pre_epoch_values() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        let times = observation_times(
+            Some(epoch + Duration::from_millis(1)),
+            epoch + Duration::from_millis(2),
+            epoch + Duration::from_millis(3),
+        )
+        .unwrap();
+
+        assert_eq!(times.previous_completed_unix_ms, Some(1));
+        assert_eq!(times.attempt_started_unix_ms, 2);
+        assert_eq!(times.attempt_completed_unix_ms, 3);
+        assert_eq!(
+            observation_times(
+                None,
+                epoch + Duration::from_millis(4),
+                epoch + Duration::from_millis(5),
+            )
+            .unwrap()
+            .previous_completed_unix_ms,
+            None,
+        );
+
+        let pre_epoch = epoch.checked_sub(Duration::from_nanos(1)).unwrap();
+        assert!(matches!(
+            observation_times(None, pre_epoch, epoch),
+            Err(super::OutputError::Public(
+                crate::public_output::PublicOutputError::ClockUnavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn monotonic_deadlines_accept_exact_boundaries_and_reject_overflow() {
+        let one_nanosecond = Duration::from_nanos(1);
+        let last_before_max = Duration::MAX
+            .checked_sub(one_nanosecond)
+            .expect("one nanosecond is below the maximum duration");
+        assert_eq!(
+            next_poll_after(last_before_max, one_nanosecond),
+            Some(Duration::MAX),
+        );
+        assert_eq!(next_poll_after(Duration::MAX, one_nanosecond), None);
+
+        let deadline = Duration::from_secs(1);
+        let just_before_deadline = deadline
+            .checked_sub(one_nanosecond)
+            .expect("one nanosecond is below the test deadline");
+        assert!(!should_stop(false, Some((just_before_deadline, deadline))));
+        assert!(should_stop(false, Some((deadline, deadline))));
+        assert!(should_stop(true, None));
+        assert!(!should_stop(false, None));
     }
 
     /// The emission loop runs exactly `EVENT_ORDER_RANK_COUNT` passes, so a

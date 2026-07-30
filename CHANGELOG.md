@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Centralized narrowly shared test fixtures so synthetic TCP and UDP rows carry
   matching listen/bound states and permission-denied ownership scenarios have
   one source of truth.
+- Made watch polling timing easier to audit by centralizing wall-clock
+  projection, monotonic deadline arithmetic, and cancellation/deadline
+  decisions without changing scheduling or output behavior.
 
 ### Fixed
 
