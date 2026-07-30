@@ -680,6 +680,7 @@ mod tests {
     };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::observation::{NativeObservationPass, ObservationSource};
+    use crate::test_support::permission_denied_owner_snapshot;
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn socket_limit_pass(
@@ -738,45 +739,6 @@ mod tests {
         Err(super::CollectorError::Observation(
             ObservationError::ProcessIdentityLimitExceeded,
         ))
-    }
-
-    fn permission_denied_owner_snapshot() -> NetworkSnapshot {
-        let mut snapshot = FakeCollector
-            .collect(MetadataProfile::Display)
-            .expect("fake collection succeeds");
-        let endpoint = {
-            let socket = snapshot
-                .sockets
-                .iter_mut()
-                .find(|socket| socket.local_endpoint.port.get() == 3000)
-                .expect("fixture has target socket");
-            socket.owners = vec![OwnerObservation::UnverifiedPid {
-                pid: 18_422,
-                reason: UnverifiedOwnerReason::PermissionDenied,
-            }];
-            socket.owner_completeness =
-                OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
-                    .expect("one reason fits");
-            socket.local_endpoint.clone()
-        };
-        snapshot
-            .processes
-            .retain(|identity, _| identity.pid != 18_422);
-        snapshot.owner_completeness = OwnerCompleteness::partial([
-            EvidenceGapCode::OwnerAttributionIncomplete,
-            EvidenceGapCode::OwnerPermissionDenied,
-        ])
-        .expect("fixture reasons fit");
-        for _ in 0..2 {
-            snapshot.evidence_gaps.push(EvidenceGap::new(
-                EvidenceImpact::Ownership,
-                EvidenceGapCode::OwnerPermissionDenied,
-                Some(endpoint.clone()),
-                Some(18_422),
-                "native owner PID could not be verified to a process start identity",
-            ));
-        }
-        snapshot
     }
 
     #[test]

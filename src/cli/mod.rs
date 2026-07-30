@@ -584,15 +584,10 @@ const TREE_HOST_PLATFORM: Platform = Platform::Macos;
 #[cfg(windows)]
 const TREE_HOST_PLATFORM: Platform = Platform::Windows;
 
-/// Test-only builders for port rows and process contexts, shared by the
-/// unit tests across this module tree.
+/// CLI-local wrappers around the shared port fixture plus process contexts.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    use crate::model::{
-        PermissionStatus, Platform, PortEntry, ProcessContext, Protocol, SocketState,
-    };
+    use crate::model::{PortEntry, ProcessContext, Protocol};
 
     pub(crate) fn entry(port: u16) -> PortEntry {
         entry_with_pid(port, Some(18_422), Protocol::Tcp, "node")
@@ -604,30 +599,7 @@ pub(crate) mod test_support {
         protocol: Protocol,
         name: &str,
     ) -> PortEntry {
-        PortEntry {
-            protocol,
-            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            local_port: port,
-            state: match protocol {
-                Protocol::Tcp => SocketState::Listen,
-                Protocol::Udp => SocketState::Bound,
-            },
-            pid,
-            process_name: Some(name.into()),
-            executable_path: None,
-            command_line: None,
-            parent_pid: None,
-            parent_process_name: None,
-            protected: false,
-            platform: Platform::Linux,
-            permission: PermissionStatus::Full,
-            process_identity: pid.map(|pid| crate::observation::ProcessIdentity {
-                pid,
-                start_marker: crate::observation::ProcessStartMarker::linux(55)
-                    .expect("test marker is nonzero"),
-            }),
-            ipv6_scope: None,
-        }
+        crate::test_support::port_entry(port, pid, protocol, name)
     }
 
     pub(crate) fn no_context(_: u32) -> ProcessContext {

@@ -1940,6 +1940,7 @@ mod tests {
     };
     use crate::observation::Ipv6Scope;
     use crate::process::{ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome};
+    use crate::test_support::port_entry;
 
     fn entry(port: u16, name: Option<&str>) -> PortEntry {
         PortEntry {
@@ -1970,30 +1971,6 @@ mod tests {
         row.pid = None;
         row.permission = PermissionStatus::Partial;
         row
-    }
-
-    fn entry_with_pid(port: u16, pid: Option<u32>, protocol: Protocol, name: &str) -> PortEntry {
-        PortEntry {
-            protocol,
-            local_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            local_port: port,
-            state: SocketState::Listen,
-            pid,
-            process_name: Some(name.into()),
-            executable_path: None,
-            command_line: None,
-            parent_pid: None,
-            parent_process_name: None,
-            protected: false,
-            platform: Platform::Linux,
-            permission: PermissionStatus::Full,
-            process_identity: pid.map(|pid| crate::observation::ProcessIdentity {
-                pid,
-                start_marker: crate::observation::ProcessStartMarker::linux(55)
-                    .expect("test marker is nonzero"),
-            }),
-            ipv6_scope: None,
-        }
     }
 
     fn app_with_rows(rows: Vec<PortEntry>) -> App {
@@ -2050,7 +2027,7 @@ mod tests {
 
     #[test]
     fn preserved_selection_distinguishes_ipv6_interface_scopes() {
-        let mut first = entry_with_pid(8080, Some(42), Protocol::Tcp, "service");
+        let mut first = port_entry(8080, Some(42), Protocol::Tcp, "service");
         first.local_addr = IpAddr::V6(Ipv6Addr::LOCALHOST);
         first.ipv6_scope = Some(Ipv6Scope::interface_index(1).unwrap());
         let mut second = first.clone();
@@ -2279,9 +2256,9 @@ mod tests {
     #[test]
     fn confirmation_lists_all_ports_owned_by_selected_pid_from_full_snapshot() {
         let mut app = app_with_rows(vec![
-            entry_with_pid(3000, Some(18422), Protocol::Tcp, "node"),
-            entry_with_pid(5173, Some(18422), Protocol::Udp, "node"),
-            entry_with_pid(8000, Some(18001), Protocol::Tcp, "cursor-agent"),
+            port_entry(3000, Some(18422), Protocol::Tcp, "node"),
+            port_entry(5173, Some(18422), Protocol::Udp, "node"),
+            port_entry(8000, Some(18001), Protocol::Tcp, "cursor-agent"),
         ]);
         app.apply_action(Action::StartSearch);
         app.apply_action(Action::SearchAppend('3'));

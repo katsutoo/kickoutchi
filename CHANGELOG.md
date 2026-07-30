@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preallocation, replaced three infallible sequence serializers with their
   direct iterator form, and aligned local dependency-policy checks with CI's
   main and fuzz workspace coverage.
+- Centralized narrowly shared test fixtures so synthetic TCP and UDP rows carry
+  matching listen/bound states and permission-denied ownership scenarios have
+  one source of truth.
 
 ### Fixed
 

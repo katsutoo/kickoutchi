@@ -36,6 +36,8 @@ mod public_output;
 mod query;
 #[cfg(fuzzing)]
 mod release_archive_path;
+#[cfg(test)]
+mod test_support;
 // Shared process-tree planning. Linux/macOS use this module's freeze-first
 // executor; Windows uses a separate Job Object containment executor.
 mod tree;
