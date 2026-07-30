@@ -657,13 +657,11 @@ impl Serialize for GapSequence<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.indices.len()))?;
-        for index in self.indices {
-            sequence.serialize_element(&EvidenceGapDto::from(
-                &self.snapshot.evidence_gaps[index.gap_index],
-            ))?;
-        }
-        sequence.end()
+        serializer.collect_seq(
+            self.indices
+                .iter()
+                .map(|index| EvidenceGapDto::from(&self.snapshot.evidence_gaps[index.gap_index])),
+        )
     }
 }
 
@@ -699,12 +697,11 @@ impl Serialize for ProcessSequence<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.identities.len()))?;
-        for &&identity in self.identities {
-            sequence
-                .serialize_element(&process_dto(identity, &self.snapshot.processes[&identity]))?;
-        }
-        sequence.end()
+        serializer.collect_seq(
+            self.identities
+                .iter()
+                .map(|&&identity| process_dto(identity, &self.snapshot.processes[&identity])),
+        )
     }
 }
 

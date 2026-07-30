@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Simplified internal maintenance code without changing public behavior:
+  removed a stale license allowance, documented four module boundaries, reduced
+  configuration-reader preallocation, and replaced three infallible sequence
+  serializers with their direct iterator form.
+
 ### Fixed
 
 - Release publication now attests cargo-dist's host-generated

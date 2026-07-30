@@ -311,7 +311,7 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 
 fn read_config_from(mut reader: impl Read, path: &Path) -> Result<String, ConfigError> {
     let limit = u64::try_from(CONFIG_FILE_MAX_BYTES).expect("config byte limit must fit in u64");
-    let mut bytes = Vec::with_capacity(CONFIG_FILE_MAX_BYTES);
+    let mut bytes = Vec::new();
     reader
         .by_ref()
         .take(limit)

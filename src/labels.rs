@@ -1,3 +1,8 @@
+//! Bounded endpoint-label validation, normalization, and lookup.
+//!
+//! Configuration selectors become exact or protocol-and-port wildcard keys
+//! once, so every interface shares the same precedence and validation policy.
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;

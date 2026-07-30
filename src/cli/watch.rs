@@ -1,3 +1,8 @@
+//! The `watch` command's bounded polling, filtering, diffing, and event output.
+//!
+//! Monotonic time drives scheduling and cancellation while captured wall-clock
+//! values remain output evidence; the two clocks are deliberately kept separate.
+
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Write};
 use std::net::IpAddr;

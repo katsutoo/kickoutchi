@@ -1,10 +1,14 @@
+//! The `why` command's read-only bindability diagnosis and stable reports.
+//!
+//! Each bounded endpoint query combines one collected network snapshot with one
+//! exact bind probe; it never terminates or otherwise mutates a process.
+
 use std::io::{self, ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::time::SystemTime;
 
 use clap::Args;
-use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 
 use crate::collector::{self, CollectorError};
@@ -547,11 +551,7 @@ impl Serialize for ResultSequence<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
-        for result in self.0 {
-            sequence.serialize_element(&result_dto(result))?;
-        }
-        sequence.end()
+        serializer.collect_seq(self.0.iter().map(result_dto))
     }
 }
 

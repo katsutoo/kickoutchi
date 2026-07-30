@@ -1,3 +1,8 @@
+//! Host-independent validation for release-archive member paths.
+//!
+//! Raw bytes remain untrusted until their UTF-8 and portable path shape have
+//! both been validated, preventing extraction behavior from varying by host.
+
 /// Validate and canonicalize one release-archive member path.
 ///
 /// Archive readers pass raw bytes so invalid UTF-8 cannot be normalized into a
