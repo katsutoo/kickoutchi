@@ -1015,19 +1015,20 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_endpointless_ownership_gap_does_not_block_port_delivery() {
+    fn endpointless_ownership_gap_refuses_port_delivery() {
         let mut snapshot = FakeCollector
             .collect(MetadataProfile::Display)
             .expect("fake collection succeeds");
+        let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
+            .expect("complete baseline resolves the target port");
         snapshot.evidence_gaps.push(EvidenceGap::new(
             EvidenceImpact::Ownership,
             EvidenceGapCode::OwnerAttributionIncomplete,
             None,
             Some(29_999),
-            "unrelated process ownership could not be attributed to an endpoint",
+            "process ownership could not be attributed to an endpoint",
         ));
-        let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
-            .expect("the unrelated ownership gap must not block the target port");
+        let mut prepared = false;
         let mut delivered = false;
         let mut visibility_polls = 0;
 
@@ -1044,17 +1045,20 @@ mod tests {
                 },
             },
             |_target, _mode, _requirement| panic!("--yes skips prompts"),
-            Ok::<u32, TerminationOutcome>,
-            |_handle: &u32, target, _protected, _mode| {
+            |pid| {
+                prepared = true;
+                Ok::<u32, TerminationOutcome>(pid)
+            },
+            |_handle: &u32, _target, _protected, _mode| {
                 delivered = true;
-                assert_eq!(target.pid, 18_422);
                 TerminationOutcome::Success
             },
         );
 
-        assert_eq!(reason, ExitReason::Success);
-        assert!(delivered);
-        assert_eq!(visibility_polls, 1);
+        assert_eq!(reason, ExitReason::Failure);
+        assert!(prepared);
+        assert!(!delivered);
+        assert_eq!(visibility_polls, 0);
     }
 
     #[test]

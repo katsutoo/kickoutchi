@@ -277,8 +277,8 @@ fn destructive_socket_match(
 ///
 /// Port targets are held to a stricter rule than PID targets: a PID target has
 /// already been resolved to one verified identity, but a port target must prove
-/// that every observable endpoint-local holder is accounted for — otherwise
-/// the signal may leave another observed holder keeping the port open.
+/// that every potential holder is accounted for — otherwise the signal may
+/// leave an unobserved co-holder keeping the port open.
 fn socket_authority(
     socket: &crate::observation::SocketObservation,
     target_mode: DestructiveTargetMode,
@@ -325,13 +325,11 @@ fn socket_authority(
 
 /// Whether an evidence gap can affect this target's authority.
 ///
-/// Provenance is the whole point: an unrelated process losing its owner
-/// attribution must not make an unprivileged `kill --port` impossible, while a
-/// gap that could plausibly hide part of *this* target must refuse. The two
-/// target modes need different rules because they are asking different
-/// questions — "is this PID's evidence intact?" versus "is this port's holder
-/// set complete?" — so a socket-set gap with no endpoint is fatal to a port
-/// target but only to an unattributed PID target.
+/// Provenance is the whole point: a gap explicitly tied to another endpoint
+/// must not make an unprivileged `kill --port` impossible, while a gap without
+/// endpoint provenance could hide a co-holder of the selected port and must
+/// refuse. PID targets instead use PID and matched-endpoint provenance because
+/// they ask whether one already-resolved process identity remains authoritative.
 fn gap_applies_to_target(
     gap: &crate::observation::EvidenceGap,
     target_mode: DestructiveTargetMode,
@@ -357,16 +355,15 @@ fn gap_applies_to_target(
         (DestructiveTargetMode::Pid(target_pid), EvidenceImpact::Ownership) => {
             names_matched_endpoint() || (gap.endpoint.is_none() && gap.pid == Some(target_pid))
         }
-        // Any socket-set loss that is not provably about another port could
-        // have hidden a co-holder of this one.
-        (DestructiveTargetMode::Port(target_port), EvidenceImpact::SocketSet) => gap
+        // Any socket-set or ownership loss that is not provably about another
+        // port could have hidden a co-holder of this one.
+        (
+            DestructiveTargetMode::Port(target_port),
+            EvidenceImpact::SocketSet | EvidenceImpact::Ownership,
+        ) => gap
             .endpoint
             .as_ref()
             .is_none_or(|endpoint| endpoint.port.get() == target_port),
-        (DestructiveTargetMode::Port(target_port), EvidenceImpact::Ownership) => gap
-            .endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.port.get() == target_port),
     }
 }
 
@@ -1021,8 +1018,12 @@ mod tests {
             "unrelated PID ownership denied",
         ));
         assert!(kill_ports_from_snapshot(&snapshot, Some(18_422), None).is_ok());
-        assert!(kill_ports_from_snapshot(&snapshot, None, Some(3000)).is_ok());
+        assert!(matches!(
+            kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+            Err(super::CollectorError::OwnershipPermissionDenied)
+        ));
 
+        snapshot.evidence_gaps.clear();
         snapshot.owner_completeness =
             OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
                 .expect("one reason fits");
@@ -1073,11 +1074,10 @@ mod tests {
                 ObservationError::PartialSocketSet
             ))
         ));
-        snapshot.evidence_gaps.retain(|gap| gap.pid != Some(18_422));
     }
 
     #[test]
-    fn aggregate_owner_scan_loss_does_not_block_an_observable_kill_target() {
+    fn aggregate_owner_scan_loss_blocks_port_but_not_unrelated_pid_target() {
         let mut snapshot = FakeCollector
             .collect(MetadataProfile::Display)
             .expect("fake collection succeeds");
@@ -1093,7 +1093,10 @@ mod tests {
         ));
 
         assert!(kill_ports_from_snapshot(&snapshot, Some(18_422), None).is_ok());
-        assert!(kill_ports_from_snapshot(&snapshot, None, Some(3000)).is_ok());
+        assert!(matches!(
+            kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+            Err(super::CollectorError::OwnershipPermissionDenied)
+        ));
 
         snapshot.evidence_gaps.push(EvidenceGap::new(
             EvidenceImpact::Ownership,
@@ -1205,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn target_pid_global_ownership_permission_gap_does_not_block_visible_port_owner() {
+    fn endpointless_target_ownership_permission_gap_blocks_pid_and_port() {
         let mut snapshot = FakeCollector
             .collect(MetadataProfile::Display)
             .expect("fake collection succeeds");
@@ -1226,7 +1229,10 @@ mod tests {
             kill_ports_from_snapshot(&snapshot, Some(18_422), None),
             Err(super::CollectorError::OwnershipPermissionDenied)
         ));
-        assert!(kill_ports_from_snapshot(&snapshot, None, Some(3000)).is_ok());
+        assert!(matches!(
+            kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+            Err(super::CollectorError::OwnershipPermissionDenied)
+        ));
     }
 
     #[test]
@@ -1444,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn port_socket_set_gaps_apply_only_globally_or_to_the_selected_port() {
+    fn port_socket_and_ownership_gaps_apply_only_globally_or_to_the_selected_port() {
         let base = FakeCollector
             .collect(MetadataProfile::Display)
             .expect("fake collection succeeds");
@@ -1463,31 +1469,33 @@ mod tests {
             .local_endpoint
             .clone();
 
-        let mut unrelated = base.clone();
-        unrelated.evidence_gaps.push(EvidenceGap::new(
-            EvidenceImpact::SocketSet,
-            EvidenceGapCode::OwnerPermissionDenied,
-            Some(unrelated_endpoint),
-            None,
-            "another port was permission denied",
-        ));
-        assert!(kill_ports_from_snapshot(&unrelated, None, Some(3000)).is_ok());
+        for impact in [EvidenceImpact::SocketSet, EvidenceImpact::Ownership] {
+            let mut unrelated = base.clone();
+            unrelated.evidence_gaps.push(EvidenceGap::new(
+                impact,
+                EvidenceGapCode::OwnerPermissionDenied,
+                Some(unrelated_endpoint.clone()),
+                None,
+                "another port was permission denied",
+            ));
+            assert!(kill_ports_from_snapshot(&unrelated, None, Some(3000)).is_ok());
 
-        for endpoint in [None, Some(selected_endpoint)] {
-            let mut applicable = base.clone();
-            applicable.evidence_gaps.push(EvidenceGap::new(
-                EvidenceImpact::SocketSet,
-                EvidenceGapCode::NativeFieldUnavailable,
-                endpoint,
-                Some(99_999),
-                "selected port socket set is partial",
-            ));
-            assert!(matches!(
-                kill_ports_from_snapshot(&applicable, None, Some(3000)),
-                Err(super::CollectorError::Observation(
-                    ObservationError::PartialSocketSet
-                ))
-            ));
+            for endpoint in [None, Some(selected_endpoint.clone())] {
+                let mut applicable = base.clone();
+                applicable.evidence_gaps.push(EvidenceGap::new(
+                    impact,
+                    EvidenceGapCode::NativeFieldUnavailable,
+                    endpoint,
+                    Some(99_999),
+                    "selected port evidence is partial",
+                ));
+                assert!(matches!(
+                    kill_ports_from_snapshot(&applicable, None, Some(3000)),
+                    Err(super::CollectorError::Observation(
+                        ObservationError::PartialSocketSet
+                    ))
+                ));
+            }
         }
     }
 

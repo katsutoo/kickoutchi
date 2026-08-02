@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.10] - 2026-08-02
+
 ### Changed
 
 - Simplified internal maintenance code without changing public behavior:
@@ -23,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Linux `kill --port` now refuses to signal a visible owner when incomplete
+  process or descriptor visibility leaves an ownership gap without endpoint
+  provenance, since an unobserved process could share the selected socket.
 - Release publication now attests cargo-dist's host-generated
   `dist-manifest.json` before the public installer journey or package-manager
   publication. This closes the provenance-gate mismatch found while publishing
@@ -1360,7 +1365,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...HEAD
+[1.3.10]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...v1.3.10
 [1.3.9]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...v1.3.9
 [1.3.8]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...v1.3.8
 [1.3.7]: https://github.com/nuggocto/kickoutchi/compare/v1.3.6...v1.3.7

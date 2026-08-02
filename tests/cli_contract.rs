@@ -1973,6 +1973,43 @@ mod linux {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
+    /// Native hosts may expose either complete procfs evidence or a
+    /// restricted/stacked mount. Only a successful signal or this exact
+    /// fail-closed authority refusal is valid.
+    fn port_kill_refused_for_incomplete_authority(output: &Output) -> bool {
+        let stderr = stderr(output);
+        let refused_during_collection = output.status.code() == Some(1)
+            && stderr.contains("collecting ports before kill failed: socket set is partial");
+        let refused_during_revalidation = output.status.code() == Some(4)
+            && stderr.contains("ownership for PID")
+            && stderr.contains("became unavailable before SIGTERM")
+            && stderr.contains("no termination was sent");
+
+        if refused_during_collection || refused_during_revalidation {
+            assert!(!stderr.contains("sent SIG"), "{stderr}");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn assert_helper_survived_refusal(helper: &mut ChildGuard) {
+        let pid = helper.id();
+        assert!(
+            helper
+                .child
+                .try_wait()
+                .expect("helper status must be readable")
+                .is_none(),
+            "helper PID {pid} must survive a refused port kill",
+        );
+        assert_ne!(
+            process_state(pid),
+            Some('T'),
+            "helper PID {pid} must not remain frozen after refusal",
+        );
+    }
+
     fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
         let pid_text = pid.to_string();
         stdout(output)
@@ -4108,13 +4145,18 @@ mod linux {
     }
 
     #[test]
-    fn host_port_kill_sends_real_sigterm() {
+    fn host_port_kill_signals_only_with_complete_owner_evidence() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, ready_file) = spawn_listener_process();
         let port_text = port.to_string();
 
         let killed = kickoutchi(&["kill", "--port", port_text.as_str(), "--yes"]);
         let killed_stderr = stderr(&killed);
+        if port_kill_refused_for_incomplete_authority(&killed) {
+            assert_helper_survived_refusal(&mut helper);
+            let _ = fs::remove_file(ready_file);
+            return;
+        }
         assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
         assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
         wait_for_child_exit(&mut helper);
@@ -4122,10 +4164,10 @@ mod linux {
     }
 
     #[test]
-    fn isolated_user_and_network_namespace_port_kill_delivers_sigterm() {
+    fn isolated_namespace_port_kill_signals_or_refuses_without_delivery() {
         let test_binary = std::env::current_exe().expect("test binary path resolves");
         let ready_file = temp_file_path("namespace-listener-ready");
-        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --ignored --nocapture & helper=$!; attempts=0; delay=0.001; while test ! -s "$3"; do attempts=$((attempts+1)); test "$attempts" -lt 100 || exit 90; sleep "$delay"; case "$delay" in 0.001) delay=0.002;; 0.002) delay=0.004;; 0.004) delay=0.008;; 0.008) delay=0.016;; 0.016) delay=0.032;; *) delay=0.050;; esac; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -ne 0; then kill "$helper"; wait "$helper"; exit "$kick_status"; fi; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143"#;
+        let script = r#"KICKOUTCHI_TEST_HELPER_LISTENER=1 KICKOUTCHI_TEST_HELPER_BIND_ANY=1 KICKOUTCHI_TEST_HELPER_PORT=0 KICKOUTCHI_TEST_HELPER_READY="$3" "$1" --exact linux::helper_tcp_listener_process --ignored --nocapture & helper=$!; attempts=0; delay=0.001; while test ! -s "$3"; do attempts=$((attempts+1)); test "$attempts" -lt 100 || exit 90; sleep "$delay"; case "$delay" in 0.001) delay=0.002;; 0.002) delay=0.004;; 0.004) delay=0.008;; 0.008) delay=0.016;; 0.016) delay=0.032;; *) delay=0.050;; esac; done; port=$(cat "$3"); XDG_CONFIG_HOME="$3-config" "$2" kill --port "$port" --yes; kick_status=$?; if test "$kick_status" -eq 0; then wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143; exit; fi; if test "$kick_status" -eq 1 || test "$kick_status" -eq 4; then kill -0 "$helper" || exit 91; kill "$helper"; wait "$helper"; helper_status=$?; rm -f "$3"; test "$helper_status" -eq 143; exit; fi; kill "$helper"; wait "$helper"; rm -f "$3"; exit "$kick_status""#;
         let output = run_command_with_deadline(
             Command::new("unshare")
                 .args([
@@ -4172,11 +4214,23 @@ mod linux {
             return;
         }
         assert!(output.status.success(), "{stderr}");
-        assert!(stderr.contains("sent SIGTERM"), "{stderr}");
+        let signalled = stderr.contains("sent SIGTERM");
+        let refused_during_collection =
+            stderr.contains("collecting ports before kill failed: socket set is partial");
+        let refused_during_revalidation = stderr.contains("ownership for PID")
+            && stderr.contains("became unavailable before SIGTERM")
+            && stderr.contains("no termination was sent");
+        assert!(
+            signalled || refused_during_collection || refused_during_revalidation,
+            "{stderr}"
+        );
+        if refused_during_collection || refused_during_revalidation {
+            assert!(!signalled, "{stderr}");
+        }
     }
 
     #[test]
-    fn tree_kill_by_port_removes_root_and_child_and_clears_port() {
+    fn tree_kill_by_port_signals_only_with_complete_owner_evidence() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, child_pid, ready_file) = spawn_tree_process("root-owns-port");
         let _child_cleanup = PidGuard::new(child_pid);
@@ -4190,8 +4244,19 @@ mod linux {
         let killed =
             kickoutchi_with_stdin(&["kill", "--port", port_text.as_str(), "--tree"], "tree\n");
 
-        assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
         let killed_stderr = stderr(&killed);
+        if port_kill_refused_for_incomplete_authority(&killed) {
+            assert_helper_survived_refusal(&mut helper);
+            assert!(pid_exists(child_pid), "child PID {child_pid} must survive");
+            assert_ne!(
+                process_state(child_pid),
+                Some('T'),
+                "child PID {child_pid} must not remain frozen after refusal",
+            );
+            let _ = fs::remove_file(ready_file);
+            return;
+        }
+        assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
         assert!(killed_stderr.contains("Scope: tree"), "{killed_stderr}");
         assert!(killed_stderr.contains("2 processes"), "{killed_stderr}");
         assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
@@ -4404,7 +4469,7 @@ mod linux {
     /// group. A tree kill from the root can never reach it; the group kill
     /// must — and the confirmation must have shown every member first.
     #[test]
-    fn group_kill_by_port_reaches_reparented_member_and_clears_port() {
+    fn group_kill_by_port_signals_only_with_complete_owner_evidence() {
         let _host_observation = lock_host_observation();
         let (mut helper, port, orphan_pid, ready_file) = spawn_group_process();
         let _orphan_cleanup = PidGuard::new(orphan_pid);
@@ -4428,6 +4493,20 @@ mod linux {
             assert!(
                 !required_linux_capabilities(),
                 "the capability-required group-kill success journey raced instead of succeeding:\n{killed_stderr}"
+            );
+            let _ = fs::remove_file(ready_file);
+            return;
+        }
+        if port_kill_refused_for_incomplete_authority(&killed) {
+            assert_helper_survived_refusal(&mut helper);
+            assert!(
+                pid_exists(orphan_pid),
+                "orphan PID {orphan_pid} must survive"
+            );
+            assert_ne!(
+                process_state(orphan_pid),
+                Some('T'),
+                "orphan PID {orphan_pid} must not remain frozen after refusal",
             );
             let _ = fs::remove_file(ready_file);
             return;

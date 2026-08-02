@@ -84,6 +84,8 @@ A restricted, incomplete, or nonstandard procfs mount can hide socket tables,
 PIDs, descriptor links, identities, or metadata. Permission denial while reading
 a required socket table fails collection; denial or disappearance during owner
 and metadata reads is retained as an explicit gap where possible.
+`kill --port` refuses when an ownership gap has no endpoint provenance because
+an unobserved process could share the selected socket.
 
 The legacy list/TUI `permission` field compresses these Unix outcomes for 1.x
 compatibility. `partial` covers permission denial, process disappearance, races,

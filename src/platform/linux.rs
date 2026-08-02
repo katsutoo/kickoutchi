@@ -3553,6 +3553,56 @@ mod tests {
     }
 
     #[test]
+    fn restricted_proc_visibility_refuses_port_kill_with_a_visible_owner() {
+        let proc_root = temp_proc_root("restricted-proc-port-kill");
+        write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+        write_socket_table(&proc_root, "net/udp", &[]);
+        write_process(&proc_root, 1234, "worker", 1);
+        std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234/fd/0"))
+            .expect("visible socket owner fixture must be linked");
+        fs::write(
+            proc_root.join("mounts"),
+            format!(
+                "proc {} proc rw,nosuid,nodev,hidepid=1 0 0\n",
+                proc_root.display()
+            ),
+        )
+        .expect("restricted proc mount evidence must be written");
+
+        let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
+            &LinuxCollector::with_proc_root(proc_root.clone()),
+            crate::observation::MetadataProfile::Display,
+        )
+        .expect("restricted proc ownership remains observable as partial");
+        let socket = snapshot
+            .sockets
+            .iter()
+            .find(|socket| socket.local_endpoint.port.get() == 3000)
+            .expect("visible target socket must be retained");
+        assert_eq!(socket.owner_completeness, OwnerCompleteness::Complete);
+        assert!(socket.owners.iter().any(|owner| {
+            matches!(
+                owner,
+                crate::observation::OwnerObservation::Verified(identity)
+                    if identity.pid == 1234
+            )
+        }));
+        assert!(snapshot.evidence_gaps.iter().any(|gap| {
+            gap.impact == EvidenceImpact::Ownership
+                && gap.code == EvidenceGapCode::OwnerAttributionIncomplete
+                && gap.endpoint.is_none()
+        }));
+        assert!(matches!(
+            crate::collector::kill_ports_from_snapshot(&snapshot, None, Some(3000)),
+            Err(crate::collector::CollectorError::Observation(
+                ObservationError::PartialSocketSet
+            ))
+        ));
+
+        fs::remove_dir_all(proc_root).expect("test proc root must clean up");
+    }
+
+    #[test]
     fn edge_free_owner_scan_losses_aggregate_across_gap_limit_boundaries() {
         for count in [
             0,
