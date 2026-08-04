@@ -73,7 +73,10 @@ use crate::display::sanitize_multiline;
 #[doc(hidden)]
 #[must_use]
 pub fn run() -> ExitCode {
-    init_tracing();
+    // Tracing must be installed before clap renders an error so repeated calls
+    // still respect an embedder-owned subscriber. The exact boolean flag can be
+    // recognized without interpreting or retaining any other argv content.
+    init_tracing(verbose_requested());
     let args = match Cli::try_parse() {
         Ok(args) => args,
         Err(error) => {
@@ -95,6 +98,9 @@ pub fn run() -> ExitCode {
             return ExitReason::InvalidArguments.into();
         }
     };
+    if args.verbose {
+        tracing::debug!("verbose diagnostics enabled");
+    }
 
     let watch_signal_guard = if matches!(args.command.as_ref(), Some(Command::Watch(_))) {
         match WatchSignalGuard::install() {
@@ -171,12 +177,24 @@ fn write_cli_stdout(mut writer: impl Write, text: &str) -> io::Result<()> {
 /// Logs go to stderr, never stdout (the alternate screen owns stdout), and only
 /// when we're outside the alternate screen anyway: startup, shutdown, panic, and
 /// fatal-error time. So they can never scribble over a rendered frame.
-fn init_tracing() {
+fn init_tracing(verbose: bool) {
     // Embedders own the process-global subscriber; an existing one is valid.
+    let max_level = if verbose {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
     let _ = tracing_subscriber::fmt()
         .with_writer(io::stderr)
-        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_max_level(max_level)
         .try_init();
+}
+
+fn verbose_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|argument| argument == "--verbose" || argument == "-v")
 }
 
 #[cfg(test)]

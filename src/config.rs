@@ -102,7 +102,7 @@ impl Default for Config {
             default_sort: SortMode::Port,
             hide_system_processes: false,
             confirm_force_kill: true,
-            docker_enrichment: true,
+            docker_enrichment: false,
             // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
-        assert!(config.docker_enrichment);
+        assert!(!config.docker_enrichment);
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
     }
 
@@ -622,7 +622,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
-        assert!(config.docker_enrichment);
+        assert!(!config.docker_enrichment);
     }
 
     #[test]
@@ -633,7 +633,7 @@ label = "web"
             default_sort = "scope"
             hide_system_processes = true
             confirm_force_kill = false
-            docker_enrichment = false
+            docker_enrichment = true
             protected_processes = ["redis", "postgres"]
             "#,
         )
@@ -642,7 +642,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Scope);
         assert!(config.hide_system_processes);
         assert!(!config.confirm_force_kill);
-        assert!(!config.docker_enrichment);
+        assert!(config.docker_enrichment);
         assert!(config.protected_processes.contains(&"docker".to_owned()));
         assert!(config.protected_processes.contains(&"postgres".to_owned()));
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
@@ -666,7 +666,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
-        assert!(config.docker_enrichment);
+        assert!(!config.docker_enrichment);
         assert!(
             config
                 .protected_processes

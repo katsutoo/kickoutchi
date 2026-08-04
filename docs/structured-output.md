@@ -952,6 +952,7 @@ Treat all structured output as sensitive local-system data.
 - JSON escaping prevents malformed JSON; it is not redaction. Host metadata remains raw structured data subject to the documented byte and decoding rules.
 - Evidence and operational messages are sanitized and bounded, but they may still reveal host facts. Message text is not a stable API.
 - Human terminal sanitization is independent from structured output and does not make JSON safe to publish.
+- Global `--verbose`/`-v` writes internal diagnostics only to stderr and never changes structured stdout. Those diagnostics can still contain local process or operating-system details.
 
 Redact structured output before sharing it. See [Security Policy](../SECURITY.md) for private vulnerability reporting.
 

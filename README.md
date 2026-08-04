@@ -30,27 +30,6 @@ evidence, and protected processes that were not explicitly confirmed.
 
 ## Install
 
-### GitHub Release
-
-Linux and macOS:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.sh \
-  | sh
-```
-
-Windows PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex"
-```
-
-Installer-based installs include `kickoutchi-update` for later upgrades.
-Release pages also provide direct archives, per-archive `.sha256` files, and a
-release-wide `sha256.sum`. Same-release checksums detect corruption; they are not
-an independent signature.
-
 ### Package Managers
 
 ```sh
@@ -88,6 +67,27 @@ real published assets. `kickoutchi-bin` installs the prebuilt Linux archive;
 
 Every package manager here is an independent publisher, so each can lag a new
 GitHub Release rather than updating with it.
+
+### GitHub Release
+
+Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.sh \
+  | sh
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://github.com/nuggocto/kickoutchi/releases/latest/download/kickoutchi-installer.ps1 | iex"
+```
+
+Installer-based installs include `kickoutchi-update` for later upgrades.
+Release pages also provide direct archives, per-archive `.sha256` files, and a
+release-wide `sha256.sum`. Same-release checksums detect corruption; they are not
+an independent signature.
 
 ### Updating
 
@@ -214,7 +214,7 @@ refresh_interval_seconds = 3
 default_sort = "port"
 hide_system_processes = false
 confirm_force_kill = true
-docker_enrichment = true
+docker_enrichment = false
 protected_processes = ["redis-server"]
 
 [[ports]]
@@ -230,9 +230,13 @@ port = 8080
 label = "local web services"
 ```
 
-Set `docker_enrichment = false` to prevent Kickoutchi from resolving or running
-the Docker CLI. When enabled, Docker is used only for optional, bounded TUI
-process-context details; native socket collection remains authoritative.
+Docker enrichment is disabled by default. Set `docker_enrichment = true` to opt
+in to optional, bounded, local-only Docker details in qualifying TUI views;
+native socket collection remains authoritative.
+
+Pass global `--verbose`/`-v` to emit internal diagnostics to stderr. Command
+stdout, including JSON and NDJSON, is unchanged. Diagnostics can still contain
+local process or operating-system details, so review them before sharing.
 
 Configured protected names extend the built-in safety list. Exact endpoint labels
 take precedence over wildcard labels. See [`docs/configuration.md`](docs/configuration.md)

@@ -9,9 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added a `docker_enrichment` configuration switch, enabled by default for
-  compatibility. Disabling it guarantees that optional TUI process-context
-  collection never resolves or executes the Docker CLI.
+- Added global `--verbose`/`-v` diagnostics. Debug details are written only to
+  stderr, leaving human, JSON, and NDJSON stdout contracts unchanged.
+- Added a `docker_enrichment` configuration switch. Enabling it permits bounded,
+  local-only Docker details in qualifying TUI views; disabling it guarantees
+  that optional TUI process-context collection never resolves or executes the
+  Docker CLI.
 
 ### Changed
 
@@ -29,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Classified the library target as internal binary bootstrap plumbing and hid it
   from generated API documentation instead of presenting `run()` as a supported
   embedding contract with process-global arguments, I/O, and signal lifecycle.
+- Kept termination warnings typed through their presentation boundary, removing
+  prose suffix recognition and scope-specific rewrite helpers. Pruned the
+  obsolete implementation-coupling test and two low-value private/trivial tests
+  while preserving destructive-path and real-binary coverage.
+- Moved package-manager installation ahead of direct remote-installer commands
+  in the README.
+- Changed optional Docker enrichment from default-on to explicit opt-in.
 
 ### Fixed
 

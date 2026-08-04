@@ -94,6 +94,10 @@ pub(crate) struct Cli {
     )]
     pub(crate) refresh_interval: Option<u64>,
 
+    /// Emit internal diagnostics to stderr without changing command stdout.
+    #[arg(short, long, global = true)]
+    pub(crate) verbose: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -1006,16 +1010,24 @@ mod tests {
 
     #[test]
     fn global_flags_parse_with_and_without_subcommands() {
-        let cli = Cli::try_parse_from(["kickoutchi", "--refresh-interval", "9"])
+        let cli = Cli::try_parse_from(["kickoutchi", "--refresh-interval", "9", "--verbose"])
             .expect("global flag without subcommand");
         assert_eq!(cli.refresh_interval, Some(9));
+        assert!(cli.verbose);
 
-        let cli = Cli::try_parse_from(["kickoutchi", "list", "--config", "/tmp/alt.toml"])
-            .expect("global flag after subcommand");
+        let cli = Cli::try_parse_from([
+            "kickoutchi",
+            "list",
+            "--config",
+            "/tmp/alt.toml",
+            "--verbose",
+        ])
+        .expect("global flag after subcommand");
         assert_eq!(
             cli.config.as_deref(),
             Some(std::path::Path::new("/tmp/alt.toml"))
         );
+        assert!(cli.verbose);
     }
 
     #[test]

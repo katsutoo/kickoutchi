@@ -446,9 +446,8 @@ impl KillTarget {
     }
 
     /// The typed warnings attached to this target. Policy gates (for example
-    /// the `--yes` all-clear check) match on these kinds; display surfaces
-    /// render them through [`KillWarning::text`] via [`Self::warning_lines`],
-    /// so the gate and the prose can never drift apart.
+    /// the `--yes` all-clear check) and display surfaces both consume these
+    /// variants, so policy never depends on rendered prose.
     pub(crate) fn warnings(&self) -> Vec<KillWarning> {
         let mut warnings = Vec::new();
 
@@ -489,10 +488,6 @@ impl KillTarget {
 
         warnings
     }
-
-    pub(crate) fn warning_lines(&self) -> Vec<String> {
-        self.warnings().iter().map(KillWarning::text).collect()
-    }
 }
 
 /// One warning attached to a kill target, typed so policy can match on the
@@ -513,10 +508,20 @@ pub(crate) enum KillWarning {
     },
 }
 
+/// The termination scope in which a target warning is presented.
+///
+/// Keeping this typed through the presentation boundary prevents tree and group
+/// renderers from having to recognize and rewrite single-process prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarningScope {
+    Process,
+    Tree,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Group,
+}
+
 impl KillWarning {
-    /// The single-kill banner wording. Tree and group surfaces rewrite the
-    /// process-scope suffix through [`tree_scope_warning_text`].
-    fn text(&self) -> String {
+    pub(crate) fn text(&self, scope: WarningScope) -> String {
         match self {
             Self::Protected => "protected process; stronger confirmation is required".to_owned(),
             Self::SystemProcess => {
@@ -538,43 +543,17 @@ impl KillWarning {
                 children_truncated,
             } => {
                 let suffix = if *children_truncated { " or more" } else { "" };
-                format!(
-                    "target has {child_count}{suffix} direct child process(es); termination targets only the confirmed PID",
-                )
+                let scope_clause = match scope {
+                    WarningScope::Process => "termination targets only the confirmed PID",
+                    WarningScope::Tree => {
+                        "tree kill targets the bounded descendant tree shown above"
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    WarningScope::Group => "group kill targets every group member shown above",
+                };
+                format!("target has {child_count}{suffix} direct child process(es); {scope_clause}")
             }
         }
-    }
-}
-
-/// Rewrite a single-kill warning line for tree scope.
-///
-/// `KillTarget::warning_lines` tells single-kill users that children survive
-/// ("termination targets only the confirmed PID") — under `--tree` that exact
-/// sentence would be false, so the tree surfaces (CLI banner and TUI modal)
-/// route every root warning through here. It lives beside `warning_lines` so
-/// the suffix it strips and the text that produces it cannot drift apart.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub(crate) fn tree_scope_warning_text(warning: &str) -> String {
-    scoped_warning_text(
-        warning,
-        "tree kill targets the bounded descendant tree shown above",
-    )
-}
-
-/// Rewrite a single-kill warning line for group scope; see
-/// [`tree_scope_warning_text`].
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn group_scope_warning_text(warning: &str) -> String {
-    scoped_warning_text(warning, "group kill targets every group member shown above")
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn scoped_warning_text(warning: &str, scope_clause: &str) -> String {
-    const PROCESS_SCOPE_SUFFIX: &str = "; termination targets only the confirmed PID";
-    if let Some(prefix) = warning.strip_suffix(PROCESS_SCOPE_SUFFIX) {
-        format!("{prefix}; {scope_clause}")
-    } else {
-        warning.to_owned()
     }
 }
 
@@ -1052,7 +1031,7 @@ fn outcome_from_errno(operation: &str, error: &std::io::Error) -> TerminationOut
 mod windows;
 
 #[cfg(all(test, windows))]
-use windows::{native_utf16_prefix, windows_api_outcome, windows_still_active_exit_code};
+use windows::{native_utf16_prefix, windows_api_outcome};
 #[cfg(windows)]
 use windows::{prepare_termination_platform, terminate_handle_checked_platform};
 

@@ -11,9 +11,7 @@ use crate::app::{self, App, KillConfirmation};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::app::{TreeConfirmStage, TreeKillConfirmation};
 use crate::display::sanitize;
-use crate::process::ConfirmationRequirement;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::process::tree_scope_warning_text;
+use crate::process::{ConfirmationRequirement, WarningScope};
 
 use super::{field, theme::Theme};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -153,9 +151,9 @@ fn tree_confirmation_lines(
     {
         tail.push(Line::styled(format!("Warning: {warning}"), theme.warning()));
     }
-    for warning in confirmation.target.warning_lines() {
+    for warning in confirmation.target.warnings() {
         tail.push(Line::styled(
-            format!("Warning: {}.", sanitize(&tree_scope_warning_text(&warning))),
+            format!("Warning: {}.", sanitize(&warning.text(WarningScope::Tree))),
             theme.warning(),
         ));
     }
@@ -334,9 +332,12 @@ fn confirmation_lines(
     {
         lines.push(Line::styled(format!("Warning: {warning}"), theme.warning()));
     }
-    for warning in confirmation.target.warning_lines() {
+    for warning in confirmation.target.warnings() {
         lines.push(Line::styled(
-            format!("Warning: {}.", sanitize(&warning)),
+            format!(
+                "Warning: {}.",
+                sanitize(&warning.text(WarningScope::Process))
+            ),
             theme.warning(),
         ));
     }

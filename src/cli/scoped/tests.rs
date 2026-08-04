@@ -1,7 +1,3 @@
-// Only the freeze-first Unix tests build a target from a single row; the
-// Windows tree tests go through `entry_views` instead.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::model::PortEntryView;
 use crate::model::entry_views;
 use std::cell::RefCell;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -26,9 +22,9 @@ use crate::cli::test_support::entry_with_pid;
 use crate::cli::test_support::{entry, no_context};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::config::Config;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::model::{ChildProcess, ChildProcessSnapshot, PortEntry, ProcessContext, SocketState};
 use crate::model::{PermissionStatus, Platform, Protocol};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::model::{PortEntry, SocketState};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::observation::{
     EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot, OwnerCompleteness,
@@ -807,43 +803,6 @@ fn tree_confirmation_gates_yes_and_protected_roots() {
             false
         ),
         TreeConfirmDecision::PromptProtectedThenWord("tree"),
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn tree_banner_child_warning_uses_tree_scope() {
-    // Feed the rewrite the *real* warning_lines() output, not a copied
-    // literal: if the single-kill wording in process.rs ever drifts, the
-    // suffix rewrite silently stops matching, and only a test wired to the
-    // genuine source can catch that.
-    let row = entry(3000);
-    let context = ProcessContext {
-        children: ChildProcessSnapshot {
-            children: vec![
-                ChildProcess {
-                    pid: 18_430,
-                    process_name: None,
-                },
-                ChildProcess {
-                    pid: 18_431,
-                    process_name: None,
-                },
-            ],
-            truncated: false,
-        },
-        ..ProcessContext::default()
-    };
-    let target = KillTarget::from_entries(18_422, [PortEntryView::from(&row)], Some(&context));
-    let warning = target
-        .warning_lines()
-        .into_iter()
-        .find(|line| line.starts_with("target has"))
-        .expect("a target with children must warn about them");
-
-    assert_eq!(
-        crate::process::tree_scope_warning_text(&warning),
-        "target has 2 direct child process(es); tree kill targets the bounded descendant tree shown above",
     );
 }
 

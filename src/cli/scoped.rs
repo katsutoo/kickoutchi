@@ -916,10 +916,10 @@ fn print_tree_kill_banner(root: &KillTarget, preview: &tree::ProcessTreeTarget, 
     if let Some(warning) = scoped_owner_warning(preview, "tree") {
         eprintln!("Warning: {warning}.");
     }
-    for warning in root.warning_lines() {
+    for warning in root.warnings() {
         eprintln!(
             "Warning: {}.",
-            sanitize(&process::tree_scope_warning_text(&warning))
+            sanitize(&warning.text(process::WarningScope::Tree))
         );
     }
 }
@@ -1238,10 +1238,10 @@ fn print_group_kill_banner(root: &KillTarget, group: &tree::ProcessGroupTarget, 
     eprintln!(
         "Warning: a process group can include unrelated processes started from the same shell; review every member above."
     );
-    for warning in root.warning_lines() {
+    for warning in root.warnings() {
         eprintln!(
             "Warning: {}.",
-            sanitize(&process::group_scope_warning_text(&warning))
+            sanitize(&warning.text(process::WarningScope::Group))
         );
     }
 }

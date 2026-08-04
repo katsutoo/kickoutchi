@@ -15,7 +15,7 @@ use crate::observation::MetadataProfile;
 use crate::platform;
 use crate::process::{
     self, CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
-    TerminationOutcome, UnsafePidReason,
+    TerminationOutcome, UnsafePidReason, WarningScope,
 };
 use crate::protection::mark_protected;
 
@@ -527,8 +527,11 @@ fn print_kill_banner(target: &KillTarget, mode: KillMode) {
     if let Some(warning) = mode.force_warning(target.platform) {
         eprintln!("Warning: {}", sanitize(warning));
     }
-    for warning in target.warning_lines() {
-        eprintln!("Warning: {}.", sanitize(&warning));
+    for warning in target.warnings() {
+        eprintln!(
+            "Warning: {}.",
+            sanitize(&warning.text(WarningScope::Process))
+        );
     }
 }
 

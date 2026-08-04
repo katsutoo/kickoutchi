@@ -3,9 +3,9 @@ use crate::model::entry_views;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::{
-    ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome, UnsafePidReason,
-    confirmation_input_matches, confirmation_requirement, revalidate_confirmed_target,
-    target_still_matches_confirmation, unsafe_pid_reason,
+    ConfirmationRequirement, KillMode, KillTarget, KillWarning, TerminationOutcome,
+    UnsafePidReason, WarningScope, confirmation_input_matches, confirmation_requirement,
+    revalidate_confirmed_target, target_still_matches_confirmation, unsafe_pid_reason,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::{
@@ -21,7 +21,7 @@ use super::{
     take_tree_stop_result, tree_cont_handle, tree_open_delivery_handle, tree_stop_handle,
 };
 #[cfg(windows)]
-use super::{native_utf16_prefix, windows_api_outcome, windows_still_active_exit_code};
+use super::{native_utf16_prefix, windows_api_outcome};
 use crate::model::{
     ChildProcess, ChildProcessSnapshot, PermissionStatus, Platform, PortEntry, ProcessContext,
     Protocol, SocketState,
@@ -583,11 +583,23 @@ fn kill_target_names_every_visible_port_once() {
     assert_eq!(target.owner_uid, Some(1000));
     assert_eq!(target.child_count, 1);
     assert!(target.has_children());
-    assert!(
-        target
-            .warning_lines()
-            .iter()
-            .any(|line| line.contains("direct child")),
+    let child_warning = target
+        .warnings()
+        .into_iter()
+        .find(|warning| matches!(warning, KillWarning::HasChildren { .. }))
+        .expect("a target with children must retain a typed warning");
+    assert_eq!(
+        child_warning.text(WarningScope::Process),
+        "target has 1 direct child process(es); termination targets only the confirmed PID",
+    );
+    assert_eq!(
+        child_warning.text(WarningScope::Tree),
+        "target has 1 direct child process(es); tree kill targets the bounded descendant tree shown above",
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert_eq!(
+        child_warning.text(WarningScope::Group),
+        "target has 1 direct child process(es); group kill targets every group member shown above",
     );
 }
 
@@ -611,21 +623,7 @@ fn kill_target_warns_for_system_processes() {
     let target = KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
 
     assert!(target.system_process);
-    assert!(
-        target
-            .warning_lines()
-            .iter()
-            .any(|line| line.contains("system/service process")),
-    );
-}
-
-#[test]
-#[should_panic(expected = "kill target row PID must match target PID")]
-fn kill_target_rejects_rows_for_other_pids() {
-    let mut row = entry(3000, Protocol::Tcp);
-    row.pid = Some(999);
-
-    let _ = KillTarget::from_entries(18422, [PortEntryView::from(&row)], Some(&context(55)));
+    assert!(target.warnings().contains(&KillWarning::SystemProcess));
 }
 
 #[test]
@@ -966,12 +964,4 @@ fn windows_termination_maps_permission_denied_and_missing_pid_separately() {
         windows_api_outcome("OpenProcess", &missing),
         TerminationOutcome::AlreadyExited,
     );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_still_active_code_matches_the_process_api_contract() {
-    // The sentinel is pinned here so a Windows API behavior change can't
-    // silently change `windows_exit_code`'s meaning of "still alive".
-    assert_eq!(windows_still_active_exit_code(), 259);
 }

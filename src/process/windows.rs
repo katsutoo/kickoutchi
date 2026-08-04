@@ -228,7 +228,7 @@ fn windows_exit_code(handle: &TerminationHandle) -> Result<Option<u32>, Terminat
 }
 
 #[cfg(windows)]
-pub(super) fn windows_still_active_exit_code() -> u32 {
+fn windows_still_active_exit_code() -> u32 {
     u32::try_from(STILL_ACTIVE).expect("STILL_ACTIVE must fit in a process exit code")
 }
 

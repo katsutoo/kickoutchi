@@ -320,6 +320,33 @@ fn public_run_tracing_preserves_an_existing_subscriber_across_repeated_calls() {
 }
 
 #[test]
+fn verbose_diagnostics_use_stderr_without_contaminating_json_stdout() {
+    let config_dir = TemporaryDirectory::new("verbose-diagnostics");
+    let config_path = config_dir.path().join("config.toml");
+    fs::write(&config_path, "").expect("empty isolated config must be writable");
+    let output = run_command_with_deadline(
+        Command::new(kickoutchi_binary())
+            .arg("list")
+            .arg("--port")
+            .arg("65535")
+            .arg("--json")
+            .arg("--verbose")
+            .arg("--config")
+            .arg(config_path),
+        None,
+        REAL_BINARY_EXIT_WAIT,
+    )
+    .expect("verbose product command must exit before its deadline");
+
+    assert!(matches!(output.status.code(), Some(0 | 3)), "{output:?}");
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .expect("verbose diagnostics must leave stdout as valid JSON");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("verbose diagnostics enabled"), "{stderr}");
+    assert!(!output.stdout.windows(5).any(|bytes| bytes == b"DEBUG"));
+}
+
+#[test]
 fn binary_overrides_are_all_or_nothing() {
     fn helper() -> Command {
         let mut command = Command::new(std::env::current_exe().expect("test binary path resolves"));
