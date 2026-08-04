@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoped outcome reporting, TUI helpers, tree actions, tree planning,
   freeze-first execution, and module-local tests now live in focused child
   modules without changing public behavior.
+- Moved the remaining oversized inline test modules for the native platform
+  adapters, Windows tree execution, Docker enrichment, collection, CLI kill and
+  Why, UI rendering, diagnostics, and public output into child test files.
 - Classified the library target as internal binary bootstrap plumbing and hid it
   from generated API documentation instead of presenting `run()` as a supported
   embedding contract with process-global arguments, I/O, and signal lifecycle.
