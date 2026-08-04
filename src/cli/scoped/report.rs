@@ -56,13 +56,13 @@ where
 pub(super) fn map_windows_tree_outcome<CollectPorts>(
     root: &KillTarget,
     _mode: KillMode,
-    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    outcome: &crate::tree::windows::WindowsTreeKillOutcome,
     collect_ports: &mut CollectPorts,
 ) -> ExitReason
 where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    use crate::windows_tree::WindowsTreeKillOutcome;
+    use crate::tree::windows::WindowsTreeKillOutcome;
 
     match outcome {
         WindowsTreeKillOutcome::Completed(report) => {
@@ -75,7 +75,7 @@ where
 #[cfg(windows)]
 pub(super) fn map_windows_tree_completed_outcome<CollectPorts>(
     root: &KillTarget,
-    report: &crate::windows_tree::WindowsTreeKillReport,
+    report: &crate::tree::windows::WindowsTreeKillReport,
     collect_ports: &mut CollectPorts,
 ) -> ExitReason
 where
@@ -108,7 +108,7 @@ where
 #[cfg(windows)]
 pub(super) fn windows_tree_partial_report_text(
     root: &KillTarget,
-    report: &crate::windows_tree::WindowsTreeKillReport,
+    report: &crate::tree::windows::WindowsTreeKillReport,
 ) -> String {
     let job = if report.job_terminated_pids.is_empty() {
         format!("job-terminated 0 of {} observed process(es)", report.total)
@@ -174,8 +174,8 @@ pub(super) fn windows_tree_partial_report_text(
 }
 
 #[cfg(windows)]
-fn windows_cleanup_issue_text(issue: &crate::windows_tree::WindowsTreeCleanupIssue) -> String {
-    use crate::windows_tree::WindowsTreeCleanupIssue;
+fn windows_cleanup_issue_text(issue: &crate::tree::windows::WindowsTreeCleanupIssue) -> String {
+    use crate::tree::windows::WindowsTreeCleanupIssue;
 
     match issue {
         WindowsTreeCleanupIssue::WithheldJobThawFailed(error) => format!(
@@ -219,9 +219,9 @@ fn windows_wait_error_suffix(wait_errors: &[(u32, String)]) -> String {
 
 #[cfg(windows)]
 pub(super) fn windows_post_commit_issue_text(
-    issue: &crate::windows_tree::WindowsTreePostCommitIssue,
+    issue: &crate::tree::windows::WindowsTreePostCommitIssue,
 ) -> String {
-    use crate::windows_tree::WindowsTreePostCommitIssue;
+    use crate::tree::windows::WindowsTreePostCommitIssue;
 
     match issue {
         WindowsTreePostCommitIssue::RootAlreadyExited => {
@@ -271,9 +271,9 @@ pub(super) fn windows_post_commit_issue_text(
 
 #[cfg(windows)]
 pub(super) fn windows_post_commit_issue_exit_reason(
-    issue: &crate::windows_tree::WindowsTreePostCommitIssue,
+    issue: &crate::tree::windows::WindowsTreePostCommitIssue,
 ) -> ExitReason {
-    use crate::windows_tree::WindowsTreePostCommitIssue;
+    use crate::tree::windows::WindowsTreePostCommitIssue;
 
     match issue {
         WindowsTreePostCommitIssue::ProtectedDescendant { .. }
@@ -296,13 +296,13 @@ pub(super) fn windows_post_commit_issue_exit_reason(
 #[cfg(windows)]
 fn map_windows_tree_refusal_outcome<CollectPorts>(
     root: &KillTarget,
-    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    outcome: &crate::tree::windows::WindowsTreeKillOutcome,
     collect_ports: &mut CollectPorts,
 ) -> ExitReason
 where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    use crate::windows_tree::WindowsTreeKillOutcome;
+    use crate::tree::windows::WindowsTreeKillOutcome;
 
     match outcome {
         WindowsTreeKillOutcome::Completed(_) => unreachable!("completed outcome handled above"),
@@ -374,11 +374,11 @@ fn map_windows_tree_refusal(
 #[cfg(windows)]
 pub(super) fn map_windows_tree_system_failure(
     root: &KillTarget,
-    outcome: &crate::windows_tree::WindowsTreeKillOutcome,
+    outcome: &crate::tree::windows::WindowsTreeKillOutcome,
     collect_ports: &mut impl FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     stderr: &mut impl Write,
 ) -> ExitReason {
-    use crate::windows_tree::WindowsTreeKillOutcome;
+    use crate::tree::windows::WindowsTreeKillOutcome;
 
     match outcome {
         WindowsTreeKillOutcome::CommitFailed { pid, error } => {

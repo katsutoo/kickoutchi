@@ -39,13 +39,11 @@ mod query;
 mod release_archive_path;
 #[cfg(test)]
 mod test_support;
-// Shared process-tree planning. Linux/macOS use this module's freeze-first
-// executor; Windows uses a separate Job Object containment executor.
+// Shared process-tree planning with Unix freeze-first and Windows Job Object
+// execution kept as platform-specific children of one capability module.
 mod tree;
 mod ui;
 mod watch;
-#[cfg(windows)]
-mod windows_tree;
 
 #[cfg(fuzzing)]
 #[doc(hidden)]

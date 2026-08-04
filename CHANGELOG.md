@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moved the remaining oversized inline test modules for the native platform
   adapters, Windows tree execution, Docker enrichment, collection, CLI kill and
   Why, UI rendering, diagnostics, and public output into child test files.
+- Nested the Windows Job Object tree executor and its tests under the shared
+  process-tree capability instead of exposing a separate crate-root module.
 - Classified the library target as internal binary bootstrap plumbing and hid it
   from generated API documentation instead of presenting `run()` as a supported
   embedding contract with process-global arguments, I/O, and signal lifecycle.

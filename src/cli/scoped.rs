@@ -244,7 +244,7 @@ fn run_windows_tree_kill(
             collect_kill_ports: || collector::collect_kill_ports(args.pid, args.port),
             collect_ports: || collector::collect_ports_with_profile(MetadataProfile::IdentityOnly),
             prepare_root: process::prepare_termination,
-            execute: crate::windows_tree::execute_tree_kill,
+            execute: crate::tree::windows::execute_tree_kill,
         },
     )
 }
@@ -301,7 +301,7 @@ where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     PrepareRoot: FnMut(u32) -> Result<RootHandle, TerminationOutcome>,
     Execute:
-        FnMut(&KillTarget, &[String], bool, bool) -> crate::windows_tree::WindowsTreeKillOutcome,
+        FnMut(&KillTarget, &[String], bool, bool) -> crate::tree::windows::WindowsTreeKillOutcome,
 {
     let snapshot = match (seams.collect_tree)() {
         Ok(snapshot) => snapshot,
@@ -356,7 +356,7 @@ where
         match (seams.prepare_root)(root.pid) {
             Ok(handle) => Some(handle),
             Err(outcome) => {
-                let outcome = crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(
+                let outcome = crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome(
                     tree_outcome_from_termination(&root, outcome),
                 );
                 return map_windows_tree_outcome(&root, mode, &outcome, &mut seams.collect_ports);
@@ -400,7 +400,7 @@ fn revalidate_windows_tree_root_before_commit<CollectTree, CollectContext, Colle
     collect_tree: &mut CollectTree,
     collect_context: &mut CollectContext,
     collect_ports: &mut CollectPorts,
-) -> Result<KillTarget, crate::windows_tree::WindowsTreeKillOutcome>
+) -> Result<KillTarget, crate::tree::windows::WindowsTreeKillOutcome>
 where
     CollectTree: FnMut() -> Result<Vec<tree::TreeProcessInfo>, collector::CollectorError>,
     CollectContext: FnMut(u32) -> ProcessContext,
@@ -408,20 +408,20 @@ where
 {
     let fresh_root = if confirmed.ports.is_empty() {
         let snapshot = collect_tree().map_err(|error| {
-            crate::windows_tree::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
+            crate::tree::windows::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
         })?;
         let root = revalidate_portless_tree_root(confirmed, &snapshot, &config.protected_processes)
-            .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+            .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
         windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
     } else {
         let root = revalidate_cli_target(args, config, confirmed, collect_context, collect_ports)
             .map_err(|outcome| {
             let outcome = tree_outcome_from_termination(confirmed, outcome);
-            crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(outcome)
+            crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome(outcome)
         })?;
         let snapshot = collect_tree().map_err(|error| {
-            crate::windows_tree::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
+            crate::tree::windows::WindowsTreeKillOutcome::snapshot_failed(error.to_string())
         })?;
         windows_fresh_tree_gates(&root, &snapshot, config, confirmation)?;
         root
@@ -435,7 +435,7 @@ fn windows_fresh_tree_gates(
     snapshot: &[tree::TreeProcessInfo],
     config: &Config,
     confirmation: ScopedConfirmationFacts,
-) -> Result<(), crate::windows_tree::WindowsTreeKillOutcome> {
+) -> Result<(), crate::tree::windows::WindowsTreeKillOutcome> {
     let preview = tree::plan_process_tree(
         root.pid,
         snapshot,
@@ -444,13 +444,13 @@ fn windows_fresh_tree_gates(
         tree::MAX_TREE_PROCESSES,
     )
     .map_err(tree::plan_error_outcome)
-    .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+    .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     tree::preflight_outcome(&preview)
-        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+        .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     tree::root_protection_outcome(&preview, confirmation.protected_confirmed)
-        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+        .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     fresh_tree_yes_outcome(root, &preview, confirmation)
-        .map_err(crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome)?;
+        .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     if let Some(pid) = preview
         .preview_nodes(preview.len())
         .iter()
@@ -459,7 +459,7 @@ fn windows_fresh_tree_gates(
             (info.process_name.is_none() || info.start_time_marker.is_none()).then_some(info.pid)
         })
     {
-        return Err(crate::windows_tree::WindowsTreeKillOutcome::Refused(
+        return Err(crate::tree::windows::WindowsTreeKillOutcome::Refused(
             TreeRefusal::PartialMetadata { pid },
         ));
     }

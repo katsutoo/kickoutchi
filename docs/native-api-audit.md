@@ -18,7 +18,7 @@ replace working native integrations.
 | `src/platform/macos.rs` | 23 | libproc, sysctl, and native socket rows |
 | `src/platform/windows.rs` | 31 | process snapshots, handles, and IP Helper tables |
 | `src/process.rs`, `src/process/{linux,macos,windows}.rs` | 23 | signals, pidfds, and Windows process handles |
-| `src/windows_tree.rs` | 12 | jobs, process handles, membership, and termination |
+| `src/tree/windows.rs` | 12 | jobs, process handles, membership, and termination |
 | `src/ui/mod.rs` | 14 | terminal signal lifecycle and restoration |
 | `src/ui/confirm.rs` | 1 | test-only effective-user query |
 | `src/cli/watch/{signal,tests}.rs` | 7 | console and signal handler lifecycle, including test-only disposition checks |

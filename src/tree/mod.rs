@@ -33,6 +33,8 @@ mod execute;
 mod plan;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests;
+#[cfg(windows)]
+pub(crate) mod windows;
 
 use crate::observation::ProcessStartMarker;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

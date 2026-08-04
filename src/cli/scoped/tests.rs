@@ -38,10 +38,10 @@ use crate::observation::{
 use crate::process::KillMode;
 use crate::process::KillTarget;
 use crate::process::TerminationOutcome;
+#[cfg(windows)]
+use crate::tree::windows::WindowsTreeTerminationState;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::tree::{ProcessTreeTarget, TreeProcessInfo, TreeProcessOps, TreeSignalResult};
-#[cfg(windows)]
-use crate::windows_tree::WindowsTreeTerminationState;
 
 #[test]
 fn already_exited_single_outcome_maps_to_root_already_exited() {
@@ -63,8 +63,8 @@ fn already_exited_single_outcome_maps_to_root_already_exited() {
     assert_eq!(refusal, crate::tree::TreeKillOutcome::RootAlreadyExited);
     #[cfg(windows)]
     assert_eq!(
-        crate::windows_tree::WindowsTreeKillOutcome::from_precommit_outcome(refusal.clone()),
-        crate::windows_tree::WindowsTreeKillOutcome::Refused(refusal),
+        crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome(refusal.clone()),
+        crate::tree::windows::WindowsTreeKillOutcome::Refused(refusal),
     );
 }
 
@@ -111,7 +111,7 @@ fn panic_windows_tree_execute(
     _protected: &[String],
     _confirmed: bool,
     _skipped: bool,
-) -> crate::windows_tree::WindowsTreeKillOutcome {
+) -> crate::tree::windows::WindowsTreeKillOutcome {
     panic!("authoritative refusal must precede Job Object assignment")
 }
 
@@ -291,25 +291,25 @@ fn windows_post_commit_protected_issue_exits_with_protected_code() {
         child_count: 0,
         children_truncated: false,
     };
-    let report = crate::windows_tree::WindowsTreeKillReport {
+    let report = crate::tree::windows::WindowsTreeKillReport {
         total: 1,
         job_terminated_pids: vec![100],
         already_exited_pids: Vec::new(),
         not_terminated: vec![101],
         termination_state: WindowsTreeTerminationState::Partial,
         post_commit_issue: Some(
-            crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
+            crate::tree::windows::WindowsTreePostCommitIssue::ProtectedDescendant {
                 pid: 101,
                 name: Some("lsass.exe".to_owned()),
             },
         ),
         secondary_post_commit_issue: Some(
-            crate::windows_tree::WindowsTreePostCommitIssue::SnapshotFailed(
+            crate::tree::windows::WindowsTreePostCommitIssue::SnapshotFailed(
                 "freezing committed Job Object failed: freeze failed".to_owned(),
             ),
         ),
         cleanup_issue: Some(
-            crate::windows_tree::WindowsTreeCleanupIssue::WithheldJobThawFailed(
+            crate::tree::windows::WindowsTreeCleanupIssue::WithheldJobThawFailed(
                 "thaw failed".to_owned(),
             ),
         ),
@@ -324,7 +324,7 @@ fn windows_post_commit_protected_issue_exits_with_protected_code() {
 #[cfg(windows)]
 #[test]
 fn windows_post_commit_warning_refusal_is_visible_and_fails() {
-    let issue = crate::windows_tree::WindowsTreePostCommitIssue::FreshConfirmationRequired;
+    let issue = crate::tree::windows::WindowsTreePostCommitIssue::FreshConfirmationRequired;
 
     let text = super::windows_post_commit_issue_text(&issue);
     let reason = super::windows_post_commit_issue_exit_reason(&issue);
@@ -336,7 +336,7 @@ fn windows_post_commit_warning_refusal_is_visible_and_fails() {
 #[cfg(windows)]
 #[test]
 fn windows_post_commit_protected_root_requires_confirmation() {
-    let issue = crate::windows_tree::WindowsTreePostCommitIssue::ProtectedRoot {
+    let issue = crate::tree::windows::WindowsTreePostCommitIssue::ProtectedRoot {
         pid: 100,
         name: Some("lsass.exe".to_owned()),
     };
@@ -369,7 +369,7 @@ fn windows_tree_success_polls_post_kill_visibility() {
         child_count: 0,
         children_truncated: false,
     };
-    let report = crate::windows_tree::WindowsTreeKillReport {
+    let report = crate::tree::windows::WindowsTreeKillReport {
         total: 1,
         job_terminated_pids: vec![100],
         already_exited_pids: Vec::new(),
@@ -407,25 +407,25 @@ fn windows_partial_report_names_every_outcome_pid() {
         child_count: 0,
         children_truncated: false,
     };
-    let report = crate::windows_tree::WindowsTreeKillReport {
+    let report = crate::tree::windows::WindowsTreeKillReport {
         total: 3,
         job_terminated_pids: Vec::new(),
         already_exited_pids: vec![102],
         not_terminated: vec![100, 103],
         termination_state: WindowsTreeTerminationState::Withheld,
         post_commit_issue: Some(
-            crate::windows_tree::WindowsTreePostCommitIssue::ProtectedDescendant {
+            crate::tree::windows::WindowsTreePostCommitIssue::ProtectedDescendant {
                 pid: 103,
                 name: Some("lsass.exe".to_owned()),
             },
         ),
         secondary_post_commit_issue: Some(
-            crate::windows_tree::WindowsTreePostCommitIssue::SnapshotFailed(
+            crate::tree::windows::WindowsTreePostCommitIssue::SnapshotFailed(
                 "freezing committed Job Object failed: freeze failed".to_owned(),
             ),
         ),
         cleanup_issue: Some(
-            crate::windows_tree::WindowsTreeCleanupIssue::WithheldJobThawFailed(
+            crate::tree::windows::WindowsTreeCleanupIssue::WithheldJobThawFailed(
                 "thaw failed".to_owned(),
             ),
         ),
@@ -478,9 +478,9 @@ fn failed_windows_job_mapping_prints_partial_report_and_refreshes_ports() {
         child_count: 0,
         children_truncated: false,
     };
-    let outcome = crate::windows_tree::WindowsTreeKillOutcome::JobTerminateFailed {
+    let outcome = crate::tree::windows::WindowsTreeKillOutcome::JobTerminateFailed {
         error: "job failed".to_owned(),
-        report: Box::new(crate::windows_tree::WindowsTreeKillReport {
+        report: Box::new(crate::tree::windows::WindowsTreeKillReport {
             total: 2,
             job_terminated_pids: Vec::new(),
             already_exited_pids: vec![102],
@@ -489,7 +489,7 @@ fn failed_windows_job_mapping_prints_partial_report_and_refreshes_ports() {
             post_commit_issue: None,
             secondary_post_commit_issue: None,
             cleanup_issue: Some(
-                crate::windows_tree::WindowsTreeCleanupIssue::FailedTerminationThawFailed(
+                crate::tree::windows::WindowsTreeCleanupIssue::FailedTerminationThawFailed(
                     "thaw failed".to_owned(),
                 ),
             ),
