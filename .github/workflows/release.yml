@@ -61,24 +61,50 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # One reviewed policy owns the hand-maintained verification/installer
+  # matrices and every release timeout. cargo-dist continues to own the native
+  # artifact target matrix through dist-workspace.toml.
+  release-policy:
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      verify-matrix: ${{ steps.policy.outputs.verify_matrix }}
+      installer-matrix: ${{ steps.policy.outputs.installer_matrix }}
+      timeouts: ${{ steps.policy.outputs.timeouts }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - id: policy
+        name: Load release policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=.github/release-policy.json
+          jq -e '
+            .schema == 1 and
+            .artifact_targets_source == "dist-workspace.toml" and
+            (.verify_matrix.include | length == 4) and
+            (.installer_matrix.include | length == 3) and
+            ([.timeouts[] | type == "number" and . >= 1 and . <= 60] | all)
+          ' "$policy" >/dev/null
+          echo "verify_matrix=$(jq -c '.verify_matrix' "$policy")" >> "$GITHUB_OUTPUT"
+          echo "installer_matrix=$(jq -c '.installer_matrix' "$policy")" >> "$GITHUB_OUTPUT"
+          echo "timeouts=$(jq -c '.timeouts' "$policy")" >> "$GITHUB_OUTPUT"
+
   # Publication is gated here rather than relying on checks from another run:
   # every check below uses this workflow's exact github.sha.
   verify:
     name: Verify (${{ matrix.name }})
+    needs:
+      - release-policy
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-latest
-          - name: Windows
-            runner: windows-latest
-          - name: macOS
-            runner: macos-latest
-          - name: Supply Chain
-            runner: ubuntu-latest
+      matrix: ${{ fromJSON(needs.release-policy.outputs.verify-matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).verify }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -163,8 +189,10 @@ jobs:
 
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - release-policy
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 20
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).plan }}
     permissions:
       contents: read
     outputs:
@@ -213,6 +241,7 @@ jobs:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
+      - release-policy
       - plan
       - verify
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
@@ -230,7 +259,7 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).build_local_artifacts }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
@@ -347,11 +376,12 @@ jobs:
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
+      - release-policy
       - plan
       - verify
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 30
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).build_global_artifacts }}
     env:
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
@@ -403,29 +433,17 @@ jobs:
   validate-installers:
     name: Validate installer (${{ matrix.name }})
     needs:
+      - release-policy
       - plan
       - verify
       - build-global-artifacts
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).validate_installers }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-22.04
-            installer: kickoutchi-installer.sh
-            targets_json: '["x86_64-unknown-linux-gnu"]'
-          - name: macOS ARM64
-            runner: macos-14
-            installer: kickoutchi-installer.sh
-            targets_json: '["aarch64-apple-darwin"]'
-          - name: Windows x64
-            runner: windows-2022
-            installer: kickoutchi-installer.ps1
-            targets_json: '["x86_64-pc-windows-msvc"]'
+      matrix: ${{ fromJSON(needs.release-policy.outputs.installer-matrix) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -462,14 +480,15 @@ jobs:
   attest-release-artifacts:
     name: Attest release artifacts
     needs:
+      - release-policy
       - plan
       - verify
       - build-local-artifacts
       - build-global-artifacts
       - validate-installers
-    if: ${{ always() && (needs.plan.outputs.publishing == 'true' || github.event_name == 'workflow_dispatch') && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.build-global-artifacts.result == 'success' && needs.validate-installers.result == 'success' }}
+    if: ${{ always() && needs.release-policy.result == 'success' && (needs.plan.outputs.publishing == 'true' || github.event_name == 'workflow_dispatch') && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.build-global-artifacts.result == 'success' && needs.validate-installers.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 15
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).attest_release_artifacts }}
     permissions:
       contents: read
       id-token: write
@@ -513,6 +532,7 @@ jobs:
   # Determines if we should publish/announce
   host:
     needs:
+      - release-policy
       - plan
       - verify
       - build-local-artifacts
@@ -520,9 +540,9 @@ jobs:
       - validate-installers
       - attest-release-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.validate-installers.result == 'success' && needs.attest-release-artifacts.result == 'success' }}
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.validate-installers.result == 'success' && needs.attest-release-artifacts.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 20
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).host }}
     permissions:
       contents: write
     outputs:
@@ -598,12 +618,13 @@ jobs:
 
   validate-published-release:
     needs:
+      - release-policy
       - plan
       - host
       - attest-published-manifest
-    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest-published-manifest.result == 'success' }}
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest-published-manifest.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 15
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).validate_published_release }}
     permissions:
       contents: read
       attestations: read
@@ -656,11 +677,12 @@ jobs:
   attest-published-manifest:
     name: Attest published release manifest
     needs:
+      - release-policy
       - plan
       - host
-    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 10
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).attest_published_manifest }}
     permissions:
       contents: read
       id-token: write
@@ -699,11 +721,12 @@ jobs:
   # output while keeping the SHA pins and narrowed permissions used here.
   publish-homebrew-formula:
     needs:
+      - release-policy
       - plan
       - host
       - validate-published-release
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 30
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).publish_homebrew_formula }}
     permissions:
       contents: read
     env:
@@ -778,6 +801,7 @@ jobs:
 
   publication-complete:
     needs:
+      - release-policy
       - plan
       - host
       - publish-homebrew-formula
@@ -785,9 +809,9 @@ jobs:
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && needs.validate-published-release.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
+    if: ${{ always() && needs.release-policy.result == 'success' && needs.host.result == 'success' && needs.validate-published-release.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 10
+    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).publication_complete }}
     steps:
       - name: Confirm publication gates
         run: "true"

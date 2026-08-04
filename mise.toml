@@ -47,6 +47,10 @@ run = "cargo test --locked --all-features"
 description = "Run documentation tests"
 run = "cargo test --locked --all-features --doc"
 
+[tasks.mutants-safety]
+description = "Mutation-test typed warnings and confirmation matching"
+run = "cargo mutants --cargo-arg=--locked -f 'src/process.rs' -F 'KillTarget::warnings|KillWarning::text|confirmation_input_matches' --timeout 60 --build-timeout 120 --jobs 2"
+
 [tasks.build-release]
 description = "Build both optimized release binaries"
 run = "cargo build --locked --release --all-features --bin kickoutchi --bin kick"

@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prose suffix recognition and scope-specific rewrite helpers. Pruned the
   obsolete implementation-coupling test and two low-value private/trivial tests
   while preserving destructive-path and real-binary coverage.
+- Centralized release verification lanes, installer platform mapping, and job
+  timeouts in a validated release-policy document while retaining cargo-dist's
+  artifact target matrix as its single source of truth.
+- Split the CLI contract suite by command and moved shared subprocess,
+  socket/process, and workflow-parser fixtures under `tests/support/`. Contract
+  names and safety behavior remain intact while individual files now have clear
+  ownership.
+- Added a documented, bounded mutation campaign for typed warnings and
+  confirmation matching. Mutation evidence justified removing a redundant
+  private decision table and exposed two warning branches plus a tree metadata
+  wait diagnostic that now have focused behavioral coverage.
 - Moved package-manager installation ahead of direct remote-installer commands
   in the README.
 - Changed optional Docker enrichment from default-on to explicit opt-in.

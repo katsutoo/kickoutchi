@@ -919,7 +919,7 @@ fn protected_names_are_marked_from_config() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tree_kill {
     use super::{App, Modal, app_with_rows, context, entry, mpsc};
-    use crate::app::{TreeConfirmStage, TreePreviewWorker, TreeSubmitVerdict};
+    use crate::app::{TreeConfirmStage, TreePreviewWorker};
     use crate::collector::{Collector, FakeCollector};
     use crate::input::Action;
     use crate::model::Platform;
@@ -1128,10 +1128,42 @@ mod tree_kill {
         let confirmation = app.tree_confirmation().expect("confirmation stays open");
         assert!(confirmation.input.is_empty());
         assert!(confirmation.error.is_none());
-        assert!(matches!(
-            app.tree_submit_verdict(),
-            Some(TreeSubmitVerdict::Reject(_)),
-        ));
+    }
+
+    #[test]
+    fn execute_waits_for_process_metadata_before_tree_signals() {
+        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        app.apply_action(Action::RequestTreeTerminate);
+        app.tree_confirmation
+            .as_mut()
+            .expect("tree confirmation opens")
+            .target
+            .process_start_time_marker = None;
+        let infos = vec![tree_info(3000, Some(1), "node", 55)];
+        app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+        let mut ops = FakeTreeOps::new(infos);
+
+        app.execute_tree_kill_confirmation_with(
+            || panic!("metadata wait must precede port collection"),
+            || panic!("metadata wait must precede visibility polling"),
+            |_| panic!("metadata wait must precede synchronous context collection"),
+            &mut ops,
+        );
+
+        let confirmation = app
+            .tree_confirmation()
+            .expect("confirmation remains open while metadata loads");
+        assert_eq!(app.modal(), Modal::ConfirmTreeKill);
+        assert!(ops.stops.is_empty());
+        assert!(ops.delivered.is_empty());
+        assert!(
+            confirmation
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("still reading process metadata")),
+            "{:?}",
+            confirmation.error,
+        );
     }
 
     #[test]
@@ -1172,47 +1204,6 @@ mod tree_kill {
             "{:?}",
             app.kill_status(),
         );
-    }
-
-    #[test]
-    fn submit_verdict_covers_the_whole_decision_table() {
-        let mut app = app_with_rows(vec![entry(5432, Some("postgres"))]);
-        app.apply_action(Action::RequestTreeTerminate);
-        let infos = vec![tree_info(5432, Some(500), "postgres", 55)];
-        app.finish_tree_preview_for_test(Ok(preview_of(&infos, 5432)));
-
-        // Protected root: wrong input rejects, the name advances to the
-        // word stage, and only the word executes.
-        let confirmation = app.tree_confirmation().expect("confirmation open");
-        assert_eq!(confirmation.stage, TreeConfirmStage::ProtectedRoot);
-
-        for ch in "nope".chars() {
-            app.apply_action(Action::KillInputAppend(ch));
-        }
-        assert!(matches!(
-            app.tree_submit_verdict(),
-            Some(TreeSubmitVerdict::Reject(_)),
-        ));
-
-        let mut app2 = app;
-        {
-            let confirmation = app2.tree_confirmation.as_mut().expect("open");
-            confirmation.input = "postgres".to_owned();
-        }
-        assert_eq!(
-            app2.tree_submit_verdict(),
-            Some(TreeSubmitVerdict::AdvanceToWord),
-        );
-        app2.apply_action(Action::SubmitKillConfirmation);
-        let confirmation = app2.tree_confirmation().expect("still open");
-        assert_eq!(confirmation.stage, TreeConfirmStage::Word);
-        assert!(confirmation.input.is_empty(), "input clears between stages");
-
-        {
-            let confirmation = app2.tree_confirmation.as_mut().expect("open");
-            confirmation.input = "TREE".to_owned();
-        }
-        assert_eq!(app2.tree_submit_verdict(), Some(TreeSubmitVerdict::Execute));
     }
 
     #[test]

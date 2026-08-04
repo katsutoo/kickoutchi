@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "artifact_targets_source": "dist-workspace.toml",
+  "verify_matrix": {
+    "include": [
+      { "name": "Linux", "runner": "ubuntu-latest" },
+      { "name": "Windows", "runner": "windows-latest" },
+      { "name": "macOS", "runner": "macos-latest" },
+      { "name": "Supply Chain", "runner": "ubuntu-latest" }
+    ]
+  },
+  "installer_matrix": {
+    "include": [
+      {
+        "name": "Linux x64",
+        "runner": "ubuntu-22.04",
+        "installer": "kickoutchi-installer.sh",
+        "targets_json": "[\"x86_64-unknown-linux-gnu\"]"
+      },
+      {
+        "name": "macOS ARM64",
+        "runner": "macos-14",
+        "installer": "kickoutchi-installer.sh",
+        "targets_json": "[\"aarch64-apple-darwin\"]"
+      },
+      {
+        "name": "Windows x64",
+        "runner": "windows-2022",
+        "installer": "kickoutchi-installer.ps1",
+        "targets_json": "[\"x86_64-pc-windows-msvc\"]"
+      }
+    ]
+  },
+  "timeouts": {
+    "release_policy": 5,
+    "verify": 35,
+    "plan": 20,
+    "build_local_artifacts": 45,
+    "build_global_artifacts": 30,
+    "validate_installers": 20,
+    "attest_release_artifacts": 15,
+    "host": 20,
+    "validate_published_release": 15,
+    "attest_published_manifest": 10,
+    "publish_homebrew_formula": 30,
+    "publication_complete": 10
+  }
+}

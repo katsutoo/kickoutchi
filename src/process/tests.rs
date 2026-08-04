@@ -626,6 +626,51 @@ fn kill_target_warns_for_system_processes() {
     assert!(target.warnings().contains(&KillWarning::SystemProcess));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn owner_warnings_distinguish_matching_and_foreign_uids() {
+    let current_uid = super::current_user_id();
+    let mut matching_context = context(55);
+    matching_context.owner_uid = Some(current_uid);
+    let matching = KillTarget::from_entries(
+        18422,
+        [PortEntryView::from(&entry(3000, Protocol::Tcp))],
+        Some(&matching_context),
+    );
+    assert!(
+        !matching
+            .warnings()
+            .iter()
+            .any(|warning| matches!(warning, KillWarning::OwnerMismatch { .. })),
+        "the current user's process must not be reported as foreign",
+    );
+
+    let mut partial_row = entry(3000, Protocol::Tcp);
+    partial_row.permission = PermissionStatus::Partial;
+    let mut foreign_context = context(55);
+    foreign_context.owner_uid = Some(current_uid ^ 1);
+    let foreign = KillTarget::from_entries(
+        18422,
+        [PortEntryView::from(&partial_row)],
+        Some(&foreign_context),
+    );
+    let warnings = foreign.warnings();
+    assert!(
+        warnings.iter().any(|warning| matches!(
+            warning,
+            KillWarning::OwnerMismatch {
+                owner_uid,
+                current_uid: warning_current_uid,
+            } if *owner_uid == current_uid ^ 1 && *warning_current_uid == current_uid
+        )),
+        "a foreign owner must retain the actionable UID warning",
+    );
+    assert!(
+        !warnings.contains(&KillWarning::PartialMetadata),
+        "the generic partial-metadata warning must not duplicate the UID warning",
+    );
+}
+
 #[test]
 fn confirmation_requirements_keep_yes_from_bypassing_protected_processes() {
     assert_eq!(

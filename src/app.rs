@@ -1120,10 +1120,9 @@ impl App {
         self.kill_status = Some("tree kill cancelled".to_owned());
     }
 
-    /// Decide what one Enter press on the tree confirmation means, without
-    /// mutating anything — separated from [`Self::submit_tree_confirmation`] so
-    /// tests can pin the whole decision table, including the Execute verdict,
-    /// without triggering a real kill.
+    /// Decide what one Enter press on the tree confirmation means from an
+    /// immutable view. Keeping the decision typed makes the stage transition
+    /// explicit and lets the follow-up mutation happen after the shared borrow.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn tree_submit_verdict(&self) -> Option<TreeSubmitVerdict> {
         let confirmation = self.tree_confirmation.as_ref()?;
