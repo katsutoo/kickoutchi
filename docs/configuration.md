@@ -58,7 +58,8 @@ valid and therefore selects all built-in defaults.
 `--refresh-interval SECONDS` is the global CLI override for
 `refresh_interval_seconds`; it accepts `1..=3600`. For `list`, `--sort MODE`
 overrides `default_sort` for that invocation. There are no CLI overrides for
-`hide_system_processes`, `confirm_force_kill`, `protected_processes`, or `ports`.
+`hide_system_processes`, `confirm_force_kill`, `docker_enrichment`,
+`protected_processes`, or `ports`.
 
 The watch polling interval is separate: `watch --interval` does not use
 `refresh_interval_seconds`.
@@ -71,6 +72,7 @@ The watch polling interval is separate: `watch --interval` does not use
 | `default_sort` | string | `"port"` | Exactly `"port"`, `"pid"`, `"protocol"`, `"process"`, `"parent"`, or `"scope"`. Sets the initial TUI sort and the `list` sort when `--sort` is absent. |
 | `hide_system_processes` | boolean | `false` | When `true`, conservatively classified system/service rows are hidden from normal `list` and TUI views. It does not affect `watch` or `list --snapshot-json`. |
 | `confirm_force_kill` | boolean | `true` | When `true`, force kill uses stronger typed confirmation unless `--yes` applies. It does not weaken protected-process confirmation. |
+| `docker_enrichment` | boolean | `true` | When `true`, qualifying TUI details and termination-context requests may run a bounded, PATH-resolved Docker CLI query for optional container metadata. When `false`, Kickoutchi never resolves or executes the Docker CLI. Native socket evidence and termination policy are unaffected. |
 | `check_for_updates` | boolean | N/A | Deprecated compatibility key. Both `true` and `false` are accepted and ignored so older configuration files still load. Kickoutchi performs no automatic update check. Non-boolean values remain invalid. |
 | `protected_processes` | array of strings | `[]` as a configured extension | Adds names to the built-in protected set; it never replaces that set. Empty names are invalid. The merged, exactly deduplicated set may contain at most 256 names. |
 | `ports` | array of tables | empty | Defines up to 256 validated endpoint label selectors. See [Endpoint labels](#endpoint-labels). |

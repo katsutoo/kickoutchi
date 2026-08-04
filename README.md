@@ -152,11 +152,15 @@ subcommand opens the TUI.
 
 ### Direct PID safety policy
 
-A direct `--pid` kill may intentionally target an ordinary parent process,
-including the shell that launched Kickoutchi. For example,
-`kick kill --pid "$PPID" --yes` terminates the invoking Unix shell without an
-additional parent-specific override. Treat `--yes` as authorization for exactly
-the PID you supplied and inspect an unfamiliar target before using it.
+A plain `kill --pid PID` targets one process only when a fresh socket snapshot
+verifies that the PID owns at least one visible open port. It does not fall back
+to the process table for a live, portless PID. Use `--tree` (or `--group` on
+Linux and macOS) when the root process owns no visible port; those scoped modes
+can resolve a live root from a fresh process-table snapshot.
+
+Treat `--yes` as authorization for exactly the resolved target or scope. It
+skips the prompt, but it does not broaden target resolution or bypass safety
+checks.
 
 Kickoutchi always refuses PID 0, PID 1, Windows System PID 4, and its own current
 PID. Tree and group kills also refuse a scope containing Kickoutchi itself so
@@ -210,6 +214,7 @@ refresh_interval_seconds = 3
 default_sort = "port"
 hide_system_processes = false
 confirm_force_kill = true
+docker_enrichment = true
 protected_processes = ["redis-server"]
 
 [[ports]]
@@ -224,6 +229,10 @@ address = "*"
 port = 8080
 label = "local web services"
 ```
+
+Set `docker_enrichment = false` to prevent Kickoutchi from resolving or running
+the Docker CLI. When enabled, Docker is used only for optional, bounded TUI
+process-context details; native socket collection remains authoritative.
 
 Configured protected names extend the built-in safety list. Exact endpoint labels
 take precedence over wildcard labels. See [`docs/configuration.md`](docs/configuration.md)

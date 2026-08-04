@@ -221,6 +221,30 @@ impl ForceKillConfirmation {
     }
 }
 
+/// Whether selected-row context collection may request optional Docker details.
+///
+/// A named policy keeps external-process permission explicit when it crosses
+/// from configuration into the background worker.
+#[derive(Debug, Clone, Copy)]
+enum DockerEnrichmentPolicy {
+    Enabled,
+    Disabled,
+}
+
+impl DockerEnrichmentPolicy {
+    fn from_config(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
 /// The mutable guts of the TUI.
 #[derive(Debug)]
 pub(crate) struct App {
@@ -232,6 +256,7 @@ pub(crate) struct App {
     sort_mode: SortMode,
     hide_system_processes: bool,
     force_kill_confirmation: ForceKillConfirmation,
+    docker_enrichment: DockerEnrichmentPolicy,
     protected_processes: Vec<String>,
     labels: crate::labels::LabelRegistry,
     network_snapshot: Option<crate::observation::NetworkSnapshot>,
@@ -301,6 +326,7 @@ impl App {
             sort_mode: config.default_sort,
             hide_system_processes: config.hide_system_processes,
             force_kill_confirmation: ForceKillConfirmation::from_config(config.confirm_force_kill),
+            docker_enrichment: DockerEnrichmentPolicy::from_config(config.docker_enrichment),
             protected_processes: config.protected_processes.clone(),
             labels: config.labels.clone(),
             network_snapshot: None,
@@ -1566,12 +1592,13 @@ impl App {
             ipv6_scope: view.ipv6_scope,
         };
         let key = RowKey::from(&entry);
+        let docker_enrichment = self.docker_enrichment.enabled();
         match crate::ui::spawn_worker(
             thread::Builder::new().name("kickoutchi-details".to_owned()),
             move || {
                 // The worker outlives the snapshot the view borrowed, so the row
                 // is owned across the thread boundary and re-borrowed here.
-                collect_selected_process_context(PortEntryView::from(&entry))
+                collect_selected_process_context(PortEntryView::from(&entry), docker_enrichment)
             },
         ) {
             Ok(worker) => {

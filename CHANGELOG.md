@@ -7,13 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added a `docker_enrichment` configuration switch, enabled by default for
+  compatibility. Disabling it guarantees that optional TUI process-context
+  collection never resolves or executes the Docker CLI.
+
 ### Changed
 
-- Split the oversized observation, process, watch, scoped-kill, and TUI app
-  modules along existing responsibility boundaries. Limits, legacy projection,
-  OS-specific termination, watch filtering and signal ownership, scoped outcome
-  reporting, TUI helpers, tree actions, and module-local tests now live in
-  focused child modules without changing public behavior.
+- Split the oversized observation, process, watch, scoped-kill, TUI app, and
+  process-tree modules along existing responsibility boundaries. Limits, legacy
+  projection, OS-specific termination, watch filtering and signal ownership,
+  scoped outcome reporting, TUI helpers, tree actions, tree planning,
+  freeze-first execution, and module-local tests now live in focused child
+  modules without changing public behavior.
+- Classified the library target as internal binary bootstrap plumbing and hid it
+  from generated API documentation instead of presenting `run()` as a supported
+  embedding contract with process-global arguments, I/O, and signal lifecycle.
+
+### Fixed
+
+- Corrected the direct-PID documentation: an unscoped PID must own a visible
+  open port, while tree and group targeting may resolve a live portless root.
 
 ## [1.3.10] - 2026-08-02
 

@@ -116,7 +116,7 @@ pub(crate) enum Command {
     /// lines. See the structured output documentation for schemas and privacy
     /// guidance.
     List(ListArgs),
-    /// Terminate the process owning a port or PID (after confirmation).
+    /// Terminate a verified port owner, process tree, or process group.
     Kill(KillArgs),
     /// Show a process's family — ancestors, descendants, siblings, process
     /// group, and ports — read-only, to pick the right root for a tree kill.
@@ -231,8 +231,8 @@ pub(crate) struct ListArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
 pub(crate) struct KillArgs {
-    /// PID of the process to terminate. Ordinary parent processes are allowed;
-    /// PID 0, PID 1, Windows System PID 4, and Kickoutchi itself are refused.
+    /// PID to target. A plain PID kill requires a visible owned port; a scoped
+    /// kill may start from a live portless root. Unsafe PIDs are refused.
     #[arg(long)]
     pid: Option<u32>,
 
@@ -251,15 +251,16 @@ pub(crate) struct KillArgs {
 
     /// Terminate the whole process tree rooted at the target, not just the one
     /// process. Opt-in; typed confirmation unless --yes passes all-clear gates.
-    /// Linux, macOS, and Windows CLI only.
+    /// May start from a live root with no visible port. Linux, macOS, and
+    /// Windows CLI only.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[arg(long)]
     tree: bool,
 
     /// Terminate the target's whole process group — every process sharing its
     /// group ID, including members that reparented away from the tree. Opt-in;
-    /// typed confirmation unless --yes passes all-clear gates. Linux and macOS
-    /// only.
+    /// typed confirmation unless --yes passes all-clear gates. May start from a
+    /// live root with no visible port. Linux and macOS only.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, conflicts_with = "tree")]
     group: bool,

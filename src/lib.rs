@@ -3,9 +3,10 @@
 //! Basically "what are you doing in my swamp?!" — but for whatever's squatting
 //! on your local ports.
 //!
-//! This library is the shared brain both binaries run on. We ship two tiny
-//! binaries (`kickoutchi` and `kick`) that just call [`run`], so Cargo isn't
-//! stuck compiling and testing the same `main.rs` twice.
+//! This crate is internal application plumbing shared by the `kickoutchi` and
+//! `kick` binaries. It is not a supported embedding API: its bootstrap reads
+//! process-global arguments and owns terminal, standard-I/O, tracing, and signal
+//! lifecycle while it runs.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 compile_error!("Kickoutchi supports only Linux, macOS, and Windows");
@@ -60,18 +61,18 @@ use crate::cli::{Cli, Command, ExitReason, WatchSignalGuard};
 use crate::config::Config;
 use crate::display::sanitize_multiline;
 
-/// Run Kickoutchi and hand back the process exit code.
+/// Binary bootstrap entry point shared by `kickoutchi` and `kick`.
 ///
-/// Argument errors are rendered here rather than by clap's process-exiting
-/// helper so untrusted argv text passes through the terminal sanitizer.
-/// On Unix, embedded callers with pre-existing non-Kickoutchi threads must
-/// block `SIGTERM` and `SIGHUP` in those threads while the TUI owns its temporary
-/// process-wide handlers. The standalone binaries mask every worker they create.
-/// Concurrent embedded watch sessions are refused because one process-global
-/// Ctrl-C handler cannot have two independent owners. On Unix, an embedder must
-/// not replace the `SIGINT` disposition while an active watch owns it. Ctrl-C
-/// cancellation remains latched for the process lifetime, so embedders should
-/// treat it as a process-wide shutdown request.
+/// This remains public only because Cargo builds each binary as a separate crate.
+/// It is intentionally hidden from generated documentation and is not a stable
+/// embedding contract: it parses process-global arguments and writes directly to
+/// standard I/O. The TUI temporarily owns process-wide signal handlers, and watch
+/// uses one process-global Ctrl-C owner whose cancellation remains latched for the
+/// process lifetime.
+///
+/// Argument errors are rendered here rather than by clap's process-exiting helper
+/// so untrusted argv text passes through the terminal sanitizer.
+#[doc(hidden)]
 #[must_use]
 pub fn run() -> ExitCode {
     init_tracing();

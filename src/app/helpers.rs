@@ -8,12 +8,16 @@ use crate::process::{self, KillMode, KillTarget, TerminationOutcome};
 
 use super::RowKey;
 
-pub(super) fn collect_selected_process_context(entry: PortEntryView<'_>) -> ProcessContext {
-    collect_selected_process_context_with(entry, docker::enrich_port)
+pub(super) fn collect_selected_process_context(
+    entry: PortEntryView<'_>,
+    docker_enrichment: bool,
+) -> ProcessContext {
+    collect_selected_process_context_with(entry, docker_enrichment, docker::enrich_port)
 }
 
 pub(super) fn collect_selected_process_context_with<EnrichDocker>(
     entry: PortEntryView<'_>,
+    docker_enrichment: bool,
     enrich_docker: EnrichDocker,
 ) -> ProcessContext
 where
@@ -22,7 +26,11 @@ where
     let mut context = entry
         .pid
         .map_or_else(ProcessContext::default, platform::collect_process_context);
-    context.docker = enrich_docker(entry);
+    context.docker = if docker_enrichment {
+        enrich_docker(entry)
+    } else {
+        None
+    };
     context
 }
 

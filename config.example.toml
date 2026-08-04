@@ -5,6 +5,8 @@ refresh_interval_seconds = 3
 default_sort = "port"
 hide_system_processes = false
 confirm_force_kill = true
+# Set this to false to prevent all PATH-resolved Docker CLI execution.
+docker_enrichment = true
 
 # These names extend Kickoutchi's built-in protected-process list.
 protected_processes = ["redis-server"]

@@ -229,6 +229,11 @@ remote Docker host or context, is bounded, and never upgrades the certainty of a
 core verdict. Docker output can be stale, incomplete, unavailable, or describe a
 publication that does not establish the current native socket owner.
 
+Set `docker_enrichment = false` in the configuration file to guarantee that
+Kickoutchi never resolves or executes the Docker CLI. The default is `true` for
+compatibility. Enrichment is limited to qualifying TUI process-context requests;
+native collection, CLI listing, watch, and Why do not depend on it.
+
 `kick why` does not request Docker enrichment. It uses one native snapshot and
 exact bind probes, so its output must not be read as a container inventory. This
 keeps the diagnostic independent of an optional CLI and daemon, avoids PATH and

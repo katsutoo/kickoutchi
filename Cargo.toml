@@ -15,6 +15,11 @@ exclude = ["mise.toml"]
 # Two binary names are declared below; `cargo run` without --bin needs this.
 default-run = "kickoutchi"
 
+# This target only shares application bootstrap code between the two binaries.
+# Kickoutchi does not expose a supported embedding API.
+[lib]
+doc = false
+
 # The same program ships under two names: `kickoutchi` is canonical (matches
 # the crate, docs, and kickoutchi.com), `kick` is the short form for daily CLI
 # use (`kick list`, `kick kill --port 3000`). Declaring any [[bin]] disables

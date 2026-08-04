@@ -86,6 +86,8 @@ pub(crate) struct Config {
     pub(crate) hide_system_processes: bool,
     /// Whether force kill uses the stronger typed confirmation when `--yes` is absent.
     pub(crate) confirm_force_kill: bool,
+    /// Whether TUI process-context requests may invoke Docker for optional details.
+    pub(crate) docker_enrichment: bool,
     /// Process names that require stronger confirmation before termination.
     pub(crate) protected_processes: Vec<String>,
     /// Validated endpoint annotations shared by CLI, TUI, and future diagnostics.
@@ -100,6 +102,7 @@ impl Default for Config {
             default_sort: SortMode::Port,
             hide_system_processes: false,
             confirm_force_kill: true,
+            docker_enrichment: true,
             // Built-in safety defaults: the stuff whose accidental death takes
             // your containers, database, init system, or desktop down with it.
             protected_processes: protection::default_protected_processes(),
@@ -121,6 +124,7 @@ struct ConfigFile {
     default_sort: Option<SortMode>,
     hide_system_processes: Option<bool>,
     confirm_force_kill: Option<bool>,
+    docker_enrichment: Option<bool>,
     // Deprecated compatibility key. Keep its bool shape because persisted
     // configs are strict, but automatic update checking no longer exists.
     check_for_updates: Option<bool>,
@@ -253,6 +257,9 @@ impl Config {
         }
         if let Some(confirm) = file.confirm_force_kill {
             config.confirm_force_kill = confirm;
+        }
+        if let Some(enabled) = file.docker_enrichment {
+            config.docker_enrichment = enabled;
         }
         let _ = file.check_for_updates;
         if let Some(protected) = file.protected_processes {
@@ -458,6 +465,7 @@ mod tests {
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
+        assert!(config.docker_enrichment);
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
     }
 
@@ -614,6 +622,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
+        assert!(config.docker_enrichment);
     }
 
     #[test]
@@ -624,6 +633,7 @@ label = "web"
             default_sort = "scope"
             hide_system_processes = true
             confirm_force_kill = false
+            docker_enrichment = false
             protected_processes = ["redis", "postgres"]
             "#,
         )
@@ -632,6 +642,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Scope);
         assert!(config.hide_system_processes);
         assert!(!config.confirm_force_kill);
+        assert!(!config.docker_enrichment);
         assert!(config.protected_processes.contains(&"docker".to_owned()));
         assert!(config.protected_processes.contains(&"postgres".to_owned()));
         assert!(config.protected_processes.contains(&"systemd".to_owned()));
@@ -655,6 +666,7 @@ label = "web"
         assert_eq!(config.default_sort, SortMode::Port);
         assert!(!config.hide_system_processes);
         assert!(config.confirm_force_kill);
+        assert!(config.docker_enrichment);
         assert!(
             config
                 .protected_processes

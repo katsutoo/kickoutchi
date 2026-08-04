@@ -821,8 +821,8 @@ pub(crate) fn unsafe_pid_reason(pid: u32) -> Option<UnsafePidReason> {
     // process group, not a single process), 1 (init — the load-bearing ogre;
     // pull it out and the whole swamp comes down), and our own PID (Kickoutchi
     // doesn't get to kick itself out of its own swamp). An ordinary parent PID
-    // is deliberately allowed: direct PID targeting is explicit, and killing a
-    // stuck invoking shell does not interrupt Kickoutchi's safety pipeline.
+    // is not categorically unsafe here: higher-level resolution must still
+    // establish a valid port-owning or scoped target before signal delivery.
     if pid == 0 {
         return Some(UnsafePidReason::Zero);
     }

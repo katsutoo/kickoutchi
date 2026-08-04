@@ -120,9 +120,10 @@ fn preserved_selection_distinguishes_ipv6_interface_scopes() {
 fn selected_context_can_attach_docker_metadata_without_a_pid() {
     let row = entry_without_pid(5432);
 
-    let context = super::collect_selected_process_context_with(PortEntryView::from(&row), |_| {
-        Some(docker_context())
-    });
+    let context =
+        super::collect_selected_process_context_with(PortEntryView::from(&row), true, |_| {
+            Some(docker_context())
+        });
 
     assert_eq!(context.children.children.len(), 0);
     assert!(context.process_start_time_marker.is_none());
@@ -142,12 +143,28 @@ fn selected_context_requests_docker_enrichment_without_a_rendering_gate() {
     row.executable_path = Some(std::path::PathBuf::from("/usr/bin/docker-proxy").into());
     let enrichment_requested = Cell::new(false);
 
-    let _context = super::collect_selected_process_context_with(PortEntryView::from(&row), |_| {
-        enrichment_requested.set(true);
-        None
-    });
+    let _context =
+        super::collect_selected_process_context_with(PortEntryView::from(&row), true, |_| {
+            enrichment_requested.set(true);
+            None
+        });
 
     assert!(enrichment_requested.get());
+}
+
+#[test]
+fn disabled_docker_enrichment_never_invokes_the_enricher() {
+    let row = entry(5432, Some("docker-proxy"));
+    let enrichment_requested = Cell::new(false);
+
+    let context =
+        super::collect_selected_process_context_with(PortEntryView::from(&row), false, |_| {
+            enrichment_requested.set(true);
+            Some(docker_context())
+        });
+
+    assert!(!enrichment_requested.get());
+    assert!(context.docker.is_none());
 }
 
 #[test]
