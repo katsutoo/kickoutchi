@@ -2,6 +2,9 @@
 
 Audit date: 2026-07-29
 
+Inventory paths updated: 2026-08-04 after a behavior-preserving module split;
+the reviewed native boundaries and block counts are unchanged.
+
 This audit covers the explicit native operating-system boundary in the
 Kickoutchi 1.3.9 release candidate. It is a finite review of ownership, buffer
 contracts, identity stability, and error handling. It is not a mandate to
@@ -14,11 +17,11 @@ replace working native integrations.
 | `src/platform/linux.rs` | 2 | process filesystem links and system limits |
 | `src/platform/macos.rs` | 23 | libproc, sysctl, and native socket rows |
 | `src/platform/windows.rs` | 31 | process snapshots, handles, and IP Helper tables |
-| `src/process.rs` | 23 | signals, pidfds, and Windows process handles |
+| `src/process.rs`, `src/process/{linux,macos,windows}.rs` | 23 | signals, pidfds, and Windows process handles |
 | `src/windows_tree.rs` | 12 | jobs, process handles, membership, and termination |
 | `src/ui/mod.rs` | 14 | terminal signal lifecycle and restoration |
 | `src/ui/confirm.rs` | 1 | test-only effective-user query |
-| `src/cli/watch.rs` | 7 | console and signal handler lifecycle |
+| `src/cli/watch/{signal,tests}.rs` | 7 | console and signal handler lifecycle, including test-only disposition checks |
 | `src/docker.rs` | 6 | user identity, token ownership, and test child reaping |
 | **Total** | **119** | |
 
