@@ -1,17 +1,14 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::str;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tar::Archive;
-use xz4rust::{XzDecoder, XzNextBlockResult};
+use xz4rust::{XzDecoder, XzReader};
 use zip::ZipArchive;
 
 #[path = "../src/release_archive_path.rs"]
@@ -26,15 +23,7 @@ const ARCHIVE_MEMBERS_MAX: usize = 64;
 const ARCHIVE_EXPANDED_BYTES_MAX: u64 = 512 * 1024 * 1024;
 const XZ_DICTIONARY_BYTES_INITIAL: usize = 8 * 1024 * 1024;
 const XZ_DICTIONARY_BYTES_MAX: usize = 64 * 1024 * 1024;
-const XZ_INPUT_BUFFER_BYTES: usize = 8192;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const INSTALLER_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
-const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const VERSION_OUTPUT_BYTES_MAX: usize = 4096;
-const READELF_OUTPUT_BYTES_MAX: usize = 64 * 1024;
 const MAXIMUM_GLIBC_VERSION: &[u32] = &[2, 31];
-const TEST_TIMEOUT: Duration = Duration::from_mins(20);
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 type ValidationResult<T> = Result<T, String>;
@@ -46,68 +35,24 @@ struct NativeTarget {
 }
 
 fn native_target(runner_os: &str, runner_arch: &str) -> ValidationResult<NativeTarget> {
-    let target = match (runner_os, runner_arch) {
-        ("Linux", "X64") => NativeTarget {
-            triple: "x86_64-unknown-linux-gnu",
-            windows: false,
-        },
-        ("Linux", "ARM64") => NativeTarget {
-            triple: "aarch64-unknown-linux-gnu",
-            windows: false,
-        },
-        ("macOS", "X64") => NativeTarget {
-            triple: "x86_64-apple-darwin",
-            windows: false,
-        },
-        ("macOS", "ARM64") => NativeTarget {
-            triple: "aarch64-apple-darwin",
-            windows: false,
-        },
-        ("Windows", "X64") => NativeTarget {
-            triple: "x86_64-pc-windows-msvc",
-            windows: true,
-        },
+    let (triple, windows) = match (runner_os, runner_arch) {
+        ("Linux", "X64") => ("x86_64-unknown-linux-gnu", false),
+        ("Linux", "ARM64") => ("aarch64-unknown-linux-gnu", false),
+        ("macOS", "X64") => ("x86_64-apple-darwin", false),
+        ("macOS", "ARM64") => ("aarch64-apple-darwin", false),
+        ("Windows", "X64") => ("x86_64-pc-windows-msvc", true),
         _ => {
             return Err(format!(
                 "unsupported native runner: {runner_os}/{runner_arch}"
             ));
         }
     };
-    Ok(target)
+    Ok(NativeTarget { triple, windows })
 }
 
-fn valid_target_triple(target: &str) -> bool {
-    let mut component_count = 0usize;
-    for component in target.split('-') {
-        if component.is_empty()
-            || !component
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        {
-            return false;
-        }
-        component_count += 1;
-    }
-    component_count >= 2
-}
-
-fn parse_targets(raw: &str) -> ValidationResult<Vec<String>> {
+fn require_native_target(raw: &str, target: &str) -> ValidationResult<()> {
     let targets: Vec<String> = serde_json::from_str(raw)
         .map_err(|error| format!("targets must be valid JSON: {error}"))?;
-    if !(1..=16).contains(&targets.len()) {
-        return Err("targets must contain 1..=16 entries".to_owned());
-    }
-    if targets.iter().any(|target| !valid_target_triple(target)) {
-        return Err("targets contain an invalid target triple".to_owned());
-    }
-    let unique: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
-    if unique.len() != targets.len() {
-        return Err("targets must be unique".to_owned());
-    }
-    Ok(targets)
-}
-
-fn require_single_native_target(targets: &[String], target: &str) -> ValidationResult<()> {
     if targets.len() == 1 && targets[0] == target {
         return Ok(());
     }
@@ -142,61 +87,38 @@ fn sha256(path: &Path) -> ValidationResult<String> {
 
 fn verify_checksum(archive: &Path, digest: &str) -> ValidationResult<()> {
     let checksum_path = PathBuf::from(format!("{}.sha256", archive.display()));
-    let metadata = fs::symlink_metadata(&checksum_path).map_err(|error| {
-        format!(
-            "missing regular checksum file for {}: {error}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
-        )
-    })?;
+    let archive_name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "release archive filename must be UTF-8".to_owned())?;
+    let metadata = fs::symlink_metadata(&checksum_path)
+        .map_err(|error| format!("missing checksum for {archive_name}: {error}"))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "missing regular checksum file for {}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        return Err(format!("checksum must be a regular file: {archive_name}"));
     }
     if !(1..=1024).contains(&metadata.len()) {
         return Err(format!(
-            "checksum file size is outside the approved bound for {}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
+            "checksum size is outside its bound: {archive_name}"
         ));
     }
-    let bytes = fs::read(&checksum_path)
+    let text = fs::read_to_string(&checksum_path)
         .map_err(|error| format!("could not read {}: {error}", checksum_path.display()))?;
-    let text = str::from_utf8(&bytes)
-        .map_err(|_| format!("checksum file is not UTF-8: {}", checksum_path.display()))?;
     if !text.is_ascii() {
         return Err(format!(
-            "checksum file is not ASCII: {}",
+            "checksum is not ASCII: {}",
             checksum_path.display()
         ));
     }
-    let records: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-    if records.len() != 1 {
-        return Err(format!(
-            "checksum file must contain exactly one record for {}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    let record = records[0];
-    if record.len() < 67 {
-        return Err(format!(
-            "invalid checksum file for {}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    }
-    let (record_digest, remainder) = record.split_at(64);
-    let filename = remainder
-        .strip_prefix("  ")
-        .or_else(|| remainder.strip_prefix(" *"));
-    let archive_name = archive.file_name().and_then(|name| name.to_str());
-    if !record_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || filename != archive_name
-        || !record_digest.eq_ignore_ascii_case(digest)
+    let mut fields = text.split_ascii_whitespace();
+    let record_digest = fields.next();
+    let filename = fields
+        .next()
+        .map(|name| name.strip_prefix('*').unwrap_or(name));
+    if record_digest.is_none_or(|value| !value.eq_ignore_ascii_case(digest))
+        || filename != Some(archive_name)
+        || fields.next().is_some()
     {
-        return Err(format!(
-            "invalid checksum file for {}",
-            archive.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        return Err(format!("invalid checksum for {archive_name}"));
     }
     Ok(())
 }
@@ -242,241 +164,31 @@ fn supported_tar_file_type(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type.is_contiguous() || entry_type.is_gnu_sparse()
 }
 
-struct BoundedReader<R> {
-    inner: R,
-    remaining: u64,
-}
+type CheckedTarArchive = Archive<XzReader<File>>;
 
-struct CheckedXzReader<R> {
-    decoder: Box<XzDecoder<'static>>,
-    inner: R,
-    input: Box<[u8]>,
-    input_consumed: usize,
-    input_filled: usize,
-    end_of_stream: bool,
-}
-
-impl<R: Read> CheckedXzReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
-            decoder: XzDecoder::in_heap_with_alloc_dict_size(
-                XZ_DICTIONARY_BYTES_INITIAL,
-                XZ_DICTIONARY_BYTES_MAX,
-            ),
-            inner,
-            input: vec![0u8; XZ_INPUT_BUFFER_BYTES].into_boxed_slice(),
-            input_consumed: 0,
-            input_filled: 0,
-            end_of_stream: false,
-        }
-    }
-
-    fn is_end_of_stream(&self) -> bool {
-        self.end_of_stream
-    }
-
-    fn into_inner(self) -> (R, Vec<u8>) {
-        (
-            self.inner,
-            self.input[self.input_consumed..self.input_filled].to_vec(),
-        )
-    }
-}
-
-impl<R: Read> Read for CheckedXzReader<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() || self.end_of_stream {
-            return Ok(0);
-        }
-        loop {
-            if self.input_consumed == self.input_filled {
-                self.input_filled = self.inner.read(&mut self.input)?;
-                self.input_consumed = 0;
-                if self.input_filled == 0 {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                }
-            }
-            let result = self
-                .decoder
-                .decode(&self.input[self.input_consumed..self.input_filled], output)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            let (input_count, output_count, end_of_stream) = match result {
-                XzNextBlockResult::NeedMoreData(input_count, output_count) => {
-                    (input_count, output_count, false)
-                }
-                XzNextBlockResult::EndOfStream(input_count, output_count) => {
-                    (input_count, output_count, true)
-                }
-            };
-            let available = self.input_filled - self.input_consumed;
-            if input_count > available || output_count > output.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XZ decoder returned an out-of-range byte count",
-                ));
-            }
-            self.input_consumed += input_count;
-            self.end_of_stream = end_of_stream;
-            if output_count != 0 || end_of_stream {
-                return Ok(output_count);
-            }
-            if input_count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XZ decoder made no progress",
-                ));
-            }
-        }
-    }
-}
-
-impl<R> BoundedReader<R> {
-    fn new(inner: R, limit: u64) -> Self {
-        Self {
-            inner,
-            remaining: limit,
-        }
-    }
-
-    fn into_inner(self) -> R {
-        self.inner
-    }
-}
-
-impl<R: Read> Read for BoundedReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            let mut excess = [0u8; 1];
-            return match self.inner.read(&mut excess)? {
-                0 => Ok(0),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "release archive expanded size is outside the approved bound",
-                )),
-            };
-        }
-        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
-        let allowed = buffer.len().min(remaining);
-        let count = self.inner.read(&mut buffer[..allowed])?;
-        self.remaining = self.remaining.saturating_sub(
-            u64::try_from(count).map_err(|_| io::Error::other("read size did not fit u64"))?,
-        );
-        Ok(count)
-    }
-}
-
-struct ZeroWriter;
-
-impl Write for ZeroWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if buffer.iter().any(|byte| *byte != 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "release TAR contains nonzero data after its end marker",
-            ));
-        }
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn verify_xz_stream_padding(mut compressed: File, buffered: &[u8]) -> ValidationResult<()> {
-    let mut padding_bytes = buffered.len();
-    if buffered.iter().any(|byte| *byte != 0) {
-        return Err("release XZ stream contains trailing non-padding data".to_owned());
-    }
-    let mut buffer = [0u8; 4096];
-    loop {
-        let count = compressed
-            .read(&mut buffer)
-            .map_err(|error| format!("could not inspect trailing XZ data: {error}"))?;
-        if count == 0 {
-            break;
-        }
-        if buffer[..count].iter().any(|byte| *byte != 0) {
-            return Err("release XZ stream contains trailing non-padding data".to_owned());
-        }
-        padding_bytes = padding_bytes
-            .checked_add(count)
-            .ok_or_else(|| "release XZ stream padding size overflowed".to_owned())?;
-    }
-    if !padding_bytes.is_multiple_of(4) {
-        return Err("release XZ stream padding is not a multiple of four bytes".to_owned());
-    }
-    Ok(())
-}
-
-type CheckedTarArchive = Archive<BoundedReader<CheckedXzReader<File>>>;
-
-fn open_checked_tar_archive(archive: &Path) -> ValidationResult<CheckedTarArchive> {
+fn open_tar_archive(archive: &Path) -> ValidationResult<CheckedTarArchive> {
     let file = File::open(archive).map_err(|error| {
         format!(
             "could not open release archive {}: {error}",
             archive.display()
         )
     })?;
-    let decoder = CheckedXzReader::new(file);
-    Ok(Archive::new(BoundedReader::new(
-        decoder,
-        ARCHIVE_EXPANDED_BYTES_MAX,
-    )))
+    let decoder = XzReader::new_with_buffer_size_and_decoder(
+        file,
+        NonZeroUsize::new(8192).expect("XZ buffer size is nonzero"),
+        XzDecoder::in_heap_with_alloc_dict_size(
+            XZ_DICTIONARY_BYTES_INITIAL,
+            XZ_DICTIONARY_BYTES_MAX,
+        ),
+    );
+    Ok(Archive::new(decoder))
 }
 
-fn finish_checked_tar_archive(bundle: CheckedTarArchive) -> ValidationResult<()> {
+fn finish_tar_archive(bundle: CheckedTarArchive) -> ValidationResult<()> {
     let mut decompressed = bundle.into_inner();
-    io::copy(&mut decompressed, &mut ZeroWriter)
-        .map_err(|error| format!("could not verify the complete TAR/XZ stream: {error}"))?;
-    let decoder = decompressed.into_inner();
-    if !decoder.is_end_of_stream() {
-        return Err("release XZ stream ended before its verified footer".to_owned());
-    }
-    let (compressed, buffered) = decoder.into_inner();
-    verify_xz_stream_padding(compressed, &buffered)
-}
-
-fn preflight_raw_tar_archive(archive: &Path) -> ValidationResult<()> {
-    let mut bundle = open_checked_tar_archive(archive)?;
-    let entries = bundle
-        .entries()
-        .map_err(|error| format!("could not read raw release TAR entries: {error}"))?
-        .raw(true);
-    let mut member_count = 0usize;
-    let mut expanded_bytes = 0u64;
-    for entry in entries {
-        member_count = member_count
-            .checked_add(1)
-            .ok_or_else(|| "release archive member count overflowed".to_owned())?;
-        if member_count > ARCHIVE_MEMBERS_MAX {
-            return Err("release archive member count is outside the approved bound".to_owned());
-        }
-        let mut entry = entry.map_err(|error| format!("could not read raw TAR entry: {error}"))?;
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_gnu_longname()
-            || entry_type.is_gnu_longlink()
-            || entry_type.is_pax_global_extensions()
-            || entry_type.is_pax_local_extensions()
-        {
-            return Err("release TAR contains an unsupported extension record".to_owned());
-        }
-        expanded_bytes = expanded_bytes
-            .checked_add(entry.size())
-            .ok_or_else(|| "release archive expanded size overflowed".to_owned())?;
-        if expanded_bytes > ARCHIVE_EXPANDED_BYTES_MAX {
-            return Err("release archive expanded size is outside the approved bound".to_owned());
-        }
-        io::copy(&mut entry, &mut io::sink())
-            .map_err(|error| format!("could not drain raw TAR entry: {error}"))?;
-    }
-    if member_count == 0 {
-        return Err("release archive member count is outside the approved bound".to_owned());
-    }
-    finish_checked_tar_archive(bundle)
+    io::copy(&mut decompressed, &mut io::sink())
+        .map(|_| ())
+        .map_err(|error| format!("could not verify the complete TAR/XZ stream: {error}"))
 }
 
 fn extract_tar_binaries(
@@ -485,8 +197,7 @@ fn extract_tar_binaries(
     target: &str,
     expected_binaries: &BTreeSet<String>,
 ) -> ValidationResult<BTreeMap<String, PathBuf>> {
-    preflight_raw_tar_archive(archive)?;
-    let mut bundle = open_checked_tar_archive(archive)?;
+    let mut bundle = open_tar_archive(archive)?;
     let entries = bundle
         .entries()
         .map_err(|error| format!("could not read release TAR entries: {error}"))?;
@@ -578,56 +289,8 @@ fn extract_tar_binaries(
     if seen_files != expected_files || seen_directories != expected_directories {
         return Err("release archive layout differs from the cargo-dist contract".to_owned());
     }
-    finish_checked_tar_archive(bundle)?;
+    finish_tar_archive(bundle)?;
     Ok(selected)
-}
-
-fn little_endian_u16(bytes: &[u8], offset: usize) -> ValidationResult<u16> {
-    let value = bytes
-        .get(offset..offset + 2)
-        .ok_or_else(|| "release ZIP end-of-central-directory record is malformed".to_owned())?;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
-}
-
-fn zip_entry_count(archive: &Path) -> ValidationResult<usize> {
-    let mut file = File::open(archive)
-        .map_err(|error| format!("could not open release ZIP {}: {error}", archive.display()))?;
-    let size = file
-        .seek(SeekFrom::End(0))
-        .map_err(|error| format!("could not size release ZIP: {error}"))?;
-    let retained = size.min(65_557);
-    let retained_i64 = i64::try_from(retained)
-        .map_err(|_| "release ZIP suffix size could not be represented".to_owned())?;
-    file.seek(SeekFrom::End(-retained_i64))
-        .map_err(|error| format!("could not seek release ZIP: {error}"))?;
-    let retained_usize = usize::try_from(retained)
-        .map_err(|_| "release ZIP suffix size could not be represented".to_owned())?;
-    let mut suffix = vec![0u8; retained_usize];
-    file.read_exact(&mut suffix)
-        .map_err(|error| format!("could not read release ZIP suffix: {error}"))?;
-    let signature = b"PK\x05\x06";
-    let offset = suffix
-        .windows(signature.len())
-        .rposition(|window| window == signature)
-        .ok_or_else(|| "release ZIP has no valid end-of-central-directory record".to_owned())?;
-    if suffix.len() - offset < 22 {
-        return Err("release ZIP has no valid end-of-central-directory record".to_owned());
-    }
-    let disk = little_endian_u16(&suffix, offset + 4)?;
-    let central_disk = little_endian_u16(&suffix, offset + 6)?;
-    let disk_entries = little_endian_u16(&suffix, offset + 8)?;
-    let total_entries = little_endian_u16(&suffix, offset + 10)?;
-    let comment_bytes = usize::from(little_endian_u16(&suffix, offset + 20)?);
-    if offset + 22 + comment_bytes != suffix.len() {
-        return Err("release ZIP end-of-central-directory record is malformed".to_owned());
-    }
-    if disk != 0 || central_disk != 0 || disk_entries != total_entries {
-        return Err("multi-disk release ZIPs are forbidden".to_owned());
-    }
-    if total_entries == u16::MAX {
-        return Err("ZIP64 release archives are outside the approved contract".to_owned());
-    }
-    Ok(usize::from(total_entries))
 }
 
 fn extract_zip_binaries(
@@ -636,16 +299,12 @@ fn extract_zip_binaries(
     target: &str,
     expected_binaries: &BTreeSet<String>,
 ) -> ValidationResult<BTreeMap<String, PathBuf>> {
-    let entry_count = zip_entry_count(archive)?;
-    if !(1..=ARCHIVE_MEMBERS_MAX).contains(&entry_count) {
-        return Err("release archive member count is outside the approved bound".to_owned());
-    }
     let file = File::open(archive)
         .map_err(|error| format!("could not open release ZIP {}: {error}", archive.display()))?;
     let mut bundle =
         ZipArchive::new(file).map_err(|error| format!("could not read release ZIP: {error}"))?;
-    if bundle.len() != entry_count {
-        return Err("release ZIP entry count changed while opening the archive".to_owned());
+    if !(1..=ARCHIVE_MEMBERS_MAX).contains(&bundle.len()) {
+        return Err("release archive member count is outside the approved bound".to_owned());
     }
     let (expected_files, expected_directories) = expected_archive_paths(target, true);
     let mut selected = BTreeMap::new();
@@ -653,7 +312,7 @@ fn extract_zip_binaries(
     let mut seen_directories = BTreeSet::new();
     let mut expanded_bytes = 0u64;
 
-    for index in 0..entry_count {
+    for index in 0..bundle.len() {
         let mut member = bundle
             .by_index(index)
             .map_err(|error| format!("could not read ZIP entry {index}: {error}"))?;
@@ -836,132 +495,16 @@ fn validate_glibc_requirements(output: &str) -> ValidationResult<Vec<u32>> {
     Ok(maximum)
 }
 
-fn terminate_and_wait(child: &mut Child) -> ValidationResult<ExitStatus> {
-    match child.kill() {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-        Err(error) => return Err(format!("could not terminate child process: {error}")),
-    }
-    let deadline = Instant::now() + CHILD_CLEANUP_TIMEOUT;
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not reap child process: {error}"))?
-        {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            return Err("child process did not reap after termination".to_owned());
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-fn wait_with_deadline(
-    child: &mut Child,
-    timeout: Duration,
-    abort: Option<&AtomicBool>,
-) -> ValidationResult<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            let _status = terminate_and_wait(child)?;
-            return Err("child process output exceeded its byte limit".to_owned());
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not wait for child process: {error}"))?
-        {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _status = terminate_and_wait(child)?;
-            return Err("child process exceeded its deadline".to_owned());
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
-struct BoundedCommandOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_bounded_command(
-    command: &mut Command,
-    description: &str,
-    output_limit: usize,
-) -> ValidationResult<BoundedCommandOutput> {
-    run_bounded_command_with_timeout(command, description, output_limit, COMMAND_TIMEOUT)
-}
-
-fn run_bounded_command_with_timeout(
-    command: &mut Command,
-    description: &str,
-    output_limit: usize,
-    timeout: Duration,
-) -> ValidationResult<BoundedCommandOutput> {
-    let mut child = command
+fn run_command(command: &mut Command, description: &str) -> ValidationResult<Output> {
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not execute {description}: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("{description} stdout pipe was unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("{description} stderr pipe was unavailable"))?;
-    let overflow = Arc::new(AtomicBool::new(false));
-    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
-    let stdout_overflow = Arc::clone(&overflow);
-    let _stdout_reader = thread::spawn(move || {
-        let result = read_bounded(stdout, output_limit);
-        if result
-            .as_ref()
-            .is_err_and(|error| error == "process output exceeded its byte limit")
-        {
-            stdout_overflow.store(true, Ordering::Release);
-        }
-        let _result = stdout_sender.send(result);
-    });
-    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
-    let stderr_overflow = Arc::clone(&overflow);
-    let _stderr_reader = thread::spawn(move || {
-        let result = read_bounded(stderr, output_limit);
-        if result
-            .as_ref()
-            .is_err_and(|error| error == "process output exceeded its byte limit")
-        {
-            stderr_overflow.store(true, Ordering::Release);
-        }
-        let _result = stderr_sender.send(result);
-    });
-    let status_result = wait_with_deadline(&mut child, timeout, Some(&overflow));
-    let stdout = stdout_receiver
-        .recv_timeout(CHILD_CLEANUP_TIMEOUT)
-        .map_err(|error| format!("{description} stdout reader did not stop: {error}"))??;
-    let stderr = stderr_receiver
-        .recv_timeout(CHILD_CLEANUP_TIMEOUT)
-        .map_err(|error| format!("{description} stderr reader did not stop: {error}"))??;
-    Ok(BoundedCommandOutput {
-        status: status_result?,
-        stdout,
-        stderr,
-    })
+        .output()
+        .map_err(|error| format!("could not execute {description}: {error}"))
 }
 
 fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
     let description = format!("{} --version", binary.display());
-    let output = run_bounded_command(
-        Command::new(binary).arg("--version"),
-        &description,
-        VERSION_OUTPUT_BYTES_MAX,
-    )?;
+    let output = run_command(Command::new(binary).arg("--version"), &description)?;
     let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| format!("version output was not UTF-8 for {}", binary.display()))?;
     let stderr = str::from_utf8(&output.stderr)
@@ -979,11 +522,7 @@ fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
 
 fn run_updater_help(updater: &Path) -> ValidationResult<()> {
     let description = format!("{} --help", updater.display());
-    let output = run_bounded_command(
-        Command::new(updater).arg("--help"),
-        &description,
-        VERSION_OUTPUT_BYTES_MAX,
-    )?;
+    let output = run_command(Command::new(updater).arg("--help"), &description)?;
     let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| format!("updater help was not UTF-8 for {}", updater.display()))?;
     if !output.status.success() || !stdout.contains("Usage:") || !stdout.contains("--tag") {
@@ -1050,13 +589,12 @@ fn validate_updater_artifact(
 
 fn inspect_glibc_abi(binary: &Path) -> ValidationResult<()> {
     let description = format!("readelf --version-info {}", binary.display());
-    let output = run_bounded_command(
+    let output = run_command(
         Command::new("readelf")
             .arg("--version-info")
             .arg(binary)
             .env("LC_ALL", "C"),
         &description,
-        READELF_OUTPUT_BYTES_MAX,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -1102,10 +640,9 @@ fn run_archive_journeys(canonical: &Path, short: &Path, runner_os: &str) -> Vali
     if runner_os == "Linux" && !release_container {
         command.env("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES", "1");
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("could not start release archive journeys: {error}"))?;
-    let status = wait_with_deadline(&mut child, TEST_TIMEOUT, None)?;
+    let status = command
+        .status()
+        .map_err(|error| format!("could not run release archive journeys: {error}"))?;
     if !status.success() {
         return Err(format!(
             "release archive journeys failed with status {status}"
@@ -1284,45 +821,15 @@ fn validate_installer_receipt(
     Ok(())
 }
 
-fn rewrite_installer_receipt_version(path: &Path, version: &str) -> ValidationResult<()> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("installer receipt is missing {}: {error}", path.display()))?;
-    let bytes = read_bounded(&mut file, RECEIPT_BYTES_MAX)?;
-    let mut receipt: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("installer receipt is invalid JSON: {error}"))?;
-    receipt["version"] = serde_json::Value::String(version.to_owned());
-    let bytes = serde_json::to_vec(&receipt)
-        .map_err(|error| format!("installer receipt could not be encoded: {error}"))?;
-    if bytes.len() > RECEIPT_BYTES_MAX {
-        return Err("rewritten installer receipt exceeds its byte bound".to_owned());
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|error| format!("installer receipt could not be rewritten: {error}"))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("installer receipt could not be rewritten: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("installer receipt could not be synced: {error}"))
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "the native installer journey keeps setup, execution, and postconditions in order"
-)]
 fn validate_generated_installer(
     distrib_path: &Path,
     installer_path: &Path,
     targets_json: &str,
     runner_os: &str,
     runner_arch: &str,
-    public_release: bool,
-    release_tag: Option<&str>,
 ) -> ValidationResult<()> {
-    let targets = parse_targets(targets_json)?;
     let target = native_target(runner_os, runner_arch)?;
-    require_single_native_target(&targets, target.triple)?;
+    require_native_target(targets_json, target.triple)?;
     let distrib = distrib_path
         .canonicalize()
         .map_err(|error| format!("distribution path could not be resolved: {error}"))?;
@@ -1352,15 +859,6 @@ fn validate_generated_installer(
     {
         return Err("installer must be a bounded regular file".to_owned());
     }
-    if public_release {
-        let generated = distrib.join(installer_name);
-        if sha256(&installer)? != sha256(&generated)? {
-            return Err(
-                "published installer differs from the same-run generated installer".to_owned(),
-            );
-        }
-    }
-
     let temporary = TemporaryDirectory::new("kickoutchi-installer-e2e")?;
     for directory in ["home", "config", "tmp"] {
         fs::create_dir(temporary.path.join(directory))
@@ -1373,20 +871,13 @@ fn validate_generated_installer(
     let archive_suffix = if target.windows { ".zip" } else { ".tar.xz" };
     let archive_name = format!("kickoutchi-{}{archive_suffix}", target.triple);
     let updater_name = format!("kickoutchi-{}-update", target.triple);
-    copy_exact_file(
-        &distrib.join(&archive_name),
-        &artifact_source.join(&archive_name),
-    )?;
-    copy_exact_file(
-        &distrib.join(&updater_name),
-        &artifact_source.join(&updater_name),
-    )?;
-    let local_url = (!public_release)
-        .then(|| percent_encode_file_path(&artifact_source, target.windows))
-        .transpose()?;
+    for name in [&archive_name, &updater_name] {
+        copy_exact_file(&distrib.join(name), &artifact_source.join(name))?;
+    }
+    let local_url = percent_encode_file_path(&artifact_source, target.windows)?;
 
-    let mut command = if target.windows {
-        let mut command = Command::new("pwsh.exe");
+    let mut command = Command::new(if target.windows { "pwsh.exe" } else { "sh" });
+    if target.windows {
         command.args([
             "-NoLogo",
             "-NoProfile",
@@ -1395,25 +886,15 @@ fn validate_generated_installer(
             "Bypass",
             "-File",
         ]);
-        command.arg(&installer);
-        command
-    } else {
-        let mut command = Command::new("sh");
-        command.arg(&installer);
-        command
-    };
+    }
+    command.arg(&installer);
     configure_installer_environment(
         &mut command,
         &temporary.path,
         &install_root,
-        local_url.as_deref(),
+        Some(&local_url),
     );
-    let output = run_bounded_command_with_timeout(
-        &mut command,
-        "generated release installer",
-        READELF_OUTPUT_BYTES_MAX,
-        INSTALLER_COMMAND_TIMEOUT,
-    )?;
+    let output = run_command(&mut command, "generated release installer")?;
     if !output.status.success() {
         return Err(format!(
             "generated installer failed: status={}, stdout={:?}, stderr={:?}",
@@ -1439,49 +920,8 @@ fn validate_generated_installer(
         .join("config/kickoutchi/kickoutchi-receipt.json");
     validate_installer_receipt(&receipt, &install_root, env!("CARGO_PKG_VERSION"))?;
 
-    if public_release {
-        let release_tag = release_tag
-            .ok_or_else(|| "public installer validation requires a release tag".to_owned())?;
-        let expected_updater = distrib.join(&updater_name);
-        if sha256(&updater)? != sha256(&expected_updater)? {
-            return Err("published updater differs from the same-run updater".to_owned());
-        }
-        rewrite_installer_receipt_version(&receipt, "0.0.0")?;
-        fs::write(&canonical, b"stale kickoutchi binary")
-            .map_err(|error| format!("could not stage stale canonical binary: {error}"))?;
-        fs::write(&short, b"stale kick binary")
-            .map_err(|error| format!("could not stage stale short binary: {error}"))?;
-        let mut update = Command::new(&updater);
-        update.args(["--tag", release_tag]);
-        configure_installer_environment(&mut update, &temporary.path, &install_root, None);
-        let github_token = std::env::var("KICKOUTCHI_RELEASE_GITHUB_TOKEN")
-            .map_err(|_| "public updater validation requires a GitHub token".to_owned())?;
-        update.env("AXOUPDATER_GITHUB_TOKEN", github_token);
-        let output = run_bounded_command_with_timeout(
-            &mut update,
-            "published updater",
-            READELF_OUTPUT_BYTES_MAX,
-            INSTALLER_COMMAND_TIMEOUT,
-        )?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() || !stderr.contains("New release") {
-            return Err(format!(
-                "published updater failed: status={}, stdout={:?}, stderr={:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                stderr,
-            ));
-        }
-        run_version(&canonical, env!("CARGO_PKG_VERSION"))?;
-        run_version(&short, env!("CARGO_PKG_VERSION"))?;
-        if sha256(&updater)? != sha256(&expected_updater)? {
-            return Err("updated public updater differs from the same-run updater".to_owned());
-        }
-        validate_installer_receipt(&receipt, &install_root, env!("CARGO_PKG_VERSION"))?;
-    }
-
     println!(
-        "validated release installer: target={}, installer={}, public_release={public_release}",
+        "validated generated release installer: target={}, installer={}",
         target.triple,
         installer.display(),
     );
@@ -1494,9 +934,8 @@ fn validate_release_artifact(
     runner_os: &str,
     runner_arch: &str,
 ) -> ValidationResult<()> {
-    let targets = parse_targets(targets_json)?;
     let target = native_target(runner_os, runner_arch)?;
-    require_single_native_target(&targets, target.triple)?;
+    require_native_target(targets_json, target.triple)?;
     let distrib = distrib_path
         .canonicalize()
         .map_err(|error| format!("distribution path could not be resolved: {error}"))?;
@@ -1598,48 +1037,16 @@ fn validate_generated_native_installer() {
         .expect("KICKOUTCHI_RELEASE_RUNNER_OS must identify the native runner OS");
     let runner_arch = std::env::var("KICKOUTCHI_RELEASE_RUNNER_ARCH")
         .expect("KICKOUTCHI_RELEASE_RUNNER_ARCH must identify the native runner architecture");
-    let public_release = std::env::var("KICKOUTCHI_RELEASE_PUBLIC").as_deref() == Ok("1");
-    let release_tag = std::env::var("KICKOUTCHI_RELEASE_TAG").ok();
-    validate_generated_installer(
-        &distrib,
-        &installer,
-        &targets,
-        &runner_os,
-        &runner_arch,
-        public_release,
-        release_tag.as_deref(),
-    )
-    .expect("generated native installer must satisfy the release contract");
+    validate_generated_installer(&distrib, &installer, &targets, &runner_os, &runner_arch)
+        .expect("generated native installer must satisfy the release contract");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lzma_rust2::{XzOptions, XzWriter};
-    use tar::{Builder, EntryType, Header};
-    use zip::write::SimpleFileOptions;
-    use zip::{CompressionMethod, ZipWriter};
 
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum TarHostile {
-        Traversal,
-        Absolute,
-        Symlink,
-        Hardlink,
-        MalformedMode,
-        Duplicate,
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ZipHostile {
-        Traversal,
-        Absolute,
-        Symlink,
-        Duplicate,
-    }
 
     fn temporary_directory(prefix: &str) -> TemporaryDirectory {
         TemporaryDirectory::new(prefix).expect("test temporary directory must be created")
@@ -1655,298 +1062,16 @@ mod tests {
         assert!(file_url_text(r"\\server\share", true).is_err());
     }
 
-    fn write_tar(path: &Path, executable_mode: u32) {
-        let file = File::create(path).expect("test TAR must be created");
-        let encoder = XzWriter::new(file, XzOptions::default()).expect("test XZ stream must start");
-        let mut builder = Builder::new(encoder);
-        let root = format!("kickoutchi-{LINUX_TARGET}");
-        let mut directory = Header::new_gnu();
-        directory.set_entry_type(EntryType::dir());
-        directory.set_mode(0o755);
-        directory.set_size(0);
-        directory.set_cksum();
-        builder
-            .append_data(&mut directory, format!("{root}/"), io::empty())
-            .expect("test TAR directory must be written");
-        for name in ["CHANGELOG.md", "LICENSE", "README.md", "kickoutchi", "kick"] {
-            let contents = name.as_bytes();
-            let mut header = Header::new_gnu();
-            header.set_entry_type(EntryType::file());
-            header.set_mode(if name == "kickoutchi" || name == "kick" {
-                executable_mode
-            } else {
-                0o644
-            });
-            header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
-            header.set_cksum();
-            builder
-                .append_data(&mut header, format!("{root}/{name}"), contents)
-                .expect("test TAR member must be written");
-        }
-        let encoder = builder.into_inner().expect("test TAR must finish");
-        encoder.finish().expect("test XZ stream must finish");
-    }
-
-    fn set_raw_tar_path(header: &mut Header, path: &str) {
-        assert!(path.len() <= 100, "test TAR path must fit the name field");
-        header.as_mut_bytes()[0..100].fill(0);
-        header.as_mut_bytes()[0..path.len()].copy_from_slice(path.as_bytes());
-    }
-
-    fn write_hostile_tar(path: &Path, hostile: TarHostile) {
-        let file = File::create(path).expect("hostile TAR must be created");
-        let encoder = XzWriter::new(file, XzOptions::default()).expect("test XZ stream must start");
-        let mut builder = Builder::new(encoder);
-        let root = format!("kickoutchi-{LINUX_TARGET}");
-        let mut directory = Header::new_gnu();
-        directory.set_entry_type(EntryType::dir());
-        directory.set_mode(0o755);
-        directory.set_size(0);
-        directory.set_cksum();
-        builder
-            .append_data(&mut directory, format!("{root}/"), io::empty())
-            .expect("test TAR directory must be written");
-
-        for name in ["CHANGELOG.md", "LICENSE", "README.md", "kickoutchi", "kick"] {
-            let is_hostile_member = match hostile {
-                TarHostile::Traversal | TarHostile::Absolute => name == "README.md",
-                TarHostile::Symlink | TarHostile::Hardlink | TarHostile::MalformedMode => {
-                    name == "kick"
-                }
-                TarHostile::Duplicate => false,
-            };
-            let contents = if is_hostile_member
-                && matches!(hostile, TarHostile::Symlink | TarHostile::Hardlink)
-            {
-                &b""[..]
-            } else {
-                name.as_bytes()
-            };
-            let mut header = Header::new_gnu();
-            header.set_entry_type(match hostile {
-                TarHostile::Symlink if is_hostile_member => EntryType::symlink(),
-                TarHostile::Hardlink if is_hostile_member => EntryType::hard_link(),
-                _ => EntryType::file(),
-            });
-            header.set_mode(if name == "kickoutchi" || name == "kick" {
-                0o755
-            } else {
-                0o644
-            });
-            header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
-            if matches!(hostile, TarHostile::Symlink | TarHostile::Hardlink) && is_hostile_member {
-                header
-                    .set_link_name(format!("{root}/kickoutchi"))
-                    .expect("test TAR link target must be set");
-            }
-            let member_path = match hostile {
-                TarHostile::Traversal if is_hostile_member => format!("{root}/../README.md"),
-                TarHostile::Absolute if is_hostile_member => "/README.md".to_owned(),
-                _ => format!("{root}/{name}"),
-            };
-            set_raw_tar_path(&mut header, &member_path);
-            if hostile == TarHostile::MalformedMode && is_hostile_member {
-                header.as_mut_bytes()[100..108].copy_from_slice(b"invalid\0");
-            }
-            header.set_cksum();
-            builder
-                .append(&header, contents)
-                .expect("hostile TAR member must be written");
-        }
-
-        if hostile == TarHostile::Duplicate {
-            let contents = b"duplicate";
-            let mut header = Header::new_gnu();
-            header.set_entry_type(EntryType::file());
-            header.set_mode(0o644);
-            header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
-            header.set_cksum();
-            builder
-                .append_data(&mut header, format!("{root}/README.md"), &contents[..])
-                .expect("duplicate TAR member must be written");
-        }
-
-        let encoder = builder.into_inner().expect("hostile TAR must finish");
-        encoder.finish().expect("hostile XZ stream must finish");
-    }
-
-    fn write_zip(path: &Path, extra: Option<&str>) {
-        let file = File::create(path).expect("test ZIP must be created");
-        let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .unix_permissions(0o755);
-        for name in [
-            "CHANGELOG.md",
-            "LICENSE",
-            "README.md",
-            "kickoutchi.exe",
-            "kick.exe",
-        ] {
-            writer
-                .start_file(name, options)
-                .expect("test ZIP member must start");
-            writer
-                .write_all(name.as_bytes())
-                .expect("test ZIP member must be written");
-        }
-        if let Some(name) = extra {
-            writer
-                .start_file(name, options)
-                .expect("extra test ZIP member must start");
-            writer
-                .write_all(b"extra")
-                .expect("extra test ZIP member must be written");
-        }
-        writer.finish().expect("test ZIP must finish");
-    }
-
-    fn write_hostile_zip(path: &Path, hostile: ZipHostile) {
-        let file = File::create(path).expect("hostile ZIP must be created");
-        let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .unix_permissions(0o755);
-        for name in [
-            "CHANGELOG.md",
-            "LICENSE",
-            "README.md",
-            "kickoutchi.exe",
-            "kick.exe",
-        ] {
-            if hostile == ZipHostile::Symlink && name == "kick.exe" {
-                writer
-                    .add_symlink(name, "kickoutchi.exe", options)
-                    .expect("hostile ZIP symlink must be written");
-                continue;
-            }
-            let member_name = match hostile {
-                ZipHostile::Traversal if name == "README.md" => "../README.md",
-                ZipHostile::Absolute if name == "README.md" => "/README.md",
-                _ => name,
-            };
-            writer
-                .start_file(member_name, options)
-                .expect("hostile ZIP member must start");
-            writer
-                .write_all(name.as_bytes())
-                .expect("hostile ZIP member must be written");
-        }
-        if hostile == ZipHostile::Duplicate {
-            writer
-                .start_file("OTHER.txt", options)
-                .expect("placeholder ZIP member must start");
-            writer
-                .write_all(b"duplicate")
-                .expect("placeholder ZIP member must be written");
-        }
-        drop(writer.finish().expect("hostile ZIP must finish"));
-        if hostile == ZipHostile::Duplicate {
-            let mut bytes = fs::read(path).expect("duplicate ZIP fixture must be readable");
-            let mut replacements = 0;
-            for offset in 0..=bytes.len() - b"OTHER.txt".len() {
-                if bytes[offset..].starts_with(b"OTHER.txt") {
-                    bytes[offset..offset + b"README.md".len()].copy_from_slice(b"README.md");
-                    replacements += 1;
-                }
-            }
-            assert_eq!(
-                replacements, 2,
-                "placeholder name must occur in local and central ZIP headers"
-            );
-            fs::write(path, bytes).expect("duplicate ZIP fixture must be patched");
-        }
-    }
-
-    fn write_tar_extension(path: &Path) {
-        let file = File::create(path).expect("test TAR must be created");
-        let encoder = XzWriter::new(file, XzOptions::default()).expect("test XZ stream must start");
-        let mut builder = Builder::new(encoder);
-        let contents = b"11 path=a\n";
-        let mut header = Header::new_gnu();
-        header.set_entry_type(EntryType::new(b'x'));
-        header.set_mode(0o644);
-        header.set_size(u64::try_from(contents.len()).expect("fixture size must fit u64"));
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "PaxHeader", &contents[..])
-            .expect("test TAR extension must be written");
-        let encoder = builder.into_inner().expect("test TAR must finish");
-        encoder.finish().expect("test XZ stream must finish");
-    }
-
-    fn write_oversized_member_count_zip(path: &Path) {
-        let file = File::create(path).expect("test ZIP must be created");
-        let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        for index in 0..=ARCHIVE_MEMBERS_MAX {
-            writer
-                .start_file(format!("member-{index}"), options)
-                .expect("test ZIP member must start");
-            writer
-                .write_all(b"x")
-                .expect("test ZIP member must be written");
-        }
-        writer.finish().expect("test ZIP must finish");
-    }
-
-    fn corrupt_zip_member(path: &Path, name: &str) {
-        let file = File::open(path).expect("test ZIP must open");
-        let mut archive = ZipArchive::new(file).expect("test ZIP must parse");
-        let member = archive.by_name(name).expect("test ZIP member must exist");
-        let offset = member.data_start().expect("test ZIP member must have data");
-        drop(member);
-        drop(archive);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("test ZIP must reopen");
-        file.seek(SeekFrom::Start(offset))
-            .expect("test ZIP member must be seekable");
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).expect("test ZIP member byte");
-        byte[0] ^= 0xff;
-        file.seek(SeekFrom::Start(offset))
-            .expect("test ZIP member must be seekable");
-        file.write_all(&byte).expect("test ZIP member corruption");
-    }
-
     #[test]
-    fn targets_require_a_bounded_unique_valid_list() {
-        assert_eq!(
-            parse_targets(&format!(r#"["{LINUX_TARGET}"]"#)).expect("valid target list"),
-            [LINUX_TARGET]
-        );
-        let maximum: Vec<String> = (0..16).map(|index| format!("arch-{index}")).collect();
-        assert_eq!(
-            parse_targets(&serde_json::to_string(&maximum).expect("serialize targets"))
-                .expect("maximum target list"),
-            maximum
-        );
-        let too_many: Vec<String> = (0..17).map(|index| format!("arch-{index}")).collect();
-        assert!(
-            parse_targets(&serde_json::to_string(&too_many).expect("serialize targets")).is_err()
-        );
+    fn matrix_must_contain_only_the_native_target() {
+        assert!(require_native_target(&format!(r#"["{LINUX_TARGET}"]"#), LINUX_TARGET).is_ok());
         for invalid in [
             "[]",
             r#""not-a-list""#,
-            r#"["bad target"]"#,
-            r#"["x-y","x-y"]"#,
+            r#"["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu"]"#,
         ] {
-            assert!(parse_targets(invalid).is_err(), "accepted {invalid}");
+            assert!(require_native_target(invalid, LINUX_TARGET).is_err());
         }
-        assert!(require_single_native_target(&[LINUX_TARGET.to_owned()], LINUX_TARGET).is_ok());
-        assert!(
-            require_single_native_target(
-                &[
-                    LINUX_TARGET.to_owned(),
-                    "aarch64-unknown-linux-gnu".to_owned()
-                ],
-                LINUX_TARGET
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -1976,20 +1101,6 @@ mod tests {
     }
 
     #[test]
-    fn saved_archive_path_corpus_remains_bounded_and_panic_free() {
-        for input in [
-            include_bytes!("../fuzz/corpus/archive_member_path/canonical-directory").as_slice(),
-            include_bytes!("../fuzz/corpus/archive_member_path/canonical-file").as_slice(),
-            include_bytes!("../fuzz/corpus/archive_member_path/unicode-file").as_slice(),
-        ] {
-            let Some((&kind, raw)) = input.split_first() else {
-                continue;
-            };
-            let _ = safe_member_name(raw, kind == b'd');
-        }
-    }
-
-    #[test]
     fn checksum_requires_one_record_for_the_exact_archive() {
         let temporary = temporary_directory("kickoutchi-checksum-test");
         let archive = temporary.path.join("artifact.tar.xz");
@@ -2009,176 +1120,6 @@ mod tests {
         }
         fs::write(&checksum, vec![b'x'; 1025]).expect("oversized checksum fixture");
         assert!(verify_checksum(&archive, &digest).is_err());
-    }
-
-    #[test]
-    fn tar_requires_exact_layout_and_executable_binaries() {
-        let temporary = temporary_directory("kickoutchi-tar-test");
-        let expected = BTreeSet::from(["kickoutchi".to_owned(), "kick".to_owned()]);
-        let archive = temporary.path.join("artifact.tar.xz");
-        write_tar(&archive, 0o755);
-        let output = temporary.path.join("output");
-        fs::create_dir(&output).expect("output directory");
-        let binaries = extract_tar_binaries(&archive, &output, LINUX_TARGET, &expected)
-            .expect("valid TAR fixture");
-        assert_eq!(binaries.keys().cloned().collect::<BTreeSet<_>>(), expected);
-
-        let non_executable = temporary.path.join("non-executable.tar.xz");
-        write_tar(&non_executable, 0o644);
-        let rejected_output = temporary.path.join("rejected-output");
-        fs::create_dir(&rejected_output).expect("rejected output directory");
-        assert!(
-            extract_tar_binaries(&non_executable, &rejected_output, LINUX_TARGET, &expected)
-                .is_err()
-        );
-
-        let extension = temporary.path.join("extension.tar.xz");
-        write_tar_extension(&extension);
-        let extension_output = temporary.path.join("extension-output");
-        fs::create_dir(&extension_output).expect("extension output directory");
-        let error = extract_tar_binaries(&extension, &extension_output, LINUX_TARGET, &expected)
-            .expect_err("TAR extension records must be rejected before preprocessing");
-        assert!(error.contains("unsupported extension record"));
-
-        let corrupt = temporary.path.join("corrupt.tar.xz");
-        write_tar(&corrupt, 0o755);
-        let length = fs::metadata(&corrupt).expect("corrupt TAR metadata").len();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&corrupt)
-            .expect("corrupt TAR must open");
-        file.seek(SeekFrom::Start(length - 8))
-            .expect("XZ footer must be seekable");
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).expect("XZ footer byte");
-        byte[0] ^= 0xff;
-        file.seek(SeekFrom::Start(length - 8))
-            .expect("XZ footer must be seekable");
-        file.write_all(&byte).expect("XZ footer corruption");
-        let corrupt_output = temporary.path.join("corrupt-output");
-        fs::create_dir(&corrupt_output).expect("corrupt output directory");
-        assert!(extract_tar_binaries(&corrupt, &corrupt_output, LINUX_TARGET, &expected).is_err());
-    }
-
-    #[test]
-    fn tar_rejects_hostile_paths_links_modes_and_duplicates() {
-        let temporary = temporary_directory("kickoutchi-hostile-tar-test");
-        let expected = BTreeSet::from(["kickoutchi".to_owned(), "kick".to_owned()]);
-        for (hostile, label, error_fragment) in [
-            (
-                TarHostile::Traversal,
-                "traversal",
-                "unsafe archive member path",
-            ),
-            (
-                TarHostile::Absolute,
-                "absolute",
-                "unsafe archive member path",
-            ),
-            (
-                TarHostile::Symlink,
-                "symlink",
-                "forbidden or unsupported member",
-            ),
-            (
-                TarHostile::Hardlink,
-                "hardlink",
-                "forbidden or unsupported member",
-            ),
-            (
-                TarHostile::MalformedMode,
-                "malformed-mode",
-                "mode is invalid",
-            ),
-            (TarHostile::Duplicate, "duplicate", "duplicate member"),
-        ] {
-            let archive = temporary.path.join(format!("{label}.tar.xz"));
-            write_hostile_tar(&archive, hostile);
-            let output = temporary.path.join(format!("{label}-output"));
-            fs::create_dir(&output).expect("hostile TAR output directory must be created");
-
-            let error = extract_tar_binaries(&archive, &output, LINUX_TARGET, &expected)
-                .expect_err("hostile TAR fixture must be rejected");
-            assert!(
-                error.contains(error_fragment),
-                "hostile TAR fixture {label} reached the wrong rejection: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn zip_requires_exact_flat_layout() {
-        let temporary = temporary_directory("kickoutchi-zip-test");
-        let expected = BTreeSet::from(["kickoutchi.exe".to_owned(), "kick.exe".to_owned()]);
-        let archive = temporary.path.join("artifact.zip");
-        write_zip(&archive, None);
-        let output = temporary.path.join("output");
-        fs::create_dir(&output).expect("output directory");
-        let binaries = extract_zip_binaries(&archive, &output, WINDOWS_TARGET, &expected)
-            .expect("valid ZIP fixture");
-        assert_eq!(binaries.keys().cloned().collect::<BTreeSet<_>>(), expected);
-
-        let unexpected = temporary.path.join("unexpected.zip");
-        write_zip(&unexpected, Some("unexpected"));
-        let rejected_output = temporary.path.join("rejected-output");
-        fs::create_dir(&rejected_output).expect("rejected output directory");
-        assert!(
-            extract_zip_binaries(&unexpected, &rejected_output, WINDOWS_TARGET, &expected).is_err()
-        );
-
-        let oversized = temporary.path.join("oversized-count.zip");
-        write_oversized_member_count_zip(&oversized);
-        let oversized_output = temporary.path.join("oversized-output");
-        fs::create_dir(&oversized_output).expect("oversized output directory");
-        let error = extract_zip_binaries(&oversized, &oversized_output, WINDOWS_TARGET, &expected)
-            .expect_err("first excess ZIP member must be rejected");
-        assert!(error.contains("member count is outside the approved bound"));
-
-        let corrupt = temporary.path.join("corrupt.zip");
-        write_zip(&corrupt, None);
-        corrupt_zip_member(&corrupt, "README.md");
-        let corrupt_output = temporary.path.join("corrupt-output");
-        fs::create_dir(&corrupt_output).expect("corrupt output directory");
-        assert!(
-            extract_zip_binaries(&corrupt, &corrupt_output, WINDOWS_TARGET, &expected).is_err()
-        );
-    }
-
-    #[test]
-    fn zip_rejects_hostile_paths_symlinks_and_duplicates() {
-        let temporary = temporary_directory("kickoutchi-hostile-zip-test");
-        let expected = BTreeSet::from(["kickoutchi.exe".to_owned(), "kick.exe".to_owned()]);
-        for (hostile, label, error_fragment) in [
-            (
-                ZipHostile::Traversal,
-                "traversal",
-                "unsafe archive member path",
-            ),
-            (
-                ZipHostile::Absolute,
-                "absolute",
-                "unsafe archive member path",
-            ),
-            (ZipHostile::Symlink, "symlink", "symbolic link"),
-            (
-                ZipHostile::Duplicate,
-                "duplicate",
-                "entry count changed while opening",
-            ),
-        ] {
-            let archive = temporary.path.join(format!("{label}.zip"));
-            write_hostile_zip(&archive, hostile);
-            let output = temporary.path.join(format!("{label}-output"));
-            fs::create_dir(&output).expect("hostile ZIP output directory must be created");
-
-            let error = extract_zip_binaries(&archive, &output, WINDOWS_TARGET, &expected)
-                .expect_err("hostile ZIP fixture must be rejected");
-            assert!(
-                error.contains(error_fragment),
-                "hostile ZIP fixture {label} reached the wrong rejection: {error}"
-            );
-        }
     }
 
     #[test]
@@ -2221,21 +1162,6 @@ mod tests {
         assert!(maximum_glibc_requirement("GLIBC_PRIVATE").is_err());
         assert!(maximum_glibc_requirement("Name: GLIBC_2").is_err());
         assert!(maximum_glibc_requirement("Name: GLIBC_2.31.future").is_err());
-    }
-
-    #[test]
-    fn expanded_stream_reader_accepts_the_limit_and_rejects_the_first_excess_byte() {
-        let mut exact = BoundedReader::new(&b"abcd"[..], 4);
-        let mut output = Vec::new();
-        exact
-            .read_to_end(&mut output)
-            .expect("exact expanded limit");
-        assert_eq!(output, b"abcd");
-
-        let mut excess = BoundedReader::new(&b"abcde"[..], 4);
-        let mut output = Vec::new();
-        assert!(excess.read_to_end(&mut output).is_err());
-        assert_eq!(output, b"abcd");
     }
 
     #[test]

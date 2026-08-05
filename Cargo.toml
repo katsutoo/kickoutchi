@@ -77,7 +77,6 @@ serde_yaml_ng = { version = "=0.10.0", default-features = false }
 # replace the former Python validator with bounded native Rust parsers.
 sha2 = { version = "=0.10.9", default-features = false }
 tar = { version = "=0.4.46", default-features = false }
-lzma-rust2 = { version = "=0.15.5", default-features = false, features = ["encoder", "std", "xz"] }
 xz4rust = { version = "=0.2.2", default-features = false, features = ["bcj", "crc64", "delta", "no_unsafe", "sha256", "std"] }
 zip = { version = "=8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

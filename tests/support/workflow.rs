@@ -42,14 +42,13 @@ fn yaml_scalar(mapping: &Mapping, key: &str) -> Option<String> {
 }
 
 fn yaml_mapping(mapping: &Mapping, key: &str) -> Vec<(String, String)> {
-    mapping_value(mapping, key)
-        .map_or_else(
-            || panic!("missing YAML mapping {key}"),
-            |value| required_mapping(value, key),
-        )
-        .iter()
-        .map(|(key, value)| (scalar_text(key), scalar_text(value)))
-        .collect()
+    required_mapping(
+        mapping_value(mapping, key).unwrap_or_else(|| panic!("missing YAML mapping {key}")),
+        key,
+    )
+    .iter()
+    .map(|(key, value)| (scalar_text(key), scalar_text(value)))
+    .collect()
 }
 
 fn yaml_sequence(mapping: &Mapping, key: &str) -> Vec<String> {
@@ -64,15 +63,17 @@ fn workflow_root(workflow: &Value) -> &Mapping {
 }
 
 fn workflow_jobs(workflow: &Value) -> &Mapping {
-    mapping_value(workflow_root(workflow), "jobs")
-        .map(|value| required_mapping(value, "workflow jobs"))
-        .expect("workflow must define jobs")
+    required_mapping(
+        mapping_value(workflow_root(workflow), "jobs").expect("workflow must define jobs"),
+        "workflow jobs",
+    )
 }
 
 fn workflow_job<'a>(workflow: &'a Value, name: &str) -> &'a Mapping {
-    mapping_value(workflow_jobs(workflow), name).map_or_else(
-        || panic!("missing workflow job {name}"),
-        |value| required_mapping(value, name),
+    required_mapping(
+        mapping_value(workflow_jobs(workflow), name)
+            .unwrap_or_else(|| panic!("missing workflow job {name}")),
+        name,
     )
 }
 
@@ -128,19 +129,26 @@ fn job_needs(job: &Mapping) -> Vec<String> {
 }
 
 fn matrix_entries(job: &Mapping) -> &[Value] {
-    let strategy = mapping_value(job, "strategy")
-        .map(|value| required_mapping(value, "job strategy"))
-        .expect("matrix job must define a strategy");
-    let matrix = mapping_value(strategy, "matrix")
-        .map(|value| required_mapping(value, "job matrix"))
-        .expect("strategy must define a matrix");
+    let strategy = required_mapping(
+        mapping_value(job, "strategy").expect("matrix job must define a strategy"),
+        "job strategy",
+    );
+    let matrix = required_mapping(
+        mapping_value(strategy, "matrix").expect("strategy must define a matrix"),
+        "job matrix",
+    );
     required_sequence(matrix, "include")
 }
 
-fn assert_pinned_actions_and_checkout_credentials(workflow: &str) {
-    let workflow = parsed_workflow(workflow);
-    let mut action_count = 0;
+fn assert_workflow_security(source: &str) {
+    let workflow = parsed_workflow(source);
+    assert_eq!(
+        yaml_mapping(workflow_root(&workflow), "permissions"),
+        [("contents".to_owned(), "read".to_owned())]
+    );
+    assert_permission_maps(&workflow);
 
+    let mut action_count = 0;
     for step in workflow_steps(&workflow) {
         let Some(reference) = mapping_value(step, "uses").and_then(Value::as_str) else {
             continue;
@@ -149,79 +157,55 @@ fn assert_pinned_actions_and_checkout_credentials(workflow: &str) {
         let (action, revision) = reference
             .rsplit_once('@')
             .unwrap_or_else(|| panic!("action must specify a revision: {reference}"));
-        assert_eq!(revision.len(), 40, "action must use a full SHA: {reference}");
         assert!(
-            revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "action SHA must be hexadecimal: {reference}"
+            revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "action must use a full commit SHA: {reference}"
         );
-
         if action == "actions/checkout" {
-            let options = mapping_value(step, "with")
-                .map(|value| required_mapping(value, "checkout options"))
-                .expect("checkout must define options");
+            let options = required_mapping(
+                mapping_value(step, "with").expect("checkout must define options"),
+                "checkout options",
+            );
             assert_eq!(
                 mapping_value(options, "persist-credentials").and_then(Value::as_bool),
-                Some(false),
-                "checkout must not persist credentials"
+                Some(false)
             );
-            assert!(
-                mapping_value(options, "token").is_none(),
-                "checkout tokens must not be persisted"
-            );
+            assert!(mapping_value(options, "token").is_none());
         }
     }
-
     assert!(action_count > 0, "workflow must use at least one action");
 }
 
-fn assert_no_permission_shorthands(value: &Value) {
+fn assert_permission_maps(value: &Value) {
     match value {
-        Value::Mapping(mapping) => {
-            for (key, value) in mapping {
-                if key.as_str() == Some("permissions") {
-                    assert!(
-                        value.as_str().is_none(),
-                        "workflow must not use a permission shorthand"
-                    );
-                }
-                assert_no_permission_shorthands(value);
+        Value::Mapping(mapping) => mapping.iter().for_each(|(key, value)| {
+            if key.as_str() == Some("permissions") {
+                assert!(value.as_mapping().is_some(), "permissions must be explicit");
             }
-        }
-        Value::Sequence(sequence) => sequence.iter().for_each(assert_no_permission_shorthands),
-        Value::Tagged(tagged) => assert_no_permission_shorthands(&tagged.value),
+            assert_permission_maps(value);
+        }),
+        Value::Sequence(sequence) => sequence.iter().for_each(assert_permission_maps),
+        Value::Tagged(tagged) => assert_permission_maps(&tagged.value),
         _ => {}
     }
-}
-
-fn assert_read_only_default(workflow: &str) {
-    let workflow = parsed_workflow(workflow);
-    assert_eq!(
-        yaml_mapping(workflow_root(&workflow), "permissions"),
-        [("contents".to_owned(), "read".to_owned())]
-    );
 }
 
 fn assert_release_job_permissions(workflow: &Value) {
     for name in workflow_job_names(workflow) {
         let job = workflow_job(workflow, &name);
         let permissions = mapping_value(job, "permissions").map(|_| yaml_mapping(job, "permissions"));
-
         match name.as_str() {
-            "host" => assert_eq!(
-                permissions,
-                Some(vec![("contents".to_owned(), "write".to_owned())])
-            ),
+            "host" => assert_eq!(permissions, Some(vec![("contents".into(), "write".into())])),
             "attest-release-artifacts" => assert_eq!(
                 permissions,
                 Some(vec![
-                    ("contents".to_owned(), "read".to_owned()),
-                    ("id-token".to_owned(), "write".to_owned()),
-                    ("attestations".to_owned(), "write".to_owned()),
+                    ("contents".into(), "read".into()),
+                    ("id-token".into(), "write".into()),
+                    ("attestations".into(), "write".into()),
                 ])
             ),
             _ => assert!(
-                permissions
-                    .is_none_or(|entries| entries.iter().all(|(_, access)| access == "read")),
+                permissions.is_none_or(|values| values.iter().all(|(_, access)| access == "read")),
                 "release job {name} has unnecessary write access"
             ),
         }
@@ -231,37 +215,7 @@ fn assert_release_job_permissions(workflow: &Value) {
 fn assert_no_ref_expression_in_scripts(workflow: &str) {
     for step in workflow_steps(&parsed_workflow(workflow)) {
         if let Some(script) = mapping_value(step, "run").and_then(Value::as_str) {
-            assert!(
-                !script.contains("${{ github.ref"),
-                "tag/ref expressions must reach scripts through environment variables"
-            );
+            assert!(!script.contains("${{ github.ref"));
         }
     }
-}
-
-fn toml_string(source: &str, key: &str) -> String {
-    let value = source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .find_map(|line| {
-            let (candidate, value) = line.split_once('=')?;
-            (candidate.trim() == key).then(|| value.trim())
-        })
-        .unwrap_or_else(|| panic!("missing TOML key {key}"));
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("{key} must be a TOML string"))
-        .to_owned()
-}
-
-fn assert_exact_semver(version: &str) {
-    let components = version.split('.').collect::<Vec<_>>();
-    assert_eq!(components.len(), 3, "version must be exact: {version}");
-    assert!(
-        components.iter().all(|component| !component.is_empty()
-            && component.bytes().all(|byte| byte.is_ascii_digit())),
-        "version must contain only numeric components: {version}"
-    );
 }

@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pull-request packaging runs, post-publication revalidation, and the separate
   release-policy layer. Native archives and installers remain validated before
   attested Linux, macOS, Windows, and Homebrew publication.
+- Reduced the release artifact validator from 2,252 to about 1,200 lines by
+  relying on the archive libraries for XZ/ZIP framing, deleting elaborate
+  corruption fixtures and the unreachable post-publication updater journey,
+  and removing its unused test-only XZ encoder. Checksums, safe member paths,
+  exact package layouts, executable/version journeys, the Linux glibc floor,
+  updater smoke tests, and generated installer receipts remain enforced.
+- Removed two repeated CI operations: Linux's full test suite is now the sole
+  ordinary validator-test run, and the x86_64 Nix lane evaluates every declared
+  system once while both x86_64 and aarch64 lanes still build and execute their
+  native packages. Workflow contract helpers were shortened while retaining
+  action pins, checkout isolation, least permissions, target coverage, and
+  release publication ordering.
+- Kept cargo-dist installed from its exact pinned source version in release
+  jobs instead of switching to faster prebuilt binaries, preserving the
+  existing supply-chain trust model for infrequent releases.
 - Split the CLI contract suite by command and moved shared subprocess,
   socket/process, and workflow-parser fixtures under `tests/support/`. Contract
   names and safety behavior remain intact while individual files now have clear

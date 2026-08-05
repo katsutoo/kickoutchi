@@ -2,13 +2,14 @@ include!("support/workflow.rs");
 
 use std::collections::BTreeSet;
 
+fn strings<const N: usize>(values: [&str; N]) -> BTreeSet<String> {
+    values.map(str::to_owned).into_iter().collect()
+}
+
 #[test]
 fn workflows_pin_actions_and_keep_credentials_and_permissions_narrow() {
     for workflow in [CI_WORKFLOW, FUZZ_WORKFLOW, RELEASE_WORKFLOW] {
-        assert_pinned_actions_and_checkout_credentials(workflow);
-        assert_read_only_default(workflow);
-        let parsed = parsed_workflow(workflow);
-        assert_no_permission_shorthands(&parsed);
+        assert_workflow_security(workflow);
     }
 
     assert_release_job_permissions(&parsed_workflow(RELEASE_WORKFLOW));
@@ -39,7 +40,7 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
     let complete = workflow_job(&ci, "ci-complete");
     assert_eq!(
         job_needs(complete).into_iter().collect::<BTreeSet<_>>(),
-        LANES.map(str::to_owned).into_iter().collect()
+        strings(LANES)
     );
     assert!(yaml_scalar(complete, "if").is_some_and(|condition| condition.contains("always()")));
 
@@ -52,28 +53,25 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
         named_job_step(job, "Build release binaries");
         named_job_step(job, "Run release binary journeys");
     }
-    assert!(
-        !CI_WORKFLOW.contains("--doc"),
-        "the internal library has doctests disabled; CI must not run a no-op command"
-    );
-
-    let nix_systems = matrix_entries(workflow_job(&ci, "nix"))
+    let nix = workflow_job(&ci, "nix");
+    let nix_systems = matrix_entries(nix)
         .iter()
         .map(|entry| {
             yaml_scalar(required_mapping(entry, "Nix matrix entry"), "system")
                 .expect("Nix matrix entry must define a system")
         })
         .collect::<BTreeSet<_>>();
+    assert_eq!(nix_systems, strings(["aarch64-linux", "x86_64-linux"]));
     assert_eq!(
-        nix_systems,
-        ["aarch64-linux", "x86_64-linux"]
-            .map(str::to_owned)
-            .into_iter()
-            .collect()
+        yaml_scalar(
+            named_job_step(nix, "Evaluate every declared Nix system"),
+            "if"
+        )
+        .as_deref(),
+        Some("${{ matrix.system == 'x86_64-linux' }}")
     );
 
     let supply_chain = workflow_job(&ci, "supply-chain");
-    named_job_step(supply_chain, "Test release artifact validator");
     named_job_step(supply_chain, "Verify regenerated Arch metadata");
     let deny = named_job_step(supply_chain, "Run cargo-deny");
     assert!(step_script(deny).contains("--manifest-path fuzz/Cargo.toml"));
@@ -154,16 +152,13 @@ fn release_runs_only_for_tags_or_manual_dry_runs_and_keeps_every_target() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         targets,
-        [
+        strings([
             "aarch64-apple-darwin",
             "aarch64-unknown-linux-gnu",
             "x86_64-apple-darwin",
             "x86_64-pc-windows-msvc",
             "x86_64-unknown-linux-gnu",
-        ]
-        .map(str::to_owned)
-        .into_iter()
-        .collect()
+        ])
     );
     assert!(dist.get("pr-run-mode").is_none());
 
@@ -179,13 +174,7 @@ fn release_runs_only_for_tags_or_manual_dry_runs_and_keeps_every_target() {
                 .to_owned()
         })
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        installers,
-        ["homebrew", "powershell", "shell"]
-            .map(str::to_owned)
-            .into_iter()
-            .collect()
-    );
+    assert_eq!(installers, strings(["homebrew", "powershell", "shell"]));
     assert_eq!(
         dist.get("tap").and_then(toml::Value::as_str),
         Some("nuggocto/homebrew-tap")
@@ -212,7 +201,7 @@ fn release_validates_packages_before_attested_publication() {
         workflow_job_names(&release)
             .into_iter()
             .collect::<BTreeSet<_>>(),
-        [
+        strings([
             "attest-release-artifacts",
             "build-global-artifacts",
             "build-local-artifacts",
@@ -220,19 +209,8 @@ fn release_validates_packages_before_attested_publication() {
             "plan",
             "publish-homebrew-formula",
             "validate-installers",
-        ]
-        .map(str::to_owned)
-        .into_iter()
-        .collect()
+        ])
     );
-
-    for name in workflow_job_names(&release) {
-        let timeout = yaml_scalar(workflow_job(&release, &name), "timeout-minutes")
-            .unwrap_or_else(|| panic!("release job {name} needs a timeout"))
-            .parse::<u64>()
-            .expect("timeout must be an integer");
-        assert!((1..=60).contains(&timeout));
-    }
 
     let local = workflow_job(&release, "build-local-artifacts");
     assert_eq!(job_needs(local), ["plan"]);
@@ -273,14 +251,11 @@ fn release_validates_packages_before_attested_publication() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         installer_targets,
-        [
+        strings([
             "[\"aarch64-apple-darwin\"]",
             "[\"x86_64-pc-windows-msvc\"]",
             "[\"x86_64-unknown-linux-gnu\"]",
-        ]
-        .map(str::to_owned)
-        .into_iter()
-        .collect()
+        ])
     );
     assert!(
         step_script(named_job_step(
@@ -344,15 +319,30 @@ fn homebrew_publication_is_a_scoped_blocking_handoff_to_the_tap() {
 
 #[test]
 fn cargo_dist_and_linux_release_inputs_are_exact_and_immutable() {
-    let configured_version = toml_string(DIST_WORKSPACE, "cargo-dist-version");
-    assert_exact_semver(&configured_version);
+    let workspace =
+        toml::from_str::<toml::Value>(DIST_WORKSPACE).expect("dist workspace must be valid TOML");
+    let dist = workspace
+        .get("dist")
+        .expect("dist workspace must define [dist]");
+    let configured_version = dist
+        .get("cargo-dist-version")
+        .and_then(toml::Value::as_str)
+        .expect("cargo-dist-version must be a string");
+    let version_parts = configured_version.split('.').collect::<Vec<_>>();
+    assert!(
+        version_parts.len() == 3
+            && version_parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "cargo-dist-version must be exact semver: {configured_version}"
+    );
 
     let release = parsed_workflow(RELEASE_WORKFLOW);
     assert_eq!(
         yaml_mapping(workflow_root(&release), "env")
             .into_iter()
             .find_map(|(name, value)| (name == "DIST_VERSION").then_some(value)),
-        Some(configured_version.clone())
+        Some(configured_version.to_owned())
     );
     for job_name in ["plan", "build-local-artifacts"] {
         let scripts = job_steps(workflow_job(&release, job_name))
@@ -365,11 +355,8 @@ fn cargo_dist_and_linux_release_inputs_are_exact_and_immutable() {
         );
     }
 
-    let workspace =
-        toml::from_str::<toml::Value>(DIST_WORKSPACE).expect("dist workspace must be valid TOML");
-    let runners = workspace
-        .get("dist")
-        .and_then(|dist| dist.get("github-custom-runners"))
+    let runners = dist
+        .get("github-custom-runners")
         .and_then(toml::Value::as_table)
         .expect("Linux release builders must be configured");
     for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {

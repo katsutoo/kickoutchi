@@ -41,9 +41,6 @@ jobs:
       - name: Install cargo-deny
         run: cargo install --locked cargo-deny --version 0.19.4
 
-      - name: Test release artifact validator
-        run: cargo test --locked --test release_artifact_validator
-
       - name: Verify regenerated Arch metadata
         run: |
           docker run --rm \
@@ -132,6 +129,7 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@d96678350ffd6a456235832eb11e1c491589b7bb # v3.21.8
 
       - name: Evaluate every declared Nix system
+        if: ${{ matrix.system == 'x86_64-linux' }}
         run: nix flake check --no-update-lock-file --all-systems
 
       - name: Build and verify native Nix package
