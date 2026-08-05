@@ -55,8 +55,8 @@ scoop install kickoutchi
 ```
 
 Stable releases publish their generated Homebrew formula to
-[`nuggocto/homebrew-tap`](https://github.com/nuggocto/homebrew-tap) after formula
-validation. [`nuggocto/scoop-bucket`](https://github.com/nuggocto/scoop-bucket)
+[`nuggocto/homebrew-tap`](https://github.com/nuggocto/homebrew-tap) as the final
+required release job. [`nuggocto/scoop-bucket`](https://github.com/nuggocto/scoop-bucket)
 checks GitHub Releases every four hours with Scoop Excavator. Those repositories
 are the package-manager sources of truth.
 
@@ -65,8 +65,9 @@ a GitHub Release exists, because their `pkgver` and checksums are taken from the
 real published assets. `kickoutchi-bin` installs the prebuilt Linux archive;
 `kickoutchi` builds from the release source archive.
 
-Every package manager here is an independent publisher, so each can lag a new
-GitHub Release rather than updating with it.
+Scoop and AUR publish independently and can briefly lag a GitHub Release. The
+Homebrew tap update is part of the release workflow, while Nix installs directly
+from this repository's flake.
 
 ### GitHub Release
 

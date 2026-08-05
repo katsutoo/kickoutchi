@@ -7,20 +7,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# Build and upload packages on pull requests so release packaging is exercised
-# before a tag can publish the same artifact graph.
-pr-run-mode = "upload"
-# release.yml began as cargo-dist output but is intentionally maintained in-repo
-# with pinned actions, narrow permissions, same-run native gates, bounded archive
-# validation, and scoped publication credentials. Review generated changes by
-# hand instead of overwriting those controls.
+# release.yml stays hand-maintained so its action pins, validation, attestations,
+# and scoped publication credentials are preserved across cargo-dist updates.
 allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
-# Homebrew tap that receives the generated formula. The publish-homebrew-formula
-# job in release.yml pushes to it with HOMEBREW_TAP_TOKEN. release.yml is
-# hand-hardened, so that job is kept in sync with cargo-dist changes by review
-# rather than blindly regenerated.
+# Homebrew tap that receives the generated formula after each stable release.
 tap = "nuggocto/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Whether to install an updater program

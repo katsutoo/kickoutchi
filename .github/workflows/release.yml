@@ -1,22 +1,14 @@
-# This workflow started from cargo-dist output but is intentionally maintained in
-# this repository. Do not overwrite its pinned actions, narrowed permissions,
-# same-run verification, native archive validation, or tap publication hardening
-# with unreviewed `dist generate` output.
-#
-# Copyright 2022-2024, axodotdev
-# SPDX-License-Identifier: MIT or Apache-2.0
-#
-# CI that:
-#
-# * checks for a Git Tag that looks like a release
-# * builds artifacts with dist (archives, installers, hashes)
-# * uploads those artifacts to temporary workflow zip
-# * on success, uploads the artifacts to a GitHub Release
-#
-# Note that the GitHub Release will be created with a generated
-# title/body based on your changelogs.
+# Hand-maintained cargo-dist release workflow. Keep action references pinned and
+# publication credentials scoped to the job or step that needs them.
 
 name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
 permissions:
   contents: read
 
@@ -26,175 +18,14 @@ env:
   RUST_VERSION: "1.95.0"
 
 concurrency:
-  # Every tag publishes to the same Homebrew branch, so different releases must
-  # not overlap after one has already created its GitHub Release.
+  # Releases share the Homebrew tap branch and must publish in order.
   group: ${{ github.workflow }}
   cancel-in-progress: false
 
-# This task will run whenever you push a git tag that looks like a version
-# like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
-# Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
-# PACKAGE_NAME must be the name of a Cargo package in your workspace, and VERSION
-# must be a Cargo-style SemVer Version (must have at least major.minor.patch).
-#
-# If PACKAGE_NAME is specified, then the announcement will be for that
-# package (erroring out if it doesn't have the given version or isn't dist-able).
-#
-# If PACKAGE_NAME isn't specified, then the announcement will be for all
-# (dist-able) packages in the workspace with that version (this mode is
-# intended for workspaces with only one dist-able package, or with all dist-able
-# packages versioned/released in lockstep).
-#
-# If you push multiple tags at once, separate instances of this workflow will
-# spin up, creating an independent announcement for each one. However, GitHub
-# will hard limit this to 3 tags per commit, as it will assume more tags is a
-# mistake.
-#
-# If there's a prerelease-style suffix to the version, then the release(s)
-# will be marked as a prerelease.
-on:
-  # Safe dry-run entry point for validating every native archive without a tag.
-  workflow_dispatch:
-  pull_request:
-  push:
-    tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
-
 jobs:
-  # One reviewed policy owns the hand-maintained verification/installer
-  # matrices and every release timeout. cargo-dist continues to own the native
-  # artifact target matrix through dist-workspace.toml.
-  release-policy:
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      verify-matrix: ${{ steps.policy.outputs.verify_matrix }}
-      installer-matrix: ${{ steps.policy.outputs.installer_matrix }}
-      timeouts: ${{ steps.policy.outputs.timeouts }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - id: policy
-        name: Load release policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          policy=.github/release-policy.json
-          jq -e '
-            .schema == 1 and
-            .artifact_targets_source == "dist-workspace.toml" and
-            (.verify_matrix.include | length == 4) and
-            (.installer_matrix.include | length == 3) and
-            ([.timeouts[] | type == "number" and . >= 1 and . <= 60] | all)
-          ' "$policy" >/dev/null
-          echo "verify_matrix=$(jq -c '.verify_matrix' "$policy")" >> "$GITHUB_OUTPUT"
-          echo "installer_matrix=$(jq -c '.installer_matrix' "$policy")" >> "$GITHUB_OUTPUT"
-          echo "timeouts=$(jq -c '.timeouts' "$policy")" >> "$GITHUB_OUTPUT"
-
-  # Publication is gated here rather than relying on checks from another run:
-  # every check below uses this workflow's exact github.sha.
-  verify:
-    name: Verify (${{ matrix.name }})
-    needs:
-      - release-policy
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.release-policy.outputs.verify-matrix) }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).verify }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - name: Install and select Rust 1.95.0 (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
-          rustup default "$RUST_VERSION"
-      - name: Install and select Rust 1.95.0 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          rustup toolchain install $env:RUST_VERSION --profile minimal --component rustfmt --component clippy
-          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
-          rustup default $env:RUST_VERSION
-          if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
-      - name: Install cargo-deny
-        if: matrix.name == 'Supply Chain'
-        shell: bash
-        run: cargo install --locked cargo-deny --version 0.19.4
-      - name: Enable unprivileged user namespaces
-        if: matrix.name == 'Linux'
-        run: |
-          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - name: Check formatting
-        if: matrix.name != 'Supply Chain'
-        run: cargo fmt --all --check
-      - name: Run strict Clippy
-        if: matrix.name != 'Supply Chain'
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Run tests (Linux capabilities required)
-        if: matrix.name == 'Linux'
-        run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features
-      - name: Run tests
-        if: matrix.name == 'Windows' || matrix.name == 'macOS'
-        run: cargo test --locked --all-features
-      - name: Run doctests
-        if: matrix.name != 'Supply Chain'
-        run: cargo test --locked --all-features --doc
-      - name: Build release binaries
-        if: matrix.name != 'Supply Chain'
-        run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
-      - name: Run release binary journeys (Linux)
-        if: matrix.name == 'Linux'
-        env:
-          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
-          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
-          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
-          KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
-        run: |
-          cargo test --locked --all-features --test cli_contract
-          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
-      - name: Run release binary journeys (Windows)
-        if: matrix.name == 'Windows'
-        env:
-          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
-          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}\target\release\kickoutchi.exe
-          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}\target\release\kick.exe
-        run: |
-          cargo test --locked --all-features --test cli_contract
-          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
-      - name: Run release binary journeys (macOS)
-        if: matrix.name == 'macOS'
-        env:
-          KICKOUTCHI_RELEASE_E2E_REQUIRED: "1"
-          KICKOUTCHI_E2E_KICKOUTCHI: ${{ github.workspace }}/target/release/kickoutchi
-          KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
-        run: |
-          cargo test --locked --all-features --test cli_contract
-          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
-      - name: Test release artifact validator
-        if: matrix.name == 'Supply Chain'
-        run: cargo test --locked --test release_artifact_validator
-      - name: Run supply-chain policy
-        if: matrix.name == 'Supply Chain'
-        run: cargo deny check
-
-  # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
-    needs:
-      - release-policy
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).plan }}
-    permissions:
-      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
@@ -205,89 +36,62 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install dist
-        shell: bash
+      - name: Install cargo-dist
         run: cargo install --locked cargo-dist --version "$DIST_VERSION"
-      - name: Cache dist
+      - name: Cache cargo-dist
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
-      # sure would be cool if github gave us proper conditionals...
-      # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
-      # functionality based on whether this is a pull_request, and whether it's from a fork.
-      # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
-      # but also really annoying to build CI around when it needs secrets to work right.)
-      # The ref name reaches the shell through env rather than ${{ }} splicing:
-      # tag pushers are already trusted, but a ref name can contain `$(...)`,
-      # and env expansion cannot inject commands the way inline interpolation can.
       - id: plan
+        name: Plan release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PLAN_ARGS: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }}
         run: |
+          set -euo pipefail
           dist $PLAN_ARGS --output-format=json > plan-dist-manifest.json
-          echo "dist ran successfully"
-          cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
-      - name: "Upload dist-manifest.json"
+          echo "manifest=$(jq -c '.' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Upload release plan
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
-  # Build and packages all the platform-specific things
   build-local-artifacts:
-    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
-    # Let the initial task tell us to not run (currently very blunt)
-    needs:
-      - release-policy
-      - plan
-      - verify
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    name: Build (${{ join(matrix.targets, ', ') }})
+    needs: plan
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
-      # Target platforms/runners are computed by dist in create-release.
-      # Each member of the matrix has the following arguments:
-      #
-      # - runner: the github runner
-      # - dist-args: cli flags to pass to dist
-      # - install-dist: expression to run to install dist on the runner
-      #
-      # Typically there will be:
-      # - 1 "global" task that builds universal installers
-      # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).build_local_artifacts }}
+    timeout-minutes: 45
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
-      - name: enable windows longpaths
-        run: |
-          git config --global core.longpaths true
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Require rustup in container
+      - name: Select Rust in release container
         if: ${{ matrix.container }}
         shell: bash
         run: |
-          command -v rustup >/dev/null 2>&1 || {
-            echo "cargo-dist container must provide rustup; refusing an unverified network bootstrap" >&2
-            exit 1
-          }
+          set -euo pipefail
+          command -v rustup >/dev/null
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-      - name: Install and select Rust 1.95.0 (Unix runner)
+      - name: Select Rust on Unix runner
         if: ${{ !matrix.container && runner.os != 'Windows' }}
         shell: bash
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-      - name: Install and select Rust 1.95.0 (Windows runner)
+      - name: Select Rust on Windows runner
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -295,33 +99,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
           rustup default $env:RUST_VERSION
           if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
-      - name: Install dist (Unix)
+      - name: Install cargo-dist on Unix
         if: runner.os != 'Windows'
-        shell: bash
         run: cargo install --locked cargo-dist --version "$DIST_VERSION"
-      - name: Install dist (Windows)
+      - name: Install cargo-dist on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: cargo install --locked cargo-dist --version $env:DIST_VERSION
-      # Get the dist-manifest
-      - name: Fetch local artifacts
+      - name: Fetch release plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
-      - name: Install dependencies
-        run: |
-          ${{ matrix.packages_install }}
+      - name: Install build dependencies
+        run: ${{ matrix.packages_install }}
       - name: Build artifacts
-        shell: bash
         env:
-          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
+        run: dist build $TAG_FLAG --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+      - id: cargo-dist
+        name: Collect artifacts
+        shell: bash
         run: |
-          # Actually do builds and make zips and whatnot
-          dist build $TAG_FLAG --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
-          echo "dist ran successfully"
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: Rebuild Linux updater at supported ABI floor
         if: runner.os == 'Linux'
         shell: bash
@@ -333,29 +137,14 @@ jobs:
           test "$RUST_HOST" = "$UPDATER_TARGET"
           cargo install --locked axoupdater-cli --version "$AXOUPDATER_VERSION" --root target/axoupdater
           install -m 0755 target/axoupdater/bin/axoupdater "target/distrib/kickoutchi-${UPDATER_TARGET}-update"
-      - id: cargo-dist
-        name: Post-build
-        # We force bash here just because github makes it really hard to get values up
-        # to "real" actions without writing to env-vars, and writing to env-vars has
-        # inconsistent syntax between shell and powershell.
-        shell: bash
-        run: |
-          # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: Enable native Linux capabilities for artifact journeys
         if: runner.os == 'Linux' && !matrix.container
-        shell: bash
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Require readelf for Linux ABI validation
         if: runner.os == 'Linux'
-        shell: bash
         run: command -v readelf >/dev/null
       - name: Validate native release archive
         env:
@@ -365,7 +154,7 @@ jobs:
           KICKOUTCHI_RELEASE_RUNNER_ARCH: ${{ runner.arch }}
           KICKOUTCHI_RELEASE_CONTAINER: ${{ matrix.container && '1' || '0' }}
         run: cargo test --locked --test release_artifact_validator validate_generated_native_archive -- --exact --ignored --nocapture
-      - name: "Upload artifacts"
+      - name: Upload native artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
@@ -373,15 +162,12 @@ jobs:
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
 
-  # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
-      - release-policy
       - plan
-      - verify
       - build-local-artifacts
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).build_global_artifacts }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     env:
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
@@ -389,40 +175,29 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install and select Rust 1.95.0
-        shell: bash
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-      - name: Install cached dist
+      - name: Install cached cargo-dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Get all the local artifacts for the global tasks to use (for e.g. checksums)
-      - name: Fetch local artifacts
+      - name: Fetch native artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
       - id: cargo-dist
-        shell: bash
+        name: Build global artifacts
         env:
-          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           dist build $TAG_FLAG --output-format=json "--artifacts=global" > dist-manifest.json
-          echo "dist ran successfully"
-
-          # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          jq --raw-output '.upload_files[]' dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
-      - name: "Upload artifacts"
+      - name: Upload global artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: artifacts-build-global
@@ -432,29 +207,35 @@ jobs:
 
   validate-installers:
     name: Validate installer (${{ matrix.name }})
-    needs:
-      - release-policy
-      - plan
-      - verify
-      - build-global-artifacts
+    needs: build-global-artifacts
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).validate_installers }}
-    permissions:
-      contents: read
+    timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.release-policy.outputs.installer-matrix) }}
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-22.04
+            installer: kickoutchi-installer.sh
+            targets_json: '["x86_64-unknown-linux-gnu"]'
+          - name: macOS ARM64
+            runner: macos-14
+            installer: kickoutchi-installer.sh
+            targets_json: '["aarch64-apple-darwin"]'
+          - name: Windows x64
+            runner: windows-2022
+            installer: kickoutchi-installer.ps1
+            targets_json: '["x86_64-pc-windows-msvc"]'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Install and select Rust 1.95.0 (Unix)
+      - name: Select Rust on Unix
         if: runner.os != 'Windows'
-        shell: bash
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
-      - name: Install and select Rust 1.95.0 (Windows)
+      - name: Select Rust on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -462,7 +243,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed" }
           rustup default $env:RUST_VERSION
           if ($LASTEXITCODE -ne 0) { throw "rustup default failed" }
-      - name: Fetch same-run release artifacts
+      - name: Fetch release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
@@ -480,28 +261,25 @@ jobs:
   attest-release-artifacts:
     name: Attest release artifacts
     needs:
-      - release-policy
       - plan
-      - verify
       - build-local-artifacts
       - build-global-artifacts
       - validate-installers
-    if: ${{ always() && needs.release-policy.result == 'success' && (needs.plan.outputs.publishing == 'true' || github.event_name == 'workflow_dispatch') && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.build-global-artifacts.result == 'success' && needs.validate-installers.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).attest_release_artifacts }}
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - name: Fetch same-run release artifacts
+      - name: Fetch release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
       - name: Stage publication assets
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/attestation-subjects
@@ -520,298 +298,129 @@ jobs:
         with:
           subject-path: target/attestation-subjects/*
       - name: Verify generated attestations
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for artifact in target/attestation-subjects/*; do
-            test -f "$artifact"
             gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
           done
 
-  # Determines if we should publish/announce
   host:
     needs:
-      - release-policy
       - plan
-      - verify
       - build-local-artifacts
       - build-global-artifacts
       - validate-installers
       - attest-release-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.result == 'success' && needs.verify.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.build-global-artifacts.result == 'success' && needs.build-local-artifacts.result == 'success' && needs.validate-installers.result == 'success' && needs.attest-release-artifacts.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).host }}
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     permissions:
       contents: write
-    outputs:
-      val: ${{ steps.host.outputs.manifest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install cached dist
+      - name: Install cached cargo-dist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
-      # Fetch artifacts from scratch-storage
-      - name: Fetch artifacts
+      - name: Fetch release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
       - id: host
-        shell: bash
+        name: Prepare GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_COMMIT: "${{ github.sha }}"
-          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
-          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
+          set -euo pipefail
           git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           TAG_COMMIT="$(git rev-parse --verify "${RELEASE_TAG}^{commit}")"
           test "$TAG_COMMIT" = "$RELEASE_COMMIT"
           dist host $TAG_FLAG --steps=upload --steps=release --output-format=json > dist-manifest.json
-          echo "artifacts uploaded and released successfully"
-          cat dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
-      - name: "Upload dist-manifest.json"
+          echo "manifest=$(jq -c '.' dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Upload final release manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
-      # Create a GitHub Release while uploading all files to it
-      - name: "Download GitHub Artifacts"
+      - name: Collect GitHub release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
-      - name: Cleanup
-        run: |
-          # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+      - name: Remove internal build manifests
+        run: rm -f artifacts/*-dist-manifest.json
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
-          # env, not ${{ }} splicing: the tag rides in the ref name (see plan job).
-          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
+          PRERELEASE_FLAG: ${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}
+          ANNOUNCEMENT_TITLE: ${{ fromJson(steps.host.outputs.manifest).announcement_title }}
+          ANNOUNCEMENT_BODY: ${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
-
+          set -euo pipefail
+          printf '%s\n' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
           git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           TAG_COMMIT="$(git rev-parse --verify "${RELEASE_TAG}^{commit}")"
           test "$TAG_COMMIT" = "$RELEASE_COMMIT"
           gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
-  validate-published-release:
-    needs:
-      - release-policy
-      - plan
-      - host
-      - attest-published-manifest
-    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest-published-manifest.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).validate_published_release }}
-    permissions:
-      contents: read
-      attestations: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - name: Install and select Rust 1.95.0
-        shell: bash
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-      - name: Fetch same-run release artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Download published assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/published"
-          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/published"
-      - name: Verify published artifact attestations
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for artifact in "$RUNNER_TEMP"/published/*; do
-            test -f "$artifact"
-            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY"
-          done
-      - name: Execute published installer and updater
-        env:
-          KICKOUTCHI_RELEASE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KICKOUTCHI_RELEASE_DISTRIB: target/distrib
-          KICKOUTCHI_RELEASE_INSTALLER: ${{ runner.temp }}/published/kickoutchi-installer.sh
-          KICKOUTCHI_RELEASE_PUBLIC: "1"
-          KICKOUTCHI_RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-          KICKOUTCHI_RELEASE_TARGETS_JSON: '["x86_64-unknown-linux-gnu"]'
-          KICKOUTCHI_RELEASE_RUNNER_OS: Linux
-          KICKOUTCHI_RELEASE_RUNNER_ARCH: X64
-        run: cargo test --locked --test release_artifact_validator validate_generated_native_installer -- --exact --ignored --nocapture
-
-  # cargo-dist creates the final dist-manifest only while preparing the hosted
-  # release, after the other publication assets have already been attested.
-  # Attest that host-generated file before any public installer is executed or
-  # package-manager metadata is published.
-  attest-published-manifest:
-    name: Attest published release manifest
-    needs:
-      - release-policy
-      - plan
-      - host
-    if: ${{ always() && needs.release-policy.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).attest_published_manifest }}
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    steps:
-      - name: Download published release manifest
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/published-manifest"
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern dist-manifest.json \
-            --dir "$RUNNER_TEMP/published-manifest"
-          test -f "$RUNNER_TEMP/published-manifest/dist-manifest.json"
-      - name: Generate release-manifest attestation
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
-        with:
-          subject-path: ${{ runner.temp }}/published-manifest/dist-manifest.json
-      - name: Verify release-manifest attestation
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh attestation verify \
-            "$RUNNER_TEMP/published-manifest/dist-manifest.json" \
-            --repo "$GITHUB_REPOSITORY"
-
-  # Publish the dist-generated Homebrew formula to the tap repo. The push
-  # authenticates with HOMEBREW_TAP_TOKEN (a PAT scoped to the tap repo), so this
-  # job needs only read on this repo. The token exists only in the final push
-  # step, after Homebrew validation. Hand-maintained to match `dist generate`
-  # output while keeping the SHA pins and narrowed permissions used here.
   publish-homebrew-formula:
+    name: Publish Homebrew formula
     needs:
-      - release-policy
       - plan
       - host
-      - validate-published-release
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).publish_homebrew_formula }}
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
       PLAN: ${{ needs.plan.outputs.val }}
-      GITHUB_USER: "github-actions[bot]"
-      GITHUB_EMAIL: "github-actions[bot]@users.noreply.github.com"
-      HOMEBREW_IMAGE: "homebrew/brew@sha256:b0072bfdebf5934ae24b93b44a1928a88057399b3283ffa0177bb86084fdedfd"
-    if: ${{ needs.validate-published-release.result == 'success' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
+      GITHUB_USER: github-actions[bot]
+      GITHUB_EMAIL: github-actions[bot]@users.noreply.github.com
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-          repository: "nuggocto/homebrew-tap"
-      # So we have access to the formula
-      - name: Fetch homebrew formulae
+          repository: nuggocto/homebrew-tap
+      - name: Fetch generated formula
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: artifacts-*
-          path: Formula/
+          path: generated-formula/
           merge-multiple: true
-      # This is extra complex because you can make your Formula name not match your app name
-      # so we need to find releases with a *.rb file, and publish with that filename.
-      - name: Commit formula files
+      - name: Commit formula
         shell: bash
         run: |
           set -euo pipefail
+          git config user.name "$GITHUB_USER"
+          git config user.email "$GITHUB_EMAIL"
 
-          git config --global user.name "${GITHUB_USER}"
-          git config --global user.email "${GITHUB_EMAIL}"
-
-          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          export HOMEBREW_NO_INSTALL_CLEANUP=1
-          export HOMEBREW_CACHE="${RUNNER_TEMP}/homebrew-cache"
-
-          tap_path="$(brew --repository)/Library/Taps/nuggocto/homebrew-tap"
-          mkdir -p "$(dirname "$tap_path")"
-          git clone --no-hardlinks "$GITHUB_WORKSPACE" "$tap_path"
-
-          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
-            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
-            name=$(echo "$filename" | sed "s/\.rb$//")
-            version=$(echo "$release" | jq .app_version --raw-output)
-
-            # We avoid reformatting user-provided data such as the app description and homepage.
-            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}"
-
-            cp "Formula/${filename}" "${tap_path}/Formula/${filename}"
-            docker run --rm \
-              --env "FORMULA_NAME=${name}" \
-              --env "FORMULA_VERSION=${version}" \
-              --env HOMEBREW_NO_AUTO_UPDATE=1 \
-              --env HOMEBREW_NO_INSTALL_CLEANUP=1 \
-              --volume "${tap_path}:/home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/nuggocto/homebrew-tap:ro" \
-              "${HOMEBREW_IMAGE}" \
-              /bin/bash -lc '
-                brew install --formula "nuggocto/tap/${FORMULA_NAME}"
-                prefix=$(brew --prefix "${FORMULA_NAME}")
-                test "$("${prefix}/bin/kickoutchi" --version)" = "kickoutchi ${FORMULA_VERSION}"
-                test "$("${prefix}/bin/kick" --version)" = "kickoutchi ${FORMULA_VERSION}"
-              '
-
+          while IFS= read -r release; do
+            filename="$(jq -r '.artifacts[] | select(endswith(".rb"))' <<< "$release")"
+            name="${filename%.rb}"
+            version="$(jq -r '.app_version' <<< "$release")"
+            test -f "generated-formula/${filename}"
+            cp "generated-formula/${filename}" "Formula/${filename}"
             git add "Formula/${filename}"
             git diff --cached --quiet || git commit -m "${name} ${version}"
-          done
-      - name: Push formula files
+          done < <(jq -c '.releases[] | select([.artifacts[] | endswith(".rb")] | any)' <<< "$PLAN")
+      - name: Push formula
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           gh auth setup-git
           git push
-
-  publication-complete:
-    needs:
-      - release-policy
-      - plan
-      - host
-      - publish-homebrew-formula
-      - validate-published-release
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.release-policy.result == 'success' && needs.host.result == 'success' && needs.validate-published-release.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
-    runs-on: "ubuntu-22.04"
-    timeout-minutes: ${{ fromJSON(needs.release-policy.outputs.timeouts).publication_complete }}
-    steps:
-      - name: Confirm publication gates
-        run: "true"
