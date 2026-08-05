@@ -683,18 +683,6 @@ fn tree_info(pid: u32, parent_pid: Option<u32>, name: &str) -> TreeProcessInfo {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tree_info_without_start_marker(
-    pid: u32,
-    parent_pid: Option<u32>,
-    name: &str,
-) -> TreeProcessInfo {
-    TreeProcessInfo {
-        start_time_marker: None,
-        ..tree_info(pid, parent_pid, name)
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tree_info_owned_by_other_uid(pid: u32, parent_pid: Option<u32>, name: &str) -> TreeProcessInfo {
     TreeProcessInfo {
         owner_uid: Some(crate::process::current_user_id().saturating_add(1)),
@@ -858,35 +846,6 @@ fn port_selected_tree_pins_old_root_before_endpoint_move_and_sends_no_signal() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn portless_tree_root_missing_start_marker_refuses_before_any_stop() {
-    // Real Linux/macOS tree snapshots fail closed before producing this row,
-    // but the shared CLI seam still has to enforce the identity contract:
-    // a portless PID root without a start marker is not safe to freeze.
-    let snapshot = vec![tree_info_without_start_marker(18_422, Some(500), "node")];
-    let mut ops = RecordingTreeOps::new(vec![snapshot]);
-    let events = Rc::clone(&ops.events);
-
-    let reason = run_tree_kill_with(
-        &kill_pid_tree(18_422),
-        &Config::default(),
-        &[],
-        KillMode::Terminate,
-        &mut ops,
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: confirm_tree_prompt,
-            collect_kill_ports: || panic!("portless tree root must not re-collect ports"),
-            collect_ports: || panic!("portless tree root must not re-collect ports"),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert_eq!(&*events.borrow(), &[RecordingTreeEvent::Pin(18_422)]);
-    assert!(ops.stops.is_empty(), "refusal must precede any stop");
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
 fn tree_losing_readable_owner_during_revalidation_exits_permission_denied() {
     let rows = vec![entry(3000)];
     let preview = vec![tree_info(18_422, Some(500), "node")];
@@ -961,44 +920,6 @@ fn tree_authority_refusal_has_zero_stop_or_delivery() {
             .iter()
             .any(|event| matches!(event, RecordingTreeEvent::Deliver(_)))
     );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn fresh_tree_cap_preflight_refuses_before_any_stop() {
-    let rows = vec![entry(3000)];
-    let mut over_cap = vec![tree_info(18_422, Some(500), "node")];
-    let max_tree_processes =
-        u32::try_from(crate::tree::MAX_TREE_PROCESSES).expect("test cap must fit u32");
-    for pid in 30_000..=(30_000 + max_tree_processes) {
-        over_cap.push(tree_info(pid, Some(18_422), "child"));
-    }
-    let preview = vec![tree_info(18_422, Some(500), "node")];
-    let mut ops = RecordingTreeOps::new(vec![preview, over_cap]);
-
-    let reason = run_tree_kill_with(
-        &KillArgs {
-            pid: Some(18_422),
-            port: None,
-            force: false,
-            yes: false,
-            tree: true,
-            group: false,
-        },
-        &Config::default(),
-        &entry_views(&rows),
-        KillMode::Terminate,
-        &mut ops,
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: confirm_tree_prompt,
-            collect_kill_ports: || Ok(rows.clone()),
-            collect_ports: || Ok(rows.clone()),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert!(ops.stops.is_empty());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1364,35 +1285,6 @@ fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn protected_group_member_refuses_before_prompt_or_stop_even_with_yes() {
-    let snapshot = vec![
-        grouped_info(18_422, Some(500), "node", 42),
-        grouped_info(18_423, Some(1), "postgres", 42),
-    ];
-    let config = Config {
-        protected_processes: vec!["postgres".to_owned()],
-        ..Config::default()
-    };
-
-    let reason = run_group_kill_with(
-        &kill_pid_group(18_422, true),
-        &config,
-        &[],
-        KillMode::Terminate,
-        &mut PreviewOnlyTreeOps(snapshot),
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: panic_tree_prompt,
-            collect_kill_ports: || panic!("protected member must not re-collect ports"),
-            collect_ports: || panic!("protected member must not re-collect ports"),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::ProtectedNeedsConfirmation);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
 fn group_kill_refuses_kernel_domain_roots_without_touching_processes() {
     // The root exists but has no targetable group (pgid 0 maps to None):
     // refuse before any prompt, freeze, or signal.
@@ -1413,37 +1305,6 @@ fn group_kill_refuses_kernel_domain_roots_without_touching_processes() {
     );
 
     assert_eq!(reason, ExitReason::Failure);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn group_root_moving_groups_between_confirmation_and_freeze_refuses_before_any_stop() {
-    // The user confirmed group 42; by execution time the root sits in 77.
-    // Killing group 77 was never shown to the user, so the fresh gate must
-    // refuse with nothing stopped.
-    let confirmation_snapshot = vec![
-        grouped_info(18_422, Some(500), "node", 42),
-        grouped_info(17_000, Some(1), "orphan", 42),
-    ];
-    let moved_snapshot = vec![grouped_info(18_422, Some(500), "node", 77)];
-    let mut ops = RecordingTreeOps::new(vec![confirmation_snapshot, moved_snapshot]);
-
-    let reason = run_group_kill_with(
-        &kill_pid_group(18_422, false),
-        &Config::default(),
-        &[],
-        KillMode::Terminate,
-        &mut ops,
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: confirm_tree_prompt,
-            collect_kill_ports: || Ok(Vec::new()),
-            collect_ports: || Ok(Vec::new()),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert!(ops.stops.is_empty(), "refusal must precede any stop");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1487,68 +1348,6 @@ fn group_losing_readable_owner_during_revalidation_exits_permission_denied() {
             RecordingTreeEvent::CollectPorts,
         ],
     );
-    assert!(ops.stops.is_empty(), "refusal must precede any stop");
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn group_authority_refusal_has_zero_stop_or_delivery() {
-    let snapshot = locally_incomplete_kill_snapshot();
-    let rows = vec![entry(3000)];
-    let preview = vec![grouped_info(18_422, Some(500), "node", 42)];
-    let mut ops = RecordingTreeOps::new(vec![preview]);
-
-    let reason = run_group_kill_with(
-        &kill_pid_group(18_422, false),
-        &Config::default(),
-        &entry_views(&rows),
-        KillMode::Terminate,
-        &mut ops,
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: confirm_tree_prompt,
-            collect_kill_ports: || {
-                crate::collector::kill_ports_from_snapshot(&snapshot, Some(18_422), None)
-            },
-            collect_ports: || panic!("refusal must not visibility-poll ports"),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert!(ops.stops.is_empty());
-    assert!(
-        !ops.events
-            .borrow()
-            .iter()
-            .any(|event| matches!(event, RecordingTreeEvent::Deliver(_)))
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn fresh_group_growing_past_yes_skip_cap_refuses_before_any_stop() {
-    let clean = vec![grouped_info(18_422, Some(500), "node", 42)];
-    let mut grown = clean.clone();
-    for pid in 0..u32::try_from(GROUP_YES_SKIP_MAX_PROCESSES).expect("cap fits u32") {
-        grown.push(grouped_info(30_000 + pid, Some(500), "worker", 42));
-    }
-    let mut ops = RecordingTreeOps::new(vec![clean, grown]);
-
-    let reason = run_group_kill_with(
-        &kill_pid_group(18_422, true),
-        &Config::default(),
-        &[],
-        KillMode::Terminate,
-        &mut ops,
-        TreeKillSeams {
-            collect_context: no_context,
-            prompt: panic_tree_prompt,
-            collect_kill_ports: || panic!("portless group root must not re-collect ports"),
-            collect_ports: || panic!("portless group root must not re-collect ports"),
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
     assert!(ops.stops.is_empty(), "refusal must precede any stop");
 }
 

@@ -212,6 +212,4 @@ The canonical contracts and privacy distinctions are documented in the
 [structured output reference](docs/structured-output.md). Configuration labels
 and filters are documented in the [configuration reference](docs/configuration.md),
 and permanent scope, polling, WSL, and bind-probe limitations are documented in
-[platform support](docs/platform-support.md). The finite native-call inventory,
-reviewed invariants, and re-audit triggers are recorded in the
-[native API boundary audit](docs/native-api-audit.md).
+[platform support](docs/platform-support.md).

@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Pruned duplicated CLI and TUI orchestration tests for refusal paths already
+  covered exhaustively by the collector, process-evidence, and process-tree
+  layers. Representative interface mappings, delivery gates, and successful
+  native journeys remain covered.
+- Removed the dated v1.3.8 same-machine performance report and its duplicated
+  README summary; the historical results remain available in Git history and
+  the v1.3.9 changelog.
 - Split the oversized observation, process, watch, scoped-kill, TUI app, and
   process-tree modules along existing responsibility boundaries. Limits, legacy
   projection, OS-specific termination, watch filtering and signal ownership,
@@ -107,10 +114,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   least-privileged job after native archive and installer validation. Release
   publication requires successful attestation, and the post-publication journey
   verifies every downloaded asset before executing the installer.
-- Added a finite native API boundary audit covering all 119 platform-call
-  blocks, their ownership and buffer invariants, process-identity protections,
-  error handling, native validation, and explicit re-audit triggers.
-
 ### Changed
 
 - CI now starts supply-chain, Linux, Windows, macOS, and both Nix lanes

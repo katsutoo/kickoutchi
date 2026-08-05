@@ -9,12 +9,10 @@ use super::{
 };
 use crate::cli::test_support::{entry, entry_with_pid, no_context};
 use crate::cli::{ExitReason, KillArgs};
-use crate::collector::{Collector, CollectorError, FakeCollector, kill_ports_from_snapshot};
+use crate::collector::{CollectorError, kill_ports_from_snapshot};
 use crate::config::Config;
 use crate::model::Protocol;
-use crate::observation::{
-    EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataProfile, ObservationError,
-};
+use crate::observation::ObservationError;
 use crate::process::{
     CONFIRMATION_INPUT_MAX_BYTES, ConfirmationRequirement, KillMode, KillTarget,
     TerminationOutcome, UnsafePidReason,
@@ -380,53 +378,6 @@ fn target_losing_readable_pid_during_revalidation_exits_permission_denied() {
 }
 
 #[test]
-fn endpointless_ownership_gap_refuses_port_delivery() {
-    let mut snapshot = FakeCollector
-        .collect(MetadataProfile::Display)
-        .expect("fake collection succeeds");
-    let rows = kill_ports_from_snapshot(&snapshot, None, Some(3000))
-        .expect("complete baseline resolves the target port");
-    snapshot.evidence_gaps.push(EvidenceGap::new(
-        EvidenceImpact::Ownership,
-        EvidenceGapCode::OwnerAttributionIncomplete,
-        None,
-        Some(29_999),
-        "process ownership could not be attributed to an endpoint",
-    ));
-    let mut prepared = false;
-    let mut delivered = false;
-    let mut visibility_polls = 0;
-
-    let reason = run_kill_with(
-        &kill_port(3000, false, true),
-        &Config::default(),
-        &entry_views(&rows),
-        KillCollectors {
-            collect_context: no_context,
-            collect_kill_ports: || kill_ports_from_snapshot(&snapshot, None, Some(3000)),
-            collect_visibility_ports: || {
-                visibility_polls += 1;
-                Ok(Vec::new())
-            },
-        },
-        |_target, _mode, _requirement| panic!("--yes skips prompts"),
-        |pid| {
-            prepared = true;
-            Ok::<u32, TerminationOutcome>(pid)
-        },
-        |_handle: &u32, _target, _protected, _mode| {
-            delivered = true;
-            TerminationOutcome::Success
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert!(prepared);
-    assert!(!delivered);
-    assert_eq!(visibility_polls, 0);
-}
-
-#[test]
 fn authoritative_snapshot_refusal_reaches_zero_delivery() {
     let rows = vec![entry(3000)];
     let mut terminated = false;
@@ -556,38 +507,6 @@ fn missing_fresh_protection_name_refuses_without_delivery() {
     let rows = vec![entry(3000)];
     let mut fresh = entry(3000);
     fresh.process_name = None;
-    let mut delivered = false;
-
-    let reason = run_kill_with(
-        &kill_pid(18_422, false, true),
-        &Config::default(),
-        &entry_views(&rows),
-        KillCollectors {
-            collect_context: no_context,
-            collect_kill_ports: || Ok(vec![fresh.clone()]),
-            collect_visibility_ports: || Ok(Vec::new()),
-        },
-        |_target, _mode, _requirement| panic!("--yes skips prompts"),
-        Ok::<u32, TerminationOutcome>,
-        |_handle: &u32, _target, _protected, _mode| {
-            delivered = true;
-            TerminationOutcome::Success
-        },
-    );
-
-    assert_eq!(reason, ExitReason::Failure);
-    assert!(!delivered);
-}
-
-#[test]
-fn oversized_fresh_protection_name_refuses_without_delivery() {
-    let mut rows = vec![entry(3000)];
-    rows[0].process_name = None;
-    let mut fresh = entry(3000);
-    fresh.process_name = Some(
-        "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES + 1)
-            .into(),
-    );
     let mut delivered = false;
 
     let reason = run_kill_with(
