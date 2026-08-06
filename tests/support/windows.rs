@@ -1,13 +1,13 @@
 use super::{
-    REAL_BINARY_EXIT_WAIT, create_unique_temp_directory, kickoutchi_binary,
-    run_command_with_deadline,
+    HELPER_PARK_MAX, REAL_BINARY_EXIT_WAIT, create_unique_temp_directory, kickoutchi_binary,
+    lock_host_observation, park_bounded, run_command_with_deadline, stderr, stdout,
+    stdout_table_has_pid,
 };
 use std::fs;
 use std::net::TcpListener;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,16 +26,7 @@ const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
 const HELPER_LATE_ENV: &str = "KICKOUTCHI_TEST_HELPER_LATE";
 const CHILD_EXIT_WAIT: Duration = Duration::from_secs(5);
 const HELPER_READY_WAIT: Duration = Duration::from_secs(5);
-/// How long a parked helper may outlive its test before self-destructing.
-const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
 static UNIQUE_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
-static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
-    HOST_OBSERVATION_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 struct ChildGuard {
     child: Child,
@@ -200,18 +191,6 @@ fn temp_file_path(label: &str) -> PathBuf {
     ))
 }
 
-/// Park a helper process for the remainder of its useful life, then exit.
-/// Bounded so helpers are self-terminating: even when the test binary that
-/// spawned them is killed and never runs cleanup, the park is the helper's
-/// own self-destruct timer.
-fn park_bounded() -> ! {
-    let deadline = Instant::now() + HELPER_PARK_MAX;
-    while Instant::now() < deadline {
-        thread::sleep(Duration::from_secs(1));
-    }
-    std::process::exit(0)
-}
-
 fn unique_suffix() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -322,22 +301,6 @@ fn pid_exists(pid: u32) -> bool {
         ),
         result => panic!("WaitForSingleObject returned unexpected status {result:#x}"),
     }
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
-    let pid_text = pid.to_string();
-    stdout(output)
-        .lines()
-        .skip(1)
-        .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
 }
 
 #[test]

@@ -1,39 +1,15 @@
-use super::{REAL_BINARY_EXIT_WAIT, kickoutchi_binary, run_command_with_deadline};
-use std::fs;
+use super::{
+    REAL_BINARY_EXIT_WAIT, TemporaryConfigFile, kickoutchi_binary, run_command_with_deadline,
+};
 use std::net::{Ipv6Addr, TcpListener, UdpSocket};
-use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-struct ConfigGuard(PathBuf);
-
-impl ConfigGuard {
-    fn new() -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "kickoutchi-why-native-{}-{unique}.toml",
-            std::process::id()
-        ));
-        fs::write(&path, "").expect("isolated config must be written");
-        Self(path)
-    }
-}
-
-impl Drop for ConfigGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 
 fn run_why(args: &[&str]) -> Output {
-    let config = ConfigGuard::new();
+    let config = TemporaryConfigFile::new("why-native", "");
     run_command_with_deadline(
         Command::new(kickoutchi_binary())
             .arg("--config")
-            .arg(&config.0)
+            .arg(config.path())
             .arg("why")
             .args(args)
             .arg("--json"),

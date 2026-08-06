@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,72 @@ impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) struct TemporaryConfigFile {
+    _directory: TemporaryDirectory,
+    path: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl TemporaryConfigFile {
+    pub(crate) fn new(label: &str, contents: &str) -> Self {
+        let directory = TemporaryDirectory::new(label);
+        let path = directory.path().join("config.toml");
+        fs::write(&path, contents).expect("isolated config must be written");
+        Self {
+            _directory: directory,
+            path,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+pub(crate) fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+pub(crate) fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+pub(crate) fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
+    let pid_text = pid.to_string();
+    stdout(output)
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
+}
+
+/// How long a parked helper may outlive its test before self-destructing.
+/// Generous enough for the slowest passing run; short enough that a
+/// killed-by-`SIGKILL` test binary can never leak an immortal helper.
+pub(crate) const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
+
+/// Park a helper process for the remainder of its useful life, then exit.
+/// Bounded so helpers are self-terminating: even when the test binary that
+/// spawned them is killed by `SIGKILL` and never runs cleanup, the park is the
+/// helper's own self-destruct timer.
+pub(crate) fn park_bounded() -> ! {
+    let deadline = Instant::now() + HELPER_PARK_MAX;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(1));
+    }
+    std::process::exit(0)
+}
+
+/// Serialize tests that observe host process and socket state (process
+/// tables, listening sockets) so parallel tests cannot race each other.
+static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
+    HOST_OBSERVATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn product_binary(variable: &str, fallback: &str) -> OsString {

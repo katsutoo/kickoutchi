@@ -1,6 +1,7 @@
 use super::{
-    CommandChild, REAL_BINARY_EXIT_WAIT, collect_child_output, kick_binary, kickoutchi_binary,
-    run_command_with_deadline,
+    CommandChild, HELPER_PARK_MAX, REAL_BINARY_EXIT_WAIT, collect_child_output, kick_binary,
+    kickoutchi_binary, lock_host_observation, park_bounded, run_command_with_deadline, stderr,
+    stdout, stdout_table_has_pid,
 };
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -16,10 +17,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CMDLINE_WAIT: Duration = Duration::from_secs(10);
 const CHILD_EXIT_WAIT: Duration = Duration::from_secs(10);
-/// How long a parked helper may outlive its test before self-destructing.
-/// Generous enough for the slowest passing run; short enough that a
-/// killed-by-`SIGKILL` test binary can never leak an immortal helper.
-const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
 /// Building a deep chain re-execs this test binary once per link, so its
 /// ready file gets a deadline far beyond the usual helper waits.
 const DEEP_CHAIN_READY_WAIT: Duration = Duration::from_secs(30);
@@ -45,17 +42,10 @@ const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
 const HELPER_BIND_ANY_ENV: &str = "KICKOUTCHI_TEST_HELPER_BIND_ANY";
 const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
 const IPC_WAIT: Duration = Duration::from_secs(10);
-static HOST_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 // Each no-match diagnostic runs in its own network namespace, where this
 // valid boundary port is guaranteed to have no unrelated host listener.
 const ISOLATED_DIAGNOSTIC_TEST_PORT: u16 = u16::MAX;
 const CONTROLLED_BIND_FAULT_PORT: &str = "49151";
-
-fn lock_host_observation() -> std::sync::MutexGuard<'static, ()> {
-    HOST_OBSERVATION_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 fn run_in_isolated_user_network_namespace(
     script: &str,
@@ -820,18 +810,6 @@ fn wait_for_file_within(path: &Path, wait: Duration) {
     }
 }
 
-/// Park a helper process for the remainder of its useful life, then exit.
-/// Bounded so helpers are self-terminating: even when the test binary that
-/// spawned them is killed by `SIGKILL` and never runs cleanup, the park is the
-/// helper's own self-destruct timer.
-fn park_bounded() -> ! {
-    let deadline = Instant::now() + HELPER_PARK_MAX;
-    while Instant::now() < deadline {
-        thread::sleep(Duration::from_secs(1));
-    }
-    std::process::exit(0)
-}
-
 fn wait_for_child_exit(guard: &mut ChildGuard) {
     let deadline = Instant::now() + CHILD_EXIT_WAIT;
     loop {
@@ -905,14 +883,6 @@ fn stop_pid(pid: u32) {
     assert_eq!(result, 0, "SIGSTOP test helper PID {pid} must succeed");
 }
 
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// Native hosts may expose either complete procfs evidence or a
 /// restricted/stacked mount. Only a successful signal or this exact
 /// fail-closed authority refusal is valid.
@@ -948,14 +918,6 @@ fn assert_helper_survived_refusal(helper: &mut ChildGuard) {
         Some('T'),
         "helper PID {pid} must not remain frozen after refusal",
     );
-}
-
-fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
-    let pid_text = pid.to_string();
-    stdout(output)
-        .lines()
-        .skip(1)
-        .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
 }
 
 fn toml_string(value: &str) -> String {

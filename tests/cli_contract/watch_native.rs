@@ -1,39 +1,14 @@
 use super::{
-    COMMAND_OUTPUT_BYTES_MAX, CommandChild, REAL_BINARY_EXIT_WAIT, finish_pipe, kick_binary,
-    kickoutchi_binary, pipe_reader, run_command_with_deadline,
+    COMMAND_OUTPUT_BYTES_MAX, CommandChild, REAL_BINARY_EXIT_WAIT, TemporaryConfigFile,
+    finish_pipe, kick_binary, kickoutchi_binary, pipe_reader, run_command_with_deadline,
 };
 use std::ffi::OsStr;
-use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-struct ConfigGuard(PathBuf);
-
-impl ConfigGuard {
-    fn new(contents: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "kickoutchi-portable-native-{}-{unique}.toml",
-            std::process::id()
-        ));
-        fs::write(&path, contents).expect("isolated config must be written");
-        Self(path)
-    }
-}
-
-impl Drop for ConfigGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
+use std::time::Instant;
 
 enum WatchOutcome {
     Events(Vec<serde_json::Value>),
@@ -44,10 +19,13 @@ enum WatchOutcome {
 #[cfg(target_os = "macos")]
 const WATCH_RELEASE_ATTEMPTS: usize = 3;
 
-fn endpoint_config(port: u16) -> ConfigGuard {
-    ConfigGuard::new(&format!(
-        "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard fixture\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"native artifact fixture\"\n"
-    ))
+fn endpoint_config(port: u16) -> TemporaryConfigFile {
+    TemporaryConfigFile::new(
+        "portable-native",
+        &format!(
+            "[[ports]]\nprotocol = \"tcp\"\naddress = \"*\"\nport = {port}\nlabel = \"wildcard fixture\"\n\n[[ports]]\nprotocol = \"tcp\"\naddress = \"127.0.0.1\"\nport = {port}\nlabel = \"native artifact fixture\"\n"
+        ),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -121,13 +99,13 @@ fn partial_socket_set_after_baseline(
 
 fn run_with_binary(
     binary: impl AsRef<OsStr>,
-    config: &ConfigGuard,
+    config: &TemporaryConfigFile,
     args: &[&str],
 ) -> std::process::Output {
     run_command_with_deadline(
         Command::new(binary)
             .arg("--config")
-            .arg(&config.0)
+            .arg(config.path())
             .args(args),
         None,
         REAL_BINARY_EXIT_WAIT,
@@ -135,7 +113,7 @@ fn run_with_binary(
     .expect("native command must finish before its deadline")
 }
 
-fn run_with_config(config: &ConfigGuard, args: &[&str]) -> std::process::Output {
+fn run_with_config(config: &TemporaryConfigFile, args: &[&str]) -> std::process::Output {
     run_with_binary(kickoutchi_binary(), config, args)
 }
 
@@ -184,7 +162,7 @@ fn watch_line_reader(
 }
 
 fn watch_until_release(
-    config: &ConfigGuard,
+    config: &TemporaryConfigFile,
     port_text: &str,
     listener: TcpListener,
 ) -> WatchOutcome {
@@ -200,7 +178,7 @@ fn watch_until_release(
     let mut command = Command::new(kickoutchi_binary());
     let mut child = command
         .arg("--config")
-        .arg(&config.0)
+        .arg(config.path())
         .args([
             "watch",
             "--tcp",
@@ -326,7 +304,7 @@ fn watch_release_journey() -> (u16, Vec<serde_json::Value>) {
 #[test]
 fn labels_and_watch_run_through_the_native_binary() {
     #[cfg(target_os = "macos")]
-    let _host_observation = super::macos::lock_host_observation();
+    let _host_observation = crate::support::lock_host_observation();
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TCP fixture must bind");
     let port = listener.local_addr().expect("TCP address is known").port();
