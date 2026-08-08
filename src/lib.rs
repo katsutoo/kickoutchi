@@ -73,6 +73,11 @@ use crate::display::sanitize_multiline;
 #[doc(hidden)]
 #[must_use]
 pub fn run() -> ExitCode {
+    #[cfg(windows)]
+    if tree::windows::freeze_probe_requested() {
+        return tree::windows::run_freeze_probe_child();
+    }
+
     // Tracing must be installed before clap renders an error so repeated calls
     // still respect an embedder-owned subscriber. The exact boolean flag can be
     // recognized without interpreting or retaining any other argv content.

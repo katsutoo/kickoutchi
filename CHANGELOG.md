@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Kept local mutation campaigns from dirtying the checkout by ignoring
+  cargo-mutants' root-level `mutants.out/` workspace.
+- Moved scheduled and documented fuzz campaigns onto disposable working
+  corpora. Checked-in seeds remain read-only, and only intentionally minimized
+  regression fixtures are copied back.
+- Strengthened the Windows private Job Object freeze preflight: a disposable
+  helper now checks execution before freeze, suspension while frozen, and
+  resumption after thaw before any selected target crosses the assignment
+  boundary.
 - Corrected the direct-PID documentation: an unscoped PID must own a visible
   open port, while tree and group targeting may resolve a live portless root.
 

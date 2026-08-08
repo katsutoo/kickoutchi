@@ -7,6 +7,12 @@
 //! explicitly terminating the job. Assignment starts side effects; it is not an
 //! atomic tree-termination commit.
 
+mod freeze_probe;
+
+pub(crate) use freeze_probe::{
+    requested as freeze_probe_requested, run_child as run_freeze_probe_child,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -58,9 +64,10 @@ struct JobObjectWakeFilter {
 
 /// Private Windows class-18 payload used by `JobObjectReserved1Information`.
 ///
-/// This 16-byte layout is not a stable public SDK contract. Production probes
-/// freeze and thaw on an empty job before assigning the target, and every later
-/// transition failure remains fail-closed with a best-effort thaw.
+/// This 16-byte layout is not a stable public SDK contract. Production checks
+/// observable freeze/thaw behavior on a disposable child before assigning the
+/// target, and every later transition failure remains fail-closed with a
+/// best-effort thaw.
 #[repr(C)]
 struct JobObjectFreezeInformation {
     flags: u32,
@@ -1591,11 +1598,36 @@ impl WindowsTreeApi for RealWindowsTreeApi {
     }
 
     fn preflight_job_freeze_thaw(&mut self) -> Result<(), String> {
-        // This empty disposable job proves both private class-18 transitions
-        // before the target can cross the real job's assignment boundary.
         let job = self.create_job()?;
+        let mut probe = freeze_probe::FreezeProbe::spawn()?;
+        probe.wait_until_ready()?;
+        let process = self
+            .open_process(probe.pid())
+            .map_err(freeze_probe_process_error)?;
+        self.assign_process(&job, &process)
+            .map_err(freeze_probe_process_error)?;
+
+        // Prove the helper and its pipes work after job assignment, then prove
+        // class 18 changes actual scheduling behavior rather than merely
+        // accepting the private payload.
+        probe.request_acknowledgement()?;
+        probe.wait_for_acknowledgement()?;
         self.set_job_frozen(&job, true)?;
-        self.set_job_frozen(&job, false)
+        let frozen_result = probe
+            .request_acknowledgement()
+            .and_then(|()| probe.verify_acknowledgement_is_suspended());
+        let thaw_result = self.set_job_frozen(&job, false);
+        if let Err(error) = frozen_result {
+            return match thaw_result {
+                Ok(()) => Err(error),
+                Err(thaw_error) => Err(format!(
+                    "{error}; best-effort probe thaw also failed: {thaw_error}"
+                )),
+            };
+        }
+        thaw_result?;
+        probe.wait_for_acknowledgement()?;
+        probe.finish()
     }
 
     fn create_job(&mut self) -> Result<Self::JobHandle, String> {
@@ -1735,6 +1767,18 @@ impl WindowsTreeApi for RealWindowsTreeApi {
                 process.pid,
             )),
         }
+    }
+}
+
+fn freeze_probe_process_error(error: WindowsApiError) -> String {
+    match error {
+        WindowsApiError::NotFound => {
+            "Job Object freeze behavior probe exited before assignment".to_owned()
+        }
+        WindowsApiError::PermissionDenied => {
+            "permission denied while assigning the Job Object freeze behavior probe".to_owned()
+        }
+        WindowsApiError::Other(error) => error,
     }
 }
 

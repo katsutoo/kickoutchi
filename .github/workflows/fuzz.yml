@@ -56,9 +56,12 @@ jobs:
           PARSER_TARGET: ${{ matrix.target }}
           MAX_INPUT_BYTES: ${{ matrix.max_input_bytes }}
         run: |
+          campaign_corpus="$RUNNER_TEMP/kickoutchi-fuzz-$PARSER_TARGET"
+          mkdir -p "$campaign_corpus"
+          cp -a "fuzz/corpus/$PARSER_TARGET/." "$campaign_corpus/"
           cargo +"$RUST_NIGHTLY" fuzz run \
             "$PARSER_TARGET" \
-            "fuzz/corpus/$PARSER_TARGET" \
+            "$campaign_corpus" \
             -- \
             -max_total_time=60 \
             -max_len="$MAX_INPUT_BYTES" \

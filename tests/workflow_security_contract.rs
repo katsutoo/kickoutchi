@@ -111,6 +111,9 @@ fn scheduled_parser_campaigns_are_pinned_and_bounded() {
     ] {
         assert!(script.contains(bound), "missing parser bound {bound}");
     }
+    assert!(script.contains("$RUNNER_TEMP/kickoutchi-fuzz-$PARSER_TARGET"));
+    assert!(script.contains("cp -a \"fuzz/corpus/$PARSER_TARGET/.\""));
+    assert!(!script.contains("\"fuzz/corpus/$PARSER_TARGET\" \\"));
     assert!(
         step_script(named_job_step(campaign, "Verify campaign dependency lock"))
             .contains("--locked")

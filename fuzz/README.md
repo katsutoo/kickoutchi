@@ -16,11 +16,18 @@ The small checked-in corpora are replayed by ordinary Rust tests on every CI
 run. Longer mutation campaigns run weekly or through manual workflow dispatch:
 
 ```console
-cargo +nightly-2026-07-01 fuzz run config fuzz/corpus/config -- \
-  -max_total_time=60 -max_len=65537 -timeout=5 -rss_limit_mb=1024
+(
+  campaign_corpus="$(mktemp -d)"
+  trap 'rm -rf "$campaign_corpus"' EXIT
+  cp -a fuzz/corpus/config/. "$campaign_corpus"/
+  cargo +nightly-2026-07-01 fuzz run config "$campaign_corpus" -- \
+    -max_total_time=60 -max_len=65537 -timeout=5 -rss_limit_mb=1024
+)
 ```
 
 The auxiliary crate and its exact dependency lock are checked by cargo-deny in
 ordinary CI. Campaign build output, coverage, and failure artifacts are ignored;
-only a minimized input that becomes an intentional regression fixture should be
-added to the saved corpus.
+the working corpus above is deleted when the campaign ends. If a failure is
+found, minimize the input from `fuzz/artifacts/config/` and copy only the chosen
+regression fixture into `fuzz/corpus/config/`. Substitute the matching target and
+saved-corpus directory when running the other campaigns.

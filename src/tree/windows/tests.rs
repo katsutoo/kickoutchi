@@ -319,11 +319,16 @@ fn root_assignment_is_the_commit_boundary() {
 }
 
 #[test]
-fn native_empty_job_freeze_thaw_preflight_is_supported() {
+fn native_private_job_freeze_calls_are_accepted_on_an_empty_job() {
     let mut api = RealWindowsTreeApi::new();
+    let job = api
+        .create_job()
+        .expect("this Windows host must create a disposable Job Object");
 
-    api.preflight_job_freeze_thaw()
-        .expect("this Windows host must support empty Job Object freeze and thaw");
+    api.set_job_frozen(&job, true)
+        .expect("this Windows host must accept the private freeze call");
+    api.set_job_frozen(&job, false)
+        .expect("this Windows host must accept the private thaw call");
 }
 
 #[test]
