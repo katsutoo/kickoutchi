@@ -18,12 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Reduced TUI rebuild temporaries by projecting each snapshot row once into a
-  mode-specific sort candidate and recording selection matches in a one-bit-per-
-  row mask. Slice-backed CLI queries instead sort compact source indices against
-  their existing views, and multi-needle filters retain bounded, needle-isolated
-  metadata match results. Duplicate-row order, labels, and selection behavior
-  remain unchanged.
+- Reduced TUI rebuild work by caching the current snapshot's compact sorted
+  source-index permutation across search edits and recording selection matches
+  in a one-bit-per-row mask. Query matching now checks cheap exact predicates
+  before metadata, specializes the common single-needle cache, skips impossible
+  plain-text field formats, and avoids allocated scoped-endpoint strings and
+  empty label-map lookups. Multi-needle results remain bounded and isolated;
+  duplicate-row order, labels, Unicode matching, and selection behavior remain
+  unchanged.
 - Bundled each native socket with its owner PIDs and local completeness before
   canonicalization, making detached parallel-vector state unrepresentable and
   removing the indexed permutation and its temporary allocations.

@@ -692,6 +692,12 @@ fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear
 #[test]
 fn search_actions_filter_and_clear_rows() {
     let mut app = app_with_rows(vec![entry(3000, Some("node")), entry(5173, Some("vite"))]);
+    let sorted = app
+        .sorted_row_indices
+        .as_ref()
+        .expect("initial rows are cached")
+        .indices
+        .clone();
 
     app.apply_action(Action::StartSearch);
     app.apply_action(Action::SearchAppend('v'));
@@ -701,12 +707,63 @@ fn search_actions_filter_and_clear_rows() {
     assert_eq!(app.filter_text(), "vi");
     assert_eq!(app.rows().len(), 1);
     assert_eq!(app.rows().next().map(|row| row.local_port), Some(5173));
+    assert_eq!(
+        app.sorted_row_indices
+            .as_ref()
+            .expect("search retains the sort cache")
+            .indices,
+        sorted
+    );
 
     app.apply_action(Action::CancelSearch);
 
     assert!(!app.search_mode());
     assert_eq!(app.filter_text(), "");
     assert_eq!(app.rows().len(), 2);
+}
+
+#[test]
+fn same_length_refresh_invalidates_the_sorted_row_cache() {
+    let mut app = app_with_rows(vec![entry(3000, Some("zulu")), entry(5173, Some("alpha"))]);
+    app.sort_mode = SortMode::Process;
+    app.rebuild_visible_rows();
+    assert_eq!(app.visible_row_indices, [1, 0]);
+
+    app.apply_successful_snapshot(
+        vec![entry(3000, Some("alpha")), entry(5173, Some("zulu"))],
+        Instant::now(),
+    );
+
+    assert_eq!(app.visible_row_indices, [0, 1]);
+    assert_eq!(
+        app.sorted_row_indices
+            .as_ref()
+            .expect("refresh rebuilds the cache")
+            .indices,
+        [0, 1]
+    );
+}
+
+#[test]
+fn search_edit_rebuilds_a_cache_missing_after_filtered_refresh() {
+    let mut app = app_with_rows(vec![entry(3000, Some("alpha")), entry(5173, Some("beta"))]);
+    app.apply_action(Action::StartSearch);
+    app.apply_action(Action::SearchAppend('a'));
+
+    app.apply_successful_snapshot(
+        vec![entry(5173, Some("beta")), entry(3000, Some("alpha"))],
+        Instant::now(),
+    );
+    assert!(app.sorted_row_indices.is_none());
+
+    app.apply_action(Action::SearchAppend('l'));
+
+    assert_eq!(app.filter_text(), "al");
+    assert_eq!(
+        app.rows().map(|row| row.local_port).collect::<Vec<_>>(),
+        [3000]
+    );
+    assert!(app.sorted_row_indices.is_some());
 }
 
 #[test]

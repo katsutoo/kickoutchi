@@ -113,6 +113,9 @@ impl LabelRegistry {
     }
 
     pub(crate) fn resolve(&self, endpoint: &EndpointIdentity) -> Option<&str> {
+        if self.is_empty() {
+            return None;
+        }
         self.exact
             .get(endpoint)
             .or_else(|| self.wildcard.get(&(endpoint.protocol, endpoint.port.get())))
@@ -126,6 +129,9 @@ impl LabelRegistry {
         port: u16,
         ipv6_scope: Option<Ipv6Scope>,
     ) -> Option<&str> {
+        if self.is_empty() {
+            return None;
+        }
         let address = normalize_ip_address(address);
         let ipv6_scope = address.is_ipv6().then_some(ipv6_scope).flatten();
         let endpoint =

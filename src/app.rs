@@ -121,6 +121,12 @@ impl From<PortEntryView<'_>> for RowKey {
     }
 }
 
+#[derive(Debug)]
+struct SortedRowIndices {
+    sort_mode: SortMode,
+    indices: Vec<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KillConfirmation {
     pub(crate) target: KillTarget,
@@ -250,6 +256,7 @@ impl DockerEnrichmentPolicy {
 pub(crate) struct App {
     row_descriptors: Vec<crate::observation::PortEntryDescriptor>,
     visible_row_indices: Vec<usize>,
+    sorted_row_indices: Option<SortedRowIndices>,
     selected_index: Option<usize>,
     filter_text: String,
     search_mode: bool,
@@ -320,6 +327,7 @@ impl App {
         Self {
             row_descriptors: Vec::new(),
             visible_row_indices: Vec::new(),
+            sorted_row_indices: None,
             selected_index: None,
             filter_text: String::new(),
             search_mode: false,
@@ -498,6 +506,7 @@ impl App {
         }
         self.network_snapshot = Some(snapshot);
         self.row_descriptors = descriptors;
+        self.sorted_row_indices = None;
         self.last_successful_refresh = Some(now);
         self.latest_error = None;
         if let Some(worker) = self.context_worker.as_mut() {
@@ -1521,6 +1530,37 @@ impl App {
         self.rebuild_visible_rows_preserving(selected_key, fallback_index);
     }
 
+    fn ensure_sorted_row_indices(&mut self) {
+        let row_count = self.row_count();
+        if self.sorted_row_indices.as_ref().is_some_and(|cached| {
+            cached.sort_mode == self.sort_mode && cached.indices.len() == row_count
+        }) {
+            return;
+        }
+
+        let result = query::query_view_indices_by(
+            row_count,
+            |index| {
+                self.row_view(index)
+                    .expect("snapshot and row descriptors must remain synchronized")
+            },
+            QueryOptions {
+                port: None,
+                process: None,
+                filter_text: "",
+                sort_mode: self.sort_mode,
+                hide_system_processes: false,
+                capabilities: crate::query::QueryCapabilities::LIST,
+            },
+        )
+        .expect("an empty list query is always valid");
+        debug_assert_eq!(result.indices.len(), row_count);
+        self.sorted_row_indices = Some(SortedRowIndices {
+            sort_mode: self.sort_mode,
+            indices: result.indices,
+        });
+    }
+
     fn rebuild_visible_rows_preserving(
         &mut self,
         selected_key: Option<RowKey>,
@@ -1532,9 +1572,16 @@ impl App {
         let mut selected_source_rows = selected_key.map(|_| vec![false; self.row_count()]);
         // The bound and callback share the same descriptor table. A missing
         // view therefore means the snapshot and its descriptors diverged.
-        let query_result = query::query_view_indices_by(
-            self.row_count(),
-            |index| {
+        let options = QueryOptions {
+            port: None,
+            process: None,
+            filter_text: &self.filter_text,
+            sort_mode: self.sort_mode,
+            hide_system_processes: self.hide_system_processes,
+            capabilities: crate::query::QueryCapabilities::LIST,
+        };
+        let query_result = {
+            let mut view_at = |index| {
                 let view = self
                     .row_view(index)
                     .expect("snapshot and row descriptors must remain synchronized");
@@ -1544,18 +1591,29 @@ impl App {
                         .expect("a selected key allocates its source-row mask")[index] = true;
                 }
                 view
-            },
-            QueryOptions {
-                port: None,
-                process: None,
-                filter_text: &self.filter_text,
-                sort_mode: self.sort_mode,
-                hide_system_processes: self.hide_system_processes,
-                capabilities: crate::query::QueryCapabilities::LIST,
-            },
-        );
+            };
+            match self.sorted_row_indices.as_ref() {
+                Some(cached)
+                    if cached.sort_mode == self.sort_mode
+                        && cached.indices.len() == self.row_count() =>
+                {
+                    query::filter_preordered_view_indices_by(&cached.indices, &mut view_at, options)
+                }
+                Some(_) | None => {
+                    query::query_view_indices_by(self.row_count(), &mut view_at, options)
+                }
+            }
+        };
         let (visible_row_indices, filter_error) = match query_result {
-            Ok(result) => (result.indices, None),
+            Ok(result) => {
+                if !result.explicit_filter_active && !self.hide_system_processes {
+                    self.sorted_row_indices = Some(SortedRowIndices {
+                        sort_mode: self.sort_mode,
+                        indices: result.indices.clone(),
+                    });
+                }
+                (result.indices, None)
+            }
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
         let selected_index = preserved_selection(
@@ -1691,6 +1749,7 @@ impl App {
         if self.filter_text.len() + ch.len_utf8() > FILTER_TEXT_MAX_BYTES {
             return;
         }
+        self.ensure_sorted_row_indices();
         self.filter_text.push(ch);
         self.rebuild_visible_rows();
     }
@@ -1699,6 +1758,7 @@ impl App {
         if !self.search_mode {
             return;
         }
+        self.ensure_sorted_row_indices();
         self.filter_text.pop();
         self.rebuild_visible_rows();
     }
@@ -1706,6 +1766,7 @@ impl App {
     fn cancel_search(&mut self) {
         self.search_mode = false;
         if !self.filter_text.is_empty() {
+            self.ensure_sorted_row_indices();
             self.filter_text.clear();
             self.rebuild_visible_rows();
         }

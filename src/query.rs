@@ -13,7 +13,6 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use thiserror::Error;
 
-use crate::display::human_endpoint_text;
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
 use crate::model::{BindScope, PortEntryView, Protocol, SortMode};
 use crate::observation::Ipv6Scope;
@@ -122,7 +121,10 @@ pub(crate) fn query_view_indices(
         Vec::new()
     };
     let mut hidden_system_process_count = 0;
-    let mut metadata = MetadataMatchCache::new(metadata_match_cache_limit(entries.len()));
+    let mut metadata = MetadataMatchCache::new(
+        metadata_match_cache_limit(entries.len()),
+        filter_plan.metadata_needle_mode,
+    );
     for (index, entry) in entries.iter().copied().enumerate() {
         if filter_plan.hide_system_processes && entry.is_system_process() {
             hidden_system_process_count += 1;
@@ -220,10 +222,145 @@ pub(crate) fn query_view_indices_by<'a>(
     })
 }
 
+/// Filter source indices that are already in the requested display order.
+///
+/// Removing rows from a total ordering preserves that ordering, so TUI search
+/// edits can reuse a snapshot-scoped permutation instead of sorting again.
+pub(crate) fn filter_preordered_view_indices_by<'a>(
+    preordered_indices: &[usize],
+    mut view_at: impl FnMut(usize) -> PortEntryView<'a>,
+    options: QueryOptions<'_>,
+) -> Result<QueryIndexResult, QueryError> {
+    let prepared = prepare_query(options)?;
+    let filter_plan = QueryFilterPlan::new(&options, &prepared);
+    let mut indices = if filter_plan.all_rows_match_without_metadata() {
+        Vec::with_capacity(preordered_indices.len())
+    } else {
+        Vec::new()
+    };
+    let mut hidden_system_process_count = 0;
+    let mut metadata = MetadataMatchCache::new(
+        metadata_match_cache_limit(preordered_indices.len()),
+        filter_plan.metadata_needle_mode,
+    );
+    for &source_index in preordered_indices {
+        let entry = view_at(source_index);
+        if filter_plan.hide_system_processes && entry.is_system_process() {
+            hidden_system_process_count += 1;
+            continue;
+        }
+        if entry_matches(entry, filter_plan, &mut metadata) {
+            indices.push(source_index);
+        }
+    }
+
+    Ok(QueryIndexResult {
+        indices,
+        explicit_filter_active: prepared.explicit_filter_active,
+        hidden_system_process_count,
+    })
+}
+
 struct PreparedQuery {
-    terms: Vec<FilterTerm>,
+    terms: Vec<PreparedFilterTerm>,
+    cheap_term_count: usize,
     process_needle: Option<String>,
     explicit_filter_active: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PlainNeedleShape {
+    decimal: bool,
+    address: bool,
+    endpoint: bool,
+}
+
+impl PlainNeedleShape {
+    fn new(needle: &str) -> Self {
+        Self {
+            decimal: needle.bytes().all(|byte| byte.is_ascii_digit()),
+            address: needle
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f' | b'.' | b':')),
+            endpoint: needle.contains(':'),
+        }
+    }
+}
+
+struct PreparedFilterTerm {
+    term: FilterTerm,
+    plain_shape: Option<PlainNeedleShape>,
+}
+
+impl PreparedFilterTerm {
+    fn new(term: FilterTerm) -> Self {
+        let plain_shape = match &term {
+            FilterTerm::Plain(needle) => Some(PlainNeedleShape::new(needle)),
+            _ => None,
+        };
+        Self { term, plain_shape }
+    }
+
+    const fn cost(&self) -> u8 {
+        match self.term {
+            FilterTerm::Pid(_)
+            | FilterTerm::Port(_)
+            | FilterTerm::Address(_)
+            | FilterTerm::ScopeId(_) => 0,
+            FilterTerm::Protocol(_)
+            | FilterTerm::Scope(_)
+            | FilterTerm::Protected(_)
+            | FilterTerm::Family(_)
+            | FilterTerm::State(_) => 1,
+            FilterTerm::Label(_) | FilterTerm::Parent(_) => 2,
+            FilterTerm::Plain(_) => 3,
+        }
+    }
+
+    const fn is_cheap(&self) -> bool {
+        self.cost() <= 1
+    }
+
+    fn metadata_needle(&self) -> Option<&str> {
+        match &self.term {
+            FilterTerm::Plain(needle) | FilterTerm::Parent(needle) | FilterTerm::Label(needle) => {
+                Some(needle)
+            }
+            FilterTerm::Pid(_)
+            | FilterTerm::Port(_)
+            | FilterTerm::Protocol(_)
+            | FilterTerm::Scope(_)
+            | FilterTerm::Protected(_)
+            | FilterTerm::Address(_)
+            | FilterTerm::ScopeId(_)
+            | FilterTerm::Family(_)
+            | FilterTerm::State(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MetadataNeedleMode<'a> {
+    None,
+    Single(&'a str),
+    Multiple,
+}
+
+impl PreparedQuery {
+    fn metadata_needle_mode(&self) -> MetadataNeedleMode<'_> {
+        let mut needle = self.process_needle.as_deref();
+        for term_needle in self
+            .terms
+            .iter()
+            .filter_map(PreparedFilterTerm::metadata_needle)
+        {
+            if needle.is_some() {
+                return MetadataNeedleMode::Multiple;
+            }
+            needle = Some(term_needle);
+        }
+        needle.map_or(MetadataNeedleMode::None, MetadataNeedleMode::Single)
+    }
 }
 
 fn prepare_query(options: QueryOptions<'_>) -> Result<PreparedQuery, QueryError> {
@@ -240,12 +377,18 @@ fn prepare_query(options: QueryOptions<'_>) -> Result<PreparedQuery, QueryError>
             "a nonempty process name substring",
         ));
     }
-    let terms = parse_filter_text(options.filter_text, options.capabilities)?;
+    let mut terms = parse_filter_text(options.filter_text, options.capabilities)?
+        .into_iter()
+        .map(PreparedFilterTerm::new)
+        .collect::<Vec<_>>();
+    terms.sort_unstable_by_key(PreparedFilterTerm::cost);
+    let cheap_term_count = terms.partition_point(PreparedFilterTerm::is_cheap);
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
         options.port.is_some() || options.process.is_some() || !terms.is_empty();
     Ok(PreparedQuery {
         terms,
+        cheap_term_count,
         process_needle,
         explicit_filter_active,
     })
@@ -289,16 +432,21 @@ struct ParentSortKey {
 struct QueryFilterPlan<'a> {
     port: Option<u16>,
     process_needle: Option<&'a str>,
-    terms: &'a [FilterTerm],
+    cheap_terms: &'a [PreparedFilterTerm],
+    metadata_terms: &'a [PreparedFilterTerm],
+    metadata_needle_mode: MetadataNeedleMode<'a>,
     hide_system_processes: bool,
 }
 
 impl<'a> QueryFilterPlan<'a> {
     fn new(options: &QueryOptions<'_>, prepared: &'a PreparedQuery) -> Self {
+        let (cheap_terms, metadata_terms) = prepared.terms.split_at(prepared.cheap_term_count);
         Self {
             port: options.port,
             process_needle: prepared.process_needle.as_deref(),
-            terms: &prepared.terms,
+            cheap_terms,
+            metadata_terms,
+            metadata_needle_mode: prepared.metadata_needle_mode(),
             hide_system_processes: options.hide_system_processes,
         }
     }
@@ -307,7 +455,8 @@ impl<'a> QueryFilterPlan<'a> {
         !self.hide_system_processes
             && self.port.is_none()
             && self.process_needle.is_none()
-            && self.terms.is_empty()
+            && self.cheap_terms.is_empty()
+            && self.metadata_terms.is_empty()
     }
 }
 
@@ -322,6 +471,13 @@ fn entry_matches<'value, 'needle>(
     {
         return false;
     }
+    if !filter_plan
+        .cheap_terms
+        .iter()
+        .all(|term| term_matches(entry, term, metadata))
+    {
+        return false;
+    }
     if filter_plan.process_needle.is_some_and(|needle| {
         entry
             .process_name
@@ -330,7 +486,7 @@ fn entry_matches<'value, 'needle>(
         return false;
     }
     filter_plan
-        .terms
+        .metadata_terms
         .iter()
         .all(|term| term_matches(entry, term, metadata))
 }
@@ -348,7 +504,10 @@ fn collect_sorted_indices<'value, 'needle, K>(
         Vec::new()
     };
     let mut hidden_system_process_count = 0;
-    let mut metadata = MetadataMatchCache::new(metadata_match_cache_limit(entry_count));
+    let mut metadata = MetadataMatchCache::new(
+        metadata_match_cache_limit(entry_count),
+        filter_plan.metadata_needle_mode,
+    );
     for index in 0..entry_count {
         let entry = view_at(index);
         if filter_plan.hide_system_processes && entry.is_system_process() {
@@ -691,11 +850,17 @@ fn invalid_value(field: &'static str, value: &str, expected: &'static str) -> Qu
 
 fn term_matches<'value, 'needle>(
     entry: PortEntryView<'value>,
-    term: &'needle FilterTerm,
+    term: &'needle PreparedFilterTerm,
     metadata: &mut MetadataMatchCache<'value, 'needle>,
 ) -> bool {
-    match term {
-        FilterTerm::Plain(needle) => plain_matches(entry, needle, metadata),
+    match &term.term {
+        FilterTerm::Plain(needle) => plain_matches(
+            entry,
+            needle,
+            term.plain_shape
+                .expect("plain terms carry their precomputed needle shape"),
+            metadata,
+        ),
         FilterTerm::Pid(pid) => entry.pid == Some(*pid),
         FilterTerm::Port(port) => entry.local_port == *port,
         FilterTerm::Protocol(protocol) => entry.protocol == *protocol,
@@ -720,17 +885,19 @@ fn term_matches<'value, 'needle>(
 fn plain_matches<'value, 'needle>(
     entry: PortEntryView<'value>,
     needle_lower: &'needle str,
+    shape: PlainNeedleShape,
     metadata: &mut MetadataMatchCache<'value, 'needle>,
 ) -> bool {
-    display_matches(entry.local_port, needle_lower)
-        || entry
-            .pid
-            .is_some_and(|pid| display_matches(pid, needle_lower))
-        || display_matches(entry.local_addr, needle_lower)
-        || socket_text_matches(&entry, needle_lower)
-        || contains_ascii(entry.protocol.label(), needle_lower)
+    contains_ascii(entry.protocol.label(), needle_lower)
         || contains_ascii(entry.state.label(), needle_lower)
         || contains_ascii(entry.scope_label(), needle_lower)
+        || (shape.decimal && display_matches(entry.local_port, needle_lower))
+        || (shape.decimal
+            && entry
+                .pid
+                .is_some_and(|pid| display_matches(pid, needle_lower)))
+        || (shape.address && display_matches(entry.local_addr, needle_lower))
+        || (shape.endpoint && socket_text_matches(&entry, needle_lower))
         || entry
             .label
             .is_some_and(|value| metadata.contains(value, needle_lower))
@@ -749,9 +916,7 @@ fn plain_matches<'value, 'needle>(
 }
 
 fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
-    if !needle_lower.contains(':') {
-        return false;
-    }
+    debug_assert!(needle_lower.contains(':'));
 
     let mut plain = StackText::new();
     let _ = write!(plain, "{}:{}", entry.local_addr, entry.local_port);
@@ -760,10 +925,24 @@ fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
     }
     let mut bracketed = StackText::new();
     let _ = write!(bracketed, "[{}]:{}", entry.local_addr, entry.local_port);
-    contains_ascii(bracketed.as_str(), needle_lower)
-        || human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope)
-            .to_ascii_lowercase()
-            .contains(needle_lower)
+    if contains_ascii(bracketed.as_str(), needle_lower) {
+        return true;
+    }
+
+    let IpAddr::V6(address) = entry.local_addr else {
+        return false;
+    };
+    let mut scoped = StackText::new();
+    match entry.ipv6_scope {
+        Some(Ipv6Scope::InterfaceIndex(index)) => {
+            let _ = write!(scoped, "[{address}%{index}]:{}", entry.local_port);
+        }
+        Some(Ipv6Scope::Unavailable) | None => {
+            let _ = write!(scoped, "[{address}%unavailable]:{}", entry.local_port);
+        }
+        Some(Ipv6Scope::Unscoped) => return false,
+    }
+    contains_ascii(scoped.as_str(), needle_lower)
 }
 
 fn parent_matches<'value, 'needle>(
@@ -849,17 +1028,34 @@ impl Hash for NeedleKey<'_> {
 
 struct MetadataMatchCache<'value, 'needle> {
     normalization: NormalizationCache<'value>,
-    matches: HashMap<(usize, NeedleKey<'needle>), bool>,
+    matches: MetadataMatchResults<'needle>,
     matches_max: usize,
     #[cfg(test)]
     scan_count: usize,
 }
 
+enum MetadataMatchResults<'needle> {
+    None,
+    Single {
+        needle: NeedleKey<'needle>,
+        matches: HashMap<usize, bool>,
+    },
+    Multiple(HashMap<(usize, NeedleKey<'needle>), bool>),
+}
+
 impl<'value, 'needle> MetadataMatchCache<'value, 'needle> {
-    fn new(matches_max: usize) -> Self {
+    fn new(matches_max: usize, needle_mode: MetadataNeedleMode<'needle>) -> Self {
+        let matches = match needle_mode {
+            MetadataNeedleMode::None => MetadataMatchResults::None,
+            MetadataNeedleMode::Single(needle) => MetadataMatchResults::Single {
+                needle: NeedleKey::from(needle),
+                matches: HashMap::new(),
+            },
+            MetadataNeedleMode::Multiple => MetadataMatchResults::Multiple(HashMap::new()),
+        };
         Self {
             normalization: NormalizationCache::default(),
-            matches: HashMap::new(),
+            matches,
             matches_max,
             #[cfg(test)]
             scan_count: 0,
@@ -871,8 +1067,16 @@ impl<'value, 'needle> MetadataMatchCache<'value, 'needle> {
         // NeedleKey retains the immutable borrow for the cache lifetime. Pointer
         // identity therefore avoids hashing up to 256 bytes on every lookup
         // without allowing an allocator-reused address to alias another needle.
-        let match_key = (value_key, NeedleKey::from(needle));
-        if let Some(result) = self.matches.get(&match_key) {
+        let needle_key = NeedleKey::from(needle);
+        let cached = match &self.matches {
+            MetadataMatchResults::Single {
+                needle: expected,
+                matches,
+            } if *expected == needle_key => matches.get(&value_key),
+            MetadataMatchResults::Multiple(matches) => matches.get(&(value_key, needle_key)),
+            MetadataMatchResults::None | MetadataMatchResults::Single { .. } => None,
+        };
+        if let Some(result) = cached {
             return *result;
         }
         #[cfg(test)]
@@ -880,10 +1084,30 @@ impl<'value, 'needle> MetadataMatchCache<'value, 'needle> {
             self.scan_count += 1;
         }
         let result = self.normalization.values[value_key].contains(needle);
-        if self.matches.len() < self.matches_max {
-            self.matches.insert(match_key, result);
+        match &mut self.matches {
+            MetadataMatchResults::Single {
+                needle: expected,
+                matches,
+            } if *expected == needle_key && matches.len() < self.matches_max => {
+                matches.insert(value_key, result);
+            }
+            MetadataMatchResults::Multiple(matches) if matches.len() < self.matches_max => {
+                matches.insert((value_key, needle_key), result);
+            }
+            MetadataMatchResults::None
+            | MetadataMatchResults::Single { .. }
+            | MetadataMatchResults::Multiple(_) => {}
         }
         result
+    }
+
+    #[cfg(test)]
+    fn matches_len(&self) -> usize {
+        match &self.matches {
+            MetadataMatchResults::None => 0,
+            MetadataMatchResults::Single { matches, .. } => matches.len(),
+            MetadataMatchResults::Multiple(matches) => matches.len(),
+        }
     }
 }
 
@@ -943,8 +1167,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions, query_view_indices,
-        query_view_indices_by,
+        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions,
+        filter_preordered_view_indices_by, query_view_indices, query_view_indices_by,
     };
     use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
@@ -1117,6 +1341,35 @@ mod tests {
         assert_eq!(matching("[::1%7]:5353"), [5353]);
         assert!(matching("[::1%8]:5353").is_empty());
         assert!(matching("scope_id:8").is_empty());
+    }
+
+    #[test]
+    fn alphabetic_ipv6_and_unicode_metadata_searches_remain_supported() {
+        let mut ipv6 = entry(5353, "mdns");
+        ipv6.local_addr = "dead::beef".parse().expect("test address is valid");
+        let unicode = entry(3000, "Äther");
+        let rows = [ipv6, unicode];
+
+        assert_eq!(matching_ports(&rows, "dead"), [5353]);
+        assert_eq!(matching_ports(&rows, "äth"), [3000]);
+    }
+
+    #[test]
+    fn endpoint_search_preserves_every_ipv6_scope_rendering() {
+        let mut unavailable = entry(5353, "unavailable");
+        unavailable.local_addr = "fe80::1".parse().expect("test address is valid");
+        unavailable.ipv6_scope = Some(Ipv6Scope::Unavailable);
+        let mut missing = entry(5354, "missing");
+        missing.local_addr = "fe80::2".parse().expect("test address is valid");
+        let mut unscoped = entry(5355, "unscoped");
+        unscoped.local_addr = "fe80::3".parse().expect("test address is valid");
+        unscoped.ipv6_scope = Some(Ipv6Scope::Unscoped);
+        let rows = [unavailable, missing, unscoped];
+
+        assert_eq!(matching_ports(&rows, "[fe80::1%unavailable]:5353"), [5353]);
+        assert_eq!(matching_ports(&rows, "[fe80::2%unavailable]:5354"), [5354]);
+        assert_eq!(matching_ports(&rows, "[fe80::3]:5355"), [5355]);
+        assert!(matching_ports(&rows, "[fe80::3%unavailable]:5355").is_empty());
     }
 
     #[test]
@@ -1440,8 +1693,89 @@ mod tests {
     }
 
     #[test]
+    fn filtering_a_preordered_permutation_preserves_source_indices_and_query_metadata() {
+        let mut zulu = entry(4000, "zulu");
+        zulu.parent_process_name = Some("runner".into());
+        let mut alpha = entry(3000, "alpha");
+        alpha.protocol = Protocol::Udp;
+        let mut system = entry(5000, "systemd-resolved");
+        system.parent_pid = Some(1);
+        let mut beta = entry(2000, "beta");
+        beta.parent_process_name = Some("runner".into());
+        let rows = [zulu, alpha, system, beta];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        for sort_mode in [
+            SortMode::Port,
+            SortMode::Pid,
+            SortMode::Protocol,
+            SortMode::Process,
+            SortMode::Parent,
+            SortMode::Scope,
+        ] {
+            let sorted = query_view_indices(
+                &views,
+                QueryOptions {
+                    sort_mode,
+                    ..query("")
+                },
+            )
+            .expect("unfiltered sort is valid");
+            let options = QueryOptions {
+                sort_mode,
+                hide_system_processes: true,
+                ..query("parent:runner")
+            };
+            let expected = query_view_indices(&views, options).expect("ordinary query is valid");
+            let mut projections = 0;
+            let actual = filter_preordered_view_indices_by(
+                &sorted.indices,
+                |source_index| {
+                    projections += 1;
+                    views[source_index]
+                },
+                options,
+            )
+            .expect("preordered query is valid");
+
+            assert_eq!(actual.indices, expected.indices);
+            let mut source_indices = actual.indices.clone();
+            source_indices.sort_unstable();
+            assert_eq!(source_indices, [0, 3]);
+            assert_eq!(
+                actual.explicit_filter_active,
+                expected.explicit_filter_active
+            );
+            assert_eq!(
+                actual.hidden_system_process_count,
+                expected.hidden_system_process_count
+            );
+            assert_eq!(projections, rows.len());
+        }
+    }
+
+    #[test]
+    fn cheap_terms_reject_rows_before_metadata_scans() {
+        let row = entry(3000, "worker");
+        let options = query("worker proto:udp");
+        let prepared = super::prepare_query(options).expect("query is valid");
+        let plan = super::QueryFilterPlan::new(&options, &prepared);
+        let mut metadata = super::MetadataMatchCache::new(
+            super::metadata_match_cache_limit(1),
+            plan.metadata_needle_mode,
+        );
+
+        assert!(!super::entry_matches(
+            PortEntryView::from(&row),
+            plan,
+            &mut metadata
+        ));
+        assert_eq!(metadata.scan_count, 0);
+    }
+
+    #[test]
     fn metadata_match_cache_isolates_and_reuses_multiple_needles() {
-        let mut metadata = super::MetadataMatchCache::new(2);
+        let mut metadata = super::MetadataMatchCache::new(2, super::MetadataNeedleMode::Multiple);
 
         for _ in 0..2 {
             assert!(metadata.contains("alpha", "alp"));
@@ -1449,19 +1783,31 @@ mod tests {
         }
 
         assert_eq!(metadata.scan_count, 2);
-        assert_eq!(metadata.matches.len(), 2);
+        assert_eq!(metadata.matches_len(), 2);
+    }
+
+    #[test]
+    fn single_needle_match_cache_uses_compact_value_keys() {
+        let mut metadata =
+            super::MetadataMatchCache::new(2, super::MetadataNeedleMode::Single("alp"));
+
+        assert!(metadata.contains("alpha", "alp"));
+        assert!(metadata.contains("alpha", "alp"));
+
+        assert_eq!(metadata.scan_count, 1);
+        assert_eq!(metadata.matches_len(), 1);
     }
 
     #[test]
     fn metadata_match_cache_stops_growing_at_its_bound() {
-        let mut metadata = super::MetadataMatchCache::new(1);
+        let mut metadata = super::MetadataMatchCache::new(1, super::MetadataNeedleMode::Multiple);
 
         assert!(metadata.contains("alpha", "alp"));
         assert!(metadata.contains("alpha", "alp"));
         assert!(!metadata.contains("alpha", "beta"));
         assert!(!metadata.contains("alpha", "beta"));
 
-        assert_eq!(metadata.matches.len(), 1);
+        assert_eq!(metadata.matches_len(), 1);
         assert_eq!(metadata.scan_count, 3);
     }
 
