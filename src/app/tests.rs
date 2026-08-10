@@ -108,12 +108,15 @@ fn preserved_selection_distinguishes_ipv6_interface_scopes() {
     let rows = [first, second];
     let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
     let selected_key = RowKey::from(views[1]);
+    let selected_source_rows = views
+        .iter()
+        .copied()
+        .map(|view| RowKey::from(view) == selected_key)
+        .collect::<Vec<_>>();
 
     assert_ne!(RowKey::from(views[0]), selected_key);
     assert_eq!(
-        preserved_selection(&[0, 1], Some(selected_key), 0, |index| {
-            RowKey::from(views[index])
-        }),
+        preserved_selection(&[0, 1], Some(&selected_source_rows), 0),
         Some(1)
     );
 }
@@ -740,6 +743,39 @@ fn sort_cycle_preserves_selected_row_when_possible() {
     assert_eq!(app.sort_mode(), SortMode::Process);
     assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
     assert_eq!(app.selected_index, Some(1));
+}
+
+#[test]
+fn filtering_duplicate_row_keys_preserves_the_visible_match() {
+    let mut zulu = entry(3000, Some("zulu"));
+    let mut alpha = entry(3000, Some("alpha"));
+    alpha.process_identity = Some(crate::observation::ProcessIdentity {
+        pid: 3000,
+        start_marker: crate::observation::ProcessStartMarker::linux(56)
+            .expect("test marker is nonzero"),
+    });
+    zulu.parent_pid = Some(1);
+    alpha.parent_pid = Some(2);
+    let unrelated = entry(4000, Some("alpha-worker"));
+    let mut app = app_with_rows(vec![zulu, alpha, unrelated]);
+    app.apply_action(Action::MoveDown);
+    assert_eq!(
+        app.selected_row().and_then(|row| row.process_name),
+        Some("alpha")
+    );
+
+    app.apply_action(Action::StartSearch);
+    for ch in "alpha".chars() {
+        app.apply_action(Action::SearchAppend(ch));
+    }
+
+    assert_eq!(app.rows().len(), 2);
+    assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
+    assert_eq!(
+        app.selected_row().and_then(|row| row.process_name),
+        Some("alpha")
+    );
+    assert_eq!(app.selected_index(), Some(0));
 }
 
 #[test]

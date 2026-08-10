@@ -6,8 +6,6 @@ use crate::model::{DockerPortContext, PortEntryView, ProcessContext};
 use crate::platform;
 use crate::process::{self, KillMode, KillTarget, TerminationOutcome};
 
-use super::RowKey;
-
 pub(super) fn collect_selected_process_context(
     entry: PortEntryView<'_>,
     docker_enrichment: bool,
@@ -65,17 +63,18 @@ pub(crate) fn kill_command_text(target: &KillTarget, mode: KillMode) -> String {
 
 pub(super) fn preserved_selection(
     visible_row_indices: &[usize],
-    selected_key: Option<RowKey>,
+    selected_source_rows: Option<&[bool]>,
     fallback_index: usize,
-    mut row_key_at: impl FnMut(usize) -> RowKey,
 ) -> Option<usize> {
     if visible_row_indices.is_empty() {
         return None;
     }
-    if let Some(key) = selected_key
-        && let Some(index) = visible_row_indices
-            .iter()
-            .position(|&index| row_key_at(index) == key)
+    if let Some(selected_source_rows) = selected_source_rows
+        && let Some(index) = visible_row_indices.iter().position(|&index| {
+            *selected_source_rows
+                .get(index)
+                .expect("visible source indices must fit the selection mask")
+        })
     {
         return Some(index);
     }

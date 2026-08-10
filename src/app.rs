@@ -609,10 +609,6 @@ impl App {
             .map(|descriptor| snapshot.port_entry_view(descriptor))
     }
 
-    fn row_key(&self, index: usize) -> Option<RowKey> {
-        self.row_view_without_label(index).map(RowKey::from)
-    }
-
     fn all_views(&self) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
         (0..self.row_count()).map(|index| self.row_view(index).expect("row index is valid"))
     }
@@ -1530,13 +1526,24 @@ impl App {
         selected_key: Option<RowKey>,
         fallback_index: usize,
     ) {
+        // Vec<bool> stores one bit per source row. Recording key matches during
+        // the query's sole projection avoids rebuilding views while preserving
+        // the existing first-visible-match behavior for duplicate row keys.
+        let mut selected_source_rows = selected_key.map(|_| vec![false; self.row_count()]);
         // The bound and callback share the same descriptor table. A missing
         // view therefore means the snapshot and its descriptors diverged.
         let query_result = query::query_view_indices_by(
             self.row_count(),
             |index| {
-                self.row_view(index)
-                    .expect("snapshot and row descriptors must remain synchronized")
+                let view = self
+                    .row_view(index)
+                    .expect("snapshot and row descriptors must remain synchronized");
+                if selected_key.is_some_and(|key| RowKey::from(view) == key) {
+                    selected_source_rows
+                        .as_mut()
+                        .expect("a selected key allocates its source-row mask")[index] = true;
+                }
+                view
             },
             QueryOptions {
                 port: None,
@@ -1553,12 +1560,8 @@ impl App {
         };
         let selected_index = preserved_selection(
             &visible_row_indices,
-            selected_key,
+            selected_source_rows.as_deref(),
             fallback_index,
-            |index| {
-                self.row_key(index)
-                    .expect("query result indices must identify source rows")
-            },
         );
         self.visible_row_indices = visible_row_indices;
         self.filter_error = filter_error;

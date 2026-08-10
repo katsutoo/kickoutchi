@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 
@@ -113,7 +114,36 @@ pub(crate) fn query_view_indices(
     entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
 ) -> Result<QueryIndexResult, QueryError> {
-    query_view_indices_by(entries.len(), |index| entries[index], options)
+    let prepared = prepare_query(options)?;
+    let filter_plan = QueryFilterPlan::new(&options, &prepared);
+    let mut indices = if filter_plan.all_rows_match_without_metadata() {
+        Vec::with_capacity(entries.len())
+    } else {
+        Vec::new()
+    };
+    let mut hidden_system_process_count = 0;
+    let mut metadata = MetadataMatchCache::new(metadata_match_cache_limit(entries.len()));
+    for (index, entry) in entries.iter().copied().enumerate() {
+        if filter_plan.hide_system_processes && entry.is_system_process() {
+            hidden_system_process_count += 1;
+            continue;
+        }
+        if entry_matches(entry, filter_plan, &mut metadata) {
+            indices.push(index);
+        }
+    }
+    sort_view_indices(
+        entries,
+        &mut indices,
+        options.sort_mode,
+        &mut metadata.normalization,
+    );
+
+    Ok(QueryIndexResult {
+        indices,
+        explicit_filter_active: prepared.explicit_filter_active,
+        hidden_system_process_count,
+    })
 }
 
 /// Query a bounded row source without first materializing every borrowed view.
@@ -126,24 +156,8 @@ pub(crate) fn query_view_indices_by<'a>(
     mut view_at: impl FnMut(usize) -> PortEntryView<'a>,
     options: QueryOptions<'_>,
 ) -> Result<QueryIndexResult, QueryError> {
-    if options.capabilities != QueryCapabilities::LIST {
-        return Err(QueryError::FullStateEntriesRequired);
-    }
-    if options.port == Some(0) {
-        return Err(invalid_value("port", "0", "a TCP/UDP port from 1 to 65535"));
-    }
-    if options.process == Some("") {
-        return Err(invalid_value(
-            "process",
-            "",
-            "a nonempty process name substring",
-        ));
-    }
-    let terms = parse_filter_text(options.filter_text, options.capabilities)?;
-    let process_needle = options.process.map(normalized);
-    let explicit_filter_active =
-        options.port.is_some() || options.process.is_some() || !terms.is_empty();
-    let filter_plan = QueryFilterPlan::new(&options, process_needle.as_deref(), &terms);
+    let prepared = prepare_query(options)?;
+    let filter_plan = QueryFilterPlan::new(&options, &prepared);
     let (indices, hidden_system_process_count) = match options.sort_mode {
         SortMode::Port => collect_sorted_indices(
             entry_count,
@@ -201,8 +215,39 @@ pub(crate) fn query_view_indices_by<'a>(
 
     Ok(QueryIndexResult {
         indices,
-        explicit_filter_active,
+        explicit_filter_active: prepared.explicit_filter_active,
         hidden_system_process_count,
+    })
+}
+
+struct PreparedQuery {
+    terms: Vec<FilterTerm>,
+    process_needle: Option<String>,
+    explicit_filter_active: bool,
+}
+
+fn prepare_query(options: QueryOptions<'_>) -> Result<PreparedQuery, QueryError> {
+    if options.capabilities != QueryCapabilities::LIST {
+        return Err(QueryError::FullStateEntriesRequired);
+    }
+    if options.port == Some(0) {
+        return Err(invalid_value("port", "0", "a TCP/UDP port from 1 to 65535"));
+    }
+    if options.process == Some("") {
+        return Err(invalid_value(
+            "process",
+            "",
+            "a nonempty process name substring",
+        ));
+    }
+    let terms = parse_filter_text(options.filter_text, options.capabilities)?;
+    let process_needle = options.process.map(normalized);
+    let explicit_filter_active =
+        options.port.is_some() || options.process.is_some() || !terms.is_empty();
+    Ok(PreparedQuery {
+        terms,
+        process_needle,
+        explicit_filter_active,
     })
 }
 
@@ -246,24 +291,15 @@ struct QueryFilterPlan<'a> {
     process_needle: Option<&'a str>,
     terms: &'a [FilterTerm],
     hide_system_processes: bool,
-    cache_match_results: bool,
 }
 
 impl<'a> QueryFilterPlan<'a> {
-    fn new(
-        options: &QueryOptions<'_>,
-        process_needle: Option<&'a str>,
-        terms: &'a [FilterTerm],
-    ) -> Self {
+    fn new(options: &QueryOptions<'_>, prepared: &'a PreparedQuery) -> Self {
         Self {
             port: options.port,
-            process_needle,
-            terms,
+            process_needle: prepared.process_needle.as_deref(),
+            terms: &prepared.terms,
             hide_system_processes: options.hide_system_processes,
-            // Match results are keyed by normalized metadata value, not by the
-            // needle. Reuse is therefore sound only when the query has at most
-            // one predicate that can search process, parent, or label text.
-            cache_match_results: metadata_needle_count(process_needle, terms) <= 1,
         }
     }
 
@@ -275,12 +311,36 @@ impl<'a> QueryFilterPlan<'a> {
     }
 }
 
-fn collect_sorted_indices<'a, K>(
+fn entry_matches<'value, 'needle>(
+    entry: PortEntryView<'value>,
+    filter_plan: QueryFilterPlan<'needle>,
+    metadata: &mut MetadataMatchCache<'value, 'needle>,
+) -> bool {
+    if filter_plan
+        .port
+        .is_some_and(|port| entry.local_port != port)
+    {
+        return false;
+    }
+    if filter_plan.process_needle.is_some_and(|needle| {
+        entry
+            .process_name
+            .is_none_or(|name| !metadata.contains(name, needle))
+    }) {
+        return false;
+    }
+    filter_plan
+        .terms
+        .iter()
+        .all(|term| term_matches(entry, term, metadata))
+}
+
+fn collect_sorted_indices<'value, 'needle, K>(
     entry_count: usize,
-    view_at: &mut impl FnMut(usize) -> PortEntryView<'a>,
-    filter_plan: QueryFilterPlan<'_>,
-    mut primary_key: impl FnMut(PortEntryView<'a>, &mut NormalizationCache<'a>) -> K,
-    compare_primary: impl Fn(&K, &K, &NormalizationCache<'a>) -> Ordering,
+    view_at: &mut impl FnMut(usize) -> PortEntryView<'value>,
+    filter_plan: QueryFilterPlan<'needle>,
+    mut primary_key: impl FnMut(PortEntryView<'value>, &mut NormalizationCache<'value>) -> K,
+    compare_primary: impl Fn(&K, &K, &NormalizationCache<'value>) -> Ordering,
 ) -> (Vec<usize>, usize) {
     let mut candidates = if filter_plan.all_rows_match_without_metadata() {
         Vec::with_capacity(entry_count)
@@ -288,31 +348,14 @@ fn collect_sorted_indices<'a, K>(
         Vec::new()
     };
     let mut hidden_system_process_count = 0;
-    let mut metadata = MetadataMatchCache::new(filter_plan.cache_match_results);
+    let mut metadata = MetadataMatchCache::new(metadata_match_cache_limit(entry_count));
     for index in 0..entry_count {
         let entry = view_at(index);
         if filter_plan.hide_system_processes && entry.is_system_process() {
             hidden_system_process_count += 1;
             continue;
         }
-        if filter_plan
-            .port
-            .is_some_and(|port| entry.local_port != port)
-        {
-            continue;
-        }
-        if filter_plan.process_needle.is_some_and(|needle| {
-            entry
-                .process_name
-                .is_none_or(|name| !metadata.contains(name, needle))
-        }) {
-            continue;
-        }
-        if filter_plan
-            .terms
-            .iter()
-            .any(|term| !term_matches(entry, term, &mut metadata))
-        {
+        if !entry_matches(entry, filter_plan, &mut metadata) {
             continue;
         }
         candidates.push(SortCandidate {
@@ -322,9 +365,12 @@ fn collect_sorted_indices<'a, K>(
         });
     }
 
-    candidates.sort_by(|left, right| {
+    candidates.sort_unstable_by(|left, right| {
         compare_primary(&left.primary, &right.primary, &metadata.normalization)
             .then_with(|| left.tie_break.cmp(&right.tie_break))
+            // This is the stable source-order tie-break made explicit, allowing
+            // the hot sort to avoid an auxiliary stable-sort allocation.
+            .then_with(|| left.source_index.cmp(&right.source_index))
     });
     let indices = candidates
         .into_iter()
@@ -343,17 +389,104 @@ fn compare_normalized_keys(
     (left.is_none(), left).cmp(&(right.is_none(), right))
 }
 
-fn metadata_needle_count(process_needle: Option<&str>, terms: &[FilterTerm]) -> usize {
-    usize::from(process_needle.is_some())
-        + terms
+const MISSING_NORMALIZED_NAME_KEY: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct NameSortCandidate {
+    source_index: usize,
+    normalized_name_key: usize,
+}
+
+fn normalized_candidate_name<'a>(
+    candidate: &NameSortCandidate,
+    normalization: &'a NormalizationCache<'_>,
+) -> Option<&'a str> {
+    (candidate.normalized_name_key != MISSING_NORMALIZED_NAME_KEY)
+        .then(|| normalization.value(candidate.normalized_name_key))
+}
+
+fn sort_view_indices<'a>(
+    entries: &[PortEntryView<'a>],
+    indices: &mut [usize],
+    mode: SortMode,
+    normalization: &mut NormalizationCache<'a>,
+) {
+    if indices.len() < 2 {
+        return;
+    }
+    if matches!(mode, SortMode::Process | SortMode::Parent) {
+        let mut candidates = indices
             .iter()
-            .filter(|term| {
-                matches!(
-                    term,
-                    FilterTerm::Plain(_) | FilterTerm::Parent(_) | FilterTerm::Label(_)
-                )
+            .copied()
+            .map(|source_index| {
+                let value = match mode {
+                    SortMode::Process => entries[source_index].process_name,
+                    SortMode::Parent => entries[source_index].parent_process_name,
+                    _ => unreachable!("only name sort modes enter this branch"),
+                };
+                let normalized_name_key = value.map_or(MISSING_NORMALIZED_NAME_KEY, |value| {
+                    let key = normalization.key(value);
+                    debug_assert_ne!(
+                        key, MISSING_NORMALIZED_NAME_KEY,
+                        "normalization key space must retain its missing-value sentinel"
+                    );
+                    key
+                });
+                NameSortCandidate {
+                    source_index,
+                    normalized_name_key,
+                }
             })
-            .count()
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| {
+            compare_views(
+                entries[left.source_index],
+                entries[right.source_index],
+                mode,
+                normalized_candidate_name(left, normalization),
+                normalized_candidate_name(right, normalization),
+            )
+            .then_with(|| left.source_index.cmp(&right.source_index))
+        });
+        for (destination, candidate) in indices.iter_mut().zip(candidates) {
+            *destination = candidate.source_index;
+        }
+        return;
+    }
+    indices.sort_unstable_by(|left, right| {
+        compare_views(entries[*left], entries[*right], mode, None, None)
+            .then_with(|| left.cmp(right))
+    });
+}
+
+fn compare_views(
+    left: PortEntryView<'_>,
+    right: PortEntryView<'_>,
+    mode: SortMode,
+    normalized_left: Option<&str>,
+    normalized_right: Option<&str>,
+) -> Ordering {
+    let primary = match mode {
+        SortMode::Port => Ordering::Equal,
+        SortMode::Pid => (left.pid.is_none(), left.pid).cmp(&(right.pid.is_none(), right.pid)),
+        SortMode::Protocol => left.protocol.cmp(&right.protocol),
+        SortMode::Process => (normalized_left.is_none(), normalized_left)
+            .cmp(&(normalized_right.is_none(), normalized_right)),
+        SortMode::Parent => (
+            normalized_left.is_none(),
+            normalized_left,
+            left.parent_pid.is_none(),
+            left.parent_pid,
+        )
+            .cmp(&(
+                normalized_right.is_none(),
+                normalized_right,
+                right.parent_pid.is_none(),
+                right.parent_pid,
+            )),
+        SortMode::Scope => left.scope().cmp(&right.scope()),
+    };
+    primary.then_with(|| SortTieBreak::from(left).cmp(&SortTieBreak::from(right)))
 }
 
 pub(crate) fn validate_filter_text(
@@ -556,10 +689,10 @@ fn invalid_value(field: &'static str, value: &str, expected: &'static str) -> Qu
     }
 }
 
-fn term_matches<'a>(
-    entry: PortEntryView<'a>,
-    term: &FilterTerm,
-    metadata: &mut MetadataMatchCache<'a>,
+fn term_matches<'value, 'needle>(
+    entry: PortEntryView<'value>,
+    term: &'needle FilterTerm,
+    metadata: &mut MetadataMatchCache<'value, 'needle>,
 ) -> bool {
     match term {
         FilterTerm::Plain(needle) => plain_matches(entry, needle, metadata),
@@ -584,10 +717,10 @@ fn term_matches<'a>(
     }
 }
 
-fn plain_matches<'a>(
-    entry: PortEntryView<'a>,
-    needle_lower: &str,
-    metadata: &mut MetadataMatchCache<'a>,
+fn plain_matches<'value, 'needle>(
+    entry: PortEntryView<'value>,
+    needle_lower: &'needle str,
+    metadata: &mut MetadataMatchCache<'value, 'needle>,
 ) -> bool {
     display_matches(entry.local_port, needle_lower)
         || entry
@@ -633,10 +766,10 @@ fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
             .contains(needle_lower)
 }
 
-fn parent_matches<'a>(
-    entry: PortEntryView<'a>,
-    needle_lower: &str,
-    metadata: &mut MetadataMatchCache<'a>,
+fn parent_matches<'value, 'needle>(
+    entry: PortEntryView<'value>,
+    needle_lower: &'needle str,
+    metadata: &mut MetadataMatchCache<'value, 'needle>,
 ) -> bool {
     entry
         .parent_pid
@@ -664,36 +797,91 @@ fn contains_ascii(haystack: &str, needle: &str) -> bool {
 
 #[derive(Default)]
 struct NormalizationCache<'a> {
+    // Snapshot metadata and endpoint labels already have aggregate source
+    // bounds. This cache retains at most one lowercase copy per distinct
+    // borrowed value and is shared by filtering and name sorting.
     by_pointer: HashMap<(usize, usize), usize>,
     by_value: HashMap<&'a str, usize>,
     values: Vec<String>,
 }
 
-struct MetadataMatchCache<'a> {
-    normalization: NormalizationCache<'a>,
-    matches: HashMap<usize, bool>,
-    cache_match_results: bool,
+// A plain term can inspect at most these borrowed metadata fields on one row:
+// label, process name, executable path, command line, and parent process name.
+// The relative cap matches the old single-predicate entry count. The absolute
+// cap prevents a maximum-size snapshot and many needles from retaining tens of
+// megabytes of match keys; misses beyond it remain correct but are recomputed.
+const METADATA_MATCHES_PER_ROW_MAX: usize = 5;
+const METADATA_MATCH_CACHE_MAX_ENTRIES: usize = 65_536;
+
+fn metadata_match_cache_limit(entry_count: usize) -> usize {
+    entry_count
+        .saturating_mul(METADATA_MATCHES_PER_ROW_MAX)
+        .min(METADATA_MATCH_CACHE_MAX_ENTRIES)
 }
 
-impl<'a> MetadataMatchCache<'a> {
-    fn new(cache_match_results: bool) -> Self {
+#[derive(Clone, Copy)]
+struct NeedleKey<'a> {
+    value: &'a str,
+}
+
+impl<'a> From<&'a str> for NeedleKey<'a> {
+    fn from(needle: &'a str) -> Self {
+        debug_assert!(!needle.is_empty(), "validated query needles are nonempty");
+        Self { value: needle }
+    }
+}
+
+impl PartialEq for NeedleKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value.len() == other.value.len()
+            && std::ptr::eq(self.value.as_ptr(), other.value.as_ptr())
+    }
+}
+
+impl Eq for NeedleKey<'_> {}
+
+impl Hash for NeedleKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.as_ptr().hash(state);
+        self.value.len().hash(state);
+    }
+}
+
+struct MetadataMatchCache<'value, 'needle> {
+    normalization: NormalizationCache<'value>,
+    matches: HashMap<(usize, NeedleKey<'needle>), bool>,
+    matches_max: usize,
+    #[cfg(test)]
+    scan_count: usize,
+}
+
+impl<'value, 'needle> MetadataMatchCache<'value, 'needle> {
+    fn new(matches_max: usize) -> Self {
         Self {
             normalization: NormalizationCache::default(),
             matches: HashMap::new(),
-            cache_match_results,
+            matches_max,
+            #[cfg(test)]
+            scan_count: 0,
         }
     }
 
-    fn contains(&mut self, value: &'a str, needle: &str) -> bool {
+    fn contains(&mut self, value: &'value str, needle: &'needle str) -> bool {
         let value_key = self.normalization.key(value);
-        if self.cache_match_results
-            && let Some(result) = self.matches.get(&value_key)
-        {
+        // NeedleKey retains the immutable borrow for the cache lifetime. Pointer
+        // identity therefore avoids hashing up to 256 bytes on every lookup
+        // without allowing an allocator-reused address to alias another needle.
+        let match_key = (value_key, NeedleKey::from(needle));
+        if let Some(result) = self.matches.get(&match_key) {
             return *result;
         }
+        #[cfg(test)]
+        {
+            self.scan_count += 1;
+        }
         let result = self.normalization.values[value_key].contains(needle);
-        if self.cache_match_results {
-            self.matches.insert(value_key, result);
+        if self.matches.len() < self.matches_max {
+            self.matches.insert(match_key, result);
         }
         result
     }
@@ -1214,15 +1402,101 @@ mod tests {
         ];
 
         for (sort_mode, expected) in cases {
-            let result = query_view_indices(
-                &views,
-                QueryOptions {
-                    sort_mode,
-                    ..query("")
-                },
-            )
-            .expect("list-mode sort options are valid");
-            assert_eq!(result.indices, expected, "unexpected {sort_mode:?} order");
+            let options = QueryOptions {
+                sort_mode,
+                ..query("")
+            };
+            let slice_result = query_view_indices(&views, options)
+                .expect("slice-backed list sort options are valid");
+            let indexed_result = query_view_indices_by(views.len(), |index| views[index], options)
+                .expect("indexed list sort options are valid");
+            assert_eq!(
+                slice_result.indices, expected,
+                "unexpected slice-backed {sort_mode:?} order"
+            );
+            assert_eq!(
+                indexed_result.indices, expected,
+                "unexpected indexed {sort_mode:?} order"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_and_indexed_queries_apply_multi_needle_filters_identically() {
+        let mut alpha = entry(3000, "alpha");
+        alpha.parent_process_name = Some("runner".into());
+        let mut beta = entry(4000, "beta");
+        beta.parent_process_name = Some("runner".into());
+        let rows = [alpha, beta];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let options = query("runner alpha");
+
+        let slice_result = query_view_indices(&views, options).expect("filter is valid");
+        let indexed_result = query_view_indices_by(views.len(), |index| views[index], options)
+            .expect("filter is valid");
+
+        assert_eq!(slice_result.indices, [0]);
+        assert_eq!(indexed_result.indices, slice_result.indices);
+    }
+
+    #[test]
+    fn metadata_match_cache_isolates_and_reuses_multiple_needles() {
+        let mut metadata = super::MetadataMatchCache::new(2);
+
+        for _ in 0..2 {
+            assert!(metadata.contains("alpha", "alp"));
+            assert!(!metadata.contains("alpha", "beta"));
+        }
+
+        assert_eq!(metadata.scan_count, 2);
+        assert_eq!(metadata.matches.len(), 2);
+    }
+
+    #[test]
+    fn metadata_match_cache_stops_growing_at_its_bound() {
+        let mut metadata = super::MetadataMatchCache::new(1);
+
+        assert!(metadata.contains("alpha", "alp"));
+        assert!(metadata.contains("alpha", "alp"));
+        assert!(!metadata.contains("alpha", "beta"));
+        assert!(!metadata.contains("alpha", "beta"));
+
+        assert_eq!(metadata.matches.len(), 1);
+        assert_eq!(metadata.scan_count, 3);
+    }
+
+    #[test]
+    fn metadata_match_cache_limit_has_relative_and_absolute_boundaries() {
+        assert_eq!(super::metadata_match_cache_limit(0), 0);
+        assert_eq!(super::metadata_match_cache_limit(1), 5);
+        assert_eq!(
+            super::metadata_match_cache_limit(usize::MAX),
+            super::METADATA_MATCH_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn sparse_name_sorts_keep_source_indices_aligned_with_compact_keys() {
+        let mut alpha = entry(4000, "alpha");
+        alpha.parent_process_name = Some("alpha-parent".into());
+        let mut zulu = entry(6000, "Zulu");
+        zulu.parent_process_name = Some("Zulu Parent".into());
+        let rows = [
+            entry(3000, "ignored-a"),
+            alpha,
+            entry(5000, "ignored-b"),
+            zulu,
+        ];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+
+        for mode in [SortMode::Process, SortMode::Parent] {
+            let mut indices = vec![3, 1];
+            let mut normalization = super::NormalizationCache::default();
+
+            super::sort_view_indices(&views, &mut indices, mode, &mut normalization);
+
+            assert_eq!(indices, [1, 3]);
+            assert_eq!(normalization.values.len(), 2);
         }
     }
 
@@ -1257,10 +1531,14 @@ mod tests {
     fn separate_metadata_needles_never_share_match_results() {
         let rows = [entry(3000, "alpha")];
         let views = [PortEntryView::from(&rows[0]).with_label(Some("alpha"))];
+        let options = query("alpha label:beta");
 
-        let result = query_view_indices(&views, query("alpha label:beta"))
+        let slice_result =
+            query_view_indices(&views, options).expect("metadata filter syntax is valid");
+        let indexed_result = query_view_indices_by(1, |_| views[0], options)
             .expect("metadata filter syntax is valid");
 
-        assert!(result.indices.is_empty());
+        assert!(slice_result.indices.is_empty());
+        assert!(indexed_result.indices.is_empty());
     }
 }
