@@ -4,6 +4,7 @@
 //! confirmed rows are visible for a given query, and in what order. It never
 //! conjures a row out of thin air.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::net::IpAddr;
@@ -112,6 +113,19 @@ pub(crate) fn query_view_indices(
     entries: &[PortEntryView<'_>],
     options: QueryOptions<'_>,
 ) -> Result<QueryIndexResult, QueryError> {
+    query_view_indices_by(entries.len(), |index| entries[index], options)
+}
+
+/// Query a bounded row source without first materializing every borrowed view.
+///
+/// The callback is evaluated exactly once per source row. Matching facts are
+/// reduced immediately to a compact sort candidate, so callers backed by a
+/// structured snapshot do not need a second table-shaped allocation.
+pub(crate) fn query_view_indices_by<'a>(
+    entry_count: usize,
+    mut view_at: impl FnMut(usize) -> PortEntryView<'a>,
+    options: QueryOptions<'_>,
+) -> Result<QueryIndexResult, QueryError> {
     if options.capabilities != QueryCapabilities::LIST {
         return Err(QueryError::FullStateEntriesRequired);
     }
@@ -129,49 +143,61 @@ pub(crate) fn query_view_indices(
     let process_needle = options.process.map(normalized);
     let explicit_filter_active =
         options.port.is_some() || options.process.is_some() || !terms.is_empty();
-
-    let mut hidden_system_process_count = 0;
-    let mut metadata = MetadataMatchCache::default();
-    let mut indices = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if options.hide_system_processes && entry.is_system_process() {
-            hidden_system_process_count += 1;
-            continue;
-        }
-        if options.port.is_some_and(|port| entry.local_port != port) {
-            continue;
-        }
-        indices.push(index);
-    }
-
-    if let Some(needle) = process_needle.as_deref() {
-        metadata.clear_matches();
-        indices.retain(|&index| {
-            entries[index]
-                .process_name
-                .is_some_and(|name| metadata.contains(name, needle))
-        });
-    }
-    for term in &terms {
-        metadata.clear_matches();
-        indices.retain(|&index| term_matches(&entries[index], term, &mut metadata));
-    }
-
-    let normalized_keys = normalized_sort_keys(
-        entries,
-        &indices,
-        options.sort_mode,
-        &mut metadata.normalization,
-    );
-    indices.sort_by(|left, right| {
-        compare_views(
-            entries[*left],
-            entries[*right],
-            options.sort_mode,
-            normalized_keys[*left].map(|key| metadata.normalization.values[key].as_str()),
-            normalized_keys[*right].map(|key| metadata.normalization.values[key].as_str()),
-        )
-    });
+    let filter_plan = QueryFilterPlan::new(&options, process_needle.as_deref(), &terms);
+    let (indices, hidden_system_process_count) = match options.sort_mode {
+        SortMode::Port => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |_, _| (),
+            |(), (), _| Ordering::Equal,
+        ),
+        SortMode::Pid => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |entry, _| entry.pid,
+            |left, right, _| (left.is_none(), left).cmp(&(right.is_none(), right)),
+        ),
+        SortMode::Protocol => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |entry, _| entry.protocol,
+            |left, right, _| left.cmp(right),
+        ),
+        SortMode::Process => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |entry, normalization| entry.process_name.map(|name| normalization.key(name)),
+            |left, right, normalization| compare_normalized_keys(*left, *right, normalization),
+        ),
+        SortMode::Parent => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |entry, normalization| ParentSortKey {
+                normalized_name: entry
+                    .parent_process_name
+                    .map(|name| normalization.key(name)),
+                pid: entry.parent_pid,
+            },
+            |left, right, normalization| {
+                compare_normalized_keys(left.normalized_name, right.normalized_name, normalization)
+                    .then_with(|| {
+                        (left.pid.is_none(), left.pid).cmp(&(right.pid.is_none(), right.pid))
+                    })
+            },
+        ),
+        SortMode::Scope => collect_sorted_indices(
+            entry_count,
+            &mut view_at,
+            filter_plan,
+            |entry, _| entry.scope(),
+            |left, right, _| left.cmp(right),
+        ),
+    };
 
     Ok(QueryIndexResult {
         indices,
@@ -180,61 +206,154 @@ pub(crate) fn query_view_indices(
     })
 }
 
-fn normalized_sort_keys<'a>(
-    entries: &[PortEntryView<'a>],
-    visible_indices: &[usize],
-    mode: SortMode,
-    normalization: &mut NormalizationCache<'a>,
-) -> Vec<Option<usize>> {
-    let mut keys = vec![None; entries.len()];
-    for &index in visible_indices {
-        let value = match mode {
-            SortMode::Process => entries[index].process_name,
-            SortMode::Parent => entries[index].parent_process_name,
-            _ => None,
-        };
-        let Some(value) = value else { continue };
-        keys[index] = Some(normalization.key(value));
-    }
-    keys
+#[derive(Clone, Copy)]
+struct SortCandidate<K> {
+    source_index: usize,
+    // The generic keeps non-name sort candidates from carrying unused name or
+    // parent fields across the full row bound.
+    primary: K,
+    tie_break: SortTieBreak,
 }
 
-fn compare_views(
-    a: PortEntryView<'_>,
-    b: PortEntryView<'_>,
-    mode: SortMode,
-    normalized_a: Option<&str>,
-    normalized_b: Option<&str>,
-) -> std::cmp::Ordering {
-    let key = match mode {
-        SortMode::Port => std::cmp::Ordering::Equal,
-        SortMode::Pid => (a.pid.is_none(), a.pid).cmp(&(b.pid.is_none(), b.pid)),
-        SortMode::Protocol => a.protocol.cmp(&b.protocol),
-        SortMode::Process => {
-            (normalized_a.is_none(), normalized_a).cmp(&(normalized_b.is_none(), normalized_b))
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SortTieBreak {
+    local_port: u16,
+    protocol: Protocol,
+    local_addr: IpAddr,
+    pid: Option<u32>,
+}
+
+impl From<PortEntryView<'_>> for SortTieBreak {
+    fn from(entry: PortEntryView<'_>) -> Self {
+        Self {
+            local_port: entry.local_port,
+            protocol: entry.protocol,
+            local_addr: entry.local_addr,
+            pid: entry.pid,
         }
-        SortMode::Parent => (
-            normalized_a.is_none(),
-            normalized_a,
-            a.parent_pid.is_none(),
-            a.parent_pid,
-        )
-            .cmp(&(
-                normalized_b.is_none(),
-                normalized_b,
-                b.parent_pid.is_none(),
-                b.parent_pid,
-            )),
-        SortMode::Scope => a.scope().cmp(&b.scope()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ParentSortKey {
+    normalized_name: Option<usize>,
+    pid: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct QueryFilterPlan<'a> {
+    port: Option<u16>,
+    process_needle: Option<&'a str>,
+    terms: &'a [FilterTerm],
+    hide_system_processes: bool,
+    cache_match_results: bool,
+}
+
+impl<'a> QueryFilterPlan<'a> {
+    fn new(
+        options: &QueryOptions<'_>,
+        process_needle: Option<&'a str>,
+        terms: &'a [FilterTerm],
+    ) -> Self {
+        Self {
+            port: options.port,
+            process_needle,
+            terms,
+            hide_system_processes: options.hide_system_processes,
+            // Match results are keyed by normalized metadata value, not by the
+            // needle. Reuse is therefore sound only when the query has at most
+            // one predicate that can search process, parent, or label text.
+            cache_match_results: metadata_needle_count(process_needle, terms) <= 1,
+        }
+    }
+
+    fn all_rows_match_without_metadata(self) -> bool {
+        !self.hide_system_processes
+            && self.port.is_none()
+            && self.process_needle.is_none()
+            && self.terms.is_empty()
+    }
+}
+
+fn collect_sorted_indices<'a, K>(
+    entry_count: usize,
+    view_at: &mut impl FnMut(usize) -> PortEntryView<'a>,
+    filter_plan: QueryFilterPlan<'_>,
+    mut primary_key: impl FnMut(PortEntryView<'a>, &mut NormalizationCache<'a>) -> K,
+    compare_primary: impl Fn(&K, &K, &NormalizationCache<'a>) -> Ordering,
+) -> (Vec<usize>, usize) {
+    let mut candidates = if filter_plan.all_rows_match_without_metadata() {
+        Vec::with_capacity(entry_count)
+    } else {
+        Vec::new()
     };
-    key.then_with(|| {
-        (a.local_port, a.protocol, a.local_addr, a.pid).cmp(&(
-            b.local_port,
-            b.protocol,
-            b.local_addr,
-            b.pid,
-        ))
-    })
+    let mut hidden_system_process_count = 0;
+    let mut metadata = MetadataMatchCache::new(filter_plan.cache_match_results);
+    for index in 0..entry_count {
+        let entry = view_at(index);
+        if filter_plan.hide_system_processes && entry.is_system_process() {
+            hidden_system_process_count += 1;
+            continue;
+        }
+        if filter_plan
+            .port
+            .is_some_and(|port| entry.local_port != port)
+        {
+            continue;
+        }
+        if filter_plan.process_needle.is_some_and(|needle| {
+            entry
+                .process_name
+                .is_none_or(|name| !metadata.contains(name, needle))
+        }) {
+            continue;
+        }
+        if filter_plan
+            .terms
+            .iter()
+            .any(|term| !term_matches(entry, term, &mut metadata))
+        {
+            continue;
+        }
+        candidates.push(SortCandidate {
+            source_index: index,
+            primary: primary_key(entry, &mut metadata.normalization),
+            tie_break: SortTieBreak::from(entry),
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        compare_primary(&left.primary, &right.primary, &metadata.normalization)
+            .then_with(|| left.tie_break.cmp(&right.tie_break))
+    });
+    let indices = candidates
+        .into_iter()
+        .map(|candidate| candidate.source_index)
+        .collect();
+    (indices, hidden_system_process_count)
+}
+
+fn compare_normalized_keys(
+    left: Option<usize>,
+    right: Option<usize>,
+    normalization: &NormalizationCache<'_>,
+) -> Ordering {
+    let left = left.map(|key| normalization.value(key));
+    let right = right.map(|key| normalization.value(key));
+    (left.is_none(), left).cmp(&(right.is_none(), right))
+}
+
+fn metadata_needle_count(process_needle: Option<&str>, terms: &[FilterTerm]) -> usize {
+    usize::from(process_needle.is_some())
+        + terms
+            .iter()
+            .filter(|term| {
+                matches!(
+                    term,
+                    FilterTerm::Plain(_) | FilterTerm::Parent(_) | FilterTerm::Label(_)
+                )
+            })
+            .count()
 }
 
 pub(crate) fn validate_filter_text(
@@ -438,7 +557,7 @@ fn invalid_value(field: &'static str, value: &str, expected: &'static str) -> Qu
 }
 
 fn term_matches<'a>(
-    entry: &'a PortEntryView<'a>,
+    entry: PortEntryView<'a>,
     term: &FilterTerm,
     metadata: &mut MetadataMatchCache<'a>,
 ) -> bool {
@@ -466,7 +585,7 @@ fn term_matches<'a>(
 }
 
 fn plain_matches<'a>(
-    entry: &'a PortEntryView<'a>,
+    entry: PortEntryView<'a>,
     needle_lower: &str,
     metadata: &mut MetadataMatchCache<'a>,
 ) -> bool {
@@ -475,7 +594,7 @@ fn plain_matches<'a>(
             .pid
             .is_some_and(|pid| display_matches(pid, needle_lower))
         || display_matches(entry.local_addr, needle_lower)
-        || socket_text_matches(entry, needle_lower)
+        || socket_text_matches(&entry, needle_lower)
         || contains_ascii(entry.protocol.label(), needle_lower)
         || contains_ascii(entry.state.label(), needle_lower)
         || contains_ascii(entry.scope_label(), needle_lower)
@@ -515,7 +634,7 @@ fn socket_text_matches(entry: &PortEntryView<'_>, needle_lower: &str) -> bool {
 }
 
 fn parent_matches<'a>(
-    entry: &'a PortEntryView<'a>,
+    entry: PortEntryView<'a>,
     needle_lower: &str,
     metadata: &mut MetadataMatchCache<'a>,
 ) -> bool {
@@ -550,24 +669,32 @@ struct NormalizationCache<'a> {
     values: Vec<String>,
 }
 
-#[derive(Default)]
 struct MetadataMatchCache<'a> {
     normalization: NormalizationCache<'a>,
     matches: HashMap<usize, bool>,
+    cache_match_results: bool,
 }
 
 impl<'a> MetadataMatchCache<'a> {
-    fn clear_matches(&mut self) {
-        self.matches.clear();
+    fn new(cache_match_results: bool) -> Self {
+        Self {
+            normalization: NormalizationCache::default(),
+            matches: HashMap::new(),
+            cache_match_results,
+        }
     }
 
     fn contains(&mut self, value: &'a str, needle: &str) -> bool {
         let value_key = self.normalization.key(value);
-        if let Some(result) = self.matches.get(&value_key) {
+        if self.cache_match_results
+            && let Some(result) = self.matches.get(&value_key)
+        {
             return *result;
         }
         let result = self.normalization.values[value_key].contains(needle);
-        self.matches.insert(value_key, result);
+        if self.cache_match_results {
+            self.matches.insert(value_key, result);
+        }
         result
     }
 }
@@ -587,6 +714,10 @@ impl<'a> NormalizationCache<'a> {
             self.by_value.insert(value, key);
             key
         }
+    }
+
+    fn value(&self, key: usize) -> &str {
+        &self.values[key]
     }
 }
 
@@ -625,6 +756,7 @@ mod tests {
 
     use super::{
         FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions, query_view_indices,
+        query_view_indices_by,
     };
     use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
@@ -1040,5 +1172,95 @@ mod tests {
             .expect("sort succeeds");
             assert_eq!(result.indices, [0, 1]);
         }
+    }
+
+    #[test]
+    fn every_sort_mode_preserves_primary_tie_break_and_duplicate_order() {
+        let mut zulu = entry(4000, "Zulu");
+        zulu.local_addr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        zulu.pid = Some(20);
+        zulu.parent_pid = Some(2);
+        zulu.parent_process_name = Some("Same".into());
+
+        let mut missing = entry(3000, "missing");
+        missing.protocol = Protocol::Udp;
+        missing.local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        missing.pid = None;
+        missing.process_name = None;
+        missing.parent_pid = None;
+        missing.parent_process_name = None;
+
+        let mut alpha = entry(3000, "alpha");
+        alpha.local_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        alpha.pid = Some(10);
+        alpha.parent_pid = Some(1);
+        alpha.parent_process_name = Some("same".into());
+
+        let mut alpha_loopback = entry(3000, "Alpha");
+        alpha_loopback.pid = Some(10);
+        alpha_loopback.parent_pid = Some(1);
+        alpha_loopback.parent_process_name = None;
+
+        let duplicate = alpha.clone();
+        let rows = [zulu, missing, alpha, alpha_loopback, duplicate];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let cases = [
+            (SortMode::Port, &[2, 4, 3, 1, 0][..]),
+            (SortMode::Pid, &[2, 4, 3, 0, 1][..]),
+            (SortMode::Protocol, &[2, 4, 3, 0, 1][..]),
+            (SortMode::Process, &[2, 4, 3, 0, 1][..]),
+            (SortMode::Parent, &[2, 4, 0, 3, 1][..]),
+            (SortMode::Scope, &[2, 4, 1, 3, 0][..]),
+        ];
+
+        for (sort_mode, expected) in cases {
+            let result = query_view_indices(
+                &views,
+                QueryOptions {
+                    sort_mode,
+                    ..query("")
+                },
+            )
+            .expect("list-mode sort options are valid");
+            assert_eq!(result.indices, expected, "unexpected {sort_mode:?} order");
+        }
+    }
+
+    #[test]
+    fn indexed_query_projects_each_source_row_once() {
+        let rows = [
+            entry(3000, "Zulu"),
+            entry(4000, "alpha"),
+            entry(5000, "beta"),
+        ];
+        let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
+        let calls = std::array::from_fn::<_, 3, _>(|_| std::cell::Cell::new(0));
+
+        let result = query_view_indices_by(
+            views.len(),
+            |index| {
+                calls[index].set(calls[index].get() + 1);
+                views[index]
+            },
+            QueryOptions {
+                sort_mode: SortMode::Process,
+                ..query("")
+            },
+        )
+        .expect("list-mode query options are valid");
+
+        assert_eq!(result.indices, [1, 2, 0]);
+        assert!(calls.iter().all(|count| count.get() == 1));
+    }
+
+    #[test]
+    fn separate_metadata_needles_never_share_match_results() {
+        let rows = [entry(3000, "alpha")];
+        let views = [PortEntryView::from(&rows[0]).with_label(Some("alpha"))];
+
+        let result = query_view_indices(&views, query("alpha label:beta"))
+            .expect("metadata filter syntax is valid");
+
+        assert!(result.indices.is_empty());
     }
 }

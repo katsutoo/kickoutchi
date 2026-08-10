@@ -64,10 +64,10 @@ pub(crate) fn kill_command_text(target: &KillTarget, mode: KillMode) -> String {
 }
 
 pub(super) fn preserved_selection(
-    rows: &[PortEntryView<'_>],
     visible_row_indices: &[usize],
     selected_key: Option<RowKey>,
     fallback_index: usize,
+    mut row_key_at: impl FnMut(usize) -> RowKey,
 ) -> Option<usize> {
     if visible_row_indices.is_empty() {
         return None;
@@ -75,7 +75,7 @@ pub(super) fn preserved_selection(
     if let Some(key) = selected_key
         && let Some(index) = visible_row_indices
             .iter()
-            .position(|&index| RowKey::from(rows[index]) == key)
+            .position(|&index| row_key_at(index) == key)
     {
         return Some(index);
     }

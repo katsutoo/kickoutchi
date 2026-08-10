@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reduced query and TUI rebuild temporaries by projecting each snapshot row
+  once into a compact, mode-specific sort candidate. Sort-name keys are now
+  allocated only for process and parent ordering, while filtering,
+  duplicate-row order, labels, and selection behavior remain unchanged.
 - Bundled each native socket with its owner PIDs and local completeness before
   canonicalization, making detached parallel-vector state unrepresentable and
   removing the indexed permutation and its temporary allocations.

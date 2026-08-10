@@ -592,17 +592,25 @@ impl App {
     }
 
     fn row_view(&self, index: usize) -> Option<PortEntryView<'_>> {
+        let view = self.row_view_without_label(index)?;
+        let label = self.labels.resolve_parts(
+            view.protocol,
+            view.local_addr,
+            view.local_port,
+            view.ipv6_scope,
+        );
+        Some(view.with_label(label))
+    }
+
+    fn row_view_without_label(&self, index: usize) -> Option<PortEntryView<'_>> {
         let snapshot = self.network_snapshot.as_ref()?;
-        self.row_descriptors.get(index).map(|descriptor| {
-            let view = snapshot.port_entry_view(descriptor);
-            let label = self.labels.resolve_parts(
-                view.protocol,
-                view.local_addr,
-                view.local_port,
-                view.ipv6_scope,
-            );
-            view.with_label(label)
-        })
+        self.row_descriptors
+            .get(index)
+            .map(|descriptor| snapshot.port_entry_view(descriptor))
+    }
+
+    fn row_key(&self, index: usize) -> Option<RowKey> {
+        self.row_view_without_label(index).map(RowKey::from)
     }
 
     fn all_views(&self) -> impl ExactSizeIterator<Item = PortEntryView<'_>> {
@@ -1522,9 +1530,14 @@ impl App {
         selected_key: Option<RowKey>,
         fallback_index: usize,
     ) {
-        let views = self.all_views().collect::<Vec<_>>();
-        let query_result = query::query_view_indices(
-            &views,
+        // The bound and callback share the same descriptor table. A missing
+        // view therefore means the snapshot and its descriptors diverged.
+        let query_result = query::query_view_indices_by(
+            self.row_count(),
+            |index| {
+                self.row_view(index)
+                    .expect("snapshot and row descriptors must remain synchronized")
+            },
             QueryOptions {
                 port: None,
                 process: None,
@@ -1538,9 +1551,15 @@ impl App {
             Ok(result) => (result.indices, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
-        let selected_index =
-            preserved_selection(&views, &visible_row_indices, selected_key, fallback_index);
-        drop(views);
+        let selected_index = preserved_selection(
+            &visible_row_indices,
+            selected_key,
+            fallback_index,
+            |index| {
+                self.row_key(index)
+                    .expect("query result indices must identify source rows")
+            },
+        );
         self.visible_row_indices = visible_row_indices;
         self.filter_error = filter_error;
         self.selected_index = selected_index;

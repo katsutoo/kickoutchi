@@ -111,7 +111,9 @@ fn preserved_selection_distinguishes_ipv6_interface_scopes() {
 
     assert_ne!(RowKey::from(views[0]), selected_key);
     assert_eq!(
-        preserved_selection(&views, &[0, 1], Some(selected_key), 0),
+        preserved_selection(&[0, 1], Some(selected_key), 0, |index| {
+            RowKey::from(views[index])
+        }),
         Some(1)
     );
 }
