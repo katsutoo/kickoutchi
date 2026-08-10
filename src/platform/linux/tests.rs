@@ -864,10 +864,10 @@ fn restricted_proc_visibility_makes_global_ownership_partial() {
     assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
     let pass = native_pass_from_records(&[], &scan).expect("loss is representable");
     assert!(matches!(
-        pass.owners.global_completeness,
+        pass.global_owner_completeness,
         OwnerCompleteness::Partial { .. }
     ));
-    assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+    assert_eq!(pass.evidence_gaps[0].pid, None);
 
     fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
 }
@@ -942,10 +942,10 @@ fn restricted_proc_visibility_is_global_loss_without_target_inodes() {
     assert!(scan.losses.contains(&OwnerScanLoss::EnumerationIncomplete));
     let pass = native_pass_from_records(&[], &scan).expect("global loss is representable");
     assert!(matches!(
-        pass.owners.global_completeness,
+        pass.global_owner_completeness,
         OwnerCompleteness::Partial { .. }
     ));
-    assert_eq!(pass.owners.evidence_gaps.len(), 1);
+    assert_eq!(pass.evidence_gaps.len(), 1);
 
     fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
 }
@@ -971,10 +971,10 @@ fn unproven_mount_and_ancestor_visibility_are_losses_without_target_inodes() {
     );
     let pass = native_pass_from_records(&[], &scan).expect("global losses are representable");
     assert!(matches!(
-        pass.owners.global_completeness,
+        pass.global_owner_completeness,
         OwnerCompleteness::Partial { .. }
     ));
-    assert_eq!(pass.owners.evidence_gaps.len(), 2);
+    assert_eq!(pass.evidence_gaps.len(), 2);
 
     fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
 }
@@ -988,8 +988,8 @@ fn unrestricted_visibility_remains_complete_without_target_inodes() {
         .expect("empty inode scan skips PID enumeration");
     assert!(scan.losses.is_empty());
     let pass = native_pass_from_records(&[], &scan).expect("complete scan is representable");
-    assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
-    assert!(pass.owners.evidence_gaps.is_empty());
+    assert_eq!(pass.global_owner_completeness, OwnerCompleteness::Complete);
+    assert!(pass.evidence_gaps.is_empty());
 
     fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
 }
@@ -1178,13 +1178,23 @@ fn retried_enrichment_does_not_reuse_parent_names_from_discarded_attempts() {
         )
         .expect("accepted retry reads");
 
-    let discarded_parent_name = match &discarded[&1234] {
+    let discarded_read = discarded
+        .iter()
+        .find(|(pid, _)| *pid == 1234)
+        .map(|(_, read)| read)
+        .expect("requested PID has one read");
+    let discarded_parent_name = match discarded_read {
         crate::observation::ProcessRead::Verified { observation, .. } => {
             observation.parent_process_name.clone()
         }
         crate::observation::ProcessRead::Unverified(_) => None,
     };
-    let accepted_parent_name = match &accepted[&1234] {
+    let accepted_read = accepted
+        .iter()
+        .find(|(pid, _)| *pid == 1234)
+        .map(|(_, read)| read)
+        .expect("requested PID has one read");
+    let accepted_parent_name = match accepted_read {
         crate::observation::ProcessRead::Verified { observation, .. } => {
             observation.parent_process_name.clone()
         }
@@ -1436,15 +1446,18 @@ fn edge_free_owner_scan_denial_is_aggregated_not_socket_local() {
         .expect("denied scan is retained as partial evidence");
 
     assert_eq!(
-        pass.owners.global_completeness,
+        pass.global_owner_completeness,
         OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied]).unwrap()
     );
-    assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
-    assert_eq!(pass.owners.evidence_gaps[0].pid, None);
-    assert_eq!(pass.owners.evidence_gaps[0].affected_pid_count(), Some(1));
-    assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
+    assert_eq!(pass.evidence_gaps[0].endpoint, None);
+    assert_eq!(pass.evidence_gaps[0].pid, None);
+    assert_eq!(pass.evidence_gaps[0].affected_pid_count(), Some(1));
+    assert_eq!(pass.omitted_evidence_gap_count, 0);
     assert_eq!(
-        pass.owners.local_completeness,
+        pass.rows
+            .iter()
+            .map(|row| row.owner_completeness.clone())
+            .collect::<Vec<_>>(),
         [OwnerCompleteness::Complete]
     );
 }
@@ -1470,9 +1483,12 @@ fn global_scan_denial_does_not_reduce_verified_endpoint_completeness() {
     );
     let pass = native_pass_from_records(&[record], &scan).expect("proven ownership remains usable");
 
-    assert!(!pass.owners.global_completeness.is_complete());
+    assert!(!pass.global_owner_completeness.is_complete());
     assert_eq!(
-        pass.owners.local_completeness,
+        pass.rows
+            .iter()
+            .map(|row| row.owner_completeness.clone())
+            .collect::<Vec<_>>(),
         [OwnerCompleteness::Complete]
     );
 }
@@ -1545,15 +1561,14 @@ fn edge_free_owner_scan_losses_aggregate_across_gap_limit_boundaries() {
             .expect("production owner scan remains bounded");
         let pass = native_pass_from_records(&[], &scan)
             .expect("aggregate owner losses remain representable");
-        assert_eq!(pass.owners.evidence_gaps.len(), usize::from(count != 0));
+        assert_eq!(pass.evidence_gaps.len(), usize::from(count != 0));
         assert_eq!(
-            pass.owners
-                .evidence_gaps
+            pass.evidence_gaps
                 .first()
                 .and_then(crate::observation::EvidenceGap::affected_pid_count),
             (count != 0).then(|| u64::try_from(count).expect("fixture count fits")),
         );
-        assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
+        assert_eq!(pass.omitted_evidence_gap_count, 0);
         fs::remove_dir_all(proc_root).expect("test proc root must clean up");
     }
 }
@@ -1579,10 +1594,10 @@ fn owner_scan_loss_stays_pid_specific_after_a_target_edge_is_discovered() {
 
     let pass = native_pass_from_records(&[record], &scan)
         .expect("target-relevant loss remains representable");
-    assert_eq!(pass.owners.evidence_gaps.len(), 1);
-    assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
-    assert_eq!(pass.owners.evidence_gaps[0].affected_pid_count(), None);
-    assert_eq!(pass.owners.omitted_evidence_gap_count, 0);
+    assert_eq!(pass.evidence_gaps.len(), 1);
+    assert_eq!(pass.evidence_gaps[0].pid, Some(42));
+    assert_eq!(pass.evidence_gaps[0].affected_pid_count(), None);
+    assert_eq!(pass.omitted_evidence_gap_count, 0);
     fs::remove_dir_all(proc_root).expect("test proc root must clean up");
 }
 

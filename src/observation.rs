@@ -4,7 +4,7 @@
 //! has one contract to satisfy.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::Path;
@@ -1000,18 +1000,18 @@ impl PartialOrd for NativeSocketObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OwnerAssociations {
-    pub(crate) owners_by_socket: Vec<Vec<u32>>,
-    pub(crate) local_completeness: Vec<OwnerCompleteness>,
-    pub(crate) global_completeness: OwnerCompleteness,
-    pub(crate) evidence_gaps: Vec<EvidenceGap>,
-    pub(crate) omitted_evidence_gap_count: u64,
+pub(crate) struct NativeSocketRow {
+    pub(crate) socket: NativeSocketObservation,
+    pub(crate) owner_pids: Vec<u32>,
+    pub(crate) owner_completeness: OwnerCompleteness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeObservationPass {
-    pub(crate) sockets: Vec<NativeSocketObservation>,
-    pub(crate) owners: OwnerAssociations,
+    pub(crate) rows: Vec<NativeSocketRow>,
+    pub(crate) global_owner_completeness: OwnerCompleteness,
+    pub(crate) evidence_gaps: Vec<EvidenceGap>,
+    pub(crate) omitted_evidence_gap_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,6 +1021,60 @@ pub(crate) enum ProcessRead {
         observation: ProcessObservation,
     },
     Unverified(UnverifiedOwnerReason),
+}
+
+pub(crate) type ProcessReadBatch = Vec<(u32, ProcessRead)>;
+
+/// Validated process reads in the same sorted, unique PID order requested from
+/// the native adapter. The invariant makes binary search and deterministic
+/// metadata materialization possible without a second index.
+#[derive(Debug, Default)]
+struct ProcessReadTable {
+    entries: ProcessReadBatch,
+}
+
+impl ProcessReadTable {
+    fn from_expected(
+        expected_pids: &[u32],
+        entries: ProcessReadBatch,
+    ) -> Result<Self, ObservationError> {
+        debug_assert!(
+            expected_pids.windows(2).all(|pair| pair[0] < pair[1]),
+            "candidate PIDs are canonicalized before native process reads"
+        );
+        if entries.len() != expected_pids.len()
+            || !expected_pids
+                .iter()
+                .zip(&entries)
+                .all(|(expected_pid, (actual_pid, _))| expected_pid == actual_pid)
+        {
+            return Err(ObservationError::NativeDataMalformed);
+        }
+        Ok(Self { entries })
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, pid: u32) -> Option<&ProcessRead> {
+        self.entries
+            .binary_search_by_key(&pid, |(entry_pid, _)| *entry_pid)
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(u32, ProcessRead)> {
+        self.entries.iter()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ProcessRead> {
+        self.entries.iter().map(|(_, read)| read)
+    }
+
+    fn into_entries(self) -> ProcessReadBatch {
+        self.entries
+    }
 }
 
 /// The internal seam implemented by native adapters.
@@ -1035,7 +1089,7 @@ pub(crate) trait ObservationSource {
         sorted_pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<BTreeMap<u32, ProcessRead>, ObservationError>;
+    ) -> Result<ProcessReadBatch, ObservationError>;
 }
 
 // The sequential metadata-budget reader is the Linux/macOS collection path;
@@ -1067,9 +1121,10 @@ pub(crate) fn process_read_metadata_bytes(read: &ProcessRead) -> usize {
 
 #[derive(Debug)]
 struct CollectedPass {
-    sockets: Vec<NativeSocketObservation>,
-    associations: OwnerAssociations,
-    processes_by_pid: BTreeMap<u32, ProcessRead>,
+    rows: Vec<NativeSocketRow>,
+    global_owner_completeness: OwnerCompleteness,
+    evidence_gaps: Vec<EvidenceGap>,
+    processes_by_pid: ProcessReadTable,
     omitted_evidence_gap_count: u64,
 }
 
@@ -1140,10 +1195,6 @@ fn collect_consistent_with_limits<S: ObservationSource>(
     unreachable!("the positive consistency-attempt constant exhausts by return")
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded native-pass orchestration is clearer as one ordered operation"
-)]
 fn collect_pass<S: ObservationSource>(
     source: &mut S,
     profile: MetadataProfile,
@@ -1152,85 +1203,44 @@ fn collect_pass<S: ObservationSource>(
     identity_reads_total: &mut usize,
 ) -> Result<CollectedPass, ObservationError> {
     let NativeObservationPass {
-        mut sockets,
-        owners: mut associations,
+        mut rows,
+        global_owner_completeness,
+        evidence_gaps,
+        omitted_evidence_gap_count,
     } = source.collect_native_pass(profile)?;
-    if sockets.len() > limits.sockets {
+    if rows.len() > limits.sockets {
         return Err(ObservationError::SocketObservationLimitExceeded);
     }
-    if associations.owners_by_socket.len() != sockets.len()
-        || associations.local_completeness.len() != sockets.len()
-    {
+    validate_owner_completeness(&global_owner_completeness)?;
+    for row in &rows {
+        validate_owner_completeness(&row.owner_completeness)?;
+    }
+    if evidence_gaps.len() > EVIDENCE_GAPS_MAX {
         return Err(ObservationError::NativeDataMalformed);
     }
-    validate_owner_completeness(&associations.global_completeness)?;
-    for completeness in &associations.local_completeness {
-        validate_owner_completeness(completeness)?;
+    for row in &mut rows {
+        row.owner_pids.sort_unstable();
     }
-    if associations.evidence_gaps.len() > EVIDENCE_GAPS_MAX {
-        return Err(ObservationError::NativeDataMalformed);
-    }
-    for owners in &mut associations.owners_by_socket {
-        owners.sort_unstable();
-    }
-    let mut order = (0..sockets.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| {
-        sockets[*left]
-            .cmp(&sockets[*right])
+    rows.sort_unstable_by(|left, right| {
+        left.socket
+            .cmp(&right.socket)
+            .then_with(|| left.owner_pids.cmp(&right.owner_pids))
             .then_with(|| {
-                associations.owners_by_socket[*left].cmp(&associations.owners_by_socket[*right])
+                compare_owner_completeness(&left.owner_completeness, &right.owner_completeness)
             })
-            .then_with(|| {
-                compare_owner_completeness(
-                    &associations.local_completeness[*left],
-                    &associations.local_completeness[*right],
-                )
-            })
-            .then_with(|| sockets[*left].timer.cmp(&sockets[*right].timer))
+            .then_with(|| left.socket.timer.cmp(&right.socket.timer))
     });
-    let mut socket_slots = sockets.into_iter().map(Some).collect::<Vec<_>>();
-    let mut owner_slots = std::mem::take(&mut associations.owners_by_socket)
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    let mut completeness_slots = std::mem::take(&mut associations.local_completeness)
-        .into_iter()
-        .map(Some)
-        .collect::<Vec<_>>();
-    sockets = Vec::with_capacity(order.len());
-    associations.owners_by_socket = Vec::with_capacity(order.len());
-    associations.local_completeness = Vec::with_capacity(order.len());
-    for index in order {
-        sockets.push(
-            socket_slots[index]
-                .take()
-                .expect("canonical index is unique"),
-        );
-        associations.owners_by_socket.push(
-            owner_slots[index]
-                .take()
-                .expect("canonical index is unique"),
-        );
-        associations.local_completeness.push(
-            completeness_slots[index]
-                .take()
-                .expect("canonical index is unique"),
-        );
-    }
-    let owner_edges = associations
-        .owners_by_socket
+    let owner_edges = rows
         .iter()
-        .try_fold(0usize, |count, owners| count.checked_add(owners.len()))
+        .try_fold(0usize, |count, row| count.checked_add(row.owner_pids.len()))
         .ok_or(ObservationError::OwnerAttributionLimitExceeded)?;
     if owner_edges > limits.owner_edges {
         return Err(ObservationError::OwnerAttributionLimitExceeded);
     }
 
-    let pids: Vec<u32> = associations
-        .owners_by_socket
+    let pids: Vec<u32> = rows
         .iter()
-        .flatten()
-        .copied()
+        .flat_map(|row| row.owner_pids.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -1252,20 +1262,14 @@ fn collect_pass<S: ObservationSource>(
     *identity_reads_attempt = next_attempt;
     *identity_reads_total = next_total;
 
-    let processes_by_pid = source.read_processes(&pids, profile, limits.optional_metadata_bytes)?;
-    if processes_by_pid.len() != pids.len()
-        || !pids
-            .iter()
-            .zip(processes_by_pid.keys())
-            .all(|(expected, actual)| expected == actual)
-    {
-        return Err(ObservationError::NativeDataMalformed);
-    }
+    let process_reads = source.read_processes(&pids, profile, limits.optional_metadata_bytes)?;
+    let processes_by_pid = ProcessReadTable::from_expected(&pids, process_reads)?;
     Ok(CollectedPass {
-        sockets,
-        omitted_evidence_gap_count: associations.omitted_evidence_gap_count,
-        associations,
+        rows,
+        global_owner_completeness,
+        evidence_gaps,
         processes_by_pid,
+        omitted_evidence_gap_count,
     })
 }
 
@@ -1300,50 +1304,50 @@ fn compare_passes(a: &CollectedPass, b: &CollectedPass) -> Instability {
     let mut owner_edges_changed = false;
     let mut index_a = 0;
     let mut index_b = 0;
-    while index_a < a.sockets.len() || index_b < b.sockets.len() {
-        match (a.sockets.get(index_a), b.sockets.get(index_b)) {
-            (Some(socket_a), Some(socket_b)) => match socket_a.cmp(socket_b) {
+    while index_a < a.rows.len() || index_b < b.rows.len() {
+        match (a.rows.get(index_a), b.rows.get(index_b)) {
+            (Some(row_a), Some(row_b)) => match row_a.socket.cmp(&row_b.socket) {
                 Ordering::Less => {
-                    let end_a = socket_group_end(&a.sockets, index_a);
+                    let end_a = socket_group_end(&a.rows, index_a);
                     socket_set = true;
                     owner_edges_changed |= group_has_owners(a, index_a, end_a);
-                    affected_sockets.insert(socket_a.clone());
+                    affected_sockets.insert(row_a.socket.clone());
                     index_a = end_a;
                 }
                 Ordering::Greater => {
-                    let end_b = socket_group_end(&b.sockets, index_b);
+                    let end_b = socket_group_end(&b.rows, index_b);
                     socket_set = true;
                     owner_edges_changed |= group_has_owners(b, index_b, end_b);
-                    affected_sockets.insert(socket_b.clone());
+                    affected_sockets.insert(row_b.socket.clone());
                     index_b = end_b;
                 }
                 Ordering::Equal => {
-                    let end_a = socket_group_end(&a.sockets, index_a);
-                    let end_b = socket_group_end(&b.sockets, index_b);
+                    let end_a = socket_group_end(&a.rows, index_a);
+                    let end_b = socket_group_end(&b.rows, index_b);
                     let counts_changed = end_a - index_a != end_b - index_b;
                     socket_set |= counts_changed;
                     let edges_changed =
                         group_owner_pids(a, index_a, end_a) != group_owner_pids(b, index_b, end_b);
                     owner_edges_changed |= edges_changed;
                     if counts_changed || edges_changed {
-                        affected_sockets.insert(socket_a.clone());
+                        affected_sockets.insert(row_a.socket.clone());
                     }
                     index_a = end_a;
                     index_b = end_b;
                 }
             },
-            (Some(socket), None) => {
-                let end = socket_group_end(&a.sockets, index_a);
+            (Some(row), None) => {
+                let end = socket_group_end(&a.rows, index_a);
                 socket_set = true;
                 owner_edges_changed |= group_has_owners(a, index_a, end);
-                affected_sockets.insert(socket.clone());
+                affected_sockets.insert(row.socket.clone());
                 index_a = end;
             }
-            (None, Some(socket)) => {
-                let end = socket_group_end(&b.sockets, index_b);
+            (None, Some(row)) => {
+                let end = socket_group_end(&b.rows, index_b);
                 socket_set = true;
                 owner_edges_changed |= group_has_owners(b, index_b, end);
-                affected_sockets.insert(socket.clone());
+                affected_sockets.insert(row.socket.clone());
                 index_b = end;
             }
             (None, None) => break,
@@ -1351,12 +1355,13 @@ fn compare_passes(a: &CollectedPass, b: &CollectedPass) -> Instability {
     }
     let identity_changed = !identities_equal(a, b);
     if identity_changed {
-        for (index, socket) in b.sockets.iter().enumerate() {
-            if b.associations.owners_by_socket[index]
+        for row in &b.rows {
+            if row
+                .owner_pids
                 .iter()
                 .any(|pid| process_marker(a, *pid) != process_marker(b, *pid))
             {
-                affected_sockets.insert(socket.clone());
+                affected_sockets.insert(row.socket.clone());
             }
         }
     }
@@ -1368,33 +1373,32 @@ fn compare_passes(a: &CollectedPass, b: &CollectedPass) -> Instability {
 }
 
 fn group_owner_pids(pass: &CollectedPass, start: usize, end: usize) -> Vec<u32> {
-    let mut pids = pass.associations.owners_by_socket[start..end]
+    let mut pids = pass.rows[start..end]
         .iter()
-        .flatten()
-        .copied()
+        .flat_map(|row| row.owner_pids.iter().copied())
         .collect::<Vec<_>>();
     pids.sort_unstable();
     pids
 }
 
 fn group_has_owners(pass: &CollectedPass, start: usize, end: usize) -> bool {
-    pass.associations.owners_by_socket[start..end]
+    pass.rows[start..end]
         .iter()
-        .any(|owners| !owners.is_empty())
+        .any(|row| !row.owner_pids.is_empty())
 }
 
 fn identities_equal(a: &CollectedPass, b: &CollectedPass) -> bool {
     a.processes_by_pid.len() == b.processes_by_pid.len()
         && a.processes_by_pid
             .iter()
-            .zip(&b.processes_by_pid)
+            .zip(b.processes_by_pid.iter())
             .all(|((pid_a, _), (pid_b, _))| {
                 pid_a == pid_b && process_marker(a, *pid_a) == process_marker(b, *pid_b)
             })
 }
 
 fn process_marker(pass: &CollectedPass, pid: u32) -> Option<ProcessStartMarker> {
-    match pass.processes_by_pid.get(&pid) {
+    match pass.processes_by_pid.get(pid) {
         Some(ProcessRead::Verified { marker, .. }) => Some(*marker),
         Some(ProcessRead::Unverified(_)) | None => None,
     }
@@ -1413,26 +1417,30 @@ fn merge_attempt_uncertainty(
     pass_a: &mut CollectedPass,
     pass_b: &mut CollectedPass,
 ) -> Result<(), ObservationError> {
-    pass_b.associations.global_completeness = merge_owner_completeness(
-        &pass_a.associations.global_completeness,
-        &pass_b.associations.global_completeness,
+    pass_b.global_owner_completeness = merge_owner_completeness(
+        &pass_a.global_owner_completeness,
+        &pass_b.global_owner_completeness,
     )?;
     let mut index_a = 0usize;
     let mut index_b = 0usize;
-    while index_a < pass_a.sockets.len() && index_b < pass_b.sockets.len() {
-        match pass_a.sockets[index_a].cmp(&pass_b.sockets[index_b]) {
-            Ordering::Less => index_a = socket_group_end(&pass_a.sockets, index_a),
-            Ordering::Greater => index_b = socket_group_end(&pass_b.sockets, index_b),
+    while index_a < pass_a.rows.len() && index_b < pass_b.rows.len() {
+        match pass_a.rows[index_a]
+            .socket
+            .cmp(&pass_b.rows[index_b].socket)
+        {
+            Ordering::Less => index_a = socket_group_end(&pass_a.rows, index_a),
+            Ordering::Greater => index_b = socket_group_end(&pass_b.rows, index_b),
             Ordering::Equal => {
-                let end_a = socket_group_end(&pass_a.sockets, index_a);
-                let end_b = socket_group_end(&pass_b.sockets, index_b);
+                let end_a = socket_group_end(&pass_a.rows, index_a);
+                let end_b = socket_group_end(&pass_b.rows, index_b);
                 let mut pass_a_completeness = OwnerCompleteness::Complete;
-                for completeness in &pass_a.associations.local_completeness[index_a..end_a] {
+                for row in &pass_a.rows[index_a..end_a] {
                     pass_a_completeness =
-                        merge_owner_completeness(&pass_a_completeness, completeness)?;
+                        merge_owner_completeness(&pass_a_completeness, &row.owner_completeness)?;
                 }
-                for completeness in &mut pass_b.associations.local_completeness[index_b..end_b] {
-                    *completeness = merge_owner_completeness(&pass_a_completeness, completeness)?;
+                for row in &mut pass_b.rows[index_b..end_b] {
+                    row.owner_completeness =
+                        merge_owner_completeness(&pass_a_completeness, &row.owner_completeness)?;
                 }
                 index_a = end_a;
                 index_b = end_b;
@@ -1448,10 +1456,10 @@ fn merge_attempt_uncertainty(
     // rather than summing and inventing a union. Exact gaps still deduplicate
     // by their complete tuple. Do this before enforcing the merged budget so
     // only distinct evidence consumes retention slots.
-    let mut merged: BTreeSet<EvidenceGap> = std::mem::take(&mut pass_a.associations.evidence_gaps)
+    let mut merged: BTreeSet<EvidenceGap> = std::mem::take(&mut pass_a.evidence_gaps)
         .into_iter()
         .collect();
-    for gap in pass_b.associations.evidence_gaps.drain(..) {
+    for gap in pass_b.evidence_gaps.drain(..) {
         if gap.affected_pid_count.is_some()
             && let Some(existing) = merged
                 .iter()
@@ -1474,13 +1482,13 @@ fn merge_attempt_uncertainty(
         }
         merged.insert(gap);
     }
-    pass_b.associations.evidence_gaps = merged.into_iter().collect();
+    pass_b.evidence_gaps = merged.into_iter().collect();
     Ok(())
 }
 
-fn socket_group_end(sockets: &[NativeSocketObservation], start: usize) -> usize {
+fn socket_group_end(rows: &[NativeSocketRow], start: usize) -> usize {
     let mut end = start + 1;
-    while end < sockets.len() && sockets[end] == sockets[start] {
+    while end < rows.len() && rows[end].socket == rows[start].socket {
         end += 1;
     }
     end
@@ -1518,7 +1526,7 @@ fn build_snapshot(
     let raced = instability.is_some();
     let mut evidence_gaps = Vec::new();
     let mut omitted_evidence_gap_count = pass.omitted_evidence_gap_count;
-    for gap in pass.associations.evidence_gaps.drain(..) {
+    for gap in pass.evidence_gaps.drain(..) {
         push_gap(
             &mut evidence_gaps,
             &mut omitted_evidence_gap_count,
@@ -1566,8 +1574,8 @@ fn build_snapshot(
         } else {
             OwnerCompleteness::partial([unverified_gap_code(*reason)])?
         };
-        pass.associations.global_completeness =
-            merge_owner_completeness(&pass.associations.global_completeness, &completeness)?;
+        pass.global_owner_completeness =
+            merge_owner_completeness(&pass.global_owner_completeness, &completeness)?;
     }
 
     let sockets = materialize_sockets(
@@ -1588,7 +1596,7 @@ fn build_snapshot(
     let owner_completeness = if instability.is_some_and(|change| change.ownership) {
         OwnerCompleteness::Raced
     } else {
-        pass.associations.global_completeness.clone()
+        pass.global_owner_completeness.clone()
     };
     evidence_gaps.sort();
     // The merge above removes the cross-pass copies. This second pass covers
@@ -1626,7 +1634,7 @@ fn materialize_processes(
 ) -> HashMap<ProcessIdentity, ProcessObservation> {
     let mut processes = HashMap::new();
     let mut retained_bytes = 0usize;
-    for (pid, read) in std::mem::take(&mut pass.processes_by_pid) {
+    for (pid, read) in std::mem::take(&mut pass.processes_by_pid).into_entries() {
         if let ProcessRead::Verified {
             marker,
             mut observation,
@@ -1696,12 +1704,13 @@ fn materialize_sockets(
     omitted_evidence_gap_count: &mut u64,
     limits: ObservationLimits,
 ) -> Result<Vec<SocketObservation>, ObservationError> {
-    let mut sockets = Vec::with_capacity(pass.sockets.len());
-    for (index, native) in pass.sockets.iter().enumerate() {
-        let mut owners = Vec::with_capacity(pass.associations.owners_by_socket[index].len());
+    let mut sockets = Vec::with_capacity(pass.rows.len());
+    for row in &pass.rows {
+        let native = &row.socket;
+        let mut owners = Vec::with_capacity(row.owner_pids.len());
         let mut unverified_local = OwnerCompleteness::Complete;
-        for pid in &pass.associations.owners_by_socket[index] {
-            let owner = match pass.processes_by_pid.get(pid) {
+        for pid in &row.owner_pids {
+            let owner = match pass.processes_by_pid.get(*pid) {
                 Some(ProcessRead::Verified { marker, .. }) => {
                     OwnerObservation::Verified(ProcessIdentity {
                         pid: *pid,
@@ -1740,7 +1749,6 @@ fn materialize_sockets(
         owners.sort();
         let local_raced =
             instability.is_some_and(|change| change.affected_sockets.contains(native));
-        let source_local = &pass.associations.local_completeness[index];
         sockets.push(SocketObservation {
             local_endpoint: native.endpoint.clone(),
             state: native.state,
@@ -1749,7 +1757,7 @@ fn materialize_sockets(
             owner_completeness: if local_raced {
                 OwnerCompleteness::Raced
             } else {
-                merge_owner_completeness(source_local, &unverified_local)?
+                merge_owner_completeness(&row.owner_completeness, &unverified_local)?
             },
             socket_token: native.token,
         });

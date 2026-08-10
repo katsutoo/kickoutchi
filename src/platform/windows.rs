@@ -6,7 +6,7 @@
 //! process handles retain high-resolution creation markers across that bracket,
 //! because PID reuse is where the dragon lives.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::{align_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -50,10 +50,11 @@ use crate::observation::{
     CANDIDATE_PROCESS_IDS_MAX, EXECUTABLE_PATH_MAX_BYTES, EvidenceGap, EvidenceGapCode,
     EvidenceImpact, Ipv6Scope, MetadataCompleteness, MetadataOmission, MetadataProfile,
     NATIVE_RESIZE_ATTEMPTS_MAX, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation,
-    NetworkSnapshot, OPTIONAL_METADATA_MAX_BYTES, ObservationScope, ObservationScopeKind,
-    OwnerAssociations, OwnerCompleteness, PROCESS_COMMAND_LINE_MAX_BYTES, PROCESS_NAME_MAX_BYTES,
-    ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker, SOCKET_OBSERVATIONS_MAX,
-    ScopeLimitation, SocketState, UnverifiedOwnerReason,
+    NativeSocketRow, NetworkSnapshot, OPTIONAL_METADATA_MAX_BYTES, ObservationScope,
+    ObservationScopeKind, OwnerCompleteness, PROCESS_COMMAND_LINE_MAX_BYTES,
+    PROCESS_NAME_MAX_BYTES, ProcessIdentity, ProcessObservation, ProcessRead, ProcessReadBatch,
+    ProcessStartMarker, SOCKET_OBSERVATIONS_MAX, ScopeLimitation, SocketState,
+    UnverifiedOwnerReason,
 };
 use crate::tree::TreeProcessInfo;
 
@@ -98,9 +99,7 @@ fn native_pass_from_records(
         }
         owner_pids.insert(pid);
     }
-    let mut sockets = Vec::with_capacity(records.len());
-    let mut owners_by_socket = Vec::with_capacity(records.len());
-    let mut local_completeness = Vec::with_capacity(records.len());
+    let mut rows = Vec::with_capacity(records.len());
     let mut evidence_gaps = Vec::new();
     let mut omitted_evidence_gap_count = 0_u64;
     let mut ownership_partial = false;
@@ -112,15 +111,10 @@ fn native_pass_from_records(
             record.ipv6_scope,
         )
         .map_err(|_| crate::observation::ObservationError::NativeDataMalformed)?;
-        if let Some(pid) = record.pid {
-            owners_by_socket.push(vec![pid]);
-            local_completeness.push(OwnerCompleteness::Complete);
+        let (owner_pids, owner_completeness) = if let Some(pid) = record.pid {
+            (vec![pid], OwnerCompleteness::Complete)
         } else {
             ownership_partial = true;
-            owners_by_socket.push(Vec::new());
-            local_completeness.push(OwnerCompleteness::partial([
-                EvidenceGapCode::OwnerAttributionIncomplete,
-            ])?);
             if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
                 evidence_gaps.push(EvidenceGap::new(
                     EvidenceImpact::Ownership,
@@ -132,27 +126,31 @@ fn native_pass_from_records(
             } else {
                 omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
             }
-        }
-        sockets.push(NativeSocketObservation {
-            endpoint,
-            state: record.state,
-            timer: None,
-            token: None,
+            (
+                Vec::new(),
+                OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?,
+            )
+        };
+        rows.push(NativeSocketRow {
+            socket: NativeSocketObservation {
+                endpoint,
+                state: record.state,
+                timer: None,
+                token: None,
+            },
+            owner_pids,
+            owner_completeness,
         });
     }
     Ok(NativeObservationPass {
-        owners: OwnerAssociations {
-            owners_by_socket,
-            local_completeness,
-            global_completeness: if ownership_partial {
-                OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?
-            } else {
-                OwnerCompleteness::Complete
-            },
-            evidence_gaps,
-            omitted_evidence_gap_count,
+        rows,
+        global_owner_completeness: if ownership_partial {
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?
+        } else {
+            OwnerCompleteness::Complete
         },
-        sockets,
+        evidence_gaps,
+        omitted_evidence_gap_count,
     })
 }
 
@@ -972,7 +970,7 @@ fn read_process_observations(
     sorted_pids: &[u32],
     profile: MetadataProfile,
     optional_metadata_bytes_remaining: usize,
-) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
+) -> Result<ProcessReadBatch, CollectorError> {
     read_process_observations_with(
         &mut RealProcessApi::default(),
         sorted_pids,
@@ -986,7 +984,7 @@ fn read_process_observations_with<Api: ProcessApi>(
     sorted_pids: &[u32],
     profile: MetadataProfile,
     optional_metadata_bytes_remaining: usize,
-) -> Result<BTreeMap<u32, ProcessRead>, CollectorError> {
+) -> Result<ProcessReadBatch, CollectorError> {
     if sorted_pids.len() > CANDIDATE_PROCESS_IDS_MAX {
         return Err(crate::observation::ObservationError::ProcessIdentityLimitExceeded.into());
     }
@@ -1044,7 +1042,7 @@ fn read_process_observations_with<Api: ProcessApi>(
 fn direct_partial_process_reads<Api: ProcessApi>(
     api: &mut Api,
     sorted_pids: &[u32],
-) -> BTreeMap<u32, ProcessRead> {
+) -> ProcessReadBatch {
     // The sole caller, read_process_observations_with, already enforces the
     // CANDIDATE_PROCESS_IDS_MAX bound before delegating here.
     sorted_pids

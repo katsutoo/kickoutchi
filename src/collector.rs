@@ -13,8 +13,6 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::model::{PortEntry, Protocol};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::observation::process_read_metadata_bytes;
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 use crate::observation::{
     EndpointIdentity, EvidenceGap, Ipv6Scope, MetadataCompleteness, ProcessIdentity,
@@ -22,10 +20,12 @@ use crate::observation::{
 };
 use crate::observation::{
     EvidenceGapCode, EvidenceImpact, MetadataProfile, NativeObservationPass, NetworkSnapshot,
-    ObservationError, ObservationScope, ObservationSource, OwnerCompleteness, ProcessRead,
+    ObservationError, ObservationScope, ObservationSource, OwnerCompleteness, ProcessReadBatch,
     SnapshotCompleteness, SocketState as ObservationSocketState, collect_consistent,
     project_legacy, project_legacy_target,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::observation::{ProcessRead, process_read_metadata_bytes};
 
 /// What went wrong during a collection pass.
 #[derive(Debug, Error)]
@@ -404,12 +404,8 @@ pub(crate) fn collect_native_snapshot<Collect, ReadProcesses>(
 ) -> Result<NetworkSnapshot, CollectorError>
 where
     Collect: FnMut(MetadataProfile) -> Result<NativeObservationPass, CollectorError>,
-    ReadProcesses: FnMut(
-        &[u32],
-        MetadataProfile,
-        usize,
-    )
-        -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError>,
+    ReadProcesses:
+        FnMut(&[u32], MetadataProfile, usize) -> Result<ProcessReadBatch, CollectorError>,
 {
     let mut source = NativeObservationSource {
         collect_pass,
@@ -428,12 +424,8 @@ struct NativeObservationSource<Collect, ReadProcesses> {
 impl<Collect, ReadProcesses> ObservationSource for NativeObservationSource<Collect, ReadProcesses>
 where
     Collect: FnMut(MetadataProfile) -> Result<NativeObservationPass, CollectorError>,
-    ReadProcesses: FnMut(
-        &[u32],
-        MetadataProfile,
-        usize,
-    )
-        -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError>,
+    ReadProcesses:
+        FnMut(&[u32], MetadataProfile, usize) -> Result<ProcessReadBatch, CollectorError>,
 {
     fn wall_clock(&mut self) -> Result<SystemTime, ObservationError> {
         Ok(SystemTime::now())
@@ -451,7 +443,7 @@ where
         sorted_pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<std::collections::BTreeMap<u32, ProcessRead>, ObservationError> {
+    ) -> Result<ProcessReadBatch, ObservationError> {
         (self.read_processes)(sorted_pids, profile, optional_metadata_bytes_remaining)
             .map_err(native_observation_error)
     }
@@ -471,17 +463,17 @@ pub(crate) fn read_processes_sequentially<ReadProcess>(
     profile: MetadataProfile,
     optional_metadata_bytes_remaining: usize,
     mut read_process: ReadProcess,
-) -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError>
+) -> Result<ProcessReadBatch, CollectorError>
 where
     ReadProcess: FnMut(u32, MetadataProfile, usize) -> Result<ProcessRead, CollectorError>,
 {
-    let mut reads = std::collections::BTreeMap::new();
+    let mut reads = Vec::with_capacity(sorted_pids.len());
     let mut retained_bytes = 0usize;
     for &pid in sorted_pids {
         let remaining = optional_metadata_bytes_remaining.saturating_sub(retained_bytes);
         let read = read_process(pid, profile, remaining)?;
         retained_bytes = retained_bytes.saturating_add(process_read_metadata_bytes(&read));
-        reads.insert(pid, read);
+        reads.push((pid, read));
     }
     Ok(reads)
 }

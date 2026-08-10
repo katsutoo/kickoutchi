@@ -29,6 +29,13 @@ fn zeroed_socket_fdinfo() -> SocketFdinfo {
     }
 }
 
+fn grouped_record(socket: super::SocketRecord, owner_pids: &[u32]) -> super::GroupedSocketRecord {
+    super::GroupedSocketRecord {
+        socket,
+        owner_pids: owner_pids.to_vec(),
+    }
+}
+
 #[test]
 fn prepare_thaw_records_the_identity_used_by_production_continuation() {
     let marker = crate::observation::ProcessStartMarker::macos(1, 0).expect("test marker is valid");
@@ -220,9 +227,13 @@ fn darwin_tcp_states_map_to_observation_states() {
             .expect("documented TCP state is valid")
             .expect("every documented TCP state is retained");
         assert_eq!(record.state, expected);
-        let pass = super::native_pass_from_records(&[record], vec![vec![42]], BTreeSet::new(), 0)
-            .expect("documented state survives native observation materialization");
-        assert_eq!(pass.sockets[0].state, expected);
+        let pass = super::native_pass_from_records(
+            vec![grouped_record(record, &[42])],
+            BTreeSet::new(),
+            0,
+        )
+        .expect("documented state survives native observation materialization");
+        assert_eq!(pass.rows[0].socket.state, expected);
     }
 }
 
@@ -314,14 +325,13 @@ fn udp_socket_info_becomes_a_bound_port_record() {
     assert_eq!(record.local_port, 5353);
 
     let pass = native_pass_from_records(
-        &[record],
-        vec![vec![902]],
+        vec![grouped_record(record, &[902])],
         std::collections::BTreeSet::new(),
         0,
     )
     .expect("unavailable native scope is representable");
     assert_eq!(
-        pass.sockets[0].endpoint.ipv6_scope,
+        pass.rows[0].socket.endpoint.ipv6_scope,
         Some(Ipv6Scope::Unavailable)
     );
 }
@@ -373,9 +383,9 @@ fn production_orchestration_emits_endpoint_null_ipv6_scope_evidence() {
     )
     .expect("IPv6 socket remains observable without native scope");
 
-    assert_eq!(pass.owners.evidence_gaps[0].impact, EvidenceImpact::Scope);
-    assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
-    assert_eq!(pass.owners.evidence_gaps[0].pid, None);
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::Scope);
+    assert_eq!(pass.evidence_gaps[0].endpoint, None);
+    assert_eq!(pass.evidence_gaps[0].pid, None);
 }
 
 #[test]
@@ -389,24 +399,20 @@ fn native_pass_retains_socket_id_and_shared_owners() {
     };
 
     let pass = native_pass_from_records(
-        &[record],
-        vec![vec![100, 101]],
+        vec![grouped_record(record, &[100, 101])],
         std::collections::BTreeSet::new(),
         0,
     )
     .expect("native macOS pass is valid");
 
     assert_eq!(
-        pass.sockets[0].token,
+        pass.rows[0].socket.token,
         PlatformSocketToken::macos_socket_id(0xCAFE)
     );
-    assert_eq!(pass.owners.owners_by_socket[0], [100, 101]);
-    assert_eq!(pass.sockets[0].timer, None);
-    assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
-    assert_eq!(
-        pass.owners.local_completeness,
-        [OwnerCompleteness::Complete]
-    );
+    assert_eq!(pass.rows[0].owner_pids, [100, 101]);
+    assert_eq!(pass.rows[0].socket.timer, None);
+    assert_eq!(pass.global_owner_completeness, OwnerCompleteness::Complete);
+    assert_eq!(pass.rows[0].owner_completeness, OwnerCompleteness::Complete);
 }
 
 #[test]
@@ -444,7 +450,6 @@ fn tokenless_same_endpoint_sockets_do_not_merge_owners_across_pids() {
         socket_id: 0,
     };
     let mut records = Vec::new();
-    let mut owners = Vec::new();
     let mut indexes = std::collections::HashMap::new();
     let mut owner_edges = 0;
     let mut losses = std::collections::BTreeSet::new();
@@ -452,7 +457,6 @@ fn tokenless_same_endpoint_sockets_do_not_merge_owners_across_pids() {
 
     retain_socket_record(
         &mut records,
-        &mut owners,
         &mut indexes,
         &mut owner_edges,
         &mut losses,
@@ -463,7 +467,6 @@ fn tokenless_same_endpoint_sockets_do_not_merge_owners_across_pids() {
     .expect("first tokenless socket is retained");
     retain_socket_record(
         &mut records,
-        &mut owners,
         &mut indexes,
         &mut owner_edges,
         &mut losses,
@@ -472,12 +475,13 @@ fn tokenless_same_endpoint_sockets_do_not_merge_owners_across_pids() {
         101,
     )
     .expect("second tokenless socket is retained");
-    let pass = native_pass_from_records(&records, owners, std::collections::BTreeSet::new(), 0)
+    let pass = native_pass_from_records(records, std::collections::BTreeSet::new(), 0)
         .expect("tokenless sockets form a valid pass");
 
-    assert_eq!(pass.sockets.len(), 2);
-    assert!(pass.sockets.iter().all(|socket| socket.token.is_none()));
-    assert_eq!(pass.owners.owners_by_socket, [vec![100], vec![101]]);
+    assert_eq!(pass.rows.len(), 2);
+    assert!(pass.rows.iter().all(|row| row.socket.token.is_none()));
+    assert_eq!(pass.rows[0].owner_pids, [100]);
+    assert_eq!(pass.rows[1].owner_pids, [101]);
     assert!(indexes.is_empty());
 }
 
@@ -495,7 +499,6 @@ fn repeated_socket_token_with_conflicting_facts_is_a_socket_set_gap() {
         ..first.clone()
     };
     let mut records = Vec::new();
-    let mut owners = Vec::new();
     let mut indexes = std::collections::HashMap::new();
     let mut owner_edges = 0;
     let mut losses = std::collections::BTreeSet::new();
@@ -503,7 +506,6 @@ fn repeated_socket_token_with_conflicting_facts_is_a_socket_set_gap() {
 
     retain_socket_record(
         &mut records,
-        &mut owners,
         &mut indexes,
         &mut owner_edges,
         &mut losses,
@@ -514,7 +516,6 @@ fn repeated_socket_token_with_conflicting_facts_is_a_socket_set_gap() {
     .unwrap();
     retain_socket_record(
         &mut records,
-        &mut owners,
         &mut indexes,
         &mut owner_edges,
         &mut losses,
@@ -525,18 +526,15 @@ fn repeated_socket_token_with_conflicting_facts_is_a_socket_set_gap() {
     .unwrap();
 
     assert_eq!(records.len(), 1);
-    assert_eq!(owners, [vec![100]]);
+    assert_eq!(records[0].owner_pids, [100]);
     assert_eq!(
         losses,
         [SocketScanLoss::TokenConflict].into_iter().collect()
     );
-    let pass = native_pass_from_records(&records, owners, losses, omitted).unwrap();
-    assert_eq!(
-        pass.owners.evidence_gaps[0].impact,
-        EvidenceImpact::SocketSet
-    );
-    assert_eq!(pass.owners.evidence_gaps[0].pid, None);
-    assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
+    let pass = native_pass_from_records(records, losses, omitted).unwrap();
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::SocketSet);
+    assert_eq!(pass.evidence_gaps[0].pid, None);
+    assert_eq!(pass.evidence_gaps[0].endpoint, None);
 }
 
 #[test]
@@ -550,24 +548,17 @@ fn pid_scan_denial_is_socket_set_loss_not_owner_loss() {
     };
 
     let pass = native_pass_from_records(
-        &[record],
-        vec![vec![902]],
+        vec![grouped_record(record, &[902])],
         [SocketScanLoss::PermissionDenied(42)].into_iter().collect(),
         0,
     )
     .expect("permission loss remains representable");
 
-    assert_eq!(pass.owners.global_completeness, OwnerCompleteness::Complete);
-    assert_eq!(
-        pass.owners.local_completeness,
-        [OwnerCompleteness::Complete]
-    );
-    assert_eq!(pass.owners.evidence_gaps[0].endpoint, None);
-    assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
-    assert_eq!(
-        pass.owners.evidence_gaps[0].impact,
-        EvidenceImpact::SocketSet
-    );
+    assert_eq!(pass.global_owner_completeness, OwnerCompleteness::Complete);
+    assert_eq!(pass.rows[0].owner_completeness, OwnerCompleteness::Complete);
+    assert_eq!(pass.evidence_gaps[0].endpoint, None);
+    assert_eq!(pass.evidence_gaps[0].pid, Some(42));
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::SocketSet);
 }
 
 #[test]
@@ -630,14 +621,11 @@ fn production_orchestration_preserves_rows_while_recording_pid_scan_denial() {
     )
     .expect("one denied PID does not erase another PID's authoritative row");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.owners.owners_by_socket, [vec![902]]);
-    assert_eq!(pass.owners.evidence_gaps.len(), 1);
-    assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
-    assert_eq!(
-        pass.owners.evidence_gaps[0].impact,
-        EvidenceImpact::SocketSet
-    );
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].owner_pids, [902]);
+    assert_eq!(pass.evidence_gaps.len(), 1);
+    assert_eq!(pass.evidence_gaps[0].pid, Some(42));
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::SocketSet);
 }
 
 #[test]
@@ -665,14 +653,11 @@ fn production_orchestration_maps_pid_scan_failures_to_socket_set_gaps() {
         )
         .expect("per-PID scan loss remains a partial pass");
 
-        assert!(pass.sockets.is_empty());
-        assert_eq!(pass.owners.evidence_gaps.len(), 1);
-        assert_eq!(pass.owners.evidence_gaps[0].pid, Some(42));
-        assert_eq!(
-            pass.owners.evidence_gaps[0].impact,
-            EvidenceImpact::SocketSet
-        );
-        assert_eq!(pass.owners.evidence_gaps[0].code, expected_code);
+        assert!(pass.rows.is_empty());
+        assert_eq!(pass.evidence_gaps.len(), 1);
+        assert_eq!(pass.evidence_gaps[0].pid, Some(42));
+        assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::SocketSet);
+        assert_eq!(pass.evidence_gaps[0].code, expected_code);
     }
 }
 
@@ -719,13 +704,13 @@ fn socket_scan_losses_are_bounded_at_the_native_pass_source() {
         &mut omitted,
         SocketScanLoss::Disappeared(u32::MAX),
     );
-    let pass = native_pass_from_records(&[], Vec::new(), losses, omitted)
+    let pass = native_pass_from_records(Vec::new(), losses, omitted)
         .expect("bounded socket losses remain observable");
     assert_eq!(
-        pass.owners.evidence_gaps.len(),
+        pass.evidence_gaps.len(),
         crate::observation::EVIDENCE_GAPS_MAX
     );
-    assert_eq!(pass.owners.omitted_evidence_gap_count, 1);
+    assert_eq!(pass.omitted_evidence_gap_count, 1);
 }
 
 #[test]
@@ -1036,11 +1021,8 @@ fn malformed_socket_fdinfo_cannot_silently_hide_a_socket() {
         losses,
         [SocketScanLoss::Malformed(42)].into_iter().collect()
     );
-    let pass = native_pass_from_records(&[], Vec::new(), losses, 0).expect("loss is representable");
-    assert_eq!(
-        pass.owners.evidence_gaps[0].impact,
-        EvidenceImpact::SocketSet
-    );
+    let pass = native_pass_from_records(Vec::new(), losses, 0).expect("loss is representable");
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::SocketSet);
 }
 
 #[test]

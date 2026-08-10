@@ -29,9 +29,8 @@ fn empty_process_reads(
     _pids: &[u32],
     _profile: MetadataProfile,
     _remaining: usize,
-) -> Result<std::collections::BTreeMap<u32, crate::observation::ProcessRead>, super::CollectorError>
-{
-    Ok(std::collections::BTreeMap::new())
+) -> Result<crate::observation::ProcessReadBatch, super::CollectorError> {
+    Ok(Vec::new())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -43,14 +42,10 @@ fn empty_native_pass(
     _profile: MetadataProfile,
 ) -> Result<NativeObservationPass, super::CollectorError> {
     Ok(NativeObservationPass {
-        sockets: Vec::new(),
-        owners: crate::observation::OwnerAssociations {
-            owners_by_socket: Vec::new(),
-            local_completeness: Vec::new(),
-            global_completeness: OwnerCompleteness::Complete,
-            evidence_gaps: Vec::new(),
-            omitted_evidence_gap_count: 0,
-        },
+        rows: Vec::new(),
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps: Vec::new(),
+        omitted_evidence_gap_count: 0,
     })
 }
 
@@ -59,8 +54,7 @@ fn process_limit_reads(
     _pids: &[u32],
     _profile: MetadataProfile,
     _remaining: usize,
-) -> Result<std::collections::BTreeMap<u32, crate::observation::ProcessRead>, super::CollectorError>
-{
+) -> Result<crate::observation::ProcessReadBatch, super::CollectorError> {
     Err(super::CollectorError::Observation(
         ObservationError::ProcessIdentityLimitExceeded,
     ))

@@ -24,12 +24,12 @@ use crate::model::{
 use crate::observation::{
     CANDIDATE_PROCESS_IDS_MAX, EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact,
     FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness, MetadataOmission,
-    MetadataProfile, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation, NetworkSnapshot,
-    OWNER_EDGES_MAX, ObservationScope, ObservationScopeKind, OwnerAssociations, OwnerCompleteness,
+    MetadataProfile, NATIVE_SOCKET_TABLE_MAX_BYTES, NativeSocketObservation, NativeSocketRow,
+    NetworkSnapshot, OWNER_EDGES_MAX, ObservationScope, ObservationScopeKind, OwnerCompleteness,
     PROCESS_NAME_MAX_BYTES, PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessRead,
-    ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES, SOCKET_OBSERVATIONS_MAX, ScopeLimitation,
-    SnapshotCompleteness, SocketState as ObservationSocketState, TcpTimerObservation,
-    UnverifiedOwnerReason,
+    ProcessReadBatch, ProcessStartMarker, SCOPE_IDENTIFIER_MAX_BYTES, SOCKET_OBSERVATIONS_MAX,
+    ScopeLimitation, SnapshotCompleteness, SocketState as ObservationSocketState,
+    TcpTimerObservation, UnverifiedOwnerReason,
 };
 use crate::process::{
     TreeDeliveryHandle, tree_cont, tree_cont_handle, tree_deliver_handle,
@@ -193,7 +193,7 @@ impl LinuxCollector {
         pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError> {
+    ) -> Result<ProcessReadBatch, CollectorError> {
         let mut parent_names = HashMap::new();
         crate::collector::read_processes_sequentially(
             pids,
@@ -505,8 +505,15 @@ fn native_pass_from_records(
     records: &[SocketRecord],
     owner_scan: &OwnerScanResult,
 ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
-    let mut sockets = Vec::with_capacity(records.len());
-    let mut owners_by_socket = Vec::with_capacity(records.len());
+    let ancestor_pid_owners_invisible = owner_scan
+        .losses
+        .contains(&OwnerScanLoss::AncestorPidOwnersInvisible);
+    let owner_completeness = if ancestor_pid_owners_invisible {
+        OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?
+    } else {
+        OwnerCompleteness::Complete
+    };
+    let mut rows = Vec::with_capacity(records.len());
     for record in records {
         let ipv6_scope = record
             .local_addr
@@ -523,47 +530,33 @@ fn native_pass_from_records(
                 error.to_string(),
             ))
         })?;
-        sockets.push(NativeSocketObservation {
-            endpoint,
-            state: record.state,
-            timer: record.timer,
-            token: PlatformSocketToken::linux_inode(record.inode),
-        });
-        owners_by_socket.push(
-            owner_scan
+        rows.push(NativeSocketRow {
+            socket: NativeSocketObservation {
+                endpoint,
+                state: record.state,
+                timer: record.timer,
+                token: PlatformSocketToken::linux_inode(record.inode),
+            },
+            owner_pids: owner_scan
                 .owners
                 .get(&record.inode)
                 .cloned()
                 .unwrap_or_default(),
-        );
+            owner_completeness: owner_completeness.clone(),
+        });
     }
 
-    let ancestor_pid_owners_invisible = owner_scan
-        .losses
-        .contains(&OwnerScanLoss::AncestorPidOwnersInvisible);
     let (global_completeness, evidence_gaps, omitted_evidence_gap_count) =
         owner_evidence(owner_scan)?;
     // Ordinary PID/fd traversal losses have no endpoint provenance and reduce
     // only global authority. Nested PID namespaces are different: an invisible
     // ancestor-namespace process may share any socket visible in the current
     // network namespace, so no socket's owner set is provably complete.
-    let local_completeness = if ancestor_pid_owners_invisible {
-        vec![
-            OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])?;
-            records.len()
-        ]
-    } else {
-        vec![OwnerCompleteness::Complete; records.len()]
-    };
     Ok(crate::observation::NativeObservationPass {
-        sockets,
-        owners: OwnerAssociations {
-            owners_by_socket,
-            local_completeness,
-            global_completeness,
-            evidence_gaps,
-            omitted_evidence_gap_count,
-        },
+        rows,
+        global_owner_completeness: global_completeness,
+        evidence_gaps,
+        omitted_evidence_gap_count,
     })
 }
 

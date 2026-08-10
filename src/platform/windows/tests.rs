@@ -338,16 +338,16 @@ fn raw_tcp4_table_parses_and_converts_complete_row() {
     append_tcp4_table(&mut records, fixture.words()).expect("valid TCPv4 table");
     let pass = native_pass_from_records(records).expect("valid native pass");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Tcp);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].socket.endpoint.protocol, Protocol::Tcp);
     assert_eq!(
-        pass.sockets[0].endpoint.address,
+        pass.rows[0].socket.endpoint.address,
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 17))
     );
-    assert_eq!(pass.sockets[0].endpoint.port.get(), 44_321);
-    assert_eq!(pass.sockets[0].endpoint.ipv6_scope, None);
-    assert_eq!(pass.sockets[0].state, SocketState::CloseWait);
-    assert_eq!(pass.owners.owners_by_socket, vec![vec![1_001]]);
+    assert_eq!(pass.rows[0].socket.endpoint.port.get(), 44_321);
+    assert_eq!(pass.rows[0].socket.endpoint.ipv6_scope, None);
+    assert_eq!(pass.rows[0].socket.state, SocketState::CloseWait);
+    assert_eq!(pass.rows[0].owner_pids, [1_001]);
     assert!(
         append_tcp4_table(
             &mut Vec::new(),
@@ -386,18 +386,18 @@ fn raw_tcp6_table_parses_and_converts_complete_row() {
     append_tcp6_table(&mut records, fixture.words()).expect("valid TCPv6 table");
     let pass = native_pass_from_records(records).expect("valid native pass");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Tcp);
-    assert_eq!(pass.sockets[0].endpoint.address, IpAddr::V6(address));
-    assert_eq!(pass.sockets[0].endpoint.port.get(), 65_535);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].socket.endpoint.protocol, Protocol::Tcp);
+    assert_eq!(pass.rows[0].socket.endpoint.address, IpAddr::V6(address));
+    assert_eq!(pass.rows[0].socket.endpoint.port.get(), 65_535);
     assert_eq!(
-        pass.sockets[0].endpoint.ipv6_scope,
+        pass.rows[0].socket.endpoint.ipv6_scope,
         Some(Ipv6Scope::InterfaceIndex(
             std::num::NonZeroU32::new(19).unwrap()
         ))
     );
-    assert_eq!(pass.sockets[0].state, SocketState::TimeWait);
-    assert_eq!(pass.owners.owners_by_socket, vec![vec![2_002]]);
+    assert_eq!(pass.rows[0].socket.state, SocketState::TimeWait);
+    assert_eq!(pass.rows[0].owner_pids, [2_002]);
     assert!(
         append_tcp6_table(
             &mut Vec::new(),
@@ -430,19 +430,19 @@ fn raw_udp4_table_retains_row_when_owner_is_unavailable() {
     append_udp4_table(&mut records, fixture.words()).expect("valid UDPv4 table");
     let pass = native_pass_from_records(records).expect("valid native pass");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Udp);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].socket.endpoint.protocol, Protocol::Udp);
     assert_eq!(
-        pass.sockets[0].endpoint.address,
+        pass.rows[0].socket.endpoint.address,
         IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23))
     );
-    assert_eq!(pass.sockets[0].endpoint.port.get(), 53);
-    assert_eq!(pass.sockets[0].endpoint.ipv6_scope, None);
-    assert_eq!(pass.sockets[0].state, SocketState::Bound);
-    assert_eq!(pass.owners.owners_by_socket, vec![Vec::<u32>::new()]);
+    assert_eq!(pass.rows[0].socket.endpoint.port.get(), 53);
+    assert_eq!(pass.rows[0].socket.endpoint.ipv6_scope, None);
+    assert_eq!(pass.rows[0].socket.state, SocketState::Bound);
+    assert!(pass.rows[0].owner_pids.is_empty());
     assert!(matches!(
-        pass.owners.local_completeness.as_slice(),
-        [OwnerCompleteness::Partial { reasons }]
+        &pass.rows[0].owner_completeness,
+        OwnerCompleteness::Partial { reasons }
             if reasons == &[EvidenceGapCode::OwnerAttributionIncomplete]
     ));
     assert!(
@@ -479,27 +479,24 @@ fn raw_udp6_table_retains_row_when_owner_is_unavailable() {
     append_udp6_table(&mut records, fixture.words()).expect("valid UDPv6 table");
     let pass = native_pass_from_records(records).expect("valid native pass");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.sockets[0].endpoint.protocol, Protocol::Udp);
-    assert_eq!(pass.sockets[0].endpoint.address, IpAddr::V6(address));
-    assert_eq!(pass.sockets[0].endpoint.port.get(), 5_353);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].socket.endpoint.protocol, Protocol::Udp);
+    assert_eq!(pass.rows[0].socket.endpoint.address, IpAddr::V6(address));
+    assert_eq!(pass.rows[0].socket.endpoint.port.get(), 5_353);
     assert_eq!(
-        pass.sockets[0].endpoint.ipv6_scope,
+        pass.rows[0].socket.endpoint.ipv6_scope,
         Some(Ipv6Scope::InterfaceIndex(
             std::num::NonZeroU32::new(7).unwrap()
         ))
     );
-    assert_eq!(pass.sockets[0].state, SocketState::Bound);
-    assert_eq!(pass.owners.owners_by_socket, vec![Vec::<u32>::new()]);
-    assert_eq!(pass.owners.evidence_gaps.len(), 1);
+    assert_eq!(pass.rows[0].socket.state, SocketState::Bound);
+    assert!(pass.rows[0].owner_pids.is_empty());
+    assert_eq!(pass.evidence_gaps.len(), 1);
     assert_eq!(
-        pass.owners.evidence_gaps[0].code,
+        pass.evidence_gaps[0].code,
         EvidenceGapCode::OwnerAttributionIncomplete
     );
-    assert_eq!(
-        pass.owners.evidence_gaps[0].impact,
-        EvidenceImpact::Ownership
-    );
+    assert_eq!(pass.evidence_gaps[0].impact, EvidenceImpact::Ownership);
     assert!(
         append_udp6_table(
             &mut Vec::new(),
@@ -790,9 +787,13 @@ fn socket_relation_fallback_preserves_per_pid_failure_reason() {
     )
     .expect("relation failure uses direct PID reads");
 
+    let [(pid, read)] = reads.as_slice() else {
+        panic!("one requested PID must produce one read");
+    };
+    assert_eq!(*pid, 7);
     assert_eq!(
-        reads[&7],
-        ProcessRead::Unverified(UnverifiedOwnerReason::PermissionDenied)
+        *read,
+        ProcessRead::Unverified(UnverifiedOwnerReason::PermissionDenied),
     );
 }
 
@@ -1425,10 +1426,10 @@ fn owner_table_row_survives_without_process_enrichment() {
 
     let pass = native_pass_from_records(vec![record]).expect("owner row is authoritative");
 
-    assert_eq!(pass.sockets.len(), 1);
-    assert_eq!(pass.sockets[0].state, SocketState::Established);
-    assert_eq!(pass.sockets[0].timer, None);
-    assert_eq!(pass.owners.owners_by_socket, vec![vec![77]]);
+    assert_eq!(pass.rows.len(), 1);
+    assert_eq!(pass.rows[0].socket.state, SocketState::Established);
+    assert_eq!(pass.rows[0].socket.timer, None);
+    assert_eq!(pass.rows[0].owner_pids, [77]);
 }
 
 #[test]
@@ -1532,7 +1533,7 @@ fn ownerless_windows_snapshot_retains_endpoints_without_reading_pid_zero() {
         |pids, _, _| {
             process_reads += 1;
             assert!(pids.is_empty(), "PID 0 must not become an owner edge");
-            Ok(std::collections::BTreeMap::new())
+            Ok(Vec::new())
         },
     )
     .expect("ownerless Windows snapshot remains valid");

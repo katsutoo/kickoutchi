@@ -26,10 +26,11 @@ use crate::model::{
 use crate::observation::{
     CANDIDATE_PROCESS_IDS_MAX, EndpointIdentity, EvidenceGap, EvidenceGapCode, EvidenceImpact,
     FILE_DESCRIPTOR_ENTRIES_MAX, Ipv6Scope, MetadataCompleteness, MetadataOmission,
-    MetadataProfile, NATIVE_RESIZE_ATTEMPTS_MAX, NativeSocketObservation, NetworkSnapshot,
-    ObservationScope, ObservationScopeKind, OwnerAssociations, OwnerCompleteness,
-    PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessRead, ProcessStartMarker,
-    ScopeLimitation, SocketState as ObservationSocketState, UnverifiedOwnerReason,
+    MetadataProfile, NATIVE_RESIZE_ATTEMPTS_MAX, NativeSocketObservation, NativeSocketRow,
+    NetworkSnapshot, ObservationScope, ObservationScopeKind, OwnerCompleteness,
+    PlatformSocketToken, ProcessIdentity, ProcessObservation, ProcessRead, ProcessReadBatch,
+    ProcessStartMarker, ScopeLimitation, SocketState as ObservationSocketState,
+    UnverifiedOwnerReason,
 };
 use crate::observation::{OWNER_EDGES_MAX, SOCKET_OBSERVATIONS_MAX};
 use crate::process::{tree_cont, tree_deliver_by_pid, tree_prepare_delivery_probe, tree_stop};
@@ -90,7 +91,7 @@ impl MacosCollector {
         pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<std::collections::BTreeMap<u32, ProcessRead>, CollectorError> {
+    ) -> Result<ProcessReadBatch, CollectorError> {
         let mut parent_names = HashMap::new();
         crate::collector::read_processes_sequentially(
             pids,
@@ -123,8 +124,7 @@ impl MacosCollector {
         )
             -> Result<(Vec<SocketRecord>, BTreeSet<SocketScanLoss>), std::io::Error>,
     {
-        let mut grouped_records = Vec::<SocketRecord>::new();
-        let mut owners_by_socket = Vec::<Vec<u32>>::new();
+        let mut grouped_records = Vec::<GroupedSocketRecord>::new();
         let mut socket_indexes = HashMap::<u64, usize>::new();
         let mut socket_set_losses = BTreeSet::new();
         let mut omitted_socket_set_loss_count = 0u64;
@@ -164,7 +164,6 @@ impl MacosCollector {
             for record in records {
                 retain_socket_record(
                     &mut grouped_records,
-                    &mut owners_by_socket,
                     &mut socket_indexes,
                     &mut owner_edges,
                     &mut socket_set_losses,
@@ -175,8 +174,7 @@ impl MacosCollector {
             }
         }
         native_pass_from_records(
-            &grouped_records,
-            owners_by_socket,
+            grouped_records,
             socket_set_losses,
             omitted_socket_set_loss_count,
         )
@@ -239,13 +237,8 @@ impl MacosCollector {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "bounded socket, owner, token-conflict, and evidence stores are updated atomically"
-)]
 fn retain_socket_record(
-    grouped_records: &mut Vec<SocketRecord>,
-    owners_by_socket: &mut Vec<Vec<u32>>,
+    grouped_records: &mut Vec<GroupedSocketRecord>,
     socket_indexes: &mut HashMap<u64, usize>,
     owner_edges: &mut usize,
     socket_set_losses: &mut BTreeSet<SocketScanLoss>,
@@ -257,7 +250,7 @@ fn retain_socket_record(
     if let Some(token) = socket_token
         && let Some(index) = socket_indexes.get(&token).copied()
     {
-        if !grouped_records[index].same_non_owner_facts(&record) {
+        if !grouped_records[index].socket.same_non_owner_facts(&record) {
             retain_socket_scan_loss(
                 socket_set_losses,
                 omitted_socket_set_loss_count,
@@ -265,13 +258,13 @@ fn retain_socket_record(
             );
             return Ok(());
         }
-        if sorted_owner_is_new(&owners_by_socket[index], pid) {
+        if sorted_owner_is_new(&grouped_records[index].owner_pids, pid) {
             if *owner_edges >= OWNER_EDGES_MAX {
                 return Err(
                     crate::observation::ObservationError::OwnerAttributionLimitExceeded.into(),
                 );
             }
-            owners_by_socket[index].push(pid);
+            grouped_records[index].owner_pids.push(pid);
             *owner_edges += 1;
         }
         return Ok(());
@@ -285,8 +278,10 @@ fn retain_socket_record(
     if let Some(token) = socket_token {
         socket_indexes.insert(token, grouped_records.len());
     }
-    grouped_records.push(record);
-    owners_by_socket.push(vec![pid]);
+    grouped_records.push(GroupedSocketRecord {
+        socket: record,
+        owner_pids: vec![pid],
+    });
     *owner_edges += 1;
     Ok(())
 }
@@ -362,6 +357,12 @@ struct SocketRecord {
     socket_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupedSocketRecord {
+    socket: SocketRecord,
+    owner_pids: Vec<u32>,
+}
+
 impl SocketRecord {
     fn key(&self) -> SocketRecordKey {
         SocketRecordKey {
@@ -391,25 +392,22 @@ enum SocketScanLoss {
 }
 
 fn native_pass_from_records(
-    records: &[SocketRecord],
-    owners_by_socket: Vec<Vec<u32>>,
+    records: Vec<GroupedSocketRecord>,
     losses: BTreeSet<SocketScanLoss>,
     mut omitted_evidence_gap_count: u64,
 ) -> Result<crate::observation::NativeObservationPass, CollectorError> {
-    if records.len() != owners_by_socket.len() {
-        return Err(crate::observation::ObservationError::NativeDataMalformed.into());
-    }
-    let sockets = records
-        .iter()
+    let rows = records
+        .into_iter()
         .map(|record| {
-            let ipv6_scope = record
+            let GroupedSocketRecord { socket, owner_pids } = record;
+            let ipv6_scope = socket
                 .local_addr
                 .is_ipv6()
                 .then_some(Ipv6Scope::Unavailable);
             let endpoint = EndpointIdentity::new(
-                record.protocol,
-                record.local_addr,
-                u32::from(record.local_port),
+                socket.protocol,
+                socket.local_addr,
+                u32::from(socket.local_port),
                 ipv6_scope,
             )
             .map_err(|error| {
@@ -417,11 +415,15 @@ fn native_pass_from_records(
                     crate::observation::ObservationError::PlatformApiFailed(error.to_string()),
                 )
             })?;
-            Ok(NativeSocketObservation {
-                endpoint,
-                state: record.state,
-                timer: None,
-                token: PlatformSocketToken::macos_socket_id(record.socket_id),
+            Ok(NativeSocketRow {
+                socket: NativeSocketObservation {
+                    endpoint,
+                    state: socket.state,
+                    timer: None,
+                    token: PlatformSocketToken::macos_socket_id(socket.socket_id),
+                },
+                owner_pids,
+                owner_completeness: OwnerCompleteness::Complete,
             })
         })
         .collect::<Result<Vec<_>, CollectorError>>()?;
@@ -463,9 +465,9 @@ fn native_pass_from_records(
             message,
         ));
     }
-    if sockets
+    if rows
         .iter()
-        .any(|socket| socket.endpoint.ipv6_scope == Some(Ipv6Scope::Unavailable))
+        .any(|row| row.socket.endpoint.ipv6_scope == Some(Ipv6Scope::Unavailable))
     {
         if evidence_gaps.len() < crate::observation::EVIDENCE_GAPS_MAX {
             evidence_gaps.push(EvidenceGap::new(
@@ -479,16 +481,11 @@ fn native_pass_from_records(
             omitted_evidence_gap_count = omitted_evidence_gap_count.saturating_add(1);
         }
     }
-    let local_completeness = vec![OwnerCompleteness::Complete; sockets.len()];
     Ok(crate::observation::NativeObservationPass {
-        sockets,
-        owners: OwnerAssociations {
-            owners_by_socket,
-            local_completeness,
-            global_completeness: OwnerCompleteness::Complete,
-            evidence_gaps,
-            omitted_evidence_gap_count,
-        },
+        rows,
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps,
+        omitted_evidence_gap_count,
     })
 }
 

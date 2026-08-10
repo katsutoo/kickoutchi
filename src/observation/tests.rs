@@ -72,9 +72,9 @@ fn lossy_utf8_length_matches_conversion() {
 #[derive(Debug, Clone)]
 enum Step {
     Clock(u64),
-    Sockets(Vec<NativeSocketObservation>),
-    Owners(OwnerAssociations),
+    Pass(NativeObservationPass),
     Process(u32, MetadataProfile, ProcessRead),
+    ProcessBatch(ProcessReadBatch),
     Error(ObservationError),
 }
 
@@ -135,17 +135,11 @@ impl ObservationSource for FakeSource {
         &mut self,
         _profile: MetadataProfile,
     ) -> Result<NativeObservationPass, ObservationError> {
-        self.calls.push("sockets".to_owned());
-        let sockets = match self.next()? {
-            Step::Sockets(sockets) => sockets,
-            step => panic!("expected sockets, got {step:?}"),
-        };
-        self.calls.push("owners".to_owned());
-        let owners = match self.next()? {
-            Step::Owners(owners) => owners,
-            step => panic!("expected owners, got {step:?}"),
-        };
-        Ok(NativeObservationPass { sockets, owners })
+        self.calls.push("pass".to_owned());
+        match self.next()? {
+            Step::Pass(pass) => Ok(pass),
+            step => panic!("expected native pass, got {step:?}"),
+        }
     }
 
     fn read_processes(
@@ -153,15 +147,21 @@ impl ObservationSource for FakeSource {
         sorted_pids: &[u32],
         profile: MetadataProfile,
         optional_metadata_bytes_remaining: usize,
-    ) -> Result<BTreeMap<u32, ProcessRead>, ObservationError> {
+    ) -> Result<ProcessReadBatch, ObservationError> {
         self.process_batch_calls += 1;
+        if matches!(self.steps.front(), Some(Step::ProcessBatch(_))) {
+            return match self.next()? {
+                Step::ProcessBatch(reads) => Ok(reads),
+                step => panic!("expected process batch, got {step:?}"),
+            };
+        }
         let mut retained_bytes = 0usize;
-        let mut reads = BTreeMap::new();
+        let mut reads = Vec::with_capacity(sorted_pids.len());
         for &pid in sorted_pids {
             let remaining = optional_metadata_bytes_remaining.saturating_sub(retained_bytes);
             let read = self.read_process(pid, profile, remaining)?;
             retained_bytes = retained_bytes.saturating_add(process_read_metadata_bytes(&read));
-            reads.insert(pid, read);
+            reads.push((pid, read));
         }
         Ok(reads)
     }
@@ -181,11 +181,23 @@ fn socket(port: u32) -> NativeSocketObservation {
     }
 }
 
-fn owners(pids: &[&[u32]]) -> OwnerAssociations {
-    OwnerAssociations {
-        owners_by_socket: pids.iter().map(|pids| pids.to_vec()).collect(),
-        local_completeness: pids.iter().map(|_| OwnerCompleteness::Complete).collect(),
-        global_completeness: OwnerCompleteness::Complete,
+fn native_pass(sockets: Vec<NativeSocketObservation>, pids: &[&[u32]]) -> NativeObservationPass {
+    assert_eq!(
+        sockets.len(),
+        pids.len(),
+        "every socket fixture needs owners"
+    );
+    NativeObservationPass {
+        rows: sockets
+            .into_iter()
+            .zip(pids)
+            .map(|(socket, owner_pids)| NativeSocketRow {
+                socket,
+                owner_pids: owner_pids.to_vec(),
+                owner_completeness: OwnerCompleteness::Complete,
+            })
+            .collect(),
+        global_owner_completeness: OwnerCompleteness::Complete,
         evidence_gaps: Vec::new(),
         omitted_evidence_gap_count: 0,
     }
@@ -229,11 +241,7 @@ fn limits(max: usize) -> ObservationLimits {
 
 fn stable_steps(rows: Vec<NativeSocketObservation>, pids: &[&[u32]]) -> Vec<Step> {
     let unique: BTreeSet<u32> = pids.iter().flat_map(|pids| pids.iter().copied()).collect();
-    let mut steps = vec![
-        Step::Clock(10),
-        Step::Sockets(rows.clone()),
-        Step::Owners(owners(pids)),
-    ];
+    let mut steps = vec![Step::Clock(10), Step::Pass(native_pass(rows.clone(), pids))];
     for pid in &unique {
         steps.push(Step::Process(
             *pid,
@@ -241,8 +249,7 @@ fn stable_steps(rows: Vec<NativeSocketObservation>, pids: &[&[u32]]) -> Vec<Step
             verified(7, None),
         ));
     }
-    steps.push(Step::Sockets(rows));
-    steps.push(Step::Owners(owners(pids)));
+    steps.push(Step::Pass(native_pass(rows, pids)));
     for pid in unique {
         steps.push(Step::Process(
             pid,
@@ -269,15 +276,13 @@ fn append_attempt(
     reads_b: &[(u32, ProcessRead)],
 ) {
     steps.push(Step::Clock(started));
-    steps.push(Step::Sockets(rows_a));
-    steps.push(Step::Owners(owners(pids_a)));
+    steps.push(Step::Pass(native_pass(rows_a, pids_a)));
     steps.extend(
         reads_a
             .iter()
             .map(|(pid, read)| Step::Process(*pid, MetadataProfile::IdentityOnly, read.clone())),
     );
-    steps.push(Step::Sockets(rows_b));
-    steps.push(Step::Owners(owners(pids_b)));
+    steps.push(Step::Pass(native_pass(rows_b, pids_b)));
     steps.extend(
         reads_b
             .iter()
@@ -652,17 +657,128 @@ fn stable_collection_returns_pass_b_and_exact_call_order() {
         source.calls,
         [
             "clock",
-            "sockets",
-            "owners",
+            "pass",
             "process:42:IdentityOnly",
-            "sockets",
-            "owners",
+            "pass",
             "process:42:Display",
             "clock"
         ]
     );
     assert!(source.steps.is_empty());
     assert_eq!(source.process_batch_calls, 2);
+}
+
+#[test]
+fn process_read_table_accepts_only_the_exact_sorted_pid_batch() {
+    let expected = [1, 2];
+    let valid = ProcessReadTable::from_expected(
+        &expected,
+        vec![(1, verified(1, None)), (2, verified(2, None))],
+    )
+    .expect("the exact sorted batch is valid");
+    assert_eq!(valid.len(), 2);
+    assert!(valid.get(1).is_some());
+    assert!(valid.get(2).is_some());
+    assert!(valid.get(3).is_none());
+
+    let malformed_batches = [
+        vec![(1, verified(1, None))],
+        vec![
+            (1, verified(1, None)),
+            (2, verified(2, None)),
+            (3, verified(3, None)),
+        ],
+        vec![(1, verified(1, None)), (1, verified(1, None))],
+        vec![(2, verified(2, None)), (1, verified(1, None))],
+        vec![(1, verified(1, None)), (3, verified(3, None))],
+    ];
+    for batch in malformed_batches {
+        assert_eq!(
+            ProcessReadTable::from_expected(&expected, batch)
+                .expect_err("missing, extra, duplicate, unordered, or wrong PIDs are malformed"),
+            ObservationError::NativeDataMalformed
+        );
+    }
+}
+
+#[test]
+fn collection_rejects_an_unordered_process_read_batch() {
+    let mut source = FakeSource::new(vec![
+        Step::Clock(1),
+        Step::Pass(native_pass(vec![socket(80)], &[&[1, 2]])),
+        Step::ProcessBatch(vec![(2, verified(2, None)), (1, verified(1, None))]),
+    ]);
+
+    assert_eq!(
+        collect_consistent_with_limits(&mut source, scope(), MetadataProfile::Display, limits(4)),
+        Err(ObservationError::NativeDataMalformed)
+    );
+    assert_eq!(source.process_batch_calls, 1);
+}
+
+#[test]
+fn canonicalization_keeps_each_socket_owner_completeness_and_timer_bundled() {
+    let mut socket_80 = socket(80);
+    socket_80.timer = Some(TcpTimerObservation::from_linux_native(1, 8, Some(100)));
+    let mut socket_81 = socket(81);
+    socket_81.timer = Some(TcpTimerObservation::from_linux_native(1, 9, Some(100)));
+    let partial = OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete])
+        .expect("one reason fits");
+    let row_80 = NativeSocketRow {
+        socket: socket_80,
+        owner_pids: vec![1],
+        owner_completeness: OwnerCompleteness::Complete,
+    };
+    let row_81 = NativeSocketRow {
+        socket: socket_81,
+        owner_pids: vec![2],
+        owner_completeness: partial.clone(),
+    };
+    let pass = |rows| NativeObservationPass {
+        rows,
+        global_owner_completeness: partial.clone(),
+        evidence_gaps: Vec::new(),
+        omitted_evidence_gap_count: 0,
+    };
+    let steps = vec![
+        Step::Clock(1),
+        Step::Pass(pass(vec![row_81.clone(), row_80.clone()])),
+        Step::Process(1, MetadataProfile::IdentityOnly, verified(1, None)),
+        Step::Process(2, MetadataProfile::IdentityOnly, verified(2, None)),
+        Step::Pass(pass(vec![row_80, row_81])),
+        Step::Process(1, MetadataProfile::Display, verified(1, Some("one"))),
+        Step::Process(2, MetadataProfile::Display, verified(2, Some("two"))),
+        Step::Clock(2),
+    ];
+    let mut source = FakeSource::new(steps);
+
+    let snapshot =
+        collect_consistent_with_limits(&mut source, scope(), MetadataProfile::Display, limits(8))
+            .expect("bundled rows canonicalize without detaching per-socket facts");
+
+    assert_eq!(snapshot.sockets[0].local_endpoint.port.get(), 80);
+    assert_eq!(
+        snapshot.sockets[0].timer.map(|timer| timer.raw_ticks),
+        Some(8)
+    );
+    assert_eq!(
+        snapshot.sockets[0].owner_completeness,
+        OwnerCompleteness::Complete
+    );
+    assert!(matches!(
+        snapshot.sockets[0].owners.as_slice(),
+        [OwnerObservation::Verified(identity)] if identity.pid == 1
+    ));
+    assert_eq!(snapshot.sockets[1].local_endpoint.port.get(), 81);
+    assert_eq!(
+        snapshot.sockets[1].timer.map(|timer| timer.raw_ticks),
+        Some(9)
+    );
+    assert_eq!(snapshot.sockets[1].owner_completeness, partial);
+    assert!(matches!(
+        snapshot.sockets[1].owners.as_slice(),
+        [OwnerObservation::Verified(identity)] if identity.pid == 2
+    ));
 }
 
 #[test]
@@ -673,10 +789,8 @@ fn timer_changes_do_not_create_socket_races_and_pass_b_is_retained() {
     pass_b.timer = Some(TcpTimerObservation::from_linux_native(1, 10, Some(100)));
     let mut source = FakeSource::new(vec![
         Step::Clock(10),
-        Step::Sockets(vec![pass_a]),
-        Step::Owners(owners(&[&[]])),
-        Step::Sockets(vec![pass_b]),
-        Step::Owners(owners(&[&[]])),
+        Step::Pass(native_pass(vec![pass_a], &[&[]])),
+        Step::Pass(native_pass(vec![pass_b], &[&[]])),
         Step::Clock(20),
     ]);
 
@@ -758,15 +872,13 @@ fn attributable_vanished_pid_merges_into_global_completeness() {
     let row = socket(80);
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(owners(&[&[42]])),
+        Step::Pass(native_pass(vec![row.clone()], &[&[42]])),
         Step::Process(
             42,
             MetadataProfile::IdentityOnly,
             ProcessRead::Unverified(UnverifiedOwnerReason::Disappeared),
         ),
-        Step::Sockets(vec![row]),
-        Step::Owners(owners(&[&[42]])),
+        Step::Pass(native_pass(vec![row], &[&[42]])),
         Step::Process(
             42,
             MetadataProfile::Display,
@@ -816,23 +928,28 @@ fn large_duplicate_group_merges_local_uncertainty_linearly() {
     let mut local_a = vec![OwnerCompleteness::Complete; DUPLICATES];
     local_a[0] = disappeared;
     local_a[DUPLICATES - 1] = denied;
-    let associations = |local_completeness| OwnerAssociations {
-        owners_by_socket: vec![Vec::new(); DUPLICATES],
-        local_completeness,
-        global_completeness: OwnerCompleteness::Complete,
-        evidence_gaps: Vec::new(),
-        omitted_evidence_gap_count: 0,
+    let rows = |local_completeness: Vec<OwnerCompleteness>| {
+        local_completeness
+            .into_iter()
+            .map(|owner_completeness| NativeSocketRow {
+                socket: row.clone(),
+                owner_pids: Vec::new(),
+                owner_completeness,
+            })
+            .collect()
     };
     let mut pass_a = CollectedPass {
-        sockets: vec![row.clone(); DUPLICATES],
-        associations: associations(local_a),
-        processes_by_pid: BTreeMap::new(),
+        rows: rows(local_a),
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: 0,
     };
     let mut pass_b = CollectedPass {
-        sockets: vec![row; DUPLICATES],
-        associations: associations(vec![OwnerCompleteness::Complete; DUPLICATES]),
-        processes_by_pid: BTreeMap::new(),
+        rows: rows(vec![OwnerCompleteness::Complete; DUPLICATES]),
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: 0,
     };
 
@@ -845,10 +962,9 @@ fn large_duplicate_group_merges_local_uncertainty_linearly() {
     .unwrap();
     assert!(
         pass_b
-            .associations
-            .local_completeness
+            .rows
             .iter()
-            .all(|completeness| completeness == &expected)
+            .all(|row| row.owner_completeness == expected)
     );
 }
 
@@ -864,30 +980,32 @@ fn attempt_merge_keeps_global_and_socket_local_owner_reasons_separate() {
         OwnerCompleteness::partial([EvidenceGapCode::ProcessIdentityUnavailable]).unwrap();
     let local_b =
         OwnerCompleteness::partial([EvidenceGapCode::OwnerAttributionIncomplete]).unwrap();
-    let associations = |global_completeness, local_completeness| OwnerAssociations {
-        owners_by_socket: vec![Vec::new()],
-        local_completeness: vec![local_completeness],
-        global_completeness,
-        evidence_gaps: Vec::new(),
-        omitted_evidence_gap_count: 0,
+    let rows = |owner_completeness| {
+        vec![NativeSocketRow {
+            socket: socket(80),
+            owner_pids: Vec::new(),
+            owner_completeness,
+        }]
     };
     let mut pass_a = CollectedPass {
-        sockets: vec![socket(80)],
-        associations: associations(global_a, local_a),
-        processes_by_pid: BTreeMap::new(),
+        rows: rows(local_a),
+        global_owner_completeness: global_a,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: 0,
     };
     let mut pass_b = CollectedPass {
-        sockets: vec![socket(80)],
-        associations: associations(global_b, local_b),
-        processes_by_pid: BTreeMap::new(),
+        rows: rows(local_b),
+        global_owner_completeness: global_b,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: 0,
     };
 
     merge_attempt_uncertainty(&mut pass_a, &mut pass_b).expect("bounded reasons merge");
 
     assert_eq!(
-        pass_b.associations.global_completeness,
+        pass_b.global_owner_completeness,
         OwnerCompleteness::partial([
             EvidenceGapCode::OwnerDisappeared,
             EvidenceGapCode::OwnerPermissionDenied,
@@ -895,27 +1013,29 @@ fn attempt_merge_keeps_global_and_socket_local_owner_reasons_separate() {
         .unwrap()
     );
     assert_eq!(
-        pass_b.associations.local_completeness,
-        [OwnerCompleteness::partial([
+        pass_b.rows[0].owner_completeness,
+        OwnerCompleteness::partial([
             EvidenceGapCode::OwnerAttributionIncomplete,
             EvidenceGapCode::ProcessIdentityUnavailable,
         ])
-        .unwrap()]
+        .unwrap()
     );
 }
 
 #[test]
 fn merged_source_omission_counts_saturate() {
     let mut pass_a = CollectedPass {
-        sockets: Vec::new(),
-        associations: owners(&[]),
-        processes_by_pid: BTreeMap::new(),
+        rows: Vec::new(),
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: u64::MAX,
     };
     let mut pass_b = CollectedPass {
-        sockets: Vec::new(),
-        associations: owners(&[]),
-        processes_by_pid: BTreeMap::new(),
+        rows: Vec::new(),
+        global_owner_completeness: OwnerCompleteness::Complete,
+        evidence_gaps: Vec::new(),
+        processes_by_pid: ProcessReadTable::default(),
         omitted_evidence_gap_count: 1,
     };
 
@@ -932,11 +1052,13 @@ fn multiplicity_owner_edges_and_identity_races_are_independent() {
             .iter()
             .flat_map(|pids| pids.iter().copied())
             .collect::<BTreeSet<_>>();
-        let associations = owners(pids);
         CollectedPass {
-            sockets,
-            associations,
-            processes_by_pid: unique.into_iter().map(|pid| (pid, read.clone())).collect(),
+            rows: native_pass(sockets, pids).rows,
+            global_owner_completeness: OwnerCompleteness::Complete,
+            evidence_gaps: Vec::new(),
+            processes_by_pid: ProcessReadTable {
+                entries: unique.into_iter().map(|pid| (pid, read.clone())).collect(),
+            },
             omitted_evidence_gap_count: 0,
         }
     };
@@ -1161,28 +1283,16 @@ fn evidence_gaps_and_projected_rows_have_deterministic_order() {
             "missing",
         )
     };
-    let associations_a = OwnerAssociations {
-        owners_by_socket: vec![vec![2], vec![1]],
-        local_completeness: vec![OwnerCompleteness::Complete; 2],
-        global_completeness: OwnerCompleteness::Complete,
-        evidence_gaps: vec![gap(81), gap(80)],
-        omitted_evidence_gap_count: 0,
-    };
-    let associations_b = OwnerAssociations {
-        owners_by_socket: vec![vec![1], vec![2]],
-        local_completeness: vec![OwnerCompleteness::Complete; 2],
-        global_completeness: OwnerCompleteness::Complete,
-        evidence_gaps: vec![gap(80), gap(81)],
-        omitted_evidence_gap_count: 0,
-    };
+    let mut pass_a = native_pass(vec![socket(81), socket(80)], &[&[2], &[1]]);
+    pass_a.evidence_gaps = vec![gap(81), gap(80)];
+    let mut pass_b = native_pass(vec![socket(80), socket(81)], &[&[1], &[2]]);
+    pass_b.evidence_gaps = vec![gap(80), gap(81)];
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![socket(81), socket(80)]),
-        Step::Owners(associations_a),
+        Step::Pass(pass_a),
         Step::Process(1, MetadataProfile::IdentityOnly, verified(1, None)),
         Step::Process(2, MetadataProfile::IdentityOnly, verified(2, None)),
-        Step::Sockets(vec![socket(80), socket(81)]),
-        Step::Owners(associations_b),
+        Step::Pass(pass_b),
         Step::Process(1, MetadataProfile::Display, verified(1, Some("one"))),
         Step::Process(2, MetadataProfile::Display, verified(2, Some("two"))),
         Step::Clock(2),
@@ -1298,24 +1408,25 @@ fn partial_and_denied_ownership_remain_explicit() {
     );
     let partial = OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
         .expect("one reason fits");
-    let associations = OwnerAssociations {
-        owners_by_socket: vec![vec![42]],
-        local_completeness: vec![partial.clone()],
-        global_completeness: partial,
+    let pass = NativeObservationPass {
+        rows: vec![NativeSocketRow {
+            socket: row.clone(),
+            owner_pids: vec![42],
+            owner_completeness: partial.clone(),
+        }],
+        global_owner_completeness: partial,
         evidence_gaps: vec![gap.clone()],
         omitted_evidence_gap_count: 0,
     };
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(associations.clone()),
+        Step::Pass(pass.clone()),
         Step::Process(
             42,
             MetadataProfile::IdentityOnly,
             ProcessRead::Unverified(UnverifiedOwnerReason::PermissionDenied),
         ),
-        Step::Sockets(vec![row]),
-        Step::Owners(associations),
+        Step::Pass(pass),
         Step::Process(
             42,
             MetadataProfile::Display,
@@ -1353,16 +1464,12 @@ fn second_unstable_attempt_returns_its_pass_b_without_a_third_attempt() {
     let b2 = socket(83);
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![a1]),
-        Step::Owners(owners(&[&[]])),
-        Step::Sockets(vec![b1]),
-        Step::Owners(owners(&[&[]])),
+        Step::Pass(native_pass(vec![a1], &[&[]])),
+        Step::Pass(native_pass(vec![b1], &[&[]])),
         Step::Clock(2),
         Step::Clock(3),
-        Step::Sockets(vec![a2]),
-        Step::Owners(owners(&[&[]])),
-        Step::Sockets(vec![b2.clone()]),
-        Step::Owners(owners(&[&[]])),
+        Step::Pass(native_pass(vec![a2], &[&[]])),
+        Step::Pass(native_pass(vec![b2.clone()], &[&[]])),
         Step::Clock(4),
     ];
     let mut source = FakeSource::new(steps);
@@ -1377,11 +1484,7 @@ fn second_unstable_attempt_returns_its_pass_b_without_a_third_attempt() {
         OwnerCompleteness::Raced
     );
     assert_eq!(
-        source
-            .calls
-            .iter()
-            .filter(|call| *call == "sockets")
-            .count(),
+        source.calls.iter().filter(|call| *call == "pass").count(),
         4
     );
     assert!(source.steps.is_empty(), "no third attempt may be consumed");
@@ -1391,10 +1494,8 @@ fn second_unstable_attempt_returns_its_pass_b_without_a_third_attempt() {
 fn stable_retry_is_accepted_on_attempt_two() {
     let mut steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![socket(80)]),
-        Step::Owners(owners(&[&[]])),
-        Step::Sockets(vec![socket(81)]),
-        Step::Owners(owners(&[&[]])),
+        Step::Pass(native_pass(vec![socket(80)], &[&[]])),
+        Step::Pass(native_pass(vec![socket(81)], &[&[]])),
         Step::Clock(2),
     ];
     steps.extend(stable_steps(vec![socket(82)], &[&[]]));
@@ -1405,11 +1506,7 @@ fn stable_retry_is_accepted_on_attempt_two() {
     assert_eq!(snapshot.completeness, SnapshotCompleteness::Complete);
     assert_eq!(snapshot.sockets[0].local_endpoint, endpoint(82));
     assert_eq!(
-        source
-            .calls
-            .iter()
-            .filter(|call| *call == "sockets")
-            .count(),
+        source.calls.iter().filter(|call| *call == "pass").count(),
         4
     );
 }
@@ -1431,14 +1528,16 @@ fn injectable_limits_cover_zero_max_and_max_plus_one() {
 
     let mut over = FakeSource::new(vec![
         Step::Clock(1),
-        Step::Sockets(vec![socket(80), socket(81), socket(82)]),
-        Step::Owners(owners(&[&[], &[], &[]])),
+        Step::Pass(native_pass(
+            vec![socket(80), socket(81), socket(82)],
+            &[&[], &[], &[]],
+        )),
     ]);
     assert_eq!(
         collect_consistent_with_limits(&mut over, scope(), MetadataProfile::Display, limits(2)),
         Err(ObservationError::SocketObservationLimitExceeded)
     );
-    assert_eq!(over.calls, ["clock", "sockets", "owners"]);
+    assert_eq!(over.calls, ["clock", "pass"]);
 }
 
 #[test]
@@ -1538,8 +1637,7 @@ fn identity_limit_refuses_before_any_process_read() {
     small.candidate_pids = 2;
     let mut source = FakeSource::new(vec![
         Step::Clock(1),
-        Step::Sockets(vec![socket(80)]),
-        Step::Owners(owners(&[&[1, 2, 3]])),
+        Step::Pass(native_pass(vec![socket(80)], &[&[1, 2, 3]])),
     ]);
     assert_eq!(
         collect_consistent_with_limits(&mut source, scope(), MetadataProfile::Display, small),
@@ -1562,8 +1660,7 @@ fn owner_edge_limit_accepts_max_and_refuses_max_plus_one_before_identity_reads()
 
     let mut over = FakeSource::new(vec![
         Step::Clock(1),
-        Step::Sockets(vec![row]),
-        Step::Owners(owners(&[&[1, 1, 1]])),
+        Step::Pass(native_pass(vec![row], &[&[1, 1, 1]])),
     ]);
     assert_eq!(
         collect_consistent_with_limits(&mut over, scope(), MetadataProfile::Display, small),
@@ -1585,11 +1682,9 @@ fn identity_reads_are_bounded_across_both_passes_of_an_attempt() {
 
     let mut over = FakeSource::new(vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(owners(&[&[1]])),
+        Step::Pass(native_pass(vec![row.clone()], &[&[1]])),
         Step::Process(1, MetadataProfile::IdentityOnly, verified(1, None)),
-        Step::Sockets(vec![row]),
-        Step::Owners(owners(&[&[1, 2]])),
+        Step::Pass(native_pass(vec![row], &[&[1, 2]])),
     ]);
     assert_eq!(
         collect_consistent_with_limits(&mut over, scope(), MetadataProfile::Display, small),
@@ -1625,11 +1720,9 @@ fn total_identity_bound_is_exact_and_refuses_before_excess_read() {
     over_limits.identity_reads_total = 1;
     let mut over = FakeSource::new(vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(owners(&[&[1]])),
+        Step::Pass(native_pass(vec![row.clone()], &[&[1]])),
         Step::Process(1, MetadataProfile::IdentityOnly, verified(1, None)),
-        Step::Sockets(vec![row]),
-        Step::Owners(owners(&[&[1]])),
+        Step::Pass(native_pass(vec![row], &[&[1]])),
     ]);
     assert_eq!(
         collect_consistent_with_limits(&mut over, scope(), MetadataProfile::Display, over_limits,),
@@ -1659,11 +1752,9 @@ fn omitted_metadata_truncation_gaps_are_counted() {
     let row = socket(80);
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(owners(&[&[1]])),
+        Step::Pass(native_pass(vec![row.clone()], &[&[1]])),
         Step::Process(1, MetadataProfile::IdentityOnly, verified(1, None)),
-        Step::Sockets(vec![row]),
-        Step::Owners(owners(&[&[1]])),
+        Step::Pass(native_pass(vec![row], &[&[1]])),
         Step::Process(1, MetadataProfile::Display, verified(1, Some("xx"))),
         Step::Clock(2),
     ];
@@ -1696,19 +1787,12 @@ fn evidence_gap_overflow_is_counted_and_forces_partial() {
             "missing",
         )
     };
-    let associations = OwnerAssociations {
-        owners_by_socket: vec![vec![]],
-        local_completeness: vec![OwnerCompleteness::Complete],
-        global_completeness: OwnerCompleteness::Complete,
-        evidence_gaps: vec![gap(1), gap(2), gap(3), gap(4)],
-        omitted_evidence_gap_count: 0,
-    };
+    let mut pass = native_pass(vec![row], &[&[]]);
+    pass.evidence_gaps = vec![gap(1), gap(2), gap(3), gap(4)];
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(associations.clone()),
-        Step::Sockets(vec![row]),
-        Step::Owners(associations),
+        Step::Pass(pass.clone()),
+        Step::Pass(pass),
         Step::Clock(2),
     ];
     let mut source = FakeSource::new(steps);
@@ -1739,19 +1823,12 @@ fn a_gap_observed_in_both_passes_is_retained_once_and_costs_one_budget_slot() {
             "denied",
         )
     };
-    let associations = OwnerAssociations {
-        owners_by_socket: vec![vec![]],
-        local_completeness: vec![OwnerCompleteness::Complete],
-        global_completeness: OwnerCompleteness::Complete,
-        evidence_gaps: vec![gap(1), gap(2)],
-        omitted_evidence_gap_count: 0,
-    };
+    let mut pass = native_pass(vec![row], &[&[]]);
+    pass.evidence_gaps = vec![gap(1), gap(2)];
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(associations.clone()),
-        Step::Sockets(vec![row]),
-        Step::Owners(associations),
+        Step::Pass(pass.clone()),
+        Step::Pass(pass),
         Step::Clock(2),
     ];
     let mut source = FakeSource::new(steps);
@@ -1787,20 +1864,18 @@ fn aggregate_gap_counts_merge_by_max_without_inventing_a_cross_pass_union() {
             "at least the reported number of PIDs were denied",
         )
     };
-    let associations = |count| OwnerAssociations {
-        owners_by_socket: vec![vec![]],
-        local_completeness: vec![OwnerCompleteness::Complete],
-        global_completeness: OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
-            .expect("one reason fits"),
-        evidence_gaps: vec![aggregate(count)],
-        omitted_evidence_gap_count: 0,
+    let pass = |count| {
+        let mut pass = native_pass(vec![row.clone()], &[&[]]);
+        pass.global_owner_completeness =
+            OwnerCompleteness::partial([EvidenceGapCode::OwnerPermissionDenied])
+                .expect("one reason fits");
+        pass.evidence_gaps = vec![aggregate(count)];
+        pass
     };
     let steps = vec![
         Step::Clock(1),
-        Step::Sockets(vec![row.clone()]),
-        Step::Owners(associations(4_096)),
-        Step::Sockets(vec![row]),
-        Step::Owners(associations(4_100)),
+        Step::Pass(pass(4_096)),
+        Step::Pass(pass(4_100)),
         Step::Clock(2),
     ];
     let mut source = FakeSource::new(steps);
@@ -1905,11 +1980,9 @@ fn metadata_budget_omits_fields_in_order_without_changing_identity_or_socket() {
         };
         let steps = vec![
             Step::Clock(1),
-            Step::Sockets(vec![row.clone()]),
-            Step::Owners(owners(&[&[42]])),
+            Step::Pass(native_pass(vec![row.clone()], &[&[42]])),
             Step::Process(42, MetadataProfile::IdentityOnly, verified(7, None)),
-            Step::Sockets(vec![row]),
-            Step::Owners(owners(&[&[42]])),
+            Step::Pass(native_pass(vec![row], &[&[42]])),
             Step::Process(42, MetadataProfile::Display, full),
             Step::Clock(2),
         ];

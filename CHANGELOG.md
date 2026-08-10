@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bundled each native socket with its owner PIDs and local completeness before
+  canonicalization, making detached parallel-vector state unrepresentable and
+  removing the indexed permutation and its temporary allocations.
+- Replaced the immutable per-pass process-read `BTreeMap` with a validated,
+  sorted contiguous table. Native adapters now return the exact requested PID
+  batch, which is checked before binary-search lookup and deterministic
+  metadata materialization.
 - Pruned duplicated CLI and TUI orchestration tests for refusal paths already
   covered exhaustively by the collector, process-evidence, and process-tree
   layers. Representative interface mappings, delivery gates, and successful
