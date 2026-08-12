@@ -11,7 +11,7 @@ authors = ["nugget <vincent@sshmoi.com>"]
 readme = "README.md"
 keywords = ["ports", "processes", "tui", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["mise.toml"]
+exclude = ["mise.toml", "rust-toolchain.toml"]
 # Two binary names are declared below; `cargo run` without --bin needs this.
 default-run = "kickoutchi"
 
