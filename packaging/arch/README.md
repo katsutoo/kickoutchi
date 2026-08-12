@@ -4,24 +4,19 @@ Swamp packages for Arch users.
 
 ## What lives here
 
-- `kickoutchi-bin/` installs the Linux release archive from the GitHub Release.
-- `kickoutchi/` builds the same thing from the release source archive with Cargo.
+`kickoutchi-bin/` installs the Linux release archive from the GitHub Release.
 
-Both ship the `kickoutchi` binary and the `kick` shortcut. The `-bin` package is the quick path; the source package is for folks who want to compile their own onion layers.
+It ships the `kickoutchi` binary and the `kick` shortcut. The former source-built
+`kickoutchi` AUR package has been retired so Arch users have one maintained AUR
+package.
 
-Kickoutchi does not check for releases automatically. Update either package
+Kickoutchi does not check for releases automatically. Update the package
 through the AUR helper that installed it.
 
 ## Install from the AUR
 
 ```sh
 yay -S kickoutchi-bin
-```
-
-Or build the source version:
-
-```sh
-yay -S kickoutchi
 ```
 
 Then:
@@ -31,7 +26,7 @@ kick --version
 kick list
 ```
 
-Update either package through a normal full-system upgrade, or by asking the
+Update the package through a normal full-system upgrade, or by asking the
 configured AUR helper to rebuild that package.
 
 ## Maintainer notes

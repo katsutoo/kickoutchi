@@ -49,41 +49,39 @@ fn distribution_profile_strips_symbols_and_preserves_unwinding() {
 /// Cargo.toml because it remains pinned to the latest published release.
 #[test]
 fn arch_srcinfo_version_and_checksums_match_pkgbuild() {
-    for package in ["kickoutchi", "kickoutchi-bin"] {
-        let directory = format!("packaging/arch/{package}");
-        let pkgbuild = read(format!("{directory}/PKGBUILD"));
-        let srcinfo = read(format!("{directory}/.SRCINFO"));
+    let directory = "packaging/arch/kickoutchi-bin";
+    let pkgbuild = read(format!("{directory}/PKGBUILD"));
+    let srcinfo = read(format!("{directory}/.SRCINFO"));
 
-        let pkgbuild_version = pkgbuild
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("pkgver="))
-            .unwrap_or_else(|| panic!("{directory}/PKGBUILD declares no pkgver"))
-            .trim();
-        let srcinfo_version = srcinfo
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("pkgver = "))
-            .unwrap_or_else(|| panic!("{directory}/.SRCINFO declares no pkgver"))
-            .trim();
-        assert_eq!(
-            pkgbuild_version, srcinfo_version,
-            "{directory}/.SRCINFO is stale; regenerate it with `makepkg --printsrcinfo > .SRCINFO`",
-        );
+    let pkgbuild_version = pkgbuild
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pkgver="))
+        .unwrap_or_else(|| panic!("{directory}/PKGBUILD declares no pkgver"))
+        .trim();
+    let srcinfo_version = srcinfo
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pkgver = "))
+        .unwrap_or_else(|| panic!("{directory}/.SRCINFO declares no pkgver"))
+        .trim();
+    assert_eq!(
+        pkgbuild_version, srcinfo_version,
+        "{directory}/.SRCINFO is stale; regenerate it with `makepkg --printsrcinfo > .SRCINFO`",
+    );
 
-        let checksums = |text: &str| {
-            text.split(|ch: char| !ch.is_ascii_hexdigit())
-                .filter(|token| token.len() == 64)
-                .map(str::to_owned)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        let pkgbuild_checksums = checksums(&pkgbuild);
-        assert!(
-            !pkgbuild_checksums.is_empty(),
-            "{directory}/PKGBUILD declares no sha256 checksums",
-        );
-        assert_eq!(
-            pkgbuild_checksums,
-            checksums(&srcinfo),
-            "{directory}/.SRCINFO checksums do not match its PKGBUILD; regenerate it",
-        );
-    }
+    let checksums = |text: &str| {
+        text.split(|ch: char| !ch.is_ascii_hexdigit())
+            .filter(|token| token.len() == 64)
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let pkgbuild_checksums = checksums(&pkgbuild);
+    assert!(
+        !pkgbuild_checksums.is_empty(),
+        "{directory}/PKGBUILD declares no sha256 checksums",
+    );
+    assert_eq!(
+        pkgbuild_checksums,
+        checksums(&srcinfo),
+        "{directory}/.SRCINFO checksums do not match its PKGBUILD; regenerate it",
+    );
 }

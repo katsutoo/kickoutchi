@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-12
+
 ### Added
 
 - Added global `--verbose`/`-v` diagnostics. Debug details are written only to
@@ -91,6 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Updated the Ratatui dependency graph to require the panic-safe `lru` 0.18.2,
+  removing the safe-Rust use-after-free reported as RUSTSEC-2026-0253.
 - Kept local mutation campaigns from dirtying the checkout by ignoring
   cargo-mutants' root-level `mutants.out/` workspace.
 - Moved scheduled and documented fuzz campaigns onto disposable working
@@ -102,6 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary.
 - Corrected the direct-PID documentation: an unscoped PID must own a visible
   open port, while tree and group targeting may resolve a live portless root.
+
+### Removed
+
+- Retired the source-built `kickoutchi` AUR package and its in-repository
+  packaging. Arch users now have one supported AUR path, `kickoutchi-bin`,
+  backed by the checksummed Linux release archives.
 
 ## [1.3.10] - 2026-08-02
 
@@ -1457,7 +1467,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...v1.4.0
 [1.3.10]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...v1.3.10
 [1.3.9]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...v1.3.9
 [1.3.8]: https://github.com/nuggocto/kickoutchi/compare/v1.3.7...v1.3.8

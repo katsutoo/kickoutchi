@@ -50,7 +50,7 @@ jobs:
               set -euo pipefail
               cp -a /workspace/packaging/arch /tmp/arch
               chown -R nobody:nobody /tmp/arch
-              for package in kickoutchi kickoutchi-bin; do
+              for package in kickoutchi-bin; do
                 runuser -u nobody -- /bin/bash -lc \
                   "cd /tmp/arch/${package} && diff -u .SRCINFO <(makepkg --printsrcinfo)"
               done

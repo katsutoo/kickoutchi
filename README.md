@@ -36,9 +36,8 @@ evidence, and protected processes that were not explicitly confirmed.
 # Homebrew (Linux and macOS)
 brew install nuggocto/tap/kickoutchi
 
-# Arch (AUR) — prebuilt binary, or build from the release source
+# Arch (AUR) — prebuilt binary
 yay -S kickoutchi-bin
-yay -S kickoutchi
 
 # Cargo from Git
 cargo install --locked --git https://github.com/nuggocto/kickoutchi
@@ -60,10 +59,9 @@ required release job. [`nuggocto/scoop-bucket`](https://github.com/nuggocto/scoo
 checks GitHub Releases every four hours with Scoop Excavator. Those repositories
 are the package-manager sources of truth.
 
-Arch packages are maintained from `packaging/arch/` and pushed to the AUR after
-a GitHub Release exists, because their `pkgver` and checksums are taken from the
-real published assets. `kickoutchi-bin` installs the prebuilt Linux archive;
-`kickoutchi` builds from the release source archive.
+The Arch package is maintained from `packaging/arch/kickoutchi-bin/` and pushed
+to the AUR after a GitHub Release exists, because its `pkgver` and checksums are
+taken from the real published assets. It installs the prebuilt Linux archive.
 
 Scoop and AUR publish independently and can briefly lag a GitHub Release. The
 Homebrew tap update is part of the release workflow, while Nix installs directly
@@ -128,7 +126,7 @@ the package manager commands above when you choose to check for an update.
 
 An unqualified Git or Linux Nix GitHub source follows the repository's default branch,
 which can contain changes newer than the latest stable release. For a
-reproducible stable source install, select an explicit tag such as `v1.3.10` and
+reproducible stable source install, select an explicit tag such as `v1.4.0` and
 replace that tag deliberately when upgrading. Direct-archive installs must be
 replaced manually after verifying the new archive.
 
