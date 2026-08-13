@@ -46,7 +46,11 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
 
     let linux = workflow_job(&ci, "linux");
     named_job_step(linux, "Check formatting");
-    named_job_step(workflow_job(&ci, "msrv"), "Run MSRV tests");
+    let msrv = workflow_job(&ci, "msrv");
+    assert!(
+        step_script(named_job_step(msrv, "Compile all targets with MSRV")).contains("+\"$MSRV\"")
+    );
+    assert!(step_script(named_job_step(msrv, "Run MSRV unit tests")).contains("+\"$MSRV\""));
     for platform in ["linux", "windows", "macos"] {
         let job = workflow_job(&ci, platform);
         named_job_step(job, "Run Clippy");

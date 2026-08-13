@@ -36,11 +36,11 @@ jobs:
       - name: Install minimum supported Rust version
         run: rustup toolchain install "$MSRV" --profile minimal
 
-      - name: Use minimum supported Rust version
-        run: rustup default "$MSRV"
+      - name: Compile all targets with MSRV
+        run: cargo +"$MSRV" test --locked --all-features --no-run
 
-      - name: Run MSRV tests
-        run: cargo test --locked --all-features
+      - name: Run MSRV unit tests
+        run: cargo +"$MSRV" test --locked --all-features --lib
 
   supply-chain:
     name: Supply Chain
