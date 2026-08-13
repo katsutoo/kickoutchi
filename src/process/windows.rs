@@ -23,7 +23,7 @@ pub(super) fn prepare_termination_platform(
         PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
     let handle = unsafe {
         // SAFETY: OpenProcess takes a PID and access mask by value. We request no
-        // inherited handle, and no Rust-managed memory crosses this swamp gate.
+        // inherited handle, and no Rust-managed memory crosses this FFI boundary.
         OpenProcess(desired_access, 0, pid)
     };
     if handle.is_null() {
@@ -33,7 +33,7 @@ pub(super) fn prepare_termination_platform(
 
     let process_handle = unsafe {
         // SAFETY: OpenProcess returned a non-null owned process handle. OwnedHandle
-        // closes it exactly once, so the ogre does not leave handle crumbs behind.
+        // closes it exactly once.
         OwnedHandle::from_raw_handle(handle)
     };
     Ok(TerminationHandle {

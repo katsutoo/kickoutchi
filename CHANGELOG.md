@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-13
+
+### Changed
+
+- Release artifacts and primary CI now use Rust 1.97.1, while Rust 1.95.0
+  remains the minimum supported version and has a dedicated compatibility lane.
+- Linux port-kill integration journeys now recognize a genuine pre-delivery
+  observation race as a safe refusal on hosts without required capabilities.
+  The capability-required CI gate still requires successful delivery.
+- Clarified process identity and termination safety comments. Runtime behavior
+  is unchanged.
+
 ## [1.4.0] - 2026-08-12
 
 ### Added
@@ -1467,7 +1479,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...v1.4.0
 [1.3.10]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...v1.3.10
 [1.3.9]: https://github.com/nuggocto/kickoutchi/compare/v1.3.8...v1.3.9

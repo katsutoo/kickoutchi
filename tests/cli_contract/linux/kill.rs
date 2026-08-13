@@ -444,16 +444,6 @@ fn group_kill_by_port_signals_only_with_complete_owner_evidence() {
     );
 
     let killed_stderr = stderr(&killed);
-    if killed.status.code() == Some(1)
-        && killed_stderr.contains("collecting ports before kill failed: observation raced")
-    {
-        assert!(
-            !required_linux_capabilities(),
-            "the capability-required group-kill success journey raced instead of succeeding:\n{killed_stderr}"
-        );
-        let _ = fs::remove_file(ready_file);
-        return;
-    }
     if port_kill_refused_for_incomplete_authority(&killed) {
         assert_helper_survived_refusal(&mut helper);
         assert!(

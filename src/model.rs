@@ -256,8 +256,7 @@ pub(crate) struct ProcessContext {
     pub(crate) owner_uid: Option<u32>,
     /// Platform-specific process start marker, used purely as a kill-target
     /// identity guard. We never render or serialize it: it only exists so a PID
-    /// that wanders off and comes back wearing another process's face gets caught
-    /// before the boot hits the swamp water.
+    /// that exits and has its PID reused is caught before signal delivery.
     pub(crate) process_start_time_marker: Option<ProcessStartMarker>,
     pub(crate) children: ChildProcessSnapshot,
     pub(crate) docker: Option<DockerPortContext>,

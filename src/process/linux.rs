@@ -25,7 +25,7 @@ pub(super) fn prepare_termination_platform(
     };
 
     // Open the pidfd before revalidation. That gives us a stable handle to the
-    // process we are about to re-check, so if the old swamp squatter exits and
+    // process we are about to re-check, so if the original process exits and
     // Linux recycles the numeric PID before signal delivery, the signal still
     // goes through this handle instead of chasing the recycled number.
     // SAFETY: pid has already been range-checked to pid_t, flags is zero as

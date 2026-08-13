@@ -1,10 +1,9 @@
 //! Process-tree planning plus the Unix freeze-first execution pipeline.
 //!
 //! Single-process kill (see `process.rs`) is precise on purpose: it signals
-//! exactly one confirmed PID. Tree kill is the big ogre button — it terminates a
-//! confirmed root together with its descendants — and its whole design exists to
-//! win one specific race: a target that keeps spawning children faster than you
-//! can kill them.
+//! exactly one confirmed PID. Tree kill terminates a confirmed root together
+//! with its descendants. Its whole design exists to win one specific race: a
+//! target that keeps spawning children faster than you can kill them.
 //!
 //! Group kill shares the same freeze-first pipeline but derives membership from
 //! the POSIX process group instead of parent links. It exists for the two cases

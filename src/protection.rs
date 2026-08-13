@@ -1,9 +1,9 @@
 //! Deciding which processes get an "are you *sure*?" before we kick them out.
 //!
 //! The collector just reports the facts; protection is a policy we layer on top
-//! from the user's config. Some swamp residents — init, your database, Docker —
-//! are load-bearing, and you really don't want them wandering off because of a
-//! stray keypress.
+//! from the user's config. Processes such as init, databases, and Docker may be
+//! operationally critical, so they require an additional warning before
+//! termination.
 
 use std::borrow::Cow;
 

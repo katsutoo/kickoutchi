@@ -17,10 +17,31 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: 1.95.0
+  RUST_VERSION: 1.97.1
+  MSRV: 1.95.0
   ARCHLINUX_IMAGE: "archlinux:base-devel@sha256:33c534be6c990710a878b37192904dd448e162ade06a201d95a80b42be2110c7"
 
 jobs:
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install minimum supported Rust version
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - name: Use minimum supported Rust version
+        run: rustup default "$MSRV"
+
+      - name: Run MSRV tests
+        run: cargo test --locked --all-features
+
   supply-chain:
     name: Supply Chain
     runs-on: ubuntu-latest
@@ -215,6 +236,7 @@ jobs:
     name: CI Complete
     if: ${{ always() }}
     needs:
+      - msrv
       - supply-chain
       - linux
       - nix
@@ -226,6 +248,7 @@ jobs:
     steps:
       - name: Require every CI lane
         env:
+          MSRV_RESULT: ${{ needs.msrv.result }}
           SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
           LINUX_RESULT: ${{ needs.linux.result }}
           NIX_RESULT: ${{ needs.nix.result }}
@@ -234,6 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           for result in \
+            "$MSRV_RESULT" \
             "$SUPPLY_CHAIN_RESULT" \
             "$LINUX_RESULT" \
             "$NIX_RESULT" \

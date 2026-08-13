@@ -17,7 +17,7 @@ fn workflows_pin_actions_and_keep_credentials_and_permissions_narrow() {
 
 #[test]
 fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
-    const LANES: [&str; 5] = ["supply-chain", "linux", "nix", "windows", "macos"];
+    const LANES: [&str; 6] = ["msrv", "supply-chain", "linux", "nix", "windows", "macos"];
 
     let ci = parsed_workflow(CI_WORKFLOW);
     let triggers = mapping_value(workflow_root(&ci), "on")
@@ -46,6 +46,7 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
 
     let linux = workflow_job(&ci, "linux");
     named_job_step(linux, "Check formatting");
+    named_job_step(workflow_job(&ci, "msrv"), "Run MSRV tests");
     for platform in ["linux", "windows", "macos"] {
         let job = workflow_job(&ci, platform);
         named_job_step(job, "Run Clippy");

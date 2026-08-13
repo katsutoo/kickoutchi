@@ -4,7 +4,7 @@
 //! owns each one. Process metadata is read natively for all sorted owner PIDs in
 //! one bounded batch bracketed by at most two Toolhelp relation snapshots. Open
 //! process handles retain high-resolution creation markers across that bracket,
-//! because PID reuse is where the dragon lives.
+//! because PID reuse can otherwise attach metadata to the wrong process.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -509,13 +509,13 @@ impl ProcessSnapshot {
 
     /// Direct children of `pid`, resolved on demand from the process map.
     ///
-    /// No standing guest list of every ogre's offspring: this scans `processes`
-    /// once per call instead of maintaining a precomputed parent->children index.
+    /// This scans `processes` once per call instead of maintaining a precomputed
+    /// parent->children index.
     /// Only `collect_process_context` asks for children, and only when the details
-    /// modal opens — a rare, human-triggered action — so the per-refresh table path
+    /// modal opens, a rare human-triggered action, so the per-refresh table path
     /// never builds a child index it does not read. It mirrors the Linux collector,
-    /// which resolves children lazily too. Self is excluded, because no resident of
-    /// the swamp gets to show up as its own kid.
+    /// which resolves children lazily too. Self is excluded because a process
+    /// cannot be its own child.
     fn children(&self, pid: u32) -> ChildProcessSnapshot {
         let mut children = self
             .processes

@@ -33,5 +33,5 @@ install-path = "CARGO_HOME"
 # The namespace capability journey hangs on the older Ubuntu 22.04 runner
 # kernels. Keep archive execution native while matching the passing CI kernel.
 [dist.github-custom-runners]
-x86_64-unknown-linux-gnu = { runner = "ubuntu-22.04", host = "x86_64-unknown-linux-gnu", container = { image = "rust:1.95-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf", host = "x86_64-unknown-linux-gnu", package-manager = "apt" } }
-aarch64-unknown-linux-gnu = { runner = "ubuntu-24.04-arm", host = "aarch64-unknown-linux-gnu", container = { image = "rust:1.95-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf", host = "aarch64-unknown-linux-gnu", package-manager = "apt" } }
+x86_64-unknown-linux-gnu = { runner = "ubuntu-22.04", host = "x86_64-unknown-linux-gnu", container = { image = "rust:1.97.1-bullseye@sha256:02d78ca3f928195c2a907543de778adfd728ad7e2a24fdc6aef582b7c77842e0", host = "x86_64-unknown-linux-gnu", package-manager = "apt" } }
+aarch64-unknown-linux-gnu = { runner = "ubuntu-24.04-arm", host = "aarch64-unknown-linux-gnu", container = { image = "rust:1.97.1-bullseye@sha256:02d78ca3f928195c2a907543de778adfd728ad7e2a24fdc6aef582b7c77842e0", host = "aarch64-unknown-linux-gnu", package-manager = "apt" } }
