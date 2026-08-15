@@ -1,4 +1,4 @@
-//! The "wait, are you sure you want to kill this?" modal.
+//! Termination confirmation modal.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -19,8 +19,7 @@ use super::{rendered_rows, wrapped_rows};
 
 /// Ceiling on the node preview inside the tree confirmation modal. The actual
 /// number of preview rows is budgeted per render from the modal height, so the
-/// typed-word instruction, the input echo, and the Esc hint can never fall
-/// below the fold — a confirmation must not accept input it is not showing.
+/// typed-word instruction, input echo, and Escape hint remain visible.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TREE_MODAL_PREVIEW_MAX: usize = 8;
 
@@ -95,11 +94,8 @@ fn tree_confirmation_lines(
     content_rows: usize,
     content_cols: usize,
 ) -> Option<Vec<Line<'static>>> {
-    // Every mandatory line is built exactly once, then measured to compute the
-    // preview budget. Measuring the rendered lines themselves — rather than
-    // re-typed copies of their prose — is what guarantees the typed-word
-    // instruction, the input echo, and the Esc hint can never fall below the
-    // fold: a confirmation must not accept input it is not showing.
+    // Measure the rendered mandatory lines before allocating preview rows. This
+    // keeps the instruction, input, and Escape hint visible.
     let mut head = vec![
         Line::styled(tree_header_text(confirmation), theme.title()),
         field(
@@ -128,8 +124,7 @@ fn tree_confirmation_lines(
         )),
     }
 
-    // Everything after the budgeted preview nodes: scoped preview warnings,
-    // mode and target warnings, and the actionable prompt block.
+    // Append warnings and the prompt after the budgeted preview nodes.
     let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(preview) = &confirmation.preview {
         if preview.has_system_process() {
@@ -514,7 +509,6 @@ mod tests {
         use super::tree_confirmation_lines;
         use crate::app::{TreeConfirmStage, TreeKillConfirmation};
 
-        // A tall modal: the preview budget is not the constraint here.
         let render = |confirmation: &TreeKillConfirmation| {
             tree_confirmation_lines(confirmation, Theme::from_environment(), 40, 100)
                 .expect("mandatory confirmation rows fit")
@@ -524,7 +518,6 @@ mod tests {
                 .join("\n")
         };
 
-        // Loading: no count yet, and the modal must say so.
         let mut confirmation = TreeKillConfirmation {
             target: target(false),
             mode: KillMode::Terminate,
@@ -539,7 +532,6 @@ mod tests {
         assert!(!text.contains("Type tree"), "{text}");
         assert!(!text.contains("Input:"), "{text}");
 
-        // Loaded word stage: count, node list, and the exact word to type.
         let infos = vec![
             crate::tree::TreeProcessInfo {
                 pid: 18422,
@@ -572,7 +564,6 @@ mod tests {
         assert!(text.contains("Type tree"), "{text}");
         assert!(text.contains("SIGTERM"), "{text}");
 
-        // Protected stage names both facts the user must type, in order.
         confirmation.target = target(true);
         confirmation.stage = TreeConfirmStage::ProtectedRoot;
         let text = render(&confirmation);
@@ -582,9 +573,8 @@ mod tests {
     }
 
     /// At the smallest supported modal (80x20 terminal -> 13 content rows),
-    /// a large tree must shrink its preview rather than push the typed-word
-    /// instruction, the input echo, or the Esc hint below the fold: the modal
-    /// keeps accepting keystrokes, so what it asks for must stay visible.
+    /// a large tree must shrink its preview to keep the instruction, input, and
+    /// Escape hint visible.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn tree_confirmation_prompt_stays_visible_at_minimum_modal_height() {
@@ -654,7 +644,6 @@ mod tests {
         assert!(text.contains("Input: for"), "{text}");
         assert!(text.contains("keep typing"), "{text}");
         assert!(text.contains("Esc cancels."), "{text}");
-        // The tree size stays honest even when the node list is clipped.
         assert!(text.contains("tree (21 processes)"), "{text}");
         assert!(text.contains("more"), "{text}");
     }

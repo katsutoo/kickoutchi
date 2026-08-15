@@ -1,10 +1,9 @@
 //! Native macOS socket collection through libproc.
 //!
 //! macOS does not have Linux's `/proc/net` tables or Windows' IP Helper owner
-//! tables. The least bad native path is process-first: list PIDs, list each
-//! process' file descriptors with `proc_pidinfo`, then ask `proc_pidfdinfo` for
-//! socket descriptors. That keeps `lsof` out of the default path and keeps every
-//! Darwin layout used for the FFI in this module.
+//! tables. Collection is process-first: list PIDs, read descriptors with
+//! `proc_pidinfo`, then inspect sockets with `proc_pidfdinfo`. Darwin FFI layouts
+//! remain inside this module.
 
 #![allow(
     clippy::struct_field_names,
@@ -819,7 +818,7 @@ pub(crate) fn process_start_time_marker_result(pid: u32) -> std::io::Result<Proc
 }
 
 /// Best-effort command line for one PID, for the read-only inspect view.
-/// `None` covers vanished, restricted, and kernel processes alike — inspect
+/// `None` covers vanished, restricted, and kernel processes alike. Inspect
 /// renders it as unknown rather than failing the report.
 pub(crate) fn process_command_line(pid: u32) -> Option<String> {
     read_command_line(pid).ok().flatten()
@@ -865,8 +864,8 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 /// Snapshots come from one `proc_listallpids` walk with a `proc_bsdinfo` read
 /// per PID; signal delivery goes through the `process` module's shared `kill(2)`
 /// boundary. Darwin has no pidfd, so delivery cannot be pinned to a process
-/// object the way Linux pins it. The stop-verify gate covers most of the gap —
-/// a stopped process cannot fork, exec, or exit *on its own* — but an external
+/// object the way Linux pins it. The stop-verify gate narrows the gap because a
+/// stopped process cannot fork, exec, or exit on its own. An external
 /// `SIGKILL` can still remove a stopped process, and for a member whose parent
 /// is running (the root, and group members with parents outside the group) the
 /// zombie can be reaped and the PID recycled before our raw-PID signal lands.
@@ -1226,11 +1225,9 @@ fn process_group_for_pid(target_pid: u32) -> Result<Option<u32>, CollectorError>
 
 /// Pure conversion from one Darwin BSD info read to a tree snapshot row.
 ///
-/// `pbi_ppid` of `0` maps to no parent (kernel/launchd roots), matching how
-/// the rest of this module treats PID 0 as "no such process". `pbi_pgid` of
-/// `0` likewise maps to no targetable process group; both ride the same
-/// fail-closed `proc_bsdinfo` read, which group kill relies on for complete
-/// membership.
+/// `pbi_ppid` of `0` maps to no parent for kernel and launchd roots. `pbi_pgid`
+/// of `0` maps to no targetable process group. Both values come from the same
+/// fail-closed `proc_bsdinfo` read used to prove group membership.
 fn tree_process_info_from_bsd(
     pid: u32,
     info: &libc::proc_bsdinfo,

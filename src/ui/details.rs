@@ -1,4 +1,4 @@
-//! The selected-row details: the panel down the side, and the bigger modal.
+//! Selected-row details panel and modal.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

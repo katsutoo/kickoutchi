@@ -1,8 +1,6 @@
 //! Terminal lifecycle, the event loop, and drawing.
 //!
-//! The one promise this module makes: we enter the terminal and — above all —
-//! always put it back. Clean quit, a propagated error, or a full-on panic, the
-//! terminal gets restored either way.
+//! Terminal state is restored after normal return, propagated error, or panic.
 
 mod confirm;
 mod details;
@@ -175,7 +173,7 @@ static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 ///
 /// Split out from the handler so the first-wins rule can be exercised against a
 /// caller-supplied slot. Driving the process-global from a test instead would
-/// race every concurrent reader of it — including the one inside
+/// race every concurrent reader of it, including the one inside
 /// [`wait_for_startup_worker`], which consumes the slot on each poll and would
 /// silently steal the recorded signal.
 ///
@@ -349,29 +347,16 @@ impl Drop for BlockedTerminationSignals {
     }
 }
 
-/// RAII guard that owns the terminal's raw-mode and alternate-screen state.
-///
-/// Setup (raw mode + alternate screen) happens in [`TerminalGuard::enter`];
-/// teardown happens in `Drop`. Bundling the two into one type makes a leak
-/// impossible to miss at the type level: while the guard is alive the terminal is
-/// in TUI mode, and the instant it drops the terminal is back to normal — whether
-/// that drop came from a normal return, `?` unwinding an error, or a panic
-/// unwinding the stack. That's the whole reason this guard exists instead of
-/// loose enable/disable calls that an early return could quietly skip.
+/// Owns raw mode and alternate-screen state, restoring both on drop.
 struct TerminalGuard {
     terminal: Tui,
 }
 
 impl TerminalGuard {
-    /// Enter raw mode and the alternate screen, handing back a guard that puts
-    /// both back on drop.
+    /// Enter raw mode and the alternate screen, returning a restoration guard.
     ///
-    /// Anything that fails *after* raw mode is on restores the terminal before
-    /// propagating. There's no guard yet at that point, so `Drop` can't run, and
-    /// the panic hook only fires on panics — so without this little dance, an
-    /// error from entering the alternate screen or building the terminal (its
-    /// first size query does real I/O) would leave the shell stuck in raw mode,
-    /// the exact thing this module exists to prevent.
+    /// If setup fails after enabling raw mode, restore the terminal before
+    /// returning the error because no guard exists yet.
     fn enter() -> AppResult<Self> {
         enable_raw_mode()?;
         TERMINAL_ACTIVE.store(true, Ordering::Release);
@@ -402,19 +387,12 @@ impl Drop for TerminalGuard {
 
 /// Put the terminal back, logging instead of propagating if a step fails.
 ///
-/// Called from `Drop` and the panic hook (where we can't return an error) and
-/// from [`TerminalGuard::enter`]'s failure path (where a restore failure must not
-/// clobber the original error). A terminal we can't reset is already a lost
-/// cause, so the best we can do is note why it might be left messy without hiding
-/// the failure that's already in flight. Callers can overlap — the panic hook and
-/// `Drop` both run during one panic, and the `enter` path restores before the
-/// alternate screen was ever entered — so a redundant restore is expected and
-/// totally harmless.
+/// Called from `Drop`, the panic hook, and setup failure. Restoration errors are
+/// logged so they do not replace the original error. Calls may overlap during
+/// panic unwinding, so restoration must be idempotent.
 ///
-/// Teardown undoes [`TerminalGuard::enter`] in reverse: leave the alternate
-/// screen, then disable raw mode. Each step is tried and logged on its own — bail
-/// out early here and you could strand the user on a blank alternate screen,
-/// which is the exact failure this module exists to prevent.
+/// Teardown leaves the alternate screen, then disables raw mode. Both steps are
+/// attempted even if the first fails.
 fn best_effort_restore() {
     if let Err(error) = execute!(io::stdout(), LeaveAlternateScreen) {
         tracing::warn!(%error, "failed to leave alternate screen");
@@ -432,11 +410,9 @@ fn restore_terminal_if_active() {
 
 /// Install a panic hook that restores the terminal before the panic prints.
 ///
-/// Has to run before we enter the alternate screen. Without it, the default hook
-/// would print the panic onto the alternate screen, which the guard's `Drop` then
-/// tears down — and poof, the message is gone. Restoring first means the panic
-/// lands on the normal screen where the user can actually read it. We keep the
-/// original hook so backtraces and `RUST_BACKTRACE` still work.
+/// Install before entering the alternate screen. The hook restores the normal
+/// screen before invoking the original hook, preserving panic messages and
+/// backtraces.
 fn install_panic_hook() -> PanicHookGuard {
     let original_hook = std::panic::take_hook();
     let original = Arc::new(OriginalPanicHook {
@@ -495,7 +471,7 @@ pub(crate) fn spawn_worker<T: Send + 'static>(
             Err(payload) => {
                 let failure = WorkerFailure::from_panic(payload.as_ref());
                 if result_sender.send(Err(failure)).is_err() {
-                    // No owner remains to surface the typed failure. Re-raise
+                    // No owner remains to report the typed failure. Re-raise
                     // with the marker cleared so the normal panic hook reports
                     // the programmer error instead of silently dropping it.
                     IS_TUI_WORKER.with(|worker| worker.set(false));
@@ -678,7 +654,7 @@ fn finalize_unix_after_block(
     if let Some(signal) = requested_signal {
         // Re-raise with the embedder's exact disposition while blocked. Restoring
         // the old mask below delivers default/custom handlers atomically; an
-        // ignored disposition deliberately discards the signal.
+        // ignored disposition discards the signal.
         // SAFETY: `signal` is one of SIGTERM/SIGHUP recorded by our handler.
         if unsafe { libc::raise(signal) } != 0 {
             return Err(io::Error::last_os_error().into());
@@ -705,8 +681,7 @@ enum EventLoopExit {
     Signal(libc::c_int),
 }
 
-// Draw a frame, wait for one input event, handle it, then go round again until
-// a quit key shows up.
+// Run the draw, input, and update loop until quit.
 fn event_loop(
     terminal: &mut Tui,
     app: &mut App,
@@ -963,9 +938,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 /// A `Label: value` line, shared by the details panel, the details modal, and
 /// the kill-confirmation modal so those panels stay visually consistent. It
-/// lives here in the parent module instead of being copied into each submodule:
-/// one definition means the label styling and the `: ` separator can never drift
-/// between panels that are meant to look the same.
+/// lives in the parent module so all panels use the same label style and
+/// separator.
 fn field(label: &'static str, value: String, theme: Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label}: "), theme.label()),

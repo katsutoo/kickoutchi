@@ -3,8 +3,8 @@
 //! Process names, paths, and command lines are read straight from the OS and can
 //! contain control characters, newlines, or ANSI escape sequences. The JSON path
 //! keeps that data raw because scripts need the real values, but anything a human
-//! sees — tables, details panels, kill confirmations — should pass through here
-//! first so a funky process can't move the cursor, hide text, or fake a prompt.
+//! sees must pass through this module so untrusted process text cannot move the
+//! cursor, hide text, or imitate a prompt.
 
 use std::net::IpAddr;
 

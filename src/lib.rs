@@ -1,10 +1,7 @@
 //! Kickoutchi: a cross-platform TUI and CLI port janitor.
 //!
-//! Basically "what are you doing in my swamp?!" — but for whatever's squatting
-//! on your local ports.
-//!
 //! This crate is internal application plumbing shared by the `kickoutchi` and
-//! `kick` binaries. It is not a supported embedding API: its bootstrap reads
+//! `kick` binaries. It is not a supported embedding API. Its bootstrap reads
 //! process-global arguments and owns terminal, standard-I/O, tracing, and signal
 //! lifecycle while it runs.
 
@@ -39,8 +36,8 @@ mod query;
 mod release_archive_path;
 #[cfg(test)]
 mod test_support;
-// Shared process-tree planning with Unix freeze-first and Windows Job Object
-// execution kept as platform-specific children of one capability module.
+// Shared process-tree planning. Unix freeze-first and Windows Job Object
+// execution remain platform-specific.
 mod tree;
 mod ui;
 mod watch;
@@ -62,7 +59,7 @@ use crate::display::sanitize_multiline;
 /// Binary bootstrap entry point shared by `kickoutchi` and `kick`.
 ///
 /// This remains public only because Cargo builds each binary as a separate crate.
-/// It is intentionally hidden from generated documentation and is not a stable
+/// It is hidden from generated documentation and is not a stable
 /// embedding contract: it parses process-global arguments and writes directly to
 /// standard I/O. The TUI temporarily owns process-wide signal handlers, and watch
 /// uses one process-global Ctrl-C owner whose cancellation remains latched for the
@@ -78,8 +75,8 @@ pub fn run() -> ExitCode {
         return tree::windows::run_freeze_probe_child();
     }
 
-    // Tracing must be installed before clap renders an error so repeated calls
-    // still respect an embedder-owned subscriber. The exact boolean flag can be
+    // Install tracing before clap renders errors. Repeated calls must still
+    // respect an embedder-owned subscriber. The exact boolean flag can be
     // recognized without interpreting or retaining any other argv content.
     init_tracing(verbose_requested());
     let args = match Cli::try_parse() {
@@ -140,9 +137,9 @@ pub fn run() -> ExitCode {
     }
 }
 
-/// Run the TUI path. [`ui::run_owned`] scopes the panic hook to this path because
-/// its whole job is putting the terminal back the way we found it; the headless
-/// CLI path never enters the alternate screen and keeps the embedder's hook.
+/// Run the TUI path. [`ui::run_owned`] scopes terminal restoration and the panic
+/// hook to this path. The headless CLI path never enters the alternate screen
+/// and keeps the embedder's hook.
 ///
 /// Order matters for safety: install the panic hook *before* entering the
 /// alternate screen, so a panic during setup or rendering still restores the
@@ -156,11 +153,8 @@ fn run_tui(config: &Config) -> ExitCode {
     match result {
         Ok(()) => ExitReason::Success.into(),
         Err(error) => {
-            // The terminal's already restored by now, so this lands on the
-            // normal screen. Just one line for the user: the tracing subscriber
-            // also writes to stderr, so logging the same error here would print
-            // it twice. Internal diagnostics go through tracing (see the
-            // Drop/panic restore path); fatal user-facing output uses eprintln.
+            // The terminal is restored before this branch. Print the fatal error
+            // once because tracing also writes to stderr.
             eprintln!("error: {}", sanitize_multiline(&error.to_string()));
             ExitReason::Failure.into()
         }
@@ -177,11 +171,10 @@ fn write_cli_stdout(mut writer: impl Write, text: &str) -> io::Result<()> {
     }
 }
 
-/// Set up tracing for diagnostics that must never touch the TUI surface.
+/// Set up tracing for diagnostics written outside rendered TUI frames.
 ///
-/// Logs go to stderr, never stdout (the alternate screen owns stdout), and only
-/// when we're outside the alternate screen anyway: startup, shutdown, panic, and
-/// fatal-error time. So they can never scribble over a rendered frame.
+/// Logs go to stderr during startup, shutdown, panic handling, and fatal-error
+/// reporting. The alternate screen owns stdout.
 fn init_tracing(verbose: bool) {
     // Embedders own the process-global subscriber; an existing one is valid.
     let max_level = if verbose {

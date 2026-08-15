@@ -306,8 +306,8 @@ fn refusal_prepares_verified_identity_before_each_thaw() {
 }
 
 /// A member that vanished under the freeze leaves nothing stopped, so it
-/// must not be named as a thaw failure — that would send the user chasing
-/// a PID that no longer exists. Only a refused `SIGCONT` is a real failure.
+/// must not be named as a thaw failure because that PID no longer exists.
+/// Only a refused `SIGCONT` is a real failure.
 /// This pins the same `Denied`-only rule the delivery paths and the
 /// single-process `outcome_after_thaw` already use.
 #[test]
@@ -829,7 +829,6 @@ fn single_root_terminates_with_term_then_cont() {
     };
     assert_eq!(report.total, 1);
     assert_eq!(report.delivered, 1);
-    // Stop first, terminate last, continue after terminate.
     assert_eq!(
         ops.events,
         vec![
@@ -844,7 +843,7 @@ fn single_root_terminates_with_term_then_cont() {
 fn spawner_converges_and_kills_leaves_first() {
     let root = root_target(100, "root", 10);
     // The child (101) spawns a grandchild (102) that only appears in a later
-    // sweep — the fixed point must still catch it.
+    // sweep. The fixed point must still catch it.
     let base = vec![
         info(100, Some(1), "root", 10),
         info(101, Some(100), "child", 11),
@@ -875,7 +874,6 @@ fn spawner_converges_and_kills_leaves_first() {
         panic!("expected completion, got {outcome:?}");
     };
     assert_eq!(report.total, 3);
-    // Deepest first, root last.
     assert_eq!(ops.delivered_pids(), vec![102, 101, 100]);
 }
 
@@ -894,7 +892,6 @@ fn force_mode_kills_without_continue() {
     );
 
     assert!(matches!(outcome, TreeKillOutcome::Completed(_)));
-    // No SIGCONT after SIGKILL.
     assert_eq!(
         ops.events,
         vec![Event::Stop(100), Event::Deliver(100, KillMode::Force)],
@@ -1123,7 +1120,7 @@ fn cap_exceeded_during_freeze_thaws_and_refuses() {
         },
     );
     assert!(ops.delivered_pids().is_empty());
-    // Everything stopped so far was thawed — the same PIDs, not just the
+    // Everything stopped so far was thawed. Check the same PIDs, not just the
     // same number of signals.
     let mut stopped: Vec<u32> = ops
         .events
@@ -1383,13 +1380,9 @@ fn ginfo(pid: u32, parent: Option<u32>, name: &str, marker: u64, group: u32) -> 
 fn group_plan_is_a_flat_member_set_with_the_root_first() {
     let snapshot = vec![
         ginfo(100, Some(1), "root", 10, 42),
-        // In the group but NOT a descendant — the case group scope exists for.
         ginfo(150, Some(1), "orphan", 11, 42),
-        // Lower PID than the root: display order is still root first.
         ginfo(90, Some(1), "worker", 12, 42),
-        // Same parent, different group: not a member.
         ginfo(300, Some(1), "outsider", 13, 77),
-        // Kernel-domain row (no targetable group): provably not a member.
         info(2, None, "kthreadd", 14),
     ];
 
@@ -1468,9 +1461,7 @@ fn group_kill_reaches_a_reparented_member_and_signals_the_root_last() {
     };
     assert_eq!(report.total, 2);
     assert_eq!(report.delivered, 2);
-    // Members first, confirmed root last.
     assert_eq!(ops.delivered_pids(), vec![150, 100]);
-    // Terminate mode: every member is continued after its pending SIGTERM.
     assert!(ops.events.contains(&Event::Cont(150)));
     assert!(ops.events.contains(&Event::Cont(100)));
 }
@@ -1571,7 +1562,7 @@ fn group_member_reparenting_mid_kill_is_not_identity_drift() {
         ginfo(150, Some(250), "worker", 11, 42),
     ];
     // ...and exits before the final verify: the worker reparents, keeping
-    // its group. Group identity is the group, not the parent — this must
+    // its group. Group identity is the group, not the parent. This must
     // proceed where the tree rules would refuse.
     let reparented = vec![
         ginfo(100, Some(1), "root", 10, 42),
@@ -1679,7 +1670,7 @@ fn group_cap_exceeded_during_freeze_thaws_and_refuses() {
         },
     );
     assert!(ops.delivered_pids().is_empty());
-    // Everything stopped so far was thawed — the same PIDs, not just the
+    // Everything stopped so far was thawed. Check the same PIDs, not just the
     // same number of signals.
     let mut stopped: Vec<u32> = ops
         .events
@@ -1797,7 +1788,6 @@ fn deep_static_chain_freezes_in_one_pass_and_kills_leaves_first() {
     };
     assert_eq!(report.total, 10);
     assert_eq!(report.delivered, 10);
-    // Deepest first, root last.
     let expected: Vec<u32> = (100..110).rev().collect();
     assert_eq!(ops.delivered_pids(), expected);
 }

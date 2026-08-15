@@ -8,7 +8,6 @@ fn inspect_shows_family_read_only_with_kill_hint() {
     let root_pid_text = helper.id().to_string();
     let port_text = port.to_string();
 
-    // By parent PID: the root owns no port, only its child does.
     let by_pid = kickoutchi(&["inspect", "--pid", root_pid_text.as_str()]);
     assert_eq!(by_pid.status.code(), Some(0), "{}", stderr(&by_pid));
     let out = stdout(&by_pid);
@@ -24,7 +23,6 @@ fn inspect_shows_family_read_only_with_kill_hint() {
         "{out}",
     );
 
-    // By port: resolves to the owning child.
     let by_port = kickoutchi(&["inspect", "--port", port_text.as_str()]);
     assert_eq!(by_port.status.code(), Some(0), "{}", stderr(&by_port));
     assert!(
@@ -33,10 +31,8 @@ fn inspect_shows_family_read_only_with_kill_hint() {
         stdout(&by_port),
     );
 
-    // Read-only: everything is still alive after both reports.
     assert!(pid_exists(child_pid), "inspect must not signal anything");
 
-    // A PID that cannot exist is a clean no-match.
     let missing = kickoutchi(&["inspect", "--pid", "4000000000"]);
     assert_eq!(missing.status.code(), Some(3));
 

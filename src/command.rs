@@ -1,7 +1,7 @@
-//! Turning a kill into the shell command we show the user.
+//! Shell-command rendering for termination previews.
 //!
-//! The real termination goes through platform APIs, but showing the matching
-//! shell command keeps the destructive bit auditable before the user says yes.
+//! Termination uses platform APIs. The preview shows an equivalent shell command
+//! before confirmation.
 
 use crate::model::Platform;
 use crate::process::KillMode;

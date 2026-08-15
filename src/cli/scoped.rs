@@ -1,7 +1,7 @@
-//! Scoped kills: `--tree` and `--group`. One confirmed root authorizes a
-//! bounded set of processes, so beyond the single-kill gates these flows add
-//! typed scope words, fresh-scan re-gating, and (on Unix) the freeze-first
-//! executor from `crate::tree`; Windows uses Job Object containment instead.
+//! Scoped `--tree` and `--group` kills.
+//!
+//! One confirmed root authorizes a bounded process set. Unix uses freeze-first
+//! execution; Windows uses Job Object containment.
 
 use std::io::Write;
 
@@ -54,7 +54,7 @@ enum TreeConfirmDecision {
 }
 
 /// Facts established by confirmation and needed by the fresh
-/// execution-time gates. `skipped_prompt` is deliberately separate from
+/// execution-time gates. `skipped_prompt` is separate from
 /// `args.yes`: `--yes` can still fall back to a typed prompt when the preview has
 /// warnings, and that explicit word should not be treated as a silent skip.
 #[derive(Debug, Clone, Copy)]
@@ -73,8 +73,7 @@ fn scope_authorization(confirmation: ScopedConfirmationFacts) -> tree::ScopeAuth
     }
 }
 
-/// The injected seams for a tree kill, bundled so the entry point stays under
-/// the argument-count limit and mirrors `KillCollectors` in the `kill` module.
+/// Injected collection and process-operation seams for a tree kill.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts> {
     collect_context: CollectContext,
@@ -143,9 +142,8 @@ where
     CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    // Preview snapshot: informational only. Execution re-enumerates under the
-    // freeze and is the authority; this drives the banner and the pre-flight
-    // refusals, which have zero side effects.
+    // The preview drives the banner and side-effect-free preflight checks.
+    // Execution enumerates again after freezing.
     let snapshot = match ops.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -351,7 +349,7 @@ where
     };
 
     // A port-selected root must be retained before the final authoritative
-    // endpoint collection. PID mode deliberately keeps its existing path.
+    // endpoint collection. PID mode keeps its existing path.
     let prepared_root = if args.port.is_some() {
         match (seams.prepare_root)(root.pid) {
             Ok(handle) => Some(handle),
@@ -467,7 +465,7 @@ fn windows_fresh_tree_gates(
 }
 
 /// Run the confirmation flow. On success, the returned bool records whether
-/// the protected-root confirmation was actually completed — the execution-time
+/// the protected-root confirmation was completed. The execution-time
 /// protection guard needs that fact, because a root can be classified as
 /// protected by a fresh scan even when the confirmed port row could not be.
 fn confirm_tree_kill<Prompt>(
@@ -491,9 +489,8 @@ where
 
 /// Execute the confirmation decision shared by tree and group scope.
 ///
-/// Scope-specific policy chooses the decision and banner before this point;
-/// this helper only preserves the identical prompt ordering and records the
-/// exact authorization facts consumed by fresh revalidation.
+/// Scope-specific policy selects the banner and requirement. This helper keeps
+/// prompt ordering identical and records facts for revalidation.
 fn confirm_scoped_kill<Prompt, PrintBanner>(
     root: &KillTarget,
     members: &tree::ProcessTreeTarget,
@@ -632,10 +629,8 @@ fn kill_target_from_tree_info(
         parent_process_name: info.parent_process_name.as_deref(),
     }
     .is_system_process();
-    // Honest metadata status: identity fields decide partial-vs-full, and the
-    // snapshot's owner UID reaches the target so the ownership warning can
-    // fire for a portless supervisor owned by another user. A missing UID is
-    // not partial metadata by itself — it only mutes the ownership warning.
+    // Identity fields determine metadata completeness. Owner UID is retained for
+    // warnings, but a missing UID alone does not make metadata partial.
     let complete = info.process_name.is_some() && info.start_time_marker.is_some();
     KillTarget {
         pid: info.pid,
@@ -830,8 +825,7 @@ fn scoped_preflight_refusal(
             eprintln!("error: process {scope_noun} contains protected process PID {pid} ({name}); refusing {scope_noun} kill");
             ExitReason::ProtectedNeedsConfirmation
         }
-        // preflight_outcome only produces the gates above today; if it ever
-        // grows one, refuse loudly rather than exiting without a word.
+        // Refuse unknown preflight outcomes with an explicit diagnostic.
         other => {
             eprintln!("error: process {scope_noun} pre-flight refused the kill: {other:?}");
             ExitReason::Failure
@@ -845,9 +839,8 @@ fn tree_confirmation(
     mode: KillMode,
     yes: bool,
 ) -> TreeConfirmDecision {
-    // Protected if *either* reader says so: the port-row policy (which needs a
-    // readable row name) or the tree scan's root classification. The two can
-    // disagree on partial-metadata rows, and protection must win either way.
+    // Treat the root as protected if either the named socket row or the tree
+    // scan classifies it that way. Protection wins when the readers disagree.
     if root.protected || preview.root().is_some_and(|node| node.protected) {
         if yes {
             return TreeConfirmDecision::RefuseProtectedYes;
@@ -855,8 +848,7 @@ fn tree_confirmation(
         return TreeConfirmDecision::PromptProtectedThenWord(tree::tree_scope_word(mode));
     }
 
-    // Terminate asks for "tree"; force asks for "force" — the more dangerous
-    // action wants the more deliberate word.
+    // Terminate requires "tree"; force requires "force".
     let word = tree::tree_scope_word(mode);
     if yes && tree_yes_skip_allowed(root, preview) {
         return TreeConfirmDecision::Skip;
@@ -1026,8 +1018,7 @@ where
     CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    // Preview snapshot: informational only, exactly like tree scope. Execution
-    // re-enumerates under the freeze and is the authority.
+    // The preview is informational. Execution enumerates again after freezing.
     let snapshot = match ops.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -1212,9 +1203,8 @@ fn print_group_kill_banner(root: &KillTarget, group: &tree::ProcessGroupTarget, 
         command.push_str(" --force");
     }
     eprintln!("Command: {}", sanitize(&command));
-    // Every member, uncapped here (the builder already bounds the set): a process
-    // group can contain unrelated commands launched from the same shell, so
-    // the confirmation must show the entire blast radius.
+    // Show every member. The builder already bounds the set, and process groups
+    // can contain unrelated commands from the same shell.
     for node in members.preview_nodes(members.len()) {
         let name = sanitize(node.process_name.as_deref().unwrap_or("<unknown>"));
         let root_marker = if node.depth == 0 {
@@ -1300,8 +1290,8 @@ fn prompt_group_confirmation(
     Ok(tree_confirmation_matches(&answer, root, requirement))
 }
 
-/// The two facts the group confirmation established, carried together into
-/// revalidation: which group the user actually saw, and whether the
+/// Group identity and protected-root confirmation carried into revalidation.
+/// These record which group was shown and whether the
 /// protected-root confirmation was completed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy)]
@@ -1311,7 +1301,7 @@ struct ConfirmedGroupFacts {
 }
 
 /// Revalidate the confirmed root and re-run every group gate against a fresh
-/// scan, immediately before the freeze. The root must match exactly and must
+/// scan immediately before the freeze. The root must match exactly and must
 /// still sit in the group the user confirmed; membership may have churned but
 /// must re-pass the cap, unsafe-PID, and protection gates.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1357,10 +1347,9 @@ where
     Ok(fresh_root)
 }
 
-/// The fresh-scan gates for a group kill: the member set must still build, the root
-/// must still sit in the confirmed group (otherwise the sweep would target a
-/// member set the user never saw), and the pre-flight and root-protection
-/// rules must re-pass.
+/// Fresh-scan gates for a group kill. The member set must build, the root must
+/// remain in the confirmed group, and preflight and root-protection checks must
+/// pass again. A changed root group would target an unconfirmed member set.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fresh_group_gates(
     root: &KillTarget,

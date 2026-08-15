@@ -1,7 +1,7 @@
-//! The TUI's state, and every way it's allowed to change.
+//! TUI state and transitions.
 //!
 //! `App` holds the latest good snapshot, the filtered table view, the selection,
-//! search/sort state, which modal is open, and the bits of status we show.
+//! search and sort state, the active modal, and status text.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread;
@@ -150,9 +150,9 @@ impl KillConfirmation {
 
 /// Which fact the tree confirmation is currently asking the user to type.
 ///
-/// A protected root walks both stages in order — its PID or name first, then
-/// the scope word — mirroring the CLI's two-step prompt so the TUI can never
-/// authorize a protected tree on less evidence than the CLI would.
+/// A protected root completes two stages: its PID or name, then the scope word.
+/// This matches the CLI prompt so the TUI cannot authorize a protected tree on
+/// less evidence than the CLI would.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TreeConfirmStage {
@@ -164,8 +164,8 @@ pub(crate) enum TreeConfirmStage {
 ///
 /// `preview` starts `None` while the background worker enumerates the process
 /// table; the modal renders a loading line until it lands. The preview is
-/// informational only — execution re-collects everything fresh under the
-/// freeze — so a slightly stale count here can never mis-target a signal.
+/// informational only. Execution collects again after freezing, so the preview
+/// does not select signal targets.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeKillConfirmation {
@@ -203,10 +203,8 @@ impl TreeKillConfirmation {
 /// How strict force-kill confirmation should be, taken from
 /// `Config::confirm_force_kill`.
 ///
-/// A named two-state type instead of yet another `bool` on `App`: it keeps the
-/// struct's bool count down (clippy `struct_excessive_bools`) and spells out the
-/// intent at the call site. It only picks *which* confirmation the force path
-/// uses — never whether the TUI confirms at all. (It always does.)
+/// Selects the force-confirmation mode. A named type keeps the policy explicit
+/// at call sites; the TUI always confirms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceKillConfirmation {
     TypedForce,
@@ -251,7 +249,7 @@ impl DockerEnrichmentPolicy {
     }
 }
 
-/// The mutable guts of the TUI.
+/// Mutable TUI state.
 #[derive(Debug)]
 pub(crate) struct App {
     row_descriptors: Vec<crate::observation::PortEntryDescriptor>,
@@ -292,11 +290,9 @@ pub(crate) struct App {
 impl App {
     /// Build the app with its first snapshot already populated.
     ///
-    /// The initial collect runs on this thread, not the background worker: the
-    /// event loop parks in `event::poll` for a whole tick, and a worker finishing
-    /// does not wake it, so an async first load would leave the table blank for
-    /// ~one tick on every launch. Only this initial load blocks — manual `r` and
-    /// the auto-refresh tick still go through the off-thread [`App::refresh`].
+    /// The initial collect runs on this thread because worker completion does
+    /// not wake `event::poll`. Otherwise the table could remain blank for one
+    /// tick. Later refreshes run through the background worker.
     pub(crate) fn new(config: &Config) -> Self {
         let mut app = Self::empty(config, Instant::now());
         app.refresh_blocking();
@@ -375,10 +371,8 @@ impl App {
             return;
         }
 
-        // One refresh worker at a time. The Linux collector may walk every
-        // process fd directory to preserve shared-socket correctness; doing that
-        // off the render loop keeps key handling out of the swamp mud without
-        // letting scans pile up behind it.
+        // Keep collection off the render loop and allow only one worker. The
+        // Linux collector may scan every process descriptor directory.
         match crate::ui::spawn_worker(
             thread::Builder::new().name("kickoutchi-refresh".to_owned()),
             move || collector::collect_snapshot(crate::observation::MetadataProfile::LegacyList),
@@ -675,7 +669,7 @@ impl App {
     }
 
     /// Whether a background refresh worker is still in flight. Test-only: the
-    /// status bar deliberately does not surface refresh progress to the user.
+    /// status bar does not show refresh progress.
     #[cfg(test)]
     fn refresh_in_progress(&self) -> bool {
         self.refresh_worker.is_some()
@@ -812,12 +806,8 @@ impl App {
         let Some(target) = self.resolve_selected_kill_target() else {
             return;
         };
-        // `yes` is always false here: the interactive TUI has no `--yes`, so the
-        // shared policy can only ever hand back `Some(_)` (a confirmation to
-        // satisfy). The `None` arm is the CLI's `--yes` "skip confirmation" path
-        // and can't happen from the TUI — but we still map it to a require-`y`
-        // prompt, so if that policy ever changes the worst case is "asks again",
-        // never "kills without asking".
+        // The TUI has no `--yes`, so this path should always require
+        // confirmation. Treat an unexpected skip as a `y` prompt.
         let requirement = match process::confirmation_requirement(
             target.protected,
             mode,
@@ -981,11 +971,11 @@ impl App {
         self.spawn_tree_preview_worker(pid, platform);
     }
 
-    /// Enumerate the tree off-thread: the full process-table scan must never
-    /// run on the render/input loop. The result is informational only —
-    /// execution re-collects everything fresh. A worker that loses a race with
-    /// cancel is drained later, and new preview requests wait for that single
-    /// worker instead of piling up full process-table scans.
+    /// Enumerate the tree off-thread because the process-table scan must not
+    /// run on the render/input loop. The result is informational only; execution
+    /// collects a fresh snapshot. A worker that loses a race with cancellation
+    /// is drained later, and new preview requests wait for that worker instead
+    /// of queuing more process-table scans.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn spawn_tree_preview_worker(&mut self, root_pid: u32, platform: crate::model::Platform) {
         let protected_names = self.protected_processes.clone();
@@ -1037,12 +1027,8 @@ impl App {
             return;
         };
         if confirmation.target.pid != worker_pid {
-            // Structurally unreachable: the worker slot is replaced together
-            // with the confirmation, and `poll_tree_preview` has already
-            // cleared it — so no result for this confirmation can ever arrive
-            // again. If the invariant breaks anyway, fail closed (modal gone,
-            // status line explains) instead of stranding a loading modal that
-            // silently eats keystrokes forever.
+            // The worker slot and confirmation are replaced together, so this
+            // state is unreachable. Fail closed if that invariant breaks.
             debug_assert!(
                 false,
                 "tree preview worker PID does not match the open confirmation"
@@ -1060,9 +1046,8 @@ impl App {
                 Ok(()) => {
                     // The port row and the tree scan are different readers: a
                     // root whose socket row had no readable name can still be
-                    // identified as protected here. Protection is a one-way
-                    // upgrade — the stronger confirmation is forced, never
-                    // relaxed, and any input typed while loading is discarded.
+                    // identified as protected here. Protection can only become
+                    // stricter, and input typed while loading is discarded.
                     confirmation.input.clear();
                     confirmation.error = None;
                     if preview.root().is_some_and(|node| node.protected)
@@ -1218,7 +1203,7 @@ impl App {
 
     /// Run the confirmed tree kill: fresh root revalidation, fresh bounded
     /// preflight, then the freeze-first pipeline. The preview the user saw is
-    /// never trusted for execution — membership may drift between confirmation
+    /// not trusted for execution. Membership may change between confirmation
     /// and now, but every gate must re-pass against reality, and the root must
     /// still be exactly the confirmed process.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1408,13 +1393,9 @@ impl App {
                     confirmation.mode,
                     &outcome,
                 ));
-                // A target that exited before we could open its pidfd is gone for
-                // good, so re-collect to drop its freed row from the table. The
-                // refresh is best-effort: the status reports only that the target
-                // already exited, and the table (or the standard error line on a
-                // failed re-collect) speaks for the snapshot rather than the status
-                // claiming a refresh that may not have happened. Other prepare
-                // failures leave the process running, so there's nothing to drop.
+                // Re-collect after an already-exited target so its freed row can
+                // leave the table. Other preparation failures leave the process
+                // running and need no refresh.
                 if matches!(outcome, TerminationOutcome::AlreadyExited) {
                     self.refresh_after_kill(&mut collect_visibility_ports);
                 }

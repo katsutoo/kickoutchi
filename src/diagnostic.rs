@@ -1,9 +1,7 @@
-//! Strict "hey, this command line mentions your port" diagnostics.
+//! Strict command-line evidence for port diagnostics.
 //!
-//! These are evidence, nothing more. They can point out that some command line
-//! references the port you asked about, but they must never invent a table row
-//! or claim ownership of a socket the OS didn't actually confirm. Hints, not
-//! accusations.
+//! A command line may mention the requested port, but that evidence never creates
+//! a socket row or establishes ownership without OS confirmation.
 
 pub(crate) mod verdict;
 
@@ -39,7 +37,7 @@ pub(crate) fn requested_diagnostic_port(port_arg: Option<u16>, filter_text: &str
     requested
 }
 
-/// True when a command line carries strict, port-shaped evidence — not just a
+/// True when a command line carries strict, port-shaped evidence, not just a
 /// number that happens to look like the port.
 pub(crate) fn command_mentions_port(command_line: &str, port: u16) -> bool {
     let port_text = port.to_string();
@@ -87,7 +85,7 @@ pub(crate) fn diagnostic_message(port: u16, hints: &[RelatedProcessHint]) -> Opt
     for hint in hints {
         // The name is attacker-controlled (a process names itself), and this
         // message lands on a human's terminal: sanitize it like every other
-        // display surface. The command line takes the quoted-escape path in
+        // terminal output. The command line takes the quoted-escape path in
         // `push_quoted_command` instead, so the name is the only raw field.
         let process = sanitize(hint.process_name.as_deref().unwrap_or("<unknown>"));
         message.push_str("Possible related process: PID ");

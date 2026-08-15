@@ -28,8 +28,8 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        // Thaw first: a helper a failed test left SIGSTOPped would otherwise
-        // shrug off the SIGKILL-less cleanup and linger frozen.
+        // Thaw first so cleanup can terminate a helper left stopped by a failed
+        // test.
         continue_pid(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();

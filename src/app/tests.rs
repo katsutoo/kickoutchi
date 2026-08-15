@@ -395,10 +395,6 @@ fn force_key_uses_force_word_confirmation() {
 
 #[test]
 fn wrong_confirmation_word_rejects_and_keeps_the_modal_open() {
-    // The plain kill modal's whole job is "wrong word must not kill":
-    // submitting a non-matching word has to set the inline error and keep
-    // the modal (and its pending confirmation) exactly where it was —
-    // never fall through to execution.
     let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
     app.apply_action(Action::RequestForceKill);
     for ch in "yes".chars() {
@@ -417,7 +413,6 @@ fn wrong_confirmation_word_rejects_and_keeps_the_modal_open() {
         .as_deref()
         .expect("rejected submit sets the inline error");
     assert!(error.contains("type force"), "{error}");
-    // No termination status: nothing was sent and nothing was attempted.
     assert!(app.kill_status().is_none(), "{:?}", app.kill_status());
 }
 
@@ -611,10 +606,7 @@ fn prepare_already_exited_refreshes_snapshot_so_freed_port_drops() {
         },
     );
 
-    // Prepare failed, so no signal was ever attempted...
     assert!(!terminated);
-    // ...but the best-effort post-kill refresh still ran once and dropped the
-    // freed port from the table.
     assert_eq!(collect_calls, 1);
     assert_eq!(app.rows().len(), 0);
     assert_eq!(app.modal(), Modal::None);
@@ -683,9 +675,6 @@ fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear
     assert_eq!(fresh_collections, 1);
     assert_eq!(app.pending_refresh, PendingRefresh::None);
     assert!(!app.refresh_in_progress());
-    // The fresh post-kill collection returned zero rows. If the stale
-    // pre-kill snapshot (which still lists port 3000) had been applied,
-    // the table would be non-empty again.
     assert_eq!(app.rows().len(), 0);
 }
 
@@ -1304,7 +1293,7 @@ mod tree_kill {
     #[test]
     fn preview_discovering_a_protected_root_forces_the_protected_stage() {
         // The selected socket row has no readable process name, so the
-        // port-row policy cannot mark the root protected — but the tree
+        // port-row policy cannot mark the root protected, but the tree
         // snapshot reads the name and it is on the protected list. The
         // confirmation must upgrade to the protected stage instead of
         // accepting the bare scope word.
@@ -1380,7 +1369,6 @@ mod tree_kill {
             "cancel keeps the one worker so it can be drained instead of replaced",
         );
 
-        // A worker result landing after the cancel must not reopen anything.
         let infos = vec![tree_info(3000, Some(1), "node", 55)];
         sender
             .send(Ok(Ok(preview_of(&infos, 3000))))
@@ -1456,7 +1444,6 @@ mod tree_kill {
 
         assert_eq!(app.modal(), Modal::None);
         assert!(app.tree_confirmation().is_none());
-        // Leaves first, root last.
         assert_eq!(ops.delivered, vec![3001, 3000]);
         assert!(
             app.kill_status()
@@ -1464,7 +1451,6 @@ mod tree_kill {
             "{:?}",
             app.kill_status(),
         );
-        // The post-kill refresh applied the freed table.
         assert_eq!(collect_calls, 1);
         assert_eq!(app.rows().len(), 0);
     }

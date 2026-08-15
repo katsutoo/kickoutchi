@@ -60,8 +60,8 @@ impl ProbeRequest {
         if identity.ipv6_scope == Some(Ipv6Scope::Unavailable) {
             return Err(ProbeRequestError::UnavailableIpv6Scope);
         }
-        // `EndpointIdentity` forgives a scope on an IPv4-mapped address; a
-        // probe treats that caller contradiction as an error.
+        // `EndpointIdentity` ignores scope on an IPv4-mapped address. Probes
+        // reject that contradictory request.
         if identity.address.is_ipv4() && ipv6_scope.is_some() {
             return Err(ProbeRequestError::Ipv4WithScope);
         }

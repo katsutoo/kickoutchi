@@ -718,9 +718,6 @@ fn panic_tree_prompt(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn tree_confirmation_gates_yes_and_protected_roots() {
-    // This is the --yes safety table: --yes may only skip the prompt on a
-    // tree with nothing to warn about, and can never authorize a protected
-    // root.
     let clean = tree_target(&[tree_info(100, Some(500), "node")], &[]);
     let clean_root = kill_target_from_tree_info(&tree_info(100, Some(500), "node"), &[]);
     assert_eq!(
@@ -736,8 +733,6 @@ fn tree_confirmation_gates_yes_and_protected_roots() {
         TreeConfirmDecision::PromptWord("force"),
     );
 
-    // A system/service member is a warning, so --yes downgrades to the
-    // typed prompt instead of skipping it.
     let with_system = tree_target(
         &[
             tree_info(100, Some(500), "node"),
@@ -750,8 +745,6 @@ fn tree_confirmation_gates_yes_and_protected_roots() {
         TreeConfirmDecision::PromptWord("tree"),
     );
 
-    // A member owned by another uid is also a warning, so --yes downgrades
-    // to the typed prompt instead of skipping it.
     let with_other_uid = tree_target(
         &[
             tree_info(100, Some(500), "node"),
@@ -764,8 +757,6 @@ fn tree_confirmation_gates_yes_and_protected_roots() {
         TreeConfirmDecision::PromptWord("tree"),
     );
 
-    // A protected root keeps the protected typed confirmation, and --yes
-    // refuses outright rather than silently skipping it.
     let protected_root = tree_target(
         &[tree_info(100, Some(500), "postgres")],
         &["postgres".to_owned()],
@@ -997,7 +988,7 @@ fn protected_tree_descendant_refuses_before_prompt_or_stop_even_with_yes() {
 }
 
 /// A port row with no readable process name, so the row policy cannot mark
-/// the root protected — the tree scan is the only reader that can.
+/// the root protected. Only the tree scan can classify it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn nameless_row(port: u16, pid: u32) -> PortEntry {
     PortEntry {
@@ -1028,7 +1019,7 @@ fn nameless_row(port: u16, pid: u32) -> PortEntry {
 fn root_turning_protected_between_confirmation_and_freeze_refuses_with_exit_6() {
     // The confirmed row has no readable name, so identity revalidation
     // cannot compare names. Between confirmation and execution the root
-    // execs into a protected name — same PID, same start marker. The fresh
+    // execs into a protected name with the same PID and start marker. The fresh
     // root-protection gate must refuse before any stop.
     let rows = vec![nameless_row(3000, 18_422)];
     let confirmation_snapshot = vec![tree_info(18_422, Some(500), "node")];
@@ -1192,8 +1183,6 @@ fn kill_port_group(port: u16) -> KillArgs {
 fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
     let root = kill_target_from_tree_info(&grouped_info(100, Some(500), "node", 42), &[]);
 
-    // Tiny, warning-free group: --yes may skip, everything else prompts
-    // for the scope word ("group", or "force" under --force).
     let tiny = group_target(&[grouped_info(100, Some(500), "node", 42)], 100, &[]);
     assert_eq!(
         group_confirmation(&root, &tiny, KillMode::Terminate, true),
@@ -1208,8 +1197,6 @@ fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
         TreeConfirmDecision::PromptWord("force"),
     );
 
-    // One member past the tiny cap: --yes falls back to the typed word. A
-    // group has no structural tie to the target, so size alone is a risk.
     let mut big_infos = vec![grouped_info(100, Some(500), "node", 42)];
     for pid in 0..u32::try_from(GROUP_YES_SKIP_MAX_PROCESSES).expect("cap fits u32") {
         big_infos.push(grouped_info(9_000 + pid, Some(500), "worker", 42));
@@ -1221,7 +1208,6 @@ fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
         TreeConfirmDecision::PromptWord("group"),
     );
 
-    // A system/service member is a warning: --yes prompts.
     let with_system = group_target(
         &[
             grouped_info(100, Some(500), "node", 42),
@@ -1235,7 +1221,6 @@ fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
         TreeConfirmDecision::PromptWord("group"),
     );
 
-    // A different-uid group member is a warning: --yes prompts.
     let with_other_uid = group_target(
         &[
             grouped_info(100, Some(500), "node", 42),
@@ -1252,7 +1237,6 @@ fn group_confirmation_gates_yes_by_size_warnings_and_protection() {
         TreeConfirmDecision::PromptWord("group"),
     );
 
-    // A protected root keeps the two-step confirmation; --yes refuses.
     let protected_names = vec!["postgres".to_owned()];
     let protected_root_target = kill_target_from_tree_info(
         &grouped_info(100, Some(500), "postgres", 42),

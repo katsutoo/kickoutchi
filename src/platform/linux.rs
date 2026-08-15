@@ -1,9 +1,7 @@
 //! The Linux `/proc` collector.
 //!
-//! This reads kernel-provided `/proc` files straight from disk on purpose,
-//! rather than shelling out to `ss`, `lsof`, or `netstat`. All the socket-table
-//! parsing and process-metadata digging stays in here, so Linux's particular
-//! file formats never leak out into the shared CLI or TUI code.
+//! This module reads kernel-provided `/proc` files instead of invoking `ss`,
+//! `lsof`, or `netstat`. Linux file formats remain inside this adapter.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -45,7 +43,7 @@ const PROC_ROOT: &str = "/proc";
 // Shared limits and their rationale live in `observation.rs`; the constants
 // below are the ones only this adapter has an opinion about.
 
-/// `/proc/<pid>/cmdline` bytes. Degrades to `None` plus partial metadata — a
+/// `/proc/<pid>/cmdline` bytes. Degrades to `None` plus partial metadata. A
 /// command line is optional enrichment, so an over-cap read is representable.
 const MAX_CMDLINE_BYTES: usize = crate::observation::PROCESS_COMMAND_LINE_MAX_BYTES;
 
@@ -53,7 +51,7 @@ const MAX_CMDLINE_BYTES: usize = crate::observation::PROCESS_COMMAND_LINE_MAX_BY
 ///
 /// Both fail closed past the cap rather than truncating, because a short `stat`
 /// line could parse a *prefix* of the start-time marker as a valid but wrong
-/// number — a silently wrong identity check on a kill path, not an error.
+/// number. That would corrupt an identity check on the kill path.
 ///
 /// Real files cannot reach either cap: `stat` is a fixed ~52-field line whose
 /// `comm` is capped at 16 bytes, and `status` stays small except for `Groups:`,
@@ -610,7 +608,7 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
 }
 
 /// Best-effort command line for one PID, for the read-only inspect view.
-/// `None` covers vanished, restricted, and kernel processes alike — inspect
+/// `None` covers vanished, restricted, and kernel processes alike. Inspect
 /// renders it as unknown rather than failing the report.
 pub(crate) fn process_command_line(pid: u32) -> Option<String> {
     let path = PathBuf::from(PROC_ROOT)
@@ -953,8 +951,8 @@ fn decode_ipv4_addr(hex: &str) -> Result<Ipv4Addr, SocketParseError> {
     let raw = u32::from_str_radix(hex, 16).map_err(|_| SocketParseError::InvalidIpv4Address {
         value: hex.to_owned(),
     })?;
-    // The kernel prints the address as its raw in-memory u32, so the hex is in
-    // *host* byte order — localhost reads "0100007F" on little-endian machines.
+    // The kernel prints the address as its raw in-memory u32, so the hex uses
+    // *host* byte order. Localhost reads "0100007F" on little-endian machines.
     // Native-endian decoding is therefore correct on every target; a big-endian
     // "fix" here would flip every address (and fail the parser fixture tests).
     Ok(Ipv4Addr::from(raw.to_ne_bytes()))
@@ -1043,14 +1041,9 @@ fn collect_socket_owners_detailed(
         result.record_loss(OwnerScanLoss::EnumerationIncomplete);
     }
 
-    // Walk every PID's file descriptors, no early exit. A single listening socket
-    // can be shared by several processes (a parent that bound it then forked,
-    // inherited fds, SO_REUSEPORT), so one inode can have several owners. Bailing
-    // out the moment each inode has *an* owner would collapse those down to one
-    // arbitrary PID — and then `kill --port` would signal one process while the
-    // others happily keep the port open. Correctness wins over the fd walks we'd
-    // save. If this scan ever becomes the refresh bottleneck on a huge host, the
-    // fix is netlink `sock_diag`, not a correctness-breaking early stop.
+    // Scan every PID and descriptor. Fork inheritance and `SO_REUSEPORT` allow
+    // one socket inode to have several owners. Stopping at the first owner would
+    // make `kill --port` miss co-owners that keep the port open.
     let mut fd_entries_visited = 0;
     for pid in pids {
         scan_pid_socket_owners(
@@ -1740,7 +1733,7 @@ fn process_evidence_io_error(pid: u32, error: &std::io::Error) -> ProcessEvidenc
 /// read here is capped exactly like the rest of the module. Fail-closed on
 /// purpose: a process that vanished mid-scan (`NotFound`/`ESRCH`) is skipped, but a
 /// live process whose name, parent, or start marker cannot be read is a hard
-/// error — tree kill must never run against a table with holes in it, because
+/// error. Tree kill must not run against a table with holes because
 /// a missing parent edge silently drops that process's whole subtree.
 fn collect_tree_process_infos(proc_root: &Path) -> Result<Vec<TreeProcessInfo>, CollectorError> {
     let pids = process_ids(proc_root).map_err(|source| CollectorError::Read {
@@ -1822,8 +1815,8 @@ fn read_tree_stat(path: &Path) -> Result<Option<TreeStat>, CollectorError> {
     // Both fields are kill-safety data and fail closed: group kill derives its
     // membership from the group ID, so an unreadable group would be a silent
     // hole in the member set, exactly like a missing start marker would be a
-    // hole in identity verification. Group 0 is the kernel's own group — never
-    // a valid target — and maps to "no targetable group" rather than an error.
+    // hole in identity verification. Group 0 is the kernel's own group and is
+    // not targetable, so it maps to "no targetable group" rather than an error.
     let start_time_marker = parse_process_start_time_ticks(&bytes)
         .and_then(|ticks| {
             ProcessStartMarker::linux(ticks)
@@ -1902,7 +1895,7 @@ fn parse_process_start_time_ticks(bytes: &[u8]) -> std::io::Result<u64> {
     // keeps this robust against a process named e.g. `ev) il`; a first/left split
     // would be fooled by a paren inside comm.
     // Once comm is stripped the fields are 1-indexed from `state` (field 3), so
-    // start time (field 22) is the 20th token here — nth(19), zero-indexed.
+    // start time (field 22) is the 20th token here, or nth(19) zero-indexed.
     let start_time = stat_field(bytes, 19)?;
     let start_time = std::str::from_utf8(start_time)
         .map_err(|source| std::io::Error::new(ErrorKind::InvalidData, source))?;

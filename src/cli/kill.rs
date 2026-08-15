@@ -1,7 +1,6 @@
-//! The single-process `kill` command: exactly one confirmed target, resolved,
-//! confirmed, revalidated fresh, and only then signalled. The scoped
-//! (`--tree`/`--group`) flows reuse the resolution, revalidation, and
-//! confirmation-input helpers defined here.
+//! The single-process `kill` command resolves, confirms, revalidates, then
+//! signals one target. Scoped (`--tree`/`--group`) flows reuse the resolution,
+//! revalidation, and confirmation-input helpers defined here.
 
 use std::io::{self, BufRead, ErrorKind, Read, Write};
 use std::time::Duration;
@@ -116,12 +115,8 @@ where
         }
     };
 
-    // Print the target banner — identity, ports, equivalent command, and any
-    // safety warnings — before the confirmation branch, so it shows on the
-    // `--yes` path too. Skipping the prompt must not also swallow the
-    // "system/service process", "owned by another uid", partial-metadata, or
-    // "has children" warnings: those are required safety notices, and
-    // `--yes` opts out of being *asked*, not of being *told*.
+    // Print identity, ports, equivalent command, and warnings before handling
+    // confirmation. `--yes` skips the prompt but not safety warnings.
     print_kill_banner(&target, mode);
 
     if let Some(requirement) = requirement {
@@ -172,9 +167,7 @@ where
 /// between reads. Termination is asynchronous: a `SIGTERM`'d process needs a
 /// moment to run its handlers and close its sockets, so one immediate
 /// re-collect would report "still visible" on perfectly successful kills.
-/// Ten polls at 100ms bound the wait to roughly one second — long enough for a
-/// normal shutdown, short enough that a genuinely stuck port is still reported
-/// promptly.
+/// Ten 100ms polls allow about one second for asynchronous shutdown.
 const POST_KILL_SETTLE_ATTEMPTS_MAX: usize = 10;
 const POST_KILL_SETTLE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const POST_KILL_VISIBILITY_PROFILE: MetadataProfile = MetadataProfile::IdentityOnly;
@@ -205,8 +198,7 @@ pub(super) fn post_kill_refresh_status_message<CollectPorts>(
 where
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
 {
-    // A portless root (a `--pid` supervisor) confirmed no ports, so there is
-    // nothing to poll and nothing honest to report about port visibility.
+    // A portless root has no confirmed ports to poll.
     if target.ports.is_empty() {
         return None;
     }
@@ -221,8 +213,8 @@ where
 
 /// Poll the port table until every confirmed port is gone or the settle window
 /// runs out. The sleep is injected so tests can drive the loop without real
-/// delays. A refresh error fails closed to a warning rather than claiming the
-/// ports cleared on data we never saw.
+/// delays. A refresh error returns a warning instead of claiming that ports
+/// cleared without evidence.
 fn wait_for_confirmed_ports_to_clear<CollectPorts, Sleep>(
     target: &KillTarget,
     collect_ports: &mut CollectPorts,
@@ -321,13 +313,9 @@ where
         .map(PortEntryView::from)
         .collect::<Vec<_>>();
 
-    // A confirmed port that's still listening but whose owner PID is now
-    // unreadable is ownership loss, not a moved target. Re-resolving a `--pid`
-    // kill by PID alone would miss this: the owner-less row just drops out and
-    // looks like the target vanished (exit 3). Check it up front so `--pid`
-    // reports the same permission-denied exit `4` as `--port` (whose resolver
-    // already flags it as `MissingPid`) and as the TUI. Sharing
-    // `confirmed_port_owner_unavailable` keeps all three from drifting.
+    // If a confirmed port remains visible without an owner PID, report ownership
+    // loss before PID re-resolution. This keeps PID, port, and TUI paths on the
+    // same permission-denied result.
     if process::confirmed_port_owner_unavailable(confirmed, &fresh_entries) {
         return Err(TerminationOutcome::OwnershipUnavailable);
     }
@@ -429,11 +417,10 @@ where
     Ok(KillTarget::from_entries(pid, rows, Some(&context)))
 }
 
-/// Resolve the single PID that owns `port`, with the precise refusal when it
-/// cannot: no matching socket, a hidden owner (a row without a PID), or
-/// several distinct owners. Kill and inspect resolution both go through here
-/// so the two policies cannot drift; the unsafe-PID guard deliberately stays
-/// with the kill caller, because reading PID 1's family is legitimate while
+/// Resolve the single PID that owns `port`. Refuse when there is no matching
+/// socket, the owner PID is hidden, or several distinct owners exist. Kill and
+/// inspect resolution use this function to share the same policy. The kill
+/// caller retains the unsafe-PID guard because inspecting PID 1 is valid while
 /// signalling it is not.
 pub(super) fn resolve_single_port_owner<'a>(
     port: u16,
@@ -572,7 +559,7 @@ fn read_confirmation_line_from(reader: &mut impl BufRead, max_bytes: usize) -> i
     // `usize` is at most 64 bits on every supported target, so widening to the
     // `u64` `Take` limit is lossless; the sole production limit is the small
     // constant `CONFIRMATION_INPUT_MAX_BYTES`, so the two bytes of headroom
-    // for a trailing "\r\n" cannot overflow either — `saturating_add` only
+    // for a trailing "\r\n" cannot overflow either. `saturating_add` only
     // guards the theoretical `usize::MAX` limit.
     let limit = u64::try_from(max_bytes)
         .unwrap_or(u64::MAX)

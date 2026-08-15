@@ -22,8 +22,7 @@ const LABELED_HEADERS: [&str; LABELED_COLUMN_COUNT] = [
     "PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE", "LABEL",
 ];
 
-/// Stand-in for metadata the OS wouldn't give us. A visible dash keeps the
-/// columns lined up and says "unknown" out loud instead of leaving a gap.
+/// Visible placeholder for unavailable metadata.
 const MISSING: &str = "-";
 
 /// Spaces used to pad every column, sized to the widest cell any column can
@@ -34,17 +33,16 @@ const MISSING: &str = "-";
 /// protocols are short, and labels are clipped to
 /// [`crate::labels::LABEL_DISPLAY_MAX_COLUMNS`]. Process names are capped at
 /// [`crate::observation::PROCESS_NAME_MAX_BYTES`] by the metadata budget, and a
-/// sanitized string's terminal width never exceeds its byte length — every
-/// width-2 scalar starts at U+1100, which needs three UTF-8 bytes — so this
+/// sanitized string's terminal width never exceeds its byte length. Every
+/// width-2 scalar starts at U+1100 and needs three UTF-8 bytes, so this
 /// length is an upper bound on any padding request.
 const PADDING: [u8; crate::observation::PROCESS_NAME_MAX_BYTES] =
     [b' '; crate::observation::PROCESS_NAME_MAX_BYTES];
 
 /// Render entries as a plain-text table, columns padded to fit their content.
 ///
-/// Plain spaces, no box-drawing characters: this output gets piped into
-/// `grep`/`awk` all the time, so every line has to stay splittable on
-/// whitespace.
+/// Uses plain spaces instead of box-drawing characters so shell tools can split
+/// each line on whitespace.
 pub(crate) fn write_view_table(
     writer: &mut impl Write,
     entries: &[PortEntryView<'_>],
@@ -56,7 +54,7 @@ pub(crate) fn write_view_table(
     }
     // Each column grows to its widest cell. The model's own types keep content
     // in check (addresses, ports, PIDs, short comm-style names), so there's no
-    // need for a width cap — and command lines deliberately aren't columns here.
+    // need for a width cap. Command lines are not table columns.
     // Widths are terminal columns, not bytes: `sanitize` keeps visible Unicode,
     // and an accented or CJK process name occupies fewer/more columns than its
     // byte length suggests.
@@ -99,9 +97,8 @@ fn write_labeled_view_table(
     Ok(())
 }
 
-/// Render entries as pretty-printed JSON. The shape is the serde contract on
-/// `PortEntry` (pinned by tests in `model`); the pretty-printing is just for
-/// human eyes and means nothing to a parser.
+/// Render entries as pretty-printed JSON using the `PortEntry` serialization
+/// contract pinned by model tests.
 pub(crate) fn write_view_json(
     writer: &mut impl Write,
     entries: &[PortEntryView<'_>],
@@ -186,8 +183,7 @@ fn write_cells<const N: usize>(
             writer.write_all(b"  ")?;
         }
         writer.write_all(cell.as_bytes())?;
-        // Pad every column but the last — trailing spaces are just invisible
-        // noise for diffs and shells.
+        // Do not add trailing spaces after the last column.
         if index < N - 1 {
             // Clamped, not asserted: the bound documented on PADDING holds, but
             // a misaligned column is a cosmetic bug while an out-of-range slice

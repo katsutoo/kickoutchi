@@ -592,9 +592,7 @@ fn settle_target() -> KillTarget {
 
 #[test]
 fn post_kill_settle_clears_when_ports_disappear_on_a_later_poll() {
-    // SIGTERM teardown is asynchronous: the first polls still see the port,
-    // a later one must turn that into a clean "cleared" rather than the
-    // still-visible warning.
+    // Model asynchronous SIGTERM teardown across several polls.
     let target = settle_target();
     let mut collect_calls = 0;
     let mut sleeps = 0;
@@ -634,17 +632,13 @@ fn post_kill_settle_reports_still_visible_after_bounded_attempts() {
 
     assert_eq!(status, PostKillPortsStatus::StillVisible);
     assert_eq!(collect_calls, POST_KILL_SETTLE_ATTEMPTS_MAX);
-    // No trailing sleep after the last poll: once the verdict is known,
-    // waiting longer would only delay the honest warning.
+    // Do not sleep after the final poll.
     assert_eq!(sleeps, POST_KILL_SETTLE_ATTEMPTS_MAX - 1);
 }
 
 #[test]
 fn post_kill_settle_stays_visible_while_any_confirmed_port_remains() {
-    // A multi-port target is only "cleared" when every confirmed port is
-    // gone: one lingering port must keep the still-visible warning, not
-    // be averaged away because the other port closed. This pins the
-    // any-port-remains check against a quiet flip to all-ports-remain.
+    // One remaining port keeps a multi-port target visible.
     let row_a = entry(3000);
     let row_b = entry(3001);
     let target = KillTarget::from_entries(

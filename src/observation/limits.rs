@@ -1,28 +1,17 @@
 //! Central bounds for collection, retention, and serialization.
 //!
-//! Native adapters import the bound and keep the rationale here so the stated
-//! over-limit behavior cannot drift away from the value it governs.
+//! Native adapters import these constants so each limit and its overflow policy
+//! are documented together.
 
-// Every collection, retention, and serialization bound lives here with the
-// reasoning that chose it. Native adapters import the constant and nothing
-// else: rationale that stays behind in an adapter drifts onto whichever
-// constant happens to be adjacent, and a "fails closed" claim parked above a
-// fail-open reader is worse than no comment at all.
-//
-// Each bound also states its over-limit behavior, because the two are not
-// interchangeable:
-//   * fails closed — the read or scan returns an operational error, because a
-//     truncated result would be a *wrong* answer (a dropped socket row, a
-//     prefix of an identity marker) rather than an incomplete one.
-//   * degrades — the value is dropped and the record is marked partial with an
-//     evidence gap, because the fact is optional enrichment and its absence is
-//     honestly representable.
+// Every limit states its overflow policy. "Fails closed" returns an operational
+// error when truncation could produce a wrong answer. "Degrades" drops optional
+// enrichment and records an evidence gap.
 
 /// Bytes read from one native socket table (`/proc/net/*`, IP Helper).
 ///
 /// Generous at ~100k sockets. Fails closed: a socket table is the one native
-/// source that must never truncate, because dropping bytes drops whole socket
-/// rows — real open ports — and a short table reads as a complete one.
+/// source that must never truncate, because dropping bytes removes socket rows
+/// while leaving a table that appears complete.
 #[allow(
     dead_code,
     reason = "unused on macOS, whose process-first collection has no socket table"
@@ -85,7 +74,7 @@ pub(crate) const EXECUTABLE_PATH_MAX_BYTES: usize = 128 * 1024;
 
 /// Command-line bytes in the legacy list profile.
 ///
-/// Degrades to `null` plus a metadata gap — never to a prefix, because half a
+/// Degrades to `null` plus a metadata gap, never to a prefix, because half a
 /// command line invites a wrong reading of what a process is doing.
 pub(crate) const PROCESS_COMMAND_LINE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -106,7 +95,7 @@ pub(crate) const PROTECTION_SCOPE_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Collection attempts before an unstable observation is reported as raced.
 ///
 /// Two, not "until stable": a host whose socket table never settles must
-/// surface that fact, not spin until it happens to agree with itself.
+/// report that fact instead of spinning until two reads agree.
 pub(super) const CONSISTENCY_ATTEMPTS_MAX: usize = 2;
 
 /// Retries when a native API reports that its output buffer grew between the

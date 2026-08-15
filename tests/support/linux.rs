@@ -1167,7 +1167,7 @@ fn run_live_spawner_helper(ready_file: &Path) -> ! {
             fs::write(&ready_tmp, "spawning").expect("live spawner ready file must be written");
             fs::rename(&ready_tmp, ready_file).expect("live spawner ready file must publish");
         }
-        // Reap finished children so the brood stays bounded and zombie-light.
+        // Reap finished children to bound the live and zombie process counts.
         children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         // Pacing, not synchronization: it keeps the burst under the tree cap
         // while still guaranteeing the kill under test lands mid-spawn.
@@ -1177,7 +1177,7 @@ fn run_live_spawner_helper(ready_file: &Path) -> ! {
 }
 
 /// A parent that owns one child from the start and forks one more member
-/// only when the trigger file appears — after the kill's preview already
+/// only when the trigger file appears after the kill's preview has
 /// printed. The second ready file publishes the late member's PID.
 fn run_fork_on_trigger_helper(ready_file: &Path) -> ! {
     let child = Command::new("sh")

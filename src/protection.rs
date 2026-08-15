@@ -1,9 +1,7 @@
-//! Deciding which processes get an "are you *sure*?" before we kick them out.
+//! Protected-process matching and confirmation policy.
 //!
-//! The collector just reports the facts; protection is a policy we layer on top
-//! from the user's config. Processes such as init, databases, and Docker may be
-//! operationally critical, so they require an additional warning before
-//! termination.
+//! The collector reports process facts. Configuration marks operationally
+//! critical processes that require an additional warning before termination.
 
 use std::borrow::Cow;
 
@@ -70,9 +68,9 @@ pub(crate) fn mark_protected(entries: &mut [PortEntry], protected_names: &[Strin
 /// 15-byte truncation of a longer configured protected name, because that is all
 /// the collector can read from the kernel. macOS also accepts a configured name
 /// followed by a process-title delimiter (`:` or ASCII whitespace). Windows names
-/// match case-insensitively, because that's the platform convention. We never
-/// match on arbitrary substrings: `postgres-backup-helper` doesn't get to ride on
-/// `postgres`'s protection by accident.
+/// match case-insensitively, following the platform convention. Arbitrary
+/// substrings do not match, so `postgres-backup-helper` does not inherit
+/// `postgres` protection.
 pub(crate) fn is_protected_process_name(
     platform: Platform,
     process_name: &str,

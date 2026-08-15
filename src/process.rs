@@ -1,9 +1,7 @@
-//! The "are we really doing this?" brain, plus the actual signal delivery.
+//! Termination policy and signal delivery.
 //!
-//! This is the safety-critical side of termination: target snapshots,
-//! confirmation rules, PID guardrails, and the tiny OS FFI paths that send the
-//! final stop request. The UI and CLI decide *when* to ask the user; this module
-//! decides what's actually safe to run. When in doubt, it says no.
+//! This module owns target snapshots, confirmation rules, PID guards, and the OS
+//! calls that deliver signals. Unverified targets are refused.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::cell::{Cell, RefCell};
@@ -132,7 +130,7 @@ pub(crate) const CONFIRMATION_INPUT_MAX_BYTES: usize = 128;
 
 /// Suffix appended to permission-denied termination messages.
 ///
-/// `EPERM`/`EACCES` from the pidfd syscalls almost always means a genuine lack of
+/// `EPERM`/`EACCES` from the pidfd syscalls usually means a lack of
 /// permission to signal the target (same rule as `kill`), but a sandbox or
 /// seccomp policy that blocks `pidfd_open`/`pidfd_send_signal` produces the same
 /// errno. We can't tell the two apart at this layer, so the message names both.
@@ -257,7 +255,7 @@ impl TerminationOutcome {
     /// Stable, interface-neutral wording for one direct termination outcome.
     ///
     /// CLI and TUI callers may add interface-specific recovery guidance, but
-    /// the underlying event is described here so their wording cannot drift.
+    /// the underlying event is described here so they use the same wording.
     pub(crate) fn status_description(&self, target: &KillTarget, mode: KillMode) -> String {
         let delivery = mode.delivery_label(target.platform);
         match self {
@@ -387,13 +385,9 @@ impl KillTarget {
             }
             ports.push(KillTargetPort::from(entry));
         }
-        // A kill target with no rows would carry an empty port set, and the
-        // confirmation/revalidation flow leans on those ports to know which
-        // process it's even looking at. We assert in release too (this runs once
-        // per kill request, not on a hot path): calling this with zero rows is a
-        // programmer bug, and a port-less target sitting on a termination path is
-        // exactly the kind of thing you want to crash on, not quietly wave
-        // through.
+        // Port rows define the target used by confirmation and revalidation.
+        // An empty set is a programmer error, so the invariant is enforced in
+        // release builds as well.
         assert!(saw_entry, "kill target must contain at least one row");
 
         ports.sort_unstable();
@@ -697,11 +691,8 @@ pub(crate) fn target_still_matches_confirmation(
 /// True when a confirmed target port is still visible but its owning PID is no
 /// longer readable.
 ///
-/// Both kill surfaces (CLI `--pid`/`--port` and the TUI) treat this as ownership
-/// loss and bail out without signalling, instead of calling it a moved target:
-/// the exact port the user confirmed is still listening, we just can't prove who
-/// owns it anymore, so firing a signal now could hit the wrong process. One
-/// shared check keeps those surfaces from drifting apart on this safety line.
+/// The CLI and TUI treat this as ownership loss and refuse to signal. The
+/// confirmed port still exists, but its current owner is unknown.
 pub(crate) fn confirmed_port_owner_unavailable(
     confirmed: &KillTarget,
     fresh_entries: &[PortEntryView<'_>],
@@ -932,8 +923,7 @@ impl TreeDeliveryHandle {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn current_user_id() -> u32 {
-    // SAFETY: geteuid takes no arguments, touches no memory, and can't fail —
-    // it just hands back this process's effective UID.
+    // SAFETY: geteuid takes no arguments, touches no memory, and cannot fail.
     unsafe { libc::geteuid() }
 }
 
@@ -963,7 +953,7 @@ pub(crate) use linux::{
 
 /// Send `SIGCONT` to a PID. Best-effort: used to resume a process before its
 /// terminating signal and to thaw the tree on any abort, so callers ignore the
-/// result — a `SIGCONT` to a process that already died is a harmless no-op.
+/// result. A `SIGCONT` to a process that already died is harmless.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn tree_cont(pid: u32) -> crate::tree::TreeSignalResult {
     tree_send_signal(pid, libc::SIGCONT)
@@ -981,7 +971,7 @@ fn tree_send_signal(pid: u32, signal: libc::c_int) -> crate::tree::TreeSignalRes
     };
     // SAFETY: kill(2) takes a pid and a fixed signal constant by value and writes
     // no Rust-managed memory. Every tree member is stopped and identity-verified
-    // before it is targeted, and terminating signals additionally re-check the
+    // before it is targeted. Terminating signals also re-check the
     // verified start marker just before this call (see MacosTreeOps).
     let result = unsafe { libc::kill(pid, signal) };
     if result == 0 {

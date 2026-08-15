@@ -46,7 +46,6 @@ fn default_frame_renders_table_details_and_status() {
     let text = render_text(&mut app, 100, 30);
 
     assert!(text.contains("Kickoutchi"), "{text}");
-    // The force-kill key is advertised on the main screen, not just in help.
     assert!(text.contains("x/X kill"), "{text}");
     assert!(text.contains("Open Ports"), "{text}");
     assert!(text.contains("3000"), "{text}");
@@ -141,7 +140,6 @@ fn help_modal_renders_keybinds() {
     for filter in ["label:", "address:", "scope_id:", "family:"] {
         assert!(text.contains(filter), "missing {filter} in {text}");
     }
-    // Tree keys are advertised only on builds that actually bind them.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert!(text.contains("terminate selected process tree"), "{text}");
 }
@@ -391,10 +389,10 @@ fn finalization_delivers_process_signal_only_after_worker_safe_teardown() {
     assert!(status.success(), "final-signal child exited with {status}");
 }
 
-/// The slot is local on purpose. The process-global one is consumed by
+/// The slot is local because the process-global one is consumed by
 /// `wait_for_startup_worker` on every poll, so a test that recorded into it
-/// would hand its signal to whichever other test happened to be polling —
-/// which is exactly the race this test used to lose intermittently. The
+/// would hand its signal to whichever other test happened to be polling,
+/// which is the race this test used to lose intermittently. The
 /// installed handler is covered end to end by the child-process tests
 /// below, with real signals; this one owns the first-wins state machine.
 #[cfg(unix)]
@@ -662,7 +660,6 @@ fn tree_confirmation_modal_renders_loading_then_preview() {
     let config = Config::default();
     let mut app = App::new_fake(&config);
 
-    // The header advertises the tree keys on builds that have them.
     assert!(render_text(&mut app, 100, 30).contains("t/T tree"));
 
     app.apply_action(Action::RequestTreeTerminate);
@@ -672,7 +669,6 @@ fn tree_confirmation_modal_renders_loading_then_preview() {
     assert!(text.contains("Wait for the process count"), "{text}");
     assert!(!text.contains("Type tree"), "{text}");
 
-    // The fake table's selected row is PID 18422 (node) with one child.
     let infos = vec![
         crate::tree::TreeProcessInfo {
             pid: 18_422,

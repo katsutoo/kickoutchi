@@ -262,25 +262,10 @@ fn watch_release_attempt() -> (u16, WatchOutcome) {
 /// Run the macOS watch journey, returning events only when the host gave a
 /// complete observation.
 ///
-/// This journey has two correct outcomes, and the host picks which one.
-/// macOS collection is process-first through `libproc`, so a SIP-protected
-/// process holding a socket makes the machine-wide observation partial even
-/// under `sudo`. `watch` then refuses to publish a baseline it cannot vouch
-/// for, or emits bounded collection gaps when the loss begins after a valid
-/// baseline. Those refusals are the designed behavior, not defects, and no
-/// retry budget can make a shared runner stop running protected processes.
-///
-/// So both outcomes are asserted rather than one being demanded:
-/// [`partial_socket_set_outcome`] pins refusal before the baseline, while
-/// [`partial_socket_set_after_baseline`] pins the ordered baseline, any valid
-/// intermediate release or gap records, and the terminal three consecutive
-/// gaps when visibility remains lost. The caller still pins a release that
-/// arrived before those terminal gaps. A regression cannot hide in either
-/// partial path because each exact public contract is asserted.
-///
-/// The attempts remain because a complete observation asserts strictly more.
-/// They exist to prefer the richer assertion, not to retry a failure into a
-/// pass — every attempt already had to satisfy one contract or the other.
+/// SIP-protected processes can make macOS socket collection partial, even under
+/// `sudo`. The test accepts either a complete observation or the documented
+/// fail-closed gap sequence. Repeated attempts prefer the stronger complete
+/// assertion; every partial attempt must still satisfy its full contract.
 #[cfg(target_os = "macos")]
 fn watch_release_journey() -> Option<(u16, Vec<serde_json::Value>)> {
     let required = std::env::var_os(super::RELEASE_E2E_REQUIRED_ENV).is_some();

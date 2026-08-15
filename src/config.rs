@@ -1,10 +1,8 @@
 //! Runtime config: safe defaults, loading the config file, and CLI overrides.
 //!
-//! Precedence has layers — like onions, like ogres: built-in defaults at the
-//! bottom, then the config file, then CLI flags on top. The app has to run fine
-//! with no config file at all — but an *invalid* one is a hard error that names
-//! the file and the bad value, because quietly falling back to defaults would
-//! just hide the user's typo.
+//! Precedence is built-in defaults, then the config file, then CLI flags. A
+//! missing default config file is valid. An invalid file is an error that names
+//! the path and value instead of falling back to defaults.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -19,15 +17,12 @@ use crate::labels::{LABEL_SELECTORS_MAX, LabelInput, LabelRegistry};
 use crate::model::SortMode;
 use crate::protection;
 
-/// Limits on the refresh interval. Zero would just busy-loop the collector, and
-/// anything past an hour is basically "never" and almost certainly a typo. The
-/// CLI flag parser shares these, so the file and the flag agree on the limits.
+/// Refresh interval limits shared by config validation and CLI parsing. Zero
+/// would busy-loop the collector; the upper bound is one hour.
 pub(crate) const REFRESH_INTERVAL_SECONDS_MIN: u64 = 1;
 pub(crate) const REFRESH_INTERVAL_SECONDS_MAX: u64 = 3600;
 
-/// Cap on the protected-process list. Matching is linear per row per refresh, so
-/// this keeps that work bounded. No real allowlist gets anywhere near it — if you
-/// hit this, the config was generated or corrupted.
+/// Cap on the protected-process list, whose matching cost is linear per row.
 pub(crate) const PROTECTED_PROCESSES_MAX: usize = 256;
 
 /// Config is hand-written and tiny in normal use. This cap prevents files,
@@ -37,21 +32,21 @@ pub(crate) const CONFIG_FILE_MAX_BYTES: usize = 64 * 1024;
 /// What went wrong while loading config.
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
-    /// The file's there (or was explicitly asked for) but we couldn't read it.
+    /// The selected file could not be read.
     #[error("cannot read config file {path}: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// We read the file, but its contents don't fly. `detail` calls out the
-    /// offending key/value so the user can fix it without guessing.
+    /// The file failed parsing or validation. `detail` identifies the offending
+    /// key or value.
     #[error("invalid config file {path}: {detail}")]
     Invalid { path: PathBuf, detail: String },
 }
 
 impl ConfigError {
     /// Render config diagnostics without letting path or I/O text create lines.
-    /// TOML detail keeps its source excerpt and caret layout intentionally.
+    /// TOML detail preserves its source excerpt and caret layout.
     pub(crate) fn render_terminal(&self) -> String {
         match self {
             Self::Read { path, source } => format!(
@@ -68,15 +63,12 @@ impl ConfigError {
     }
 }
 
-/// The resolved runtime settings. Everything downstream reads this one shared
-/// source instead of sprinkling magic literals all over the codebase.
+/// Resolved runtime settings shared by the CLI and TUI.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     /// The longest the event loop will sit waiting for input before looping.
     ///
-    /// It's a latency cap, not a busy-poll: queued input wakes the loop right
-    /// away, so this only bounds how long we idle. Internal knob — not something
-    /// we hand to users.
+    /// A latency cap, not a polling interval. Queued input wakes the loop.
     pub(crate) tick_interval: Duration,
     /// How often the TUI re-collects ports for auto-refresh.
     pub(crate) refresh_interval: Duration,
@@ -103,8 +95,8 @@ impl Default for Config {
             hide_system_processes: false,
             confirm_force_kill: true,
             docker_enrichment: false,
-            // Built-in safety defaults: the stuff whose accidental death takes
-            // your containers, database, init system, or desktop down with it.
+            // Built-in protections for container runtimes, databases, init
+            // systems, and desktop services.
             protected_processes: protection::default_protected_processes(),
             labels: LabelRegistry::default(),
         }
@@ -114,9 +106,7 @@ impl Default for Config {
 /// The on-disk shape of the config file. Every field is optional, so a partial
 /// file only changes what it actually names; most fields override their default,
 /// while `protected_processes` extends it (see `merge_protected_processes`).
-/// Unknown keys are rejected on purpose: in a hand-edited file an unknown key is
-/// almost always a typo, and ignoring it would make the user's setting silently
-/// do nothing.
+/// Unknown keys are rejected so misspelled settings do not silently do nothing.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -191,12 +181,10 @@ struct PortLabelFile {
 }
 
 impl Config {
-    /// Load config, figuring out which file to read.
+    /// Load config from an explicit path or the platform default.
     ///
-    /// An explicit `path_override` (the `--config` flag) has to exist: the user
-    /// pointed at that exact file, so a missing one is an error. The default
-    /// platform path is the opposite — not being there just means "use defaults",
-    /// which is the totally normal first-run state.
+    /// A missing explicit path is an error. A missing default path selects the
+    /// built-in defaults.
     pub(crate) fn load(path_override: Option<&Path>) -> Result<Self, ConfigError> {
         if let Some(path) = path_override {
             return Self::load_from(path);
@@ -211,9 +199,7 @@ impl Config {
         };
         match read_config_file(&path) {
             Ok(text) => Self::parse(&text, &path),
-            // We just try the read and handle the result instead of checking
-            // exists() first — that check would only race file creation/removal
-            // for no real benefit.
+            // Read directly to avoid an existence-check race.
             Err(ConfigError::Read { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -223,20 +209,17 @@ impl Config {
         }
     }
 
-    /// Load from a file the user explicitly asked for. Any failure here — the
-    /// file not existing included — is an error.
+    /// Load an explicitly selected file. A missing file is an error.
     fn load_from(path: &Path) -> Result<Self, ConfigError> {
         let text = read_config_file(path)?;
         Self::parse(&text, path)
     }
 
-    /// Parse and validate the file contents. Kept separate from the I/O so tests
-    /// can hammer every validation rule without touching the filesystem.
+    /// Parse and validate file contents independently of filesystem I/O.
     fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
         let file: ConfigFile = toml::from_str(text).map_err(|error| ConfigError::Invalid {
             path: path.to_path_buf(),
-            // toml's own message already names the key, the line, and the
-            // expected type — exactly the "name the bad value" we're after.
+            // TOML errors already identify the key, line, and expected type.
             detail: error.to_string(),
         })?;
 
@@ -292,7 +275,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Apply CLI flag overrides — the top of the precedence stack.
+    /// Apply CLI overrides after file settings.
     ///
     /// The value's already validated by the time it lands here: clap enforces the
     /// same `REFRESH_INTERVAL_SECONDS_*` bounds at parse time, so a bad flag is a
@@ -359,7 +342,7 @@ pub(crate) fn exercise_config_parser(bytes: &[u8]) {
     }
 }
 
-/// Make sure a refresh interval from the config file is actually in range.
+/// Validate a refresh interval from the config file.
 fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
     if !(REFRESH_INTERVAL_SECONDS_MIN..=REFRESH_INTERVAL_SECONDS_MAX).contains(&seconds) {
         return Err(format!(
@@ -370,9 +353,7 @@ fn validate_refresh_seconds(seconds: u64) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
-/// Sanity-check the protected-process list: bounded in size, no empty names.
-/// An empty name can never match anything, so it's always a mistake worth
-/// flagging rather than dead weight we'd haul around on every refresh.
+/// Validate the protected-process list size and reject empty names.
 ///
 /// The size bound applies to the merged list, but the user only sees their own
 /// file. Keep every stage's count so duplicates do not make the diagnostic lie.
@@ -398,9 +379,8 @@ fn validate_protected_processes(
 
 /// Add the user's configured names on top of the built-in safety set.
 ///
-/// Config is additive on purpose: adding `redis` must not quietly strip
-/// protection from `systemd` or `postgres`. Exact de-duplication keeps the
-/// bounded matching work steady without messing with Unix case-sensitivity.
+/// Configured names extend the built-in list. Exact de-duplication preserves
+/// Unix case sensitivity and bounds matching work.
 fn merge_protected_processes(
     mut defaults: Vec<String>,
     configured: Vec<String>,
@@ -422,8 +402,8 @@ fn merge_protected_processes(
     Ok(defaults)
 }
 
-/// The platform's default config path (`~/.config/kickoutchi/config.toml` on
-/// Linux via XDG). `None` if the OS hands us no config directory at all.
+/// The platform default config path. Returns `None` when no config directory is
+/// available.
 fn default_config_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("kickoutchi").join("config.toml"))
 }
@@ -444,9 +424,8 @@ mod tests {
     use crate::model::Protocol;
     use crate::model::SortMode;
 
-    /// Tests go through `Config::parse` with a fixed fake path: the I/O above it
-    /// is a thin read wrapper, and every rule worth pinning lives down here in
-    /// parsing and validation.
+    /// Tests call `Config::parse` with a fixed path to isolate parsing and
+    /// validation from filesystem I/O.
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse(text, Path::new("/tmp/kickoutchi-test/config.toml"))
     }

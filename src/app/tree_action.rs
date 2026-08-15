@@ -6,9 +6,7 @@ use crate::tree::{self, TreeProcessOps};
 
 use super::{TreeKillConfirmation, TreePreviewResult};
 
-/// What one Enter press on the tree confirmation should do, decided against an
-/// immutable view of the state so the follow-up mutation cannot fight the
-/// borrow checker inside one match.
+/// Result of one Enter press, computed before mutating confirmation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TreeSubmitVerdict {
     Execute,
@@ -60,9 +58,9 @@ pub(super) fn collect_tree_preview(
 ///
 /// `confirmation.target.protected` is true only when the protected-root stage
 /// was actually walked (set at request time or upgraded by the preview); a
-/// root the fresh scan newly classifies as protected — e.g. one that exec'd
-/// into a protected name with the same PID and start marker — must refuse
-/// here rather than ride a plain word confirmation.
+/// root the fresh scan newly classifies as protected, such as one that exec'd
+/// into a protected name with the same PID and start marker, must be refused
+/// unless protected-root confirmation was completed.
 pub(super) fn fresh_tree_gates<Ops: TreeProcessOps>(
     fresh_root: &KillTarget,
     protected_processes: &[String],

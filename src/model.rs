@@ -1,13 +1,9 @@
-//! The shared vocabulary: the types the CLI, TUI, collectors, filters, and the
-//! kill flow all pass around.
+//! Shared types for collection, querying, display, and termination.
 //!
-//! Platform collectors produce one authoritative `NetworkSnapshot`, and
-//! [`PortEntryView`] borrows a row out of it. Every surface that only reads a
-//! row — list, kill, scoped kill, inspect, Docker enrichment, TUI rendering —
-//! speaks that view, and it also owns the stable `list --json` serialization
-//! contract while internal identity evidence remains outside that wire shape.
-//! [`PortEntry`] is the owned mirror, kept only where a row must outlive the
-//! snapshot it came from.
+//! Platform collectors produce an authoritative `NetworkSnapshot`.
+//! [`PortEntryView`] borrows rows from it. [`PortEntry`] is the owned projection
+//! used when a row must outlive its snapshot. Internal identity evidence is not
+//! part of the stable `list --json` shape.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -34,12 +30,9 @@ impl Protocol {
     }
 }
 
-/// What "open" actually means to Kickoutchi.
+/// Socket states included in open-port views.
 ///
-/// Just two states, on purpose: a TCP socket counts when it's listening, and a
-/// UDP socket counts when it's bound (UDP has no listen state to speak of).
-/// Showing established connections could be a later filter, but it's not part of
-/// the core model.
+/// TCP sockets count when listening. UDP sockets count when bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocketState {
     Listen,
@@ -87,8 +80,7 @@ pub(crate) enum PermissionStatus {
 
 /// Human-facing bind scope for a local socket address.
 ///
-/// The ordering is safety-first for `sort: scope`: public binds come first, then
-/// local-interface binds, with loopback-only binds last (the least scary).
+/// `sort: scope` orders public, local-interface, then loopback-only binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum BindScope {
     Public,
@@ -106,7 +98,7 @@ impl BindScope {
     }
 }
 
-/// One open port and everything we know about the process behind it.
+/// Owned projection of one socket and its process metadata.
 ///
 /// `Option` fields are `None` when metadata was unavailable. The historical
 /// `permission` field records only complete versus partial legacy projection;
@@ -116,24 +108,10 @@ impl BindScope {
 /// not a source of truth. Every field is derived by `project_legacy*`, and the
 /// snapshot is authoritative for anything a destructive decision rests on.
 ///
-/// No signature that only *reads* a row names this type. List, kill, scoped
-/// kill, inspect, Docker enrichment, and TUI rendering all take
-/// [`PortEntryView`], which borrows the same facts from a live snapshot without
-/// copying the shared process metadata. The signatures that still name the
-/// owned form are the ones that produce or hold a row outliving the snapshot it
-/// came from:
-///
-/// - the TUI's stored table, which keeps rows across frames while snapshots
-///   come and go, hands one to a details worker on another thread, and lets
-///   `mark_protected` stamp them in place;
-/// - the `collect_*_ports` seams and the `CollectPorts` closure bounds they
-///   satisfy, which own a snapshot internally and must return rows that
-///   survive it;
-/// - test fixtures, which are clearer written out than assembled into a whole
-///   `NetworkSnapshot` (see `entry_views`).
-///
-/// Each of those converts to a view at the first read. Do not add fields here
-/// to serve a caller: add them to the snapshot and project what is needed.
+/// Read-only consumers use [`PortEntryView`] to avoid copying shared metadata.
+/// This owned form is limited to the TUI's stored rows, collection seams that
+/// return after dropping their snapshot, and compact test fixtures. Add new
+/// source facts to `NetworkSnapshot`, then project them here if required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortEntry {
     pub(crate) protocol: Protocol,
@@ -209,12 +187,9 @@ impl PortEntryView<'_> {
     /// Best-effort "is this a system/service process?" check, used for optional
     /// hiding.
     ///
-    /// Deliberately cautious: PID 0/1, direct children of PID 1, and a short
-    /// list of well-known OS names. We don't collect per-row owner UID (that's
-    /// resolved lazily for the selected row only), so this table-wide check
-    /// can't lean on it. And a protected app like `postgres` doesn't count as a
-    /// system process just because it's protected — those are two different
-    /// ideas.
+    /// Classifies PID 0/1, direct children of PID 1, and known OS process names.
+    /// Owner UID is resolved only for selected rows, so it is unavailable here.
+    /// Protected-process policy is independent of this classification.
     pub(crate) fn is_system_process(self) -> bool {
         SystemProcessCheck {
             platform: self.platform,
@@ -236,11 +211,8 @@ impl<'a> PortEntryView<'a> {
 
 /// Borrow a slice of owned fixture rows as the views production code speaks.
 ///
-/// Production builds views from a live snapshot, but a test that only needs a
-/// handful of rows is clearer writing them out than assembling a whole
-/// `NetworkSnapshot`. This is the one bridge between those two worlds, so
-/// `PortEntry` stays a fixture convenience instead of leaking back into a
-/// signature.
+/// Production builds views from snapshots. Tests may use small owned fixtures
+/// and convert them through this helper.
 #[cfg(test)]
 pub(crate) fn entry_views(rows: &[PortEntry]) -> Vec<PortEntryView<'_>> {
     rows.iter().map(PortEntryView::from).collect()
@@ -248,9 +220,8 @@ pub(crate) fn entry_views(rows: &[PortEntry]) -> Vec<PortEntryView<'_>> {
 
 /// Extra context we gather lazily for the selected process.
 ///
-/// This lives outside [`PortEntry`] on purpose: it keeps the rule that table rows
-/// and JSON output are OS-confirmed sockets and nothing else. Process-tree stuff
-/// is a selected-row detail, not part of the main snapshot.
+/// This stays outside [`PortEntry`] because table and JSON rows contain only
+/// OS-confirmed socket facts. Process-tree data belongs to selected-row details.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ProcessContext {
     pub(crate) owner_uid: Option<u32>,
@@ -286,7 +257,7 @@ pub(crate) struct RelatedProcessHint {
 
 /// Optional Docker ownership context for one selected local port.
 ///
-/// This intentionally stays outside [`PortEntry`]: Docker is enrichment, not the
+/// This stays outside [`PortEntry`] because Docker is enrichment, not the
 /// OS-confirmed socket source of truth or the `list --json` contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerPortContext {
@@ -354,12 +325,9 @@ fn bind_scope(local_addr: IpAddr) -> BindScope {
 /// table rows: kill-time process-tree nodes carry the same fields without
 /// being socket entries, and two copies of the policy would drift apart.
 ///
-/// It is a named-fields struct instead of positional arguments on purpose:
-/// the two PIDs share a type and the two names share a type, so a swapped
-/// pair at a call site would compile fine and silently bend a safety policy.
-/// A swapped PID pair would not even show up in behavior — PID <= 1 and
-/// parent PID 1 both classify as system — so the compiler-visible field names
-/// are the guard here, not tests.
+/// Named fields prevent callers from swapping the same-typed PID and name
+/// values. Such a swap can change the system-process policy without a type
+/// error.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SystemProcessCheck<'a> {
     pub(crate) platform: Platform,
@@ -551,9 +519,8 @@ mod tests {
 
     #[test]
     fn json_shape_is_stable() {
-        // This pins the script-facing JSON contract: field names, enum casing,
-        // null handling. Touch any assertion here and you've broken someone's
-        // script.
+        // Pin field names, enum casing, and null handling in the public JSON
+        // contract.
         let mut row = entry(3000, Some(18422), Some("node"));
         row.executable_path = Some(PathBuf::from("/usr/bin/node").into());
         row.command_line = Some(Arc::from("node server.js"));

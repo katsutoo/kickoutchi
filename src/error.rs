@@ -1,4 +1,4 @@
-//! The error types the app actually deals with.
+//! Application error types.
 
 use std::io;
 
@@ -6,18 +6,15 @@ use thiserror::Error;
 
 /// Top-level error for the TUI path of the Kickoutchi binary.
 ///
-/// This covers failures that must leave the TUI loop: terminal/IO failures and
+/// Covers failures that leave the TUI loop: terminal I/O failures and
 /// caught worker panics. Config errors have their own type
 /// (`config::ConfigError`, handled before the TUI even starts), and collector
-/// and termination failures are operational, not fatal: those show up in the
-/// status line (last collector error, kill outcome) instead of bubbling all the
-/// way up here.
+/// and termination failures are operational. The status line reports them
+/// without ending the TUI loop.
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
-    /// Something in the terminal dance failed: entering raw mode / the alternate
-    /// screen, drawing a frame, or reading input. Restore failures don't come
-    /// through here — those get logged best-effort, since they happen in `Drop`
-    /// and the panic hook.
+    /// Entering terminal mode, drawing, or reading input failed. Restoration
+    /// failures are logged from `Drop` or the panic hook.
     #[error("terminal I/O failed: {0}")]
     Terminal(#[from] io::Error),
     /// A background TUI worker hit a programmer error. The worker boundary

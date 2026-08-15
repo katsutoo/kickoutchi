@@ -88,12 +88,9 @@ impl FrozenNode {
 
 /// The scope-specific half of the shared freeze pipeline.
 ///
-/// Tree and group kills share every stage — stop the root first, sweep to a
-/// fixed point, verify frozen identities, gate on policy, signal leaves-first —
-/// and differ only in what makes a process a member and what post-stop fact
-/// proves that membership still holds. Keeping the two answers in one enum
-/// keeps the pipeline single-copy and each scope's rules auditable side by
-/// side.
+/// Tree and group kills share one pipeline: stop the root, sweep to a fixed
+/// point, verify frozen identities, apply policy, then signal. Scope determines
+/// membership and the relation checked after stopping.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SweepScope {
@@ -142,24 +139,22 @@ impl SweepScope {
 /// What the completed confirmation actually authorized, re-applied to the
 /// final frozen set before any terminating signal.
 ///
-/// The confirmation gates run against previews — snapshots taken before the
-/// freeze. The frozen set is collected after them and can differ: children
-/// fork, a root can `exec` into a different name, processes can join a group.
-/// So the two facts the prompt established are re-checked where they can no
-/// longer drift — while every member is stopped.
+/// Confirmation uses a pre-freeze preview. The final frozen set can differ when
+/// processes fork, exec, or join a group, so prompt authorization is checked
+/// again while every member is stopped.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScopeAuthorization {
     /// The protected-root typed confirmation (PID or name) was completed.
     /// When false, a root whose fresh post-stop name is protected refuses the
-    /// whole kill — even if its name was unreadable or different at every
+    /// whole kill, even if its name was unreadable or different at every
     /// earlier check, because `exec` changes the name without changing the
     /// PID, parent, or start marker.
     pub(crate) protected_root_confirmed: bool,
     /// The typed-word prompt was skipped (the `--yes` all-clear path). The
     /// skip was justified by a preview; if the frozen set would no longer
-    /// qualify — a system/service member appeared, a different-uid member
-    /// appeared, or a group outgrew [`GROUP_YES_SKIP_MAX_PROCESSES`] — the kill
+    /// qualify because a system process or different-UID member appeared, or a
+    /// group outgrew [`GROUP_YES_SKIP_MAX_PROCESSES`], the kill
     /// refuses and asks to be rerun with a real prompt.
     pub(crate) prompt_skipped: bool,
 }
@@ -310,8 +305,8 @@ impl TreeKillOutcome {
     }
 }
 
-/// Freeze the tree, verify it, and terminate it — root first to stop, root last
-/// to signal.
+/// Freeze the tree, verify it, and terminate it. Stop the root first and signal
+/// it last.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn execute_tree_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
@@ -332,8 +327,8 @@ pub(crate) fn execute_tree_kill<Ops: TreeProcessOps>(
     )
 }
 
-/// Freeze the process group `pgid`, verify it, and terminate it — the confirmed
-/// root first to stop, last to signal. `pgid` is the group the user confirmed;
+/// Freeze the process group `pgid`, verify it, and terminate it. Stop the
+/// confirmed root first and signal it last. `pgid` is the confirmed group;
 /// the pipeline re-proves after every stop that each member (root included)
 /// still belongs to it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -552,15 +547,10 @@ fn root_identity_matches(root: &KillTarget, info: &TreeProcessInfo) -> bool {
     true
 }
 
-/// Sweep to a fixed point: each pass reads one fresh snapshot and drains it —
-/// stopping every not-yet-frozen member the snapshot shows, including members
-/// whose parents were only frozen earlier in the same pass. A static tree of
-/// any depth therefore freezes in a single pass, because every generation is
-/// already present in that one snapshot. Converges because frozen processes
-/// cannot fork on their own while they remain stopped. A pass whose snapshot
-/// shows nothing new is the pipeline's bounded convergence point; external
-/// continuations can still race it. The pass limit bounds churn between
-/// snapshots (fresh forks in tree scope, `setpgid` joins in group scope).
+/// Sweep until a fresh snapshot contains no unfrozen members. Each pass drains
+/// the complete snapshot, so a static tree freezes in one pass regardless of
+/// depth. The pass limit bounds new forks and process-group joins between
+/// snapshots. External continuation can still race the sweep.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn freeze_sweep<Ops: TreeProcessOps>(
     frozen: &mut Vec<FrozenNode>,
@@ -833,9 +823,8 @@ fn check_tree_policy(
     // The root's protection is re-checked against its fresh post-stop name.
     // The confirmation-stage verdict used whatever name was readable then, but
     // `exec` swaps the name without changing the PID, parent, or start marker
-    // — and an unknown confirmed name makes the identity check name-blind. So
-    // unless the protected-root typed confirmation was actually completed, a
-    // root that is protected *now* refuses now.
+    // while an unknown confirmed name makes the identity check name-blind. A
+    // newly protected root requires completed protected-root confirmation.
     if !authorization.protected_root_confirmed
         && let Some(root) = frozen.iter().find(|node| node.depth == 0)
         && let Some(name) = root.process_name.as_deref()
@@ -846,9 +835,8 @@ fn check_tree_policy(
             name: Some(name.to_owned()),
         });
     }
-    // A skipped prompt was justified by an all-clear preview. The frozen set
-    // may have grown since; if it would no longer justify the skip, refuse and
-    // ask for a rerun that actually prompts.
+    // Refuse a skipped prompt if the final frozen set no longer satisfies the
+    // preview's all-clear policy.
     if authorization.prompt_skipped {
         let system_member_appeared = frozen.iter().any(|node| {
             is_system(
@@ -978,14 +966,12 @@ fn signal_group<Ops: TreeProcessOps>(
 }
 
 /// Thaw every member Kickoutchi transitioned and report the ones that may still
-/// be stopped. Members observed already stopped are deliberately untouched.
+/// be stopped. Members observed already stopped are left unchanged.
 ///
 /// Only `Denied` counts as a cleanup failure, matching `signal_tree`,
 /// `signal_group`, and the single-process `outcome_after_thaw`. `NotFound`
-/// means the member is gone — an external `SIGKILL` removed it, or macOS
-/// observed a changed start marker — so there is no stopped survivor to
-/// report, and naming it would send the user hunting for a process that no
-/// longer exists.
+/// means the member is gone because an external `SIGKILL` removed it or macOS
+/// observed a changed start marker. It cannot leave a stopped survivor.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn thaw_all<Ops: TreeProcessOps>(frozen: &[FrozenNode], ops: &mut Ops) -> Vec<u32> {
     let mut failed = Vec::new();

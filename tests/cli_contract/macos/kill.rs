@@ -1,9 +1,8 @@
 use super::*;
 
-/// The scenario group scope exists for: a member that double-forked away
-/// from the tree but kept the group. See the Linux twin for the full
-/// premise; macOS has no `/proc`, so the reparenting itself is not
-/// asserted here — the sweep reaching a non-descendant is.
+/// A double-forked member leaves the root's tree but remains in its process
+/// group. macOS has no `/proc`, so this test asserts that group scope reaches a
+/// non-descendant rather than inspecting its reparenting directly.
 #[test]
 fn macos_group_kill_reaches_reparented_member_a_tree_walk_cannot() {
     let _host_observation = lock_host_observation();

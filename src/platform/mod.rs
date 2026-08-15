@@ -98,7 +98,7 @@ pub(crate) fn inspect_command_line_reader(
 
 /// Reads a PID's command line only when its start-time marker matches the
 /// identity captured at observation time, re-checking the marker after the
-/// read so a PID reused mid-read cannot smuggle in another process's command.
+/// read so PID reuse cannot return another process's command.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn marker_checked_command_line_reader(
     identities: &[ProcessIdentity],

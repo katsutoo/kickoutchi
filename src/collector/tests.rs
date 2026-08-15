@@ -124,29 +124,23 @@ fn fake_snapshot_covers_every_rendering_path() {
         .expect("fake collection cannot fail");
     let entries = project_legacy(&snapshot).expect("fake projection cannot fail");
 
-    // Port 3000 has to be here: examples and CLI filter tests both lean on it.
     assert!(entries.iter().any(|entry| entry.local_port == 3000));
-    // At least one row where all the metadata is withheld.
     assert!(
         entries
             .iter()
             .any(|entry| entry.pid.is_none() && entry.permission == PermissionStatus::Partial)
     );
-    // And one half-withheld row: PID and name readable, executable path
-    // hidden (the "someone else's process" shape the UI must explain).
     assert!(entries.iter().any(|entry| {
         entry.pid.is_some()
             && entry.executable_path.is_none()
             && entry.permission == PermissionStatus::Partial
     }));
-    // At least one bound UDP row and one IPv6 row.
     assert!(
         entries
             .iter()
             .any(|entry| entry.protocol == Protocol::Udp && entry.state == SocketState::Bound)
     );
     assert!(entries.iter().any(|entry| entry.local_addr.is_ipv6()));
-    // The collector never pre-marks protection — that's config's job.
     assert!(entries.iter().all(|entry| !entry.protected));
 }
 

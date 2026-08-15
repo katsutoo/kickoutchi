@@ -1,8 +1,7 @@
 //! The shared filter-and-sort engine behind both the CLI and TUI views.
 //!
 //! The collector decides which rows exist; this module only picks which of those
-//! confirmed rows are visible for a given query, and in what order. It never
-//! conjures a row out of thin air.
+//! confirmed rows are visible for a given query and in what order.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -19,8 +18,7 @@ use crate::observation::Ipv6Scope;
 
 /// Longest search text we'll take from the TUI or CLI.
 ///
-/// In the TUI, filtering runs on every keypress, so a small fixed cap keeps that
-/// work bounded — and it's still way longer than any query you'd actually type.
+/// Filtering runs on every TUI keypress, so this cap bounds per-key work.
 pub(crate) const FILTER_TEXT_MAX_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
@@ -1501,7 +1499,7 @@ mod tests {
     #[test]
     fn filter_text_over_the_byte_cap_is_rejected() {
         // The TUI already caps input in `append_search_char`, so the only way to
-        // actually hit this bound is via CLI `--filter`. The cap lives here, so
+        // hit this bound is via CLI `--filter`. The cap lives here, so
         // the test pins it here too; the CLI turns the error into exit 2.
         let rows = [entry(3000, "node")];
         let maximum = "a".repeat(FILTER_TEXT_MAX_BYTES);

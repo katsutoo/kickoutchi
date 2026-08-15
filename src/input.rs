@@ -1,8 +1,8 @@
 //! Turning key presses into actions for the TUI.
 //!
-//! On purpose, this hands back small `Action`s instead of poking `App` directly.
-//! That keeps crossterm out of the state machine and makes the key contract easy
-//! to test without ever opening a terminal.
+//! This module returns small `Action` values instead of mutating `App`. The state
+//! machine therefore has no crossterm dependency and can be tested without a
+//! terminal.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -40,10 +40,8 @@ pub(crate) enum Action {
 /// Turn a key event into an app action.
 ///
 /// `filter_active` lets a single `Esc` outside search mode clear an applied
-/// filter instead of quitting: someone who set a filter, hit Enter to finish
-/// editing, then reflexively jabs Esc should lose the filter, not the whole
-/// session. Esc only quits once there's no modal to close and no filter left to
-/// clear. The order is fixed: modal first, then filter, then quit.
+/// filter instead of quitting. Escape closes a modal first, then clears a
+/// filter, then quits.
 pub(crate) fn action_for_key(
     key: KeyEvent,
     modal: Modal,
@@ -167,9 +165,7 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    /// Most cases don't care about an active filter; the Esc-clears-filter test
-    /// below passes `filter_active` itself. Funnelling the common case through one
-    /// helper keeps two easily-confused trailing bools out of every call site.
+    /// Default helper for cases without an active filter.
     fn act(code: KeyCode, modal: Modal, search_mode: bool) -> Action {
         action_for_key(key(code), modal, search_mode, false)
     }

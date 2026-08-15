@@ -375,7 +375,7 @@ pub(crate) fn tree_stop_handle(handle: &TreeDeliveryHandle) -> crate::tree::Tree
             (
                 if cleanup_required {
                     // Preserve the pidfd in LinuxTreeOps so the immediate cleanup
-                    // continuation cannot wander to a recycled numeric PID.
+                    // continuation cannot target a recycled numeric PID.
                     TreeSignalResult::Delivered
                 } else {
                     TreeSignalResult::Denied

@@ -156,7 +156,7 @@ fn docker_container_ls_with_host_and_runner(
         debug!("ignoring non-local Docker endpoint during port enrichment");
     }
     let publish_filter = format!("publish={port}/{}", protocol_filter(protocol));
-    // `docker` resolves through PATH on purpose: install locations vary too
+    // Resolve `docker` through PATH because install locations vary too
     // much (distro packages, Docker Desktop, Homebrew) for a fixed allowlist.
     // Elevation is rejected above before PATH resolution. An explicit local
     // host prevents the user's current Docker context from selecting a remote

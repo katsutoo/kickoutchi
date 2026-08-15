@@ -129,7 +129,7 @@ fn run_list_views_with_writer(
 
     // An empty *filtered* result exits 3, so scripts can probe occupancy
     // (`kickoutchi list --port 3000 && echo busy`). An empty *unfiltered* list
-    // just means a quiet machine — that's a success, not a failure.
+    // means a quiet machine and is successful.
     if result.explicit_filter_active && visible_indices.is_empty() {
         return ExitReason::NoMatch;
     }

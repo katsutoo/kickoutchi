@@ -1,9 +1,7 @@
-//! The non-TUI command-line side: the argument shape, the stable exit-code
-//! contract, and the `list`/`kill` commands themselves.
+//! CLI arguments, commands, and exit-code mapping.
 //!
-//! CLI commands never pop open the TUI — they print to stdout/stderr and exit.
-//! The data flows through the same collector and model as the TUI, so the two
-//! stay in sync and this layer doesn't care which collector produced the rows.
+//! CLI commands print to standard output or error and do not open the TUI. They
+//! use the same collector and model as the TUI.
 
 mod kill;
 mod list;
@@ -43,12 +41,10 @@ pub(crate) use self::watch::WatchSignalGuard;
 use self::watch::{WatchArgs, run_watch};
 use self::why::{WhyArgs, run_why};
 
-/// Stable exit codes — the script-facing contract.
+/// Stable script-facing exit codes.
 ///
-/// All in one place so scripts can count on the numbers never drifting. Every
-/// variant really is constructed somewhere on the CLI exit path, so don't reach
-/// for a dead-code allow here; keep the contract complete even though clap is the
-/// one that actually hands out `InvalidArguments` (2) in practice.
+/// Every variant is used by the CLI. Clap produces `InvalidArguments` in
+/// practice, but it remains part of this mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitReason {
@@ -70,14 +66,12 @@ impl From<ExitReason> for ExitCode {
 /// Top-level argument shape. No subcommand opens the TUI; `list` and `kill`
 /// run headless and exit.
 ///
-/// `about` pulls the user-facing summary straight from the Cargo.toml
-/// `description`; `long_about = None` is there so clap *doesn't* dump this doc
-/// comment into `--help` — these lines are notes for developers, not users.
+/// `about` uses the Cargo package description. `long_about = None` keeps this
+/// developer documentation out of `--help`.
 ///
 /// The fixed `name` keeps `--version` reporting the canonical `kickoutchi` under
 /// both binary names, while clap takes the usage line from argv(0), so
-/// `kick --help` correctly shows `Usage: kick ...`. Both are exactly what we want
-/// for the short-alias binary.
+/// `kick --help` shows `Usage: kick ...`, preserving the short binary alias.
 #[derive(Debug, Parser)]
 #[command(name = "kickoutchi", version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -122,8 +116,7 @@ pub(crate) enum Command {
     List(ListArgs),
     /// Terminate a verified port owner, process tree, or process group.
     Kill(KillArgs),
-    /// Show a process's family — ancestors, descendants, siblings, process
-    /// group, and ports — read-only, to pick the right root for a tree kill.
+    /// Show a process's family, group, and ports without sending signals.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Inspect(InspectArgs),
     /// Stream bounded socket changes until interrupted or the duration expires.
@@ -175,9 +168,8 @@ pub(crate) enum Command {
     Why(WhyArgs),
 }
 
-/// `inspect` takes exactly one starting point, like `kill`: a PID (which may
-/// own no port — supervisors usually don't) or a port whose owner to start
-/// from. Strictly read-only; it never signals anything.
+/// `inspect` accepts either a PID or a port whose owner becomes the starting
+/// PID. The command is read-only, and the starting PID need not own a port.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["pid", "port"])))]
@@ -225,9 +217,7 @@ pub(crate) struct ListArgs {
     snapshot_json: bool,
 }
 
-/// `kill` requires exactly one target: a PID or a port. Requiring one stops
-/// a bare `kickoutchi kill` from meaning "kill something"; forbidding both
-/// stops a contradictory selection.
+/// `kill` requires one target, either a PID or a port.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent CLI flag; clap's derive requires bools, and `--tree --group` is already rejected at parse time. `allow`, not `expect`: only Linux and macOS have `--group`, so Windows stays under the threshold"
@@ -261,10 +251,10 @@ pub(crate) struct KillArgs {
     #[arg(long)]
     tree: bool,
 
-    /// Terminate the target's whole process group — every process sharing its
-    /// group ID, including members that reparented away from the tree. Opt-in;
-    /// typed confirmation unless --yes passes all-clear gates. May start from a
-    /// live root with no visible port. Linux and macOS only.
+    /// Terminate every process sharing the target's group ID, including members
+    /// that reparented away from the tree. Opt-in; typed confirmation unless
+    /// --yes passes all-clear gates. May start from a live root with no visible
+    /// port. Linux and macOS only.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[arg(long, conflicts_with = "tree")]
     group: bool,
@@ -272,9 +262,7 @@ pub(crate) struct KillArgs {
 
 /// Run a CLI command to completion and report how the process should exit.
 ///
-/// Errors are printed here (stderr) rather than propagated: the exit-code
-/// mapping is this module's whole job, so letting errors escape to `main`
-/// would split that contract across two files.
+/// Print command errors to stderr and map them to CLI exit codes.
 pub(crate) fn run(
     command: &Command,
     config: &Config,
@@ -392,10 +380,9 @@ fn parse_sort_mode(value: &str) -> Result<SortMode, String> {
 
 /// Reject an empty `--process` selector.
 ///
-/// An empty needle is a substring of every name, so the row set it selects is
-/// "every row whose process name was readable" — a silently narrowed answer
-/// rather than a filter, and one nobody asks for deliberately. Whitespace is
-/// left alone: a space is a legitimate substring of a real process title.
+/// An empty needle would select every readable process name instead of every
+/// row. Whitespace is preserved because a space is a legitimate substring of a
+/// process title.
 fn parse_process(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("expected a nonempty process name substring".to_owned());
@@ -414,8 +401,7 @@ fn parse_port(value: &str) -> Result<u16, String> {
 
 /// Run the read-only family inspection and print the report to stdout.
 ///
-/// No signals, no confirmation: the strongest thing this command does is
-/// suggest a `kick kill --pid <root> --tree` for the user to run themselves.
+/// This command sends no signals. It may print a suggested tree-kill command.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn run_inspect(
     args: &InspectArgs,
@@ -580,8 +566,8 @@ fn inspect_port_owner_matches_snapshot(
 }
 
 /// The platform a tree target built from the local process table lives on.
-/// Snapshot rows come straight from the host OS, so this is a compile-time
-/// fact, unlike `PortEntry.platform` which rides along per row.
+/// Snapshot rows come from the host OS, so this is a compile-time fact. Legacy
+/// `PortEntry` rows carry their platform per row.
 #[cfg(target_os = "linux")]
 const TREE_HOST_PLATFORM: Platform = Platform::Linux;
 #[cfg(target_os = "macos")]
@@ -639,8 +625,7 @@ mod tests {
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
-        // These numbers are the script-facing API: if this test breaks, you've
-        // made a breaking change, not done a refactor.
+        // Pin the script-facing exit-code values.
         assert_eq!(ExitReason::Success as u8, 0);
         assert_eq!(ExitReason::Failure as u8, 1);
         assert_eq!(ExitReason::InvalidArguments as u8, 2);
@@ -917,7 +902,7 @@ mod tests {
             port: Some(port),
         };
 
-        // Reading PID 1's family is legitimate — no unsafe-PID guard here.
+        // Inspect may read PID 1 because it does not signal the process.
         assert_eq!(resolve_inspect_target(&by_pid(1), &[]), Ok(1));
 
         let rows = vec![entry(3000)];

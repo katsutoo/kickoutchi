@@ -1,8 +1,6 @@
-//! The collector contract, plus the fake data we lean on for tests.
+//! Collector contracts and deterministic test data.
 //!
-//! The trait pins down what every platform collector has to provide. The CLI and
-//! TUI talk to that contract, so adding or swapping collectors never ripples out
-//! into the output layer.
+//! Platform collectors implement one interface consumed by the CLI and TUI.
 
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,9 +28,8 @@ use crate::observation::{ProcessRead, process_read_metadata_bytes};
 /// What went wrong during a collection pass.
 #[derive(Debug, Error)]
 pub(crate) enum CollectorError {
-    /// We couldn't read a path we genuinely need. This is for the must-have
-    /// paths only — one process being cagey about its metadata isn't fatal, it
-    /// just becomes a partial row.
+    /// A required path could not be read. Optional per-process metadata failures
+    /// produce partial rows instead.
     #[cfg(target_os = "linux")]
     #[error("cannot read {path}: {source}")]
     Read {
@@ -55,13 +52,12 @@ pub(crate) enum CollectorError {
     OwnershipPermissionDenied,
 }
 
-/// Anything that can hand us a snapshot of the open ports.
+/// Source of open-port snapshots.
 ///
-/// Every call returns a full snapshot — no incremental updates, on purpose. A
-/// whole snapshot is trivially self-consistent, and we refresh at human speed
-/// (seconds, not microseconds), so the extra complexity would buy us nothing.
+/// Each call returns a complete snapshot. The application refreshes at
+/// second-scale intervals and does not consume incremental updates.
 pub(crate) trait Collector {
-    /// Grab one bounded, consistency-checked observation.
+    /// Collect one bounded, consistency-checked observation.
     fn collect(&self, profile: MetadataProfile) -> Result<NetworkSnapshot, CollectorError>;
 }
 
@@ -99,13 +95,12 @@ pub(crate) fn collect_snapshot(
     }
 }
 
-/// Collect one snapshot and hand back owned legacy rows that outlive it.
+/// Collect one snapshot and return owned legacy rows that outlive it.
 ///
-/// The owned projection exists because this function drops the snapshot it
-/// collected from: the TUI stores these rows across frames, and the kill and
-/// scoped-kill seams re-collect through closures that must return something
-/// after their snapshot goes away. Callers that hold a live snapshot should
-/// project `PortEntryView` from it instead of coming through here.
+/// The owned projection exists because this function drops its snapshot. The
+/// TUI stores rows across frames, while kill seams re-collect through closures
+/// that return after the snapshot is dropped. Callers that hold a live snapshot
+/// should project `PortEntryView` from it instead.
 pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
     collect_ports_with_profile(MetadataProfile::LegacyList)
 }
@@ -134,11 +129,9 @@ pub(crate) fn collect_target_ports(pid: u32) -> Result<Vec<PortEntry>, Collector
 
 /// Project the rows a destructive command is allowed to act on, or refuse.
 ///
-/// The whole function is a fail-closed gate: it answers "may we signal based on
-/// this snapshot?" before it answers "which rows?". Authority is accumulated
-/// from two independent sources — the matched sockets themselves, and the
-/// snapshot's evidence gaps — and only then converted into a refusal, so no
-/// early return can skip a reason that a later source would have raised.
+/// This fail-closed gate evaluates signalling authority before returning rows.
+/// It combines matched-socket evidence with snapshot gaps before selecting the
+/// refusal, so an early return cannot omit a reason.
 pub(crate) fn kill_ports_from_snapshot(
     snapshot: &NetworkSnapshot,
     pid: Option<u32>,
@@ -178,7 +171,7 @@ pub(crate) fn kill_ports_from_snapshot(
     }
 
     // A race outranks all observations made inside that unstable read. Reporting
-    // permission denial would claim a stable cause we did not actually prove.
+    // permission denial would claim a stable cause we did not prove.
     if authority.raced {
         return Err(ObservationError::ObservationRaced.into());
     }
@@ -193,11 +186,10 @@ pub(crate) fn kill_ports_from_snapshot(
     project_legacy_target(snapshot, pid, port).map_err(CollectorError::from)
 }
 
-/// Why a destructive command may not act on a snapshot, if it may not.
+/// Reasons a destructive command may not act on a snapshot.
 ///
-/// Two independent reasons rather than one flag, because they map to different
-/// exit codes and different user advice. Both are monotonic: once raised, no
-/// later evidence can lower them.
+/// The reasons remain separate because they map to different exit codes and
+/// guidance. Once raised, later evidence cannot clear them.
 #[derive(Debug, Clone, Copy)]
 struct Authority {
     permission_denied: bool,
@@ -277,7 +269,7 @@ fn destructive_socket_match(
 ///
 /// Port targets are held to a stricter rule than PID targets: a PID target has
 /// already been resolved to one verified identity, but a port target must prove
-/// that every potential holder is accounted for — otherwise the signal may
+/// that every potential holder is accounted for. Otherwise the signal may
 /// leave an unobserved co-holder keeping the port open.
 fn socket_authority(
     socket: &crate::observation::SocketObservation,
@@ -325,11 +317,10 @@ fn socket_authority(
 
 /// Whether an evidence gap can affect this target's authority.
 ///
-/// Provenance is the whole point: a gap explicitly tied to another endpoint
-/// must not make an unprivileged `kill --port` impossible, while a gap without
-/// endpoint provenance could hide a co-holder of the selected port and must
-/// refuse. PID targets instead use PID and matched-endpoint provenance because
-/// they ask whether one already-resolved process identity remains authoritative.
+/// A gap tied to another endpoint does not affect this target. A gap without
+/// endpoint provenance could hide a co-holder of the selected port and causes
+/// refusal. PID targets use PID and matched-endpoint provenance because they ask
+/// whether one resolved process identity remains authoritative.
 fn gap_applies_to_target(
     gap: &crate::observation::EvidenceGap,
     target_mode: DestructiveTargetMode,
@@ -379,12 +370,11 @@ impl CollectorError {
     }
 }
 
-/// Deterministic fake rows: both the test fixture and the fallback collector on
+/// Deterministic rows for tests and the fallback collector on
 /// platforms that don't have a native one yet.
 ///
-/// The rows are hand-picked to hit every rendering path the model allows: full
-/// metadata, permission-restricted partial metadata, a default-protected process
-/// name, IPv6, and a bound UDP socket.
+/// The rows cover full and partial metadata, a default-protected name, IPv6,
+/// and a bound UDP socket.
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
 pub(crate) struct FakeCollector;
 

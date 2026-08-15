@@ -18,10 +18,8 @@ pub(crate) const PROCESS_TREE_INDEX_MAX: usize = crate::observation::CANDIDATE_P
 
 /// One node in the preview tree shown before confirmation.
 ///
-/// The preview is informational: it is built from a single un-frozen snapshot,
-/// so a racing spawner can make it undercount. Execution re-enumerates under the
-/// freeze and is the authority; this only drives the confirmation banner and the
-/// pre-flight refusals that have zero side effects.
+/// Built from one unfrozen snapshot, so concurrent process creation can make the
+/// preview undercount. Execution enumerates again after freezing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessTreeNode {
     pub(crate) pid: u32,
@@ -33,12 +31,8 @@ pub(crate) struct ProcessTreeNode {
     pub(crate) depth: usize,
 }
 
-/// The previewed member set: the root at depth 0 plus the rest, and whether the
-/// cap was hit while building it. Tree scope puts descendants at their real
-/// depth; group scope puts every non-root member at depth 1 because membership
-/// is flat. The final group signal step still queues all terminating signals
-/// before continuing anyone, so parent-like members cannot wake before their
-/// children have a pending termination.
+/// Preview members and whether collection reached its cap. Tree scope records
+/// descendant depth. Group scope records every non-root member at depth 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessTreeTarget {
     nodes: Vec<ProcessTreeNode>,
@@ -52,7 +46,7 @@ pub(crate) struct ProcessTreeTarget {
 /// Why a tree preview could not be built at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TreePlanError {
-    /// The root PID is not present in the snapshot — it exited already.
+    /// The root PID is not present in the snapshot because it exited.
     RootMissing,
     SnapshotLimitExceeded {
         limit: usize,
@@ -110,7 +104,7 @@ impl<'a> ProcessTreeIndex<'a> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GroupPlanError {
-    /// The root PID is not present in the snapshot — it exited already.
+    /// The root PID is not present in the snapshot because it exited.
     RootMissing,
     /// The root has no targetable process group: its group could not be read,
     /// or it lives in the kernel's group `0`.
@@ -164,9 +158,8 @@ impl ProcessTreeTarget {
         })
     }
 
-    /// Whether the tree carries anything worth a stronger look before a `--yes`
-    /// kill: system/service members, members owned by another uid, or members
-    /// whose metadata we could not read.
+    /// Whether `--yes` must show a prompt because the tree contains a system
+    /// process, a different-UID member, or unreadable metadata.
     pub(crate) fn has_warnings(&self) -> bool {
         let base_warnings = self.has_system_process() || self.has_unreadable_name();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -186,9 +179,7 @@ impl ProcessTreeTarget {
     }
 }
 
-/// The word a tree kill must have typed to proceed: the more dangerous mode
-/// wants the more deliberate word. Shared by the CLI prompt and the TUI modal
-/// so the two surfaces can never ask for different words.
+/// Required tree confirmation word, shared by the CLI and TUI.
 pub(crate) fn tree_scope_word(mode: KillMode) -> &'static str {
     match mode {
         KillMode::Force => "force",
@@ -196,9 +187,7 @@ pub(crate) fn tree_scope_word(mode: KillMode) -> &'static str {
     }
 }
 
-/// The word a group kill must have typed to proceed. `force` stays the force
-/// word across every scope — the word confirms deliberateness, the banner
-/// names the scope.
+/// Required group confirmation word. Force mode uses `force` in every scope.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn group_scope_word(mode: KillMode) -> &'static str {
     match mode {
@@ -207,8 +196,7 @@ pub(crate) fn group_scope_word(mode: KillMode) -> &'static str {
     }
 }
 
-/// Whether typed confirmation input satisfies the scope word. Case-insensitive
-/// so Caps Lock cannot trap the user, exactly like the single-kill `force` word.
+/// Whether typed input matches the scope word, ignoring ASCII case.
 pub(crate) fn word_confirmation_matches(input: &str, word: &str) -> bool {
     input.trim().eq_ignore_ascii_case(word)
 }
@@ -222,10 +210,9 @@ pub(crate) fn format_pid_list(pids: &[u32]) -> String {
         .join(", ")
 }
 
-/// The pre-flight gates every tree kill must pass before any signal is sent:
-/// complete enumeration, no unsafe PIDs, no protected descendants. Shared by
-/// the CLI and the TUI so a gate can never exist on one surface and not the
-/// other. Zero side effects: this only inspects an already-built preview.
+/// Check complete enumeration, unsafe PIDs, and protected descendants before
+/// signal delivery. This function has no side effects and is shared by the CLI
+/// and TUI.
 pub(crate) fn preflight_outcome(preview: &ProcessTreeTarget) -> Result<(), TreeKillOutcome> {
     if preview.truncated() {
         return Err(TreeKillOutcome::Truncated {
@@ -249,13 +236,10 @@ pub(crate) fn preflight_outcome(preview: &ProcessTreeTarget) -> Result<(), TreeK
 
 /// The protected-root gate for a tree kill.
 ///
-/// The confirmation stage is decided from whatever names were readable at the
-/// time — but the port row and the process-table scan are different readers,
-/// and `exec` swaps a process's name without changing its PID, parent, or start
-/// marker. So a root can turn out protected only in a later scan. This gate
-/// runs against the freshest preview: a protected root proceeds only when the
-/// protected-root confirmation was actually completed. Both surfaces call it,
-/// so neither can drift into trusting a stale protection verdict.
+/// Recheck root protection against the latest preview. The socket row and
+/// process-table scan may observe different names, and `exec` can change the
+/// name without changing PID or start marker. A protected root proceeds only
+/// after protected-root confirmation.
 pub(crate) fn root_protection_outcome(
     preview: &ProcessTreeTarget,
     protected_confirmation_completed: bool,
@@ -276,12 +260,10 @@ pub(crate) fn root_protection_outcome(
 
 /// Build the preview tree from a single snapshot.
 ///
-/// Pure: no signals, no freezing. An iterative walk from the root over
-/// `parent_pid` edges (traversal order does not matter — nodes are normalized
-/// by the final depth-then-PID sort), enriching each node with the protection
-/// and system/service policy. Stops adding nodes at `limit` and reports
-/// truncation instead of erroring, so the caller can refuse a too-large tree
-/// with zero side effects.
+/// Sends no signals and does not freeze processes. Walks `parent_pid` edges from
+/// the root, then sorts nodes by depth and PID and applies protection and
+/// system/service policy. At `limit`, stops adding nodes and reports truncation
+/// so the caller can refuse the tree.
 pub(crate) fn plan_process_tree(
     root_pid: u32,
     snapshot: &[TreeProcessInfo],
@@ -357,7 +339,7 @@ impl ProcessGroupTarget {
 /// Build the group preview from a single snapshot.
 ///
 /// Pure like the tree preview builder: no signals, no freezing. Membership is one
-/// flat filter — every process whose group ID equals the root's — which is why
+/// flat filter selecting every process whose group ID equals the root's. This
 /// group scope can cover reparented survivors a parent-link walk cannot reach.
 /// Rows whose group is `None` are provably non-members: the platforms map only
 /// the untargetable kernel group `0` to `None` and fail the scan on anything

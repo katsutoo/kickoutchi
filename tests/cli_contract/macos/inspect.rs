@@ -30,7 +30,6 @@ fn macos_inspect_shows_family_read_only_with_kill_hint() {
         stdout(&by_port),
     );
 
-    // Read-only: everything is still alive after both reports.
     assert!(pid_exists(child_pid), "inspect must not signal anything");
 
     let _ = fs::remove_file(ready_file);

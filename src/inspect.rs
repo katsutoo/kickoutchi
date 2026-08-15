@@ -1,16 +1,8 @@
 //! The read-only family view behind `kickoutchi inspect`.
 //!
-//! Tree kill points downward from one confirmed root. This view exists for the
-//! case where downward is not enough: a supervisor, agent, or runner keeps
-//! respawning the port owner, and the *right* root to kill is somewhere above
-//! it. Instead of guessing (or ever killing upward automatically), inspect
-//! shows the whole neighborhood — ancestors, descendants, siblings, and, on
-//! POSIX platforms, the process group — so the user can pick the real root and
-//! point tree kill at it deliberately.
-//!
-//! Strictly read-only by design: this module renders a report string and
-//! nothing else. No signals, no handles, no confirmation flow. The only kill
-//! it ever mentions is the `kick kill --pid <root> --tree` hint at the end.
+//! Reports include ancestors, descendants, siblings, and POSIX process-group
+//! members so callers can identify a supervisor that respawns the port owner.
+//! This module renders reports and never sends signals or opens process handles.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 // Writing into a String is infallible, so the `let _ =` on each `write!` is
@@ -28,8 +20,7 @@ use crate::tree::{
 
 /// Display caps. The walk itself is bounded elsewhere (the tree builder caps at
 /// [`MAX_TREE_PROCESSES`], the ancestor walk at [`ANCESTOR_WALK_MAX`]); these
-/// only bound how much of the bounded data lands on the terminal, with an
-/// honest "and N more" for the rest.
+/// only bound terminal output. Omitted rows are reported as "and N more".
 const ANCESTORS_DISPLAY_MAX: usize = 12;
 const SIBLINGS_DISPLAY_MAX: usize = 8;
 const TREE_DISPLAY_MAX: usize = 20;
@@ -49,10 +40,9 @@ pub(crate) enum InspectError {
 
 /// PID lookup over one process-table snapshot.
 ///
-/// A report resolves the same table many times — the ancestor walk, the scope
-/// PID set, the tree and group sections — and a linear scan per lookup makes a
-/// bounded report cost `lookups x table size` on a host with many processes.
-/// Built once per entry point and passed down instead.
+/// A report resolves the same table for the ancestor walk, scope PID set, tree,
+/// and group sections. Without this index, cost grows with
+/// `lookups x table size`. Build it once per report.
 type PidIndex<'a> = HashMap<u32, &'a TreeProcessInfo>;
 
 fn index_by_pid(snapshot: &[TreeProcessInfo]) -> PidIndex<'_> {
@@ -234,8 +224,7 @@ where
         out,
         "\nTo terminate this tree: kick kill --pid {target_pid} --tree\n",
     );
-    // Group members outside the tree are exactly what a tree kill would leave
-    // alive, so that is the one case where the group command earns a mention.
+    // Suggest group scope only when it reaches members outside the tree.
     if members_outside_tree > 0 {
         let _ = writeln!(
             out,
@@ -346,8 +335,7 @@ fn render_siblings(
     let _ = writeln!(out, "Siblings (same parent): {shown}{suffix}");
 }
 
-/// Render the descendant tree and hand back its member PIDs so the group view
-/// can mark who sits outside it.
+/// Render the descendant tree and return its PIDs for group-membership marking.
 fn render_tree(
     out: &mut String,
     target_pid: u32,
@@ -452,8 +440,7 @@ fn render_group(
     let tree_pids = tree_pids.iter().copied().collect::<HashSet<_>>();
     let (members, shown) = capped_group_members(group, snapshot);
 
-    // Members outside the descendant tree are the interesting ones: they are
-    // exactly what a tree kill from this target would leave alive.
+    // Mark group members that tree scope would leave alive.
     let outside_count = members
         .iter()
         .filter(|info| !tree_pids.contains(&info.pid))
@@ -816,8 +803,8 @@ mod tests {
 
     #[test]
     fn group_kill_hint_is_absent_when_the_tree_already_covers_the_group() {
-        // The agent's group (100) contains only itself and its shell child —
-        // both inside its descendant tree — so suggesting a group kill would
+        // The agent's group (100) contains only itself and its shell child.
+        // Both are inside its descendant tree, so suggesting a group kill would
         // add scope without adding coverage.
         let report = render(100);
 

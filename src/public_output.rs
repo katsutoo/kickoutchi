@@ -60,12 +60,8 @@ impl Serialize for LegacyListRecord<'_> {
         row.serialize_field("command_line", &self.view.command_line)?;
         row.serialize_field("parent_pid", &self.view.parent_pid)?;
         row.serialize_field("parent_process_name", &self.view.parent_process_name)?;
-        // Frozen `1.x` compatibility field with no backing data. It has never
-        // carried real children — per-row child enumeration would walk the
-        // whole process table on every refresh — but existing scripts index the
-        // key, so removing it would be a breaking change. The empty array is
-        // the whole implementation; there is deliberately no struct field
-        // behind it to drift out of sync.
+        // Frozen `1.x` compatibility field. Existing scripts index this key, so
+        // the serializer emits an empty array without storing backing data.
         row.serialize_field("child_pids", &[] as &[u32])?;
         row.serialize_field("protected", &self.view.protected)?;
         row.serialize_field("platform", platform_name(self.view.platform))?;

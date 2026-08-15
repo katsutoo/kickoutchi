@@ -1222,7 +1222,6 @@ fn process_snapshot_tracks_current_process_ancestors() {
 fn children_are_resolved_on_demand_sorted_and_self_excluded() {
     let snapshot = ProcessSnapshot {
         processes: HashMap::from([
-            // Self-parented: must not show up as its own child.
             (
                 100,
                 ProcessMetadata {
@@ -1230,7 +1229,6 @@ fn children_are_resolved_on_demand_sorted_and_self_excluded() {
                     ..ProcessMetadata::default()
                 },
             ),
-            // Two real children, inserted out of PID order to pin the sort.
             (
                 102,
                 ProcessMetadata {
@@ -1247,7 +1245,6 @@ fn children_are_resolved_on_demand_sorted_and_self_excluded() {
                     ..ProcessMetadata::default()
                 },
             ),
-            // Unrelated parent: must be filtered out.
             (
                 200,
                 ProcessMetadata {

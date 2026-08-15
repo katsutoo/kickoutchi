@@ -1,32 +1,19 @@
 //! Process-tree planning plus the Unix freeze-first execution pipeline.
 //!
-//! Single-process kill (see `process.rs`) is precise on purpose: it signals
-//! exactly one confirmed PID. Tree kill terminates a confirmed root together
-//! with its descendants. Its whole design exists to win one specific race: a
-//! target that keeps spawning children faster than you can kill them.
+//! Tree kill terminates a confirmed root and its descendants. Group kill targets
+//! every verified member of a POSIX process group, including reparented members.
 //!
-//! Group kill shares the same freeze-first pipeline but derives membership from
-//! the POSIX process group instead of parent links. It exists for the two cases
-//! tree scope honestly cannot cover: survivors that reparented away from the
-//! tree (double-fork daemons, orphaned workers) and runaway spawners whose tree
-//! outgrows the tree cap. It is deliberately never implemented as
-//! `kill(-pgid)`: every member is enumerated, frozen, identity-verified, and
-//! signalled individually, so the same refusal gates apply to every PID.
+//! Both scopes enumerate, freeze, verify, and signal members individually. Group
+//! scope does not use `kill(-pgid)`, so every PID passes the same refusal gates.
 //!
-//! On Unix, the trick is to freeze before you count. A process observed stopped
-//! cannot `fork` unless another actor continues it, so the tree normally stops
-//! growing from the root while a bounded re-scan sweep reaches descendants.
-//! Identity is re-checked after each observed stop; Linux pins delivery with a
-//! pidfd and macOS re-checks start markers at each raw-PID boundary. Any refusal
-//! after freezing thaws only processes Kickoutchi transitioned to stopped, so an
-//! externally stopped process is not resumed as refusal cleanup. Concurrent
-//! external `SIGSTOP`/`SIGCONT` can still race those observations; scoped kill is
-//! bounded best-effort convergence, not an atomic kernel transaction.
+//! Unix execution stops the root before a bounded rescan reaches the remaining
+//! members. Linux pins delivery with pidfds; macOS checks start markers before
+//! raw-PID signals. Refusal cleanup resumes only processes Kickoutchi observed
+//! transitioning to stopped. External stop and continue signals can still race
+//! this bounded process; it is not an atomic kernel transaction.
 //!
-//! This module is the pure orchestration. All real process I/O — enumerating
-//! `/proc`, sending signals — is injected through [`TreeProcessOps`], so the
-//! whole pipeline is exercised in tests with a fake that scripts snapshots and
-//! records the exact order of stop/continue/signal calls.
+//! [`TreeProcessOps`] supplies process I/O so tests can script snapshots and
+//! record signal order.
 
 mod execute;
 mod plan;
@@ -64,24 +51,18 @@ use execute::{FrozenNode, SweepScope, thaw_all, verify_frozen_identities};
 
 /// Hard cap on the number of processes a single tree kill will touch.
 ///
-/// A real dev-server or agent tree is a handful to a few dozen processes. This
-/// ceiling is generous for that and still bounds the work per kill. A tree that
-/// exceeds it is refused, not partially killed: partial kills of a runaway
-/// spawner report false progress while the survivors regrow.
+/// Trees above this limit are refused rather than partially terminated.
 pub(crate) const MAX_TREE_PROCESSES: usize = 256;
 
 /// Hard cap on the number of processes a single group kill will touch.
 ///
-/// Higher than the tree cap because group scope is the designated tool for
-/// runaway spawners whose tree outgrows [`MAX_TREE_PROCESSES`]. Still a hard
-/// bound: past it the kill is refused, never partially executed. The value
-/// also respects a resource budget — on Linux every member holds one pidfd
-/// during delivery, and 512 stays comfortably under the common 1024
+/// Higher than the tree cap because group scope can cover processes outside the
+/// tree. Linux holds one pidfd per member, so 512 stays below the common 1024
 /// soft file-descriptor limit.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) const MAX_GROUP_PROCESSES: usize = 512;
 
-/// Ceiling on group size for a `--yes` prompt skip. A tiny, all-clear group is
+/// Ceiling on group size for a `--yes` prompt skip. An all-clear group is
 /// the only group kill allowed to proceed without the typed word, and the same
 /// ceiling is re-applied to the final frozen set: a group that grows past it
 /// mid-freeze no longer matches what `--yes` was allowed to skip for.
@@ -125,7 +106,7 @@ pub(crate) struct TreeProcessInfo {
 pub(crate) enum TreeSignalResult {
     /// The signal was accepted by the kernel.
     Delivered,
-    /// No such process — it exited before we signalled it.
+    /// No such process. It exited before signal delivery.
     NotFound,
     /// Permission denied, or any other refusal we treat conservatively as one.
     Denied,
@@ -189,10 +170,8 @@ pub(crate) enum TreeSnapshotScope {
 
 /// The injected process I/O the pipeline drives.
 ///
-/// A trait rather than loose closures because there are four related operations
-/// and a fake needs to implement all of them coherently (scripted snapshots plus
-/// a recorded call log). The real Linux implementation lives in
-/// `platform/linux.rs`.
+/// Groups related process operations so production adapters and test fakes
+/// implement one coherent interface.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) trait TreeProcessOps {
     /// Narrow subsequent snapshots to the scope currently being executed.
@@ -254,7 +233,7 @@ pub(crate) trait TreeProcessOps {
     }
     /// `SIGCONT` a process.
     ///
-    /// `NotFound` leaves no stopped survivor — the process is gone, so there is
+    /// `NotFound` leaves no stopped survivor. The process is gone, so there is
     /// nothing to resume and nothing to report. Only `Denied` is a cleanup
     /// failure: the process is still there and may still be stopped. Every
     /// caller classifies on `Denied` alone; see the executor's thaw cleanup.

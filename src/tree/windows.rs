@@ -1,7 +1,7 @@
 //! Windows process-tree termination through Job Object containment.
 //!
-//! This is deliberately separate from the Unix freeze-first tree executor. Windows
-//! has no supported SIGSTOP-equivalent safety primitive, so the safety boundary is
+//! This is separate from the Unix freeze-first tree executor. Windows has no
+//! supported SIGSTOP-equivalent mechanism, so the safety boundary is
 //! different: verify process handles first, begin containment by assigning the
 //! root, converge on descendants, freeze, then re-prove final membership before
 //! explicitly terminating the job. Assignment starts side effects; it is not an
@@ -139,7 +139,7 @@ pub(crate) enum WindowsTreeCleanupIssue {
 /// A refusal discovered after Windows Job Object containment was committed.
 ///
 /// The report field supplies the post-commit phase; the underlying fact reuses
-/// the pre-commit tree vocabulary, so there is no second mapping table to drift.
+/// the pre-commit tree vocabulary, avoiding a second mapping table.
 pub(crate) type WindowsTreePostCommitIssue = TreeRefusal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1463,7 +1463,7 @@ enum OpenVerifiedError {
 
 /// Map an [`open_verified_process`] failure on `pid` to the user-facing
 /// outcome. Every open site shares this mapping so the same OS failure can
-/// never surface as different outcomes depending on which phase observed it.
+/// produces the same outcome regardless of which phase observed it.
 fn open_error_outcome(pid: u32, error: OpenVerifiedError) -> WindowsTreeKillOutcome {
     match error {
         OpenVerifiedError::NotFound => {

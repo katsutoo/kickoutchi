@@ -418,10 +418,8 @@ pub(super) fn macos_tree_stop_result(
 
 /// Send `SIGSTOP` to a PID for the process-tree freeze.
 ///
-/// macOS has no pidfd equivalent, so the freeze path stops by PID and then
-/// immediately verifies identity while the process is stopped. Linux callers use
-/// `tree_stop_handle` instead so the root and every descendant are pinned
-/// before the first stop signal.
+/// macOS stops by PID and verifies identity after the stop. Linux uses pidfds
+/// through `tree_stop_handle` instead.
 #[cfg(target_os = "macos")]
 pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
     let (signal_result, stop_result) =
@@ -432,14 +430,11 @@ pub(crate) fn tree_stop(pid: u32) -> crate::tree::TreeSignalResult {
 
 /// macOS delivery preparation: probe that the stopped process still exists.
 ///
-/// There is no pidfd to hold on Darwin, so the reuse defense is layered
-/// instead of absolute: every member is stopped and identity-verified first (a
-/// stopped process cannot fork, exec, or exit on its own), and `MacosTreeOps`
-/// re-checks the verified start marker immediately before each raw-PID signal.
-/// The stop does not make PID reuse impossible — an external `SIGKILL` can
-/// remove a stopped process, and a running parent can reap it — it makes the
-/// window a few instructions wide. Signal `0` performs the kernel's existence
-/// and permission checks without delivering anything.
+/// Darwin has no pidfd. The pipeline stops and verifies each member, then
+/// `MacosTreeOps` checks the start marker again immediately before each raw-PID
+/// signal. Signal `0` checks existence and permission without delivering a
+/// signal. An external kill and reap can still recycle a PID between the marker
+/// check and delivery.
 #[cfg(target_os = "macos")]
 pub(crate) fn tree_prepare_delivery_probe(pid: u32) -> crate::tree::TreeSignalResult {
     tree_send_signal(pid, 0)

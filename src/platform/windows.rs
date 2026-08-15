@@ -509,13 +509,8 @@ impl ProcessSnapshot {
 
     /// Direct children of `pid`, resolved on demand from the process map.
     ///
-    /// This scans `processes` once per call instead of maintaining a precomputed
-    /// parent->children index.
-    /// Only `collect_process_context` asks for children, and only when the details
-    /// modal opens, a rare human-triggered action, so the per-refresh table path
-    /// never builds a child index it does not read. It mirrors the Linux collector,
-    /// which resolves children lazily too. Self is excluded because a process
-    /// cannot be its own child.
+    /// Scans `processes` on demand because only the details view requests
+    /// children. Excludes self-parent edges.
     fn children(&self, pid: u32) -> ChildProcessSnapshot {
         let mut children = self
             .processes

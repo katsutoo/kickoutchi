@@ -1,5 +1,4 @@
-//! Drawing the main open-ports table — the roll call of everything currently
-//! squatting in your swamp.
+//! Main open-ports table rendering.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};

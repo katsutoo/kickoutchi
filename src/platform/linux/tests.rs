@@ -1096,7 +1096,6 @@ fn status_read_parses_inside_the_cap_and_fails_closed_past_it() {
     fs::create_dir_all(&process_dir).expect("test process directory must exist");
     let status_path = process_dir.join("status");
 
-    // A large-but-legitimate file (a long Groups line) parses fine.
     let groups = (0..60_000u32).fold(String::from("Groups:"), |mut line, gid| {
         line.push(' ');
         line.push_str(&gid.to_string());
@@ -1110,7 +1109,6 @@ fn status_read_parses_inside_the_cap_and_fails_closed_past_it() {
         .parent_pid;
     assert_eq!(parent, Some(42));
 
-    // Past the cap the read fails closed, PPid or not.
     let oversized = format!(
         "Name:\tnode\nPPid:\t42\n{}",
         "Filler:\t0\n".repeat(MAX_STATUS_BYTES / 8),

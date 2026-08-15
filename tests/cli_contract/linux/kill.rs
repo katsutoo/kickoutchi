@@ -23,7 +23,7 @@ fn configured_protected_process_refuses_yes_kill_with_exit_6() {
     // resolved while the rows were projected rather than only at delivery.
     // Delivery re-checks protection independently, so without this the whole
     // projection-time policy could be unwired and the exit code would still
-    // be 6 — the only symptom would be a banner announcing a kill that never
+    // be 6. The only symptom would be a banner announcing a kill that never
     // runs.
     assert!(
         !stderr(&output).contains("Command: kill"),
@@ -84,8 +84,8 @@ fn kill_pid_yes_sends_real_sigterm_and_port_disappears() {
     assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
     assert!(killed_stderr.contains("sent SIGTERM"), "{killed_stderr}");
     // The target banner (identity + equivalent command) prints even on the
-    // `--yes` path, so a scripted kill still leaves the safety context — and
-    // any warning lines — on stderr instead of signalling silently.
+    // `--yes` path, so a scripted kill still leaves the safety context and
+    // warning lines on stderr instead of signalling silently.
     assert!(
         killed_stderr.contains(&format!("Terminate PID {pid_text}")),
         "{killed_stderr}"
@@ -228,7 +228,7 @@ fn tree_kill_by_port_signals_only_with_complete_owner_evidence() {
 
 /// Declining the typed-word prompt must leave the whole tree alive and
 /// *running*: confirmation happens before any freeze, so no member may be
-/// left `SIGSTOP`ped in state `T`. This pins that ordering end to end — a
+/// left `SIGSTOP`ped in state `T`. This pins that ordering end to end. A
 /// refactor that froze the tree before prompting (say, to make the count
 /// exact) would fail here by leaving a frozen member behind.
 #[test]
@@ -239,20 +239,18 @@ fn tree_kill_declined_at_prompt_leaves_tree_running_and_unfrozen() {
     let port_text = port.to_string();
     let root_pid = helper.id();
 
-    // Enter alone at the typed-word prompt declines the kill.
     let declined = kickoutchi_with_stdin(&["kill", "--port", port_text.as_str(), "--tree"], "\n");
 
     assert_eq!(declined.status.code(), Some(5), "{}", stderr(&declined));
     let declined_stderr = stderr(&declined);
     // The preview printed and the prompt was really reached before the
-    // cancel — this declined after enumeration, not before it.
+    // cancel. This declined after enumeration, not before it.
     assert!(declined_stderr.contains("Scope: tree"), "{declined_stderr}");
     assert!(
         declined_stderr.contains("kill cancelled"),
         "{declined_stderr}"
     );
 
-    // Both members survive, and neither is left stopped.
     for pid in [root_pid, child_pid] {
         assert!(pid_exists(pid), "PID {pid} must survive a declined kill");
         let state = process_state(pid);
@@ -421,10 +419,8 @@ fn tree_kill_recollects_after_prompt_and_kills_late_fork() {
     let _ = fs::remove_file(second_file);
 }
 
-/// The scenario group scope exists for: a member that double-forked away
-/// from the tree (its spawner exited, so it reparented) but kept the
-/// group. A tree kill from the root can never reach it; the group kill
-/// must — and the confirmation must have shown every member first.
+/// A double-forked member leaves the root's tree after reparenting but remains
+/// in its process group. Group scope must show and terminate that member.
 #[test]
 fn group_kill_by_port_signals_only_with_complete_owner_evidence() {
     let _host_observation = lock_host_observation();
@@ -460,7 +456,6 @@ fn group_kill_by_port_signals_only_with_complete_owner_evidence() {
     }
     assert_eq!(killed.status.code(), Some(0), "{killed_stderr}");
     assert!(killed_stderr.contains("Scope: group"), "{killed_stderr}");
-    // Every member is listed, the reparented one included.
     assert!(
         killed_stderr.contains(&format!("PID {orphan_pid}")),
         "{killed_stderr}",

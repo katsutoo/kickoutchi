@@ -1,7 +1,7 @@
 //! Colors and styles for the TUI.
 //!
 //! The UI has to stay usable with no color at all. `NO_COLOR` drops foreground
-//! and background colors but keeps the color-free emphasis — bold, and reverse
+//! and background colors but keeps color-free emphasis through bold and reverse
 //! video for the selected row.
 
 use ratatui::style::{Color, Modifier, Style};

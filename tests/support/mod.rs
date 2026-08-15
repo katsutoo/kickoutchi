@@ -91,15 +91,11 @@ pub(crate) fn stdout_table_has_pid(output: &Output, pid: u32) -> bool {
         .any(|line| line.split_whitespace().nth(3) == Some(pid_text.as_str()))
 }
 
-/// How long a parked helper may outlive its test before self-destructing.
-/// Generous enough for the slowest passing run; short enough that a
-/// killed-by-`SIGKILL` test binary can never leak an immortal helper.
+/// Maximum lifetime of a parked helper after its test exits.
 pub(crate) const HELPER_PARK_MAX: Duration = Duration::from_mins(5);
 
-/// Park a helper process for the remainder of its useful life, then exit.
-/// Bounded so helpers are self-terminating: even when the test binary that
-/// spawned them is killed by `SIGKILL` and never runs cleanup, the park is the
-/// helper's own self-destruct timer.
+/// Park a helper until its timeout. This bounds its lifetime when `SIGKILL`
+/// prevents the test binary from running cleanup.
 pub(crate) fn park_bounded() -> ! {
     let deadline = Instant::now() + HELPER_PARK_MAX;
     while Instant::now() < deadline {

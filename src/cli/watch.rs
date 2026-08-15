@@ -1,7 +1,7 @@
 //! The `watch` command's bounded polling, filtering, diffing, and event output.
 //!
 //! Monotonic time drives scheduling and cancellation while captured wall-clock
-//! values remain output evidence; the two clocks are deliberately kept separate.
+//! values remain output evidence; the two clocks stay separate.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Write};
@@ -102,7 +102,7 @@ impl WatchOptions {
     fn parse(args: &WatchArgs) -> Result<Self, String> {
         // The clap default is a duration token like any other, so it parses
         // through the same path as a user-supplied value. No separate default
-        // branch means nothing to drift out of sync with the declared default.
+        // branch keeps parsing aligned with the declared default.
         let interval = parse_duration_token(&args.interval, WATCH_INTERVAL_MIN, WATCH_INTERVAL_MAX)
             .map_err(|error| format!("invalid --interval: {error}"))?;
         let duration = args
@@ -884,7 +884,7 @@ fn write_endpoint_event(
 
 /// Enforce the bounded evidence contract on a watch event. Today
 /// [`write_endpoint_event`] emits at most one evidence item, so the truncation
-/// path is unreachable; the helper future-proofs the NDJSON promise that
+/// path is unreachable. The helper enforces the NDJSON contract that
 /// `evidence` never exceeds `WATCH_EVENT_EVIDENCE_MAX` and `omitted_evidence_count`
 /// accounts for the rest.
 fn retain_event_evidence(evidence: Vec<EvidenceDto<'static>>) -> (Vec<EvidenceDto<'static>>, u64) {
