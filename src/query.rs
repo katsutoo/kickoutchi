@@ -12,7 +12,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use thiserror::Error;
 
-use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, normalize_ip_address};
+use crate::labels::{normalize_ip_address, SELECTOR_ADDRESS_MAX_BYTES};
 use crate::model::{BindScope, PortEntryView, Protocol, SortMode};
 use crate::observation::Ipv6Scope;
 
@@ -1165,8 +1165,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions,
         filter_preordered_view_indices_by, query_view_indices, query_view_indices_by,
+        QueryCapabilities, QueryError, QueryOptions, FILTER_TEXT_MAX_BYTES,
     };
     use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
