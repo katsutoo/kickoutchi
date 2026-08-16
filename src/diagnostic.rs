@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn command_matcher_handles_many_tokens_without_retaining_an_index() {
+    fn command_matcher_handles_large_command_lines() {
         let command = std::iter::repeat_n("x", 100_000)
             .chain(["--port", "3000"])
             .collect::<Vec<_>>()

@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn single_needle_match_cache_uses_compact_value_keys() {
+    fn single_needle_reuses_cached_match() {
         let mut metadata =
             super::MetadataMatchCache::new(2, super::MetadataNeedleMode::Single("alp"));
 
