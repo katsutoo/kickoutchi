@@ -1294,17 +1294,18 @@ impl App {
             return;
         }
 
-        // The TUI never skips the typed-word modal, so only the protected-root
-        // fact carries into the final frozen-set policy.
+        // The TUI never skips the typed-word modal.
+        let authorization = if confirmation.target.protected {
+            tree::ScopeAuthorization::ProtectedRootAndWordConfirmed
+        } else {
+            tree::ScopeAuthorization::TypedWordConfirmed
+        };
         let outcome = tree::execute_tree_kill(
             &fresh_root,
             confirmation.mode,
             &self.protected_processes,
             fresh_root.platform,
-            tree::ScopeAuthorization {
-                protected_root_confirmed: confirmation.target.protected,
-                prompt_skipped: false,
-            },
+            authorization,
             ops,
         );
         self.kill_status = Some(tree_kill_status_line(

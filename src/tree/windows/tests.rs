@@ -5,8 +5,12 @@ use super::{
 };
 use crate::model::{PermissionStatus, Platform};
 use crate::process::KillTarget;
-use crate::tree::{TreeKillOutcome as TreeRefusal, TreeProcessInfo};
+use crate::tree::{ScopeAuthorization, TreeKillOutcome as TreeRefusal, TreeProcessInfo};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+const fn auth() -> ScopeAuthorization {
+    ScopeAuthorization::TypedWordConfirmed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
@@ -302,7 +306,7 @@ fn root_assignment_is_the_commit_boundary() {
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
     api.fail_root_assign = true;
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert!(matches!(
         outcome,
@@ -336,7 +340,7 @@ fn freeze_capability_preflight_failure_refuses_before_root_assignment() {
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
     api.preflight_error = Some("class 18 is unavailable".to_owned());
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -352,7 +356,7 @@ fn freeze_capability_preflight_failure_refuses_before_root_assignment() {
 fn root_snapshot_identity_drift_refuses_before_job_creation() {
     let mut api = FakeApi::new(vec![vec![info(100, None, 200), info(101, Some(100), 201)]]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -369,7 +373,7 @@ fn root_handle_identity_drift_refuses_before_job_creation() {
         crate::observation::ProcessStartMarker::windows(200).unwrap(),
     );
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -383,7 +387,7 @@ fn missing_fresh_name_refuses_with_zero_delivery_or_job_termination() {
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
     api.remove_name(101, 101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -398,7 +402,7 @@ fn denied_fresh_name_refuses_distinctly_with_zero_delivery_or_job_termination() 
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), info(101, Some(100), 101)]]);
     api.deny_name.insert(101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -417,7 +421,7 @@ fn oversized_fresh_name_refuses_with_zero_delivery_or_job_termination() {
         "x".repeat(crate::observation::PROTECTION_NAME_MAX_BYTES + 1),
     );
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -440,7 +444,7 @@ fn live_assignment_failure_prevents_descendant_spawning_during_fallback() {
     );
     api.spawn_on_wait = Some((101, 2, 102));
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -470,7 +474,7 @@ fn frozen_final_window_refuses_late_protected_child() {
     let mut api = FakeApi::new(vec![initial.clone(), initial.clone(), initial, late]);
     api.contain(102, 102);
 
-    let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit protection refusal returns a report");
@@ -506,7 +510,8 @@ fn yes_skip_withholds_all_termination_when_a_late_child_adds_a_warning() {
     let mut api = FakeApi::new(vec![initial, late]);
     api.deny_assign.insert(101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, true, &mut api);
+    let outcome =
+        execute_tree_kill_with(&root(), &[], ScopeAuthorization::SkippedAllClear, &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit warning refusal returns a report");
@@ -526,7 +531,7 @@ fn real_job_freeze_failure_withholds_job_termination() {
     api.fail_freeze_job = true;
     api.fail_thaw_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit freeze failure returns a report");
@@ -562,7 +567,7 @@ fn freeze_failure_after_primary_issue_is_retained_as_secondary() {
     let mut api = FakeApi::new(vec![first, with_protected]);
     api.fail_freeze_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit issues return a report");
@@ -591,7 +596,7 @@ fn frozen_sweep_failure_after_primary_issue_is_retained_as_secondary() {
     let mut api = FakeApi::new(vec![first, with_protected, with_unknown]);
     api.remove_name(102, 102);
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit issues return a report");
@@ -617,7 +622,7 @@ fn withheld_thaw_failure_preserves_primary_issue_and_avoids_job_termination() {
     api.contain(101, 101);
     api.fail_thaw_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("withheld termination returns a report");
@@ -645,7 +650,7 @@ fn failed_job_termination_thaw_failure_is_reported_separately() {
     api.fail_terminate_job = true;
     api.fail_thaw_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::JobTerminateFailed { error, report } = outcome else {
         panic!("expected failed job termination");
@@ -681,7 +686,7 @@ fn failed_job_termination_preserves_assigned_and_already_exited_members() {
         .insert(102, VecDeque::from([WindowsWaitResult::Exited]));
     api.fail_terminate_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::JobTerminateFailed { error, report } = outcome else {
         panic!("expected failed job termination");
@@ -712,7 +717,7 @@ fn report_waits_share_one_total_deadline() {
     api.wait_elapsed_ms.insert(100, VecDeque::from([2_000]));
     api.wait_elapsed_ms.insert(101, VecDeque::from([3_000]));
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -735,7 +740,7 @@ fn exited_member_after_assign_failure_is_not_reported_alive() {
     api.wait_results
         .insert(101, VecDeque::from([WindowsWaitResult::Exited]));
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -755,7 +760,7 @@ fn live_uncontained_member_is_not_retried_even_if_it_would_exit_later() {
         VecDeque::from([WindowsWaitResult::StillRunning, WindowsWaitResult::Exited]),
     );
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -777,7 +782,7 @@ fn already_contained_late_child_terminates_with_the_job() {
     let mut api = FakeApi::new(vec![first, second]);
     api.contain(101, 101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -792,7 +797,7 @@ fn protected_late_child_withholds_final_job_termination() {
     let second = vec![info(100, None, 100), info(101, Some(100), 101)];
     let mut api = FakeApi::new(vec![first, second]);
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -819,7 +824,7 @@ fn protected_late_child_already_in_job_is_not_reported_alive() {
     let mut api = FakeApi::new(vec![first, second]);
     api.contain(101, 101);
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -847,8 +852,7 @@ fn newly_protected_late_child_uses_fresh_name_and_withholds_termination() {
     api.set_name(101, 101, "lsass.exe");
     api.contain(101, 101);
 
-    let outcome =
-        execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected truthful contained partial report");
@@ -873,7 +877,7 @@ fn unknown_late_contained_child_withholds_all_termination() {
     api.remove_name(101, 101);
     api.contain(101, 101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected truthful contained partial report");
@@ -896,8 +900,7 @@ fn protected_late_child_with_unknown_job_state_withholds_all_termination() {
     api.set_name(101, 101, "lsass.exe");
     api.fail_in_job.insert(101);
 
-    let outcome =
-        execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], auth(), &mut api);
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected fail-closed partial report");
     };
@@ -913,7 +916,7 @@ fn unknown_late_child_with_unknown_job_state_withholds_all_termination() {
     api.remove_name(101, 101);
     api.fail_in_job.insert(101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected fail-closed partial report");
     };
@@ -927,7 +930,7 @@ fn post_commit_snapshot_error_withholds_job_termination() {
     api.snapshot_errors
         .insert(1, "injected sweep snapshot failure".to_owned());
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected post-commit report");
     };
@@ -950,7 +953,7 @@ fn sweep_pass_exhaustion_withholds_job_termination() {
     }
     let mut api = FakeApi::new(snapshots);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected post-commit report");
     };
@@ -982,7 +985,7 @@ fn pre_freeze_and_frozen_sweeps_share_exact_total_pass_budget() {
     }
     let mut api = FakeApi::new(snapshots);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("budget exhaustion returns a post-commit report");
@@ -1011,7 +1014,7 @@ fn final_window_snapshot_catches_late_protected_child() {
     let mut api = FakeApi::new(vec![first, second, third]);
     api.contain(101, 101);
 
-    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p101".to_owned()], auth(), &mut api);
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected post-commit report");
     };
@@ -1040,7 +1043,7 @@ fn final_reconciliation_keeps_a_descendant_whose_intermediate_parent_exited() {
         .insert(101, VecDeque::from([WindowsWaitResult::Exited]));
     api.membership_results = VecDeque::from([Ok(vec![100, 102]), Ok(vec![100, 102])]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("expected completed report");
@@ -1064,7 +1067,7 @@ fn exact_membership_finds_unseen_inherited_protected_child() {
     ]);
     api.contain(102, 102);
 
-    let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["p102".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("protected inherited member returns a withheld report");
@@ -1095,8 +1098,7 @@ fn final_graph_never_traverses_a_reused_root_pid() {
         replacement,
     ]);
 
-    let outcome =
-        execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("PID reuse after commit returns a withheld report");
@@ -1126,7 +1128,7 @@ fn final_graph_never_traverses_a_reused_intermediate_pid() {
         replacement,
     ]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("intermediate PID reuse returns a withheld report");
@@ -1145,7 +1147,7 @@ fn exact_membership_mismatch_withholds_termination() {
     let mut api = FakeApi::new(vec![snapshot]);
     api.membership_results = VecDeque::from([Ok(vec![100])]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("membership mismatch returns a withheld report");
@@ -1166,7 +1168,7 @@ fn oversized_exact_membership_withholds_termination() {
         limit: crate::tree::MAX_TREE_PROCESSES,
     })]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("oversized membership returns a withheld report");
@@ -1185,7 +1187,7 @@ fn changing_exact_membership_during_validation_withholds_termination() {
     let mut api = FakeApi::new(vec![vec![info(100, None, 100)]]);
     api.membership_results = VecDeque::from([Ok(vec![100]), Ok(Vec::new())]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("raced membership returns a withheld report");
@@ -1204,7 +1206,7 @@ fn survivor_after_successful_job_termination_is_thawed_and_reported() {
     api.wait_results
         .insert(100, VecDeque::from([WindowsWaitResult::StillRunning]));
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("successful job termination returns a report");
@@ -1229,7 +1231,7 @@ fn survivor_thaw_failure_after_successful_job_termination_is_distinct() {
     );
     api.fail_thaw_job = true;
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("successful job termination returns a report");
@@ -1255,8 +1257,7 @@ fn protected_root_change_after_commit_keeps_typed_confirmation_result() {
         ]),
     );
 
-    let outcome =
-        execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &["lsass.exe".to_owned()], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-commit protected root returns a withheld report");
@@ -1278,7 +1279,7 @@ fn final_reconciliation_refuses_unproven_live_membership_and_thaws() {
     let mut api = FakeApi::new(vec![snapshot]);
     api.force_not_in_job.insert(101);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("containment refusal returns a report");
@@ -1305,7 +1306,7 @@ fn final_reconciliation_snapshot_error_always_thaws_the_job() {
     api.snapshot_errors
         .insert(5, "final reconciliation failed".to_owned());
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     let WindowsTreeKillOutcome::Completed(report) = outcome else {
         panic!("post-freeze error returns a report");
@@ -1327,7 +1328,7 @@ fn partial_metadata_refuses_before_job_creation() {
     partial.start_time_marker = None;
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), partial]]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,
@@ -1343,7 +1344,7 @@ fn unverified_parent_edge_into_preview_refuses_before_job_creation() {
     partial_child.unverified_parent_pid = Some(100);
     let mut api = FakeApi::new(vec![vec![info(100, None, 100), partial_child]]);
 
-    let outcome = execute_tree_kill_with(&root(), &[], false, false, &mut api);
+    let outcome = execute_tree_kill_with(&root(), &[], auth(), &mut api);
 
     assert_eq!(
         outcome,

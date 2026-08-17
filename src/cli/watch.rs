@@ -16,6 +16,7 @@ use crate::collector::{self, CollectorError};
 use crate::config::Config;
 use crate::display::{human_endpoint_text, sanitize, sanitize_bounded};
 use crate::labels::{SELECTOR_ADDRESS_MAX_BYTES, label_display_text, normalize_ip_address};
+use crate::model::Protocol;
 use crate::observation::{
     EndpointIdentity, EvidenceGap, MetadataProfile, NetworkSnapshot, ObservationError,
     OwnerObservation, SnapshotCompleteness, SocketObservation,
@@ -81,13 +82,8 @@ pub(crate) struct WatchArgs {
 }
 
 #[derive(Debug)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent CLI selectors and output mode remain explicit after validation"
-)]
 struct WatchOptions {
-    tcp: bool,
-    udp: bool,
+    protocols: ProtocolSelection,
     address: Option<IpAddr>,
     scope_id: Option<NonZeroU32>,
     port: Option<u16>,
@@ -96,6 +92,22 @@ struct WatchOptions {
     interval: Duration,
     duration: Option<Duration>,
     json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolSelection {
+    Tcp,
+    Udp,
+    Both,
+}
+
+impl ProtocolSelection {
+    const fn includes(self, protocol: Protocol) -> bool {
+        matches!(
+            (self, protocol),
+            (Self::Tcp | Self::Both, Protocol::Tcp) | (Self::Udp | Self::Both, Protocol::Udp)
+        )
+    }
 }
 
 impl WatchOptions {
@@ -132,8 +144,11 @@ impl WatchOptions {
         .map_err(|error| format!("invalid filter: {error}"))?;
         let protocol_selected = args.tcp || args.udp;
         Ok(Self {
-            tcp: args.tcp || !protocol_selected,
-            udp: args.udp || !protocol_selected,
+            protocols: match (args.tcp, args.udp) {
+                (true, false) => ProtocolSelection::Tcp,
+                (false, true) => ProtocolSelection::Udp,
+                (false, false) | (true, true) => ProtocolSelection::Both,
+            },
             address,
             scope_id,
             port,

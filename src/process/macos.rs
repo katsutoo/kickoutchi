@@ -12,7 +12,8 @@ use super::{
     tree_stop_deadline, unix_signal,
 };
 use super::{
-    StopFailure, TerminationOutcome, UnixProcessState, stop_deadline_failure, tree_stop_error,
+    StopFailure, TerminationOutcome, UnixProcessState, UnixProcessStatus, stop_deadline_failure,
+    tree_stop_error,
 };
 
 #[cfg(target_os = "macos")]
@@ -73,8 +74,13 @@ fn macos_process_state(pid: u32) -> std::io::Result<UnixProcessState> {
     })?;
     Ok(UnixProcessState {
         marker,
-        stopped: info.pbi_status == libc::SSTOP,
-        exited: macos_status_is_exited(info.pbi_status),
+        status: if macos_status_is_exited(info.pbi_status) {
+            UnixProcessStatus::Exited
+        } else if info.pbi_status == libc::SSTOP {
+            UnixProcessStatus::Stopped
+        } else {
+            UnixProcessStatus::Running
+        },
     })
 }
 
@@ -84,7 +90,7 @@ pub(super) fn macos_stop_observation_result(
     observed: UnixProcessState,
     deadline_expired: bool,
 ) -> Option<Result<bool, StopFailure>> {
-    if observed.exited {
+    if observed.status == UnixProcessStatus::Exited {
         return Some(Err(StopFailure {
             outcome: TerminationOutcome::AlreadyExited,
             cleanup_required: false,
@@ -94,18 +100,20 @@ pub(super) fn macos_stop_observation_result(
     if observed.marker != before.marker {
         return Some(Err(StopFailure {
             outcome: TerminationOutcome::TargetChanged,
-            cleanup_required: observed.stopped,
-            rollback_start_time_marker: observed.stopped.then_some(observed.marker),
+            cleanup_required: observed.status == UnixProcessStatus::Stopped,
+            rollback_start_time_marker: (observed.status == UnixProcessStatus::Stopped)
+                .then_some(observed.marker),
         }));
     }
     if deadline_expired {
-        let cleanup_required = !before.stopped;
+        let cleanup_required = before.status != UnixProcessStatus::Stopped;
         return Some(Err(stop_deadline_failure(
             cleanup_required,
             cleanup_required.then_some(observed.marker),
         )));
     }
-    observed.stopped.then_some(Ok(!before.stopped))
+    (observed.status == UnixProcessStatus::Stopped)
+        .then_some(Ok(before.status != UnixProcessStatus::Stopped))
 }
 
 #[cfg(target_os = "macos")]
@@ -119,7 +127,7 @@ fn macos_stop_process(
         cleanup_required: false,
         rollback_start_time_marker: None,
     })?;
-    if before.exited {
+    if before.status == UnixProcessStatus::Exited {
         return Err(StopFailure {
             outcome: TerminationOutcome::AlreadyExited,
             cleanup_required: false,
@@ -152,7 +160,7 @@ fn macos_stop_process(
 
     loop {
         if std::time::Instant::now() >= deadline {
-            let cleanup_required = !before.stopped;
+            let cleanup_required = before.status != UnixProcessStatus::Stopped;
             return Err(stop_deadline_failure(
                 cleanup_required,
                 cleanup_required.then_some(before.marker),
@@ -170,19 +178,19 @@ fn macos_stop_process(
             }
             Err(error) => {
                 if std::time::Instant::now() >= deadline {
-                    let cleanup_required = !before.stopped;
+                    let cleanup_required = before.status != UnixProcessStatus::Stopped;
                     return Err(stop_deadline_failure(cleanup_required, None));
                 }
                 return Err(StopFailure {
                     outcome: macos_signal_outcome("proc_pidinfo after SIGSTOP", &error),
-                    cleanup_required: !before.stopped,
+                    cleanup_required: before.status != UnixProcessStatus::Stopped,
                     rollback_start_time_marker: None,
                 });
             }
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            let cleanup_required = !before.stopped;
+            let cleanup_required = before.status != UnixProcessStatus::Stopped;
             return Err(stop_deadline_failure(
                 cleanup_required,
                 cleanup_required.then_some(before.marker),

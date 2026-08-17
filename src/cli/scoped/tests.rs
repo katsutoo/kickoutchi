@@ -10,8 +10,9 @@ use std::rc::Rc;
 use super::tree_outcome_from_termination;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::{
-    GROUP_YES_SKIP_MAX_PROCESSES, TreeConfirmDecision, TreeKillSeams, group_confirmation,
-    kill_target_from_tree_info, run_group_kill_with, run_tree_kill_with, tree_confirmation,
+    GROUP_YES_SKIP_MAX_PROCESSES, TreeConfirmDecision, TreeKillSeams, confirm_tree_kill,
+    group_confirmation, kill_target_from_tree_info, run_group_kill_with, run_tree_kill_with,
+    tree_confirmation,
 };
 use crate::cli::ExitReason;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -105,8 +106,7 @@ fn confirm_windows_tree_prompt(
 fn panic_windows_tree_execute(
     _root: &KillTarget,
     _protected: &[String],
-    _confirmed: bool,
-    _skipped: bool,
+    _authorization: crate::tree::ScopeAuthorization,
 ) -> crate::tree::windows::WindowsTreeKillOutcome {
     panic!("authoritative refusal must precede Job Object assignment")
 }
@@ -259,8 +259,7 @@ fn windows_port_owner_move_after_root_prepare_never_commits_job() {
             },
             execute: |_root: &KillTarget,
                       _protected: &[String],
-                      _confirmed: bool,
-                      _skipped: bool| {
+                      _authorization: crate::tree::ScopeAuthorization| {
                 events.borrow_mut().push("commit");
                 panic!("moved endpoint must prevent Job Object commit")
             },
@@ -782,6 +781,55 @@ fn tree_confirmation_gates_yes_and_protected_roots() {
             false
         ),
         TreeConfirmDecision::PromptProtectedThenWord("tree"),
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn completed_tree_confirmation_returns_exact_authorization() {
+    let clean = tree_target(&[tree_info(100, Some(500), "node")], &[]);
+    let clean_root = kill_target_from_tree_info(&tree_info(100, Some(500), "node"), &[]);
+    assert_eq!(
+        confirm_tree_kill(
+            &clean_root,
+            &clean,
+            KillMode::Terminate,
+            true,
+            &mut panic_tree_prompt,
+        )
+        .expect("all-clear --yes skips the prompt"),
+        crate::tree::ScopeAuthorization::SkippedAllClear,
+    );
+    assert_eq!(
+        confirm_tree_kill(
+            &clean_root,
+            &clean,
+            KillMode::Terminate,
+            false,
+            &mut confirm_tree_prompt,
+        )
+        .expect("typed scope word confirms an unprotected tree"),
+        crate::tree::ScopeAuthorization::TypedWordConfirmed,
+    );
+
+    let protected = tree_target(
+        &[tree_info(100, Some(500), "postgres")],
+        &["postgres".to_owned()],
+    );
+    let protected_root = kill_target_from_tree_info(
+        &tree_info(100, Some(500), "postgres"),
+        &["postgres".to_owned()],
+    );
+    assert_eq!(
+        confirm_tree_kill(
+            &protected_root,
+            &protected,
+            KillMode::Terminate,
+            false,
+            &mut confirm_tree_prompt,
+        )
+        .expect("protected identity and scope word confirm the tree"),
+        crate::tree::ScopeAuthorization::ProtectedRootAndWordConfirmed,
     );
 }
 

@@ -53,26 +53,6 @@ enum TreeConfirmDecision {
     RefuseProtectedYes,
 }
 
-/// Facts established by confirmation and needed by the fresh
-/// execution-time gates. `skipped_prompt` is separate from
-/// `args.yes`: `--yes` can still fall back to a typed prompt when the preview has
-/// warnings, and that explicit word should not be treated as a silent skip.
-#[derive(Debug, Clone, Copy)]
-struct ScopedConfirmationFacts {
-    protected_confirmed: bool,
-    skipped_prompt: bool,
-}
-
-/// The confirmation facts in the pipeline's vocabulary, so the final frozen-set
-/// policy can re-apply exactly what the prompt (or its skip) authorized.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn scope_authorization(confirmation: ScopedConfirmationFacts) -> tree::ScopeAuthorization {
-    tree::ScopeAuthorization {
-        protected_root_confirmed: confirmation.protected_confirmed,
-        prompt_skipped: confirmation.skipped_prompt,
-    }
-}
-
 /// Injected collection and process-operation seams for a tree kill.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct TreeKillSeams<CollectContext, Prompt, CollectKillPorts, CollectPorts> {
@@ -217,7 +197,7 @@ where
         mode,
         &config.protected_processes,
         fresh_root.platform,
-        scope_authorization(confirmation),
+        confirmation,
         ops,
     );
     map_tree_outcome(&fresh_root, mode, &outcome, &mut seams.collect_ports)
@@ -298,8 +278,11 @@ where
     CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
     PrepareRoot: FnMut(u32) -> Result<RootHandle, TerminationOutcome>,
-    Execute:
-        FnMut(&KillTarget, &[String], bool, bool) -> crate::tree::windows::WindowsTreeKillOutcome,
+    Execute: FnMut(
+        &KillTarget,
+        &[String],
+        tree::ScopeAuthorization,
+    ) -> crate::tree::windows::WindowsTreeKillOutcome,
 {
     let snapshot = match (seams.collect_tree)() {
         Ok(snapshot) => snapshot,
@@ -379,12 +362,7 @@ where
         }
     };
 
-    let outcome = (seams.execute)(
-        &fresh_root,
-        &config.protected_processes,
-        confirmation.protected_confirmed,
-        confirmation.skipped_prompt,
-    );
+    let outcome = (seams.execute)(&fresh_root, &config.protected_processes, confirmation);
     drop(prepared_root);
     map_windows_tree_outcome(&fresh_root, mode, &outcome, &mut seams.collect_ports)
 }
@@ -394,7 +372,7 @@ fn revalidate_windows_tree_root_before_commit<CollectTree, CollectContext, Colle
     args: &KillArgs,
     config: &Config,
     confirmed: &KillTarget,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
     collect_tree: &mut CollectTree,
     collect_context: &mut CollectContext,
     collect_ports: &mut CollectPorts,
@@ -432,7 +410,7 @@ fn windows_fresh_tree_gates(
     root: &KillTarget,
     snapshot: &[tree::TreeProcessInfo],
     config: &Config,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
 ) -> Result<(), crate::tree::windows::WindowsTreeKillOutcome> {
     let preview = tree::plan_process_tree(
         root.pid,
@@ -445,7 +423,7 @@ fn windows_fresh_tree_gates(
     .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     tree::preflight_outcome(&preview)
         .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
-    tree::root_protection_outcome(&preview, confirmation.protected_confirmed)
+    tree::root_protection_outcome(&preview, confirmation.protected_root_confirmed())
         .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
     fresh_tree_yes_outcome(root, &preview, confirmation)
         .map_err(crate::tree::windows::WindowsTreeKillOutcome::from_precommit_outcome)?;
@@ -474,7 +452,7 @@ fn confirm_tree_kill<Prompt>(
     mode: KillMode,
     yes: bool,
     prompt: &mut Prompt,
-) -> Result<ScopedConfirmationFacts, ExitReason>
+) -> Result<tree::ScopeAuthorization, ExitReason>
 where
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
 {
@@ -497,7 +475,7 @@ fn confirm_scoped_kill<Prompt, PrintBanner>(
     decision: TreeConfirmDecision,
     print_banner: PrintBanner,
     prompt: &mut Prompt,
-) -> Result<ScopedConfirmationFacts, ExitReason>
+) -> Result<tree::ScopeAuthorization, ExitReason>
 where
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
     PrintBanner: FnOnce(),
@@ -515,24 +493,15 @@ where
         TreeConfirmDecision::RefuseProtectedYes => {
             unreachable!("protected --yes refusal returned before printing a banner")
         }
-        TreeConfirmDecision::Skip => Ok(ScopedConfirmationFacts {
-            protected_confirmed: false,
-            skipped_prompt: true,
-        }),
+        TreeConfirmDecision::Skip => Ok(tree::ScopeAuthorization::SkippedAllClear),
         TreeConfirmDecision::PromptWord(word) => {
             prompt_tree_step(root, members, TreeConfirmation::TypedWord(word), prompt)?;
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: false,
-                skipped_prompt: false,
-            })
+            Ok(tree::ScopeAuthorization::TypedWordConfirmed)
         }
         TreeConfirmDecision::PromptProtectedThenWord(word) => {
             prompt_tree_step(root, members, TreeConfirmation::ProtectedRoot, prompt)?;
             prompt_tree_step(root, members, TreeConfirmation::TypedWord(word), prompt)?;
-            Ok(ScopedConfirmationFacts {
-                protected_confirmed: true,
-                skipped_prompt: false,
-            })
+            Ok(tree::ScopeAuthorization::ProtectedRootAndWordConfirmed)
         }
     }
 }
@@ -656,7 +625,7 @@ fn revalidate_tree_root_before_freeze<Ops, CollectContext, CollectPorts>(
     args: &KillArgs,
     config: &Config,
     confirmed: &KillTarget,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
     collect_context: &mut CollectContext,
     collect_ports: &mut CollectPorts,
     ops: &mut Ops,
@@ -698,7 +667,7 @@ fn fresh_tree_gates(
     root: &KillTarget,
     snapshot: &[tree::TreeProcessInfo],
     config: &Config,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
 ) -> Result<(), tree::TreeKillOutcome> {
     let preview = tree::plan_process_tree(
         root.pid,
@@ -709,16 +678,16 @@ fn fresh_tree_gates(
     )
     .map_err(tree::plan_error_outcome)?;
     tree::preflight_outcome(&preview)?;
-    tree::root_protection_outcome(&preview, confirmation.protected_confirmed)?;
+    tree::root_protection_outcome(&preview, confirmation.protected_root_confirmed())?;
     fresh_tree_yes_outcome(root, &preview, confirmation)
 }
 
 fn fresh_tree_yes_outcome(
     root: &KillTarget,
     preview: &tree::ProcessTreeTarget,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
 ) -> Result<(), tree::TreeKillOutcome> {
-    if confirmation.skipped_prompt && !tree_yes_skip_allowed(root, preview) {
+    if confirmation.prompt_skipped() && !tree_yes_skip_allowed(root, preview) {
         return Err(tree::TreeKillOutcome::FreshConfirmationRequired);
     }
     Ok(())
@@ -1113,7 +1082,7 @@ where
         mode,
         &config.protected_processes,
         fresh_root.platform,
-        scope_authorization(confirmation),
+        confirmation,
         ops,
     );
     map_group_outcome(
@@ -1134,7 +1103,7 @@ fn confirm_group_kill<Prompt>(
     mode: KillMode,
     yes: bool,
     prompt: &mut Prompt,
-) -> Result<ScopedConfirmationFacts, ExitReason>
+) -> Result<tree::ScopeAuthorization, ExitReason>
 where
     Prompt: FnMut(&KillTarget, &tree::ProcessTreeTarget, TreeConfirmation) -> std::io::Result<bool>,
 {
@@ -1297,7 +1266,7 @@ fn prompt_group_confirmation(
 #[derive(Debug, Clone, Copy)]
 struct ConfirmedGroupFacts {
     pgid: u32,
-    confirmation: ScopedConfirmationFacts,
+    confirmation: tree::ScopeAuthorization,
 }
 
 /// Revalidate the confirmed root and re-run every group gate against a fresh
@@ -1376,9 +1345,10 @@ fn fresh_group_gates(
     tree::preflight_outcome(group.members())?;
     tree::root_protection_outcome(
         group.members(),
-        confirmed_group.confirmation.protected_confirmed,
+        confirmed_group.confirmation.protected_root_confirmed(),
     )?;
-    if confirmed_group.confirmation.skipped_prompt && !group_yes_skip_allowed(root, group.members())
+    if confirmed_group.confirmation.prompt_skipped()
+        && !group_yes_skip_allowed(root, group.members())
     {
         return Err(tree::TreeKillOutcome::FreshConfirmationRequired);
     }

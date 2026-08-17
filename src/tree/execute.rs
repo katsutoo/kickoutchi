@@ -27,8 +27,8 @@ use super::plan::{format_pid_list, is_system};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::{
     GROUP_YES_SKIP_MAX_PROCESSES, MAX_GROUP_PROCESSES, MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX,
-    ProcessTreeIndex, TreePlanError, TreeProcessInfo, TreeProcessOps, TreeSignalResult,
-    TreeSnapshotScope, TreeStopError, TreeStopResult, stop_deadline_expired,
+    ProcessTreeIndex, ScopeAuthorization, TreePlanError, TreeProcessInfo, TreeProcessOps,
+    TreeSignalResult, TreeSnapshotScope, TreeStopError, TreeStopResult, stop_deadline_expired,
 };
 
 /// Cap on freeze-sweep passes. Every pass drains one snapshot completely, so a
@@ -134,29 +134,6 @@ impl SweepScope {
             Self::Group { pgid } => info.process_group == Some(pgid),
         }
     }
-}
-
-/// What the completed confirmation actually authorized, re-applied to the
-/// final frozen set before any terminating signal.
-///
-/// Confirmation uses a pre-freeze preview. The final frozen set can differ when
-/// processes fork, exec, or join a group, so prompt authorization is checked
-/// again while every member is stopped.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ScopeAuthorization {
-    /// The protected-root typed confirmation (PID or name) was completed.
-    /// When false, a root whose fresh post-stop name is protected refuses the
-    /// whole kill, even if its name was unreadable or different at every
-    /// earlier check, because `exec` changes the name without changing the
-    /// PID, parent, or start marker.
-    pub(crate) protected_root_confirmed: bool,
-    /// The typed-word prompt was skipped (the `--yes` all-clear path). The
-    /// skip was justified by a preview; if the frozen set would no longer
-    /// qualify because a system process or different-UID member appeared, or a
-    /// group outgrew [`GROUP_YES_SKIP_MAX_PROCESSES`], the kill
-    /// refuses and asks to be rerun with a real prompt.
-    pub(crate) prompt_skipped: bool,
 }
 
 /// What a report line needs after a completed tree kill.
@@ -825,7 +802,7 @@ fn check_tree_policy(
     // `exec` swaps the name without changing the PID, parent, or start marker
     // while an unknown confirmed name makes the identity check name-blind. A
     // newly protected root requires completed protected-root confirmation.
-    if !authorization.protected_root_confirmed
+    if !authorization.protected_root_confirmed()
         && let Some(root) = frozen.iter().find(|node| node.depth == 0)
         && let Some(name) = root.process_name.as_deref()
         && is_protected_process_name(platform, name, protected_names)
@@ -837,7 +814,7 @@ fn check_tree_policy(
     }
     // Refuse a skipped prompt if the final frozen set no longer satisfies the
     // preview's all-clear policy.
-    if authorization.prompt_skipped {
+    if authorization.prompt_skipped() {
         let system_member_appeared = frozen.iter().any(|node| {
             is_system(
                 node.pid,

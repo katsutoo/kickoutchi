@@ -30,12 +30,11 @@ use crate::process_evidence::{FreshProcessEvidence, ProcessEvidenceError};
 
 #[cfg(windows)]
 pub(crate) use execute::evidence_tree_outcome;
+pub(crate) use execute::{TreeKillOutcome, TreeRefusalClass};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use execute::{
-    ScopeAuthorization, TreeKillReport, execute_group_kill, execute_tree_kill,
-    pin_root_before_revalidation,
+    TreeKillReport, execute_group_kill, execute_tree_kill, pin_root_before_revalidation,
 };
-pub(crate) use execute::{TreeKillOutcome, TreeRefusalClass};
 #[cfg(windows)]
 pub(crate) use plan::plan_process_tree_with_index;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -53,6 +52,28 @@ use execute::{FrozenNode, SweepScope, thaw_all, verify_frozen_identities};
 ///
 /// Trees above this limit are refused rather than partially terminated.
 pub(crate) const MAX_TREE_PROCESSES: usize = 256;
+
+/// What the completed confirmation authorized, re-applied immediately before
+/// termination after the platform has established its final process set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeAuthorization {
+    /// The scope word was typed for an unprotected root.
+    TypedWordConfirmed,
+    /// The protected root identity and then the scope word were typed.
+    ProtectedRootAndWordConfirmed,
+    /// `--yes` skipped the prompt after an all-clear preview.
+    SkippedAllClear,
+}
+
+impl ScopeAuthorization {
+    pub(crate) const fn protected_root_confirmed(self) -> bool {
+        matches!(self, Self::ProtectedRootAndWordConfirmed)
+    }
+
+    pub(crate) const fn prompt_skipped(self) -> bool {
+        matches!(self, Self::SkippedAllClear)
+    }
+}
 
 /// Hard cap on the number of processes a single group kill will touch.
 ///

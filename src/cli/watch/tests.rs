@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{
     BoundedRecord, EVENT_ORDER_RANK_COUNT, FilterCache, FilterResult, GapIndex, ObservationTimes,
-    OwnerPidConstraint, Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN,
+    OwnerPidConstraint, ProtocolSelection, Truth, WATCH_DURATION_MAX, WATCH_DURATION_MIN,
     WATCH_INTERVAL_DEFAULT_TOKEN, WATCH_INTERVAL_MAX, WATCH_INTERVAL_MIN, WatchArgs, WatchOptions,
     WatchRuntime, evaluate_event, evaluate_side, event_order_rank, next_poll_after,
     observation_times, parse_duration_token, run_watch_loop, should_stop, write_human_event,
@@ -13,6 +13,7 @@ use super::{
 use crate::cli::ExitReason;
 use crate::collector::{Collector, CollectorError, FakeCollector};
 use crate::config::Config;
+use crate::model::Protocol;
 
 #[test]
 fn watch_signal_reservation_rejects_overlap_and_fails_closed() {
@@ -281,6 +282,34 @@ fn default_interval_is_one_second_and_scope_requires_ipv6_address() {
     assert!(WatchOptions::parse(&invalid).is_err());
 }
 
+#[test]
+fn protocol_flags_normalize_to_exact_internal_selection() {
+    for (tcp, udp, expected, includes_tcp, includes_udp, filter_active) in [
+        (false, false, ProtocolSelection::Both, true, true, false),
+        (true, false, ProtocolSelection::Tcp, true, false, true),
+        (false, true, ProtocolSelection::Udp, false, true, true),
+        (true, true, ProtocolSelection::Both, true, true, true),
+    ] {
+        let args = WatchArgs {
+            tcp,
+            udp,
+            address: None,
+            scope_id: None,
+            port: None,
+            filter: None,
+            interval: WATCH_INTERVAL_DEFAULT_TOKEN.to_owned(),
+            duration: None,
+            json: false,
+        };
+
+        let options = WatchOptions::parse(&args).expect("protocol flags are valid");
+        assert_eq!(options.protocols, expected);
+        assert_eq!(options.protocols.includes(Protocol::Tcp), includes_tcp);
+        assert_eq!(options.protocols.includes(Protocol::Udp), includes_udp);
+        assert_eq!(options.filter_active, filter_active);
+    }
+}
+
 struct FakeRuntime {
     snapshots: VecDeque<Result<NetworkSnapshot, CollectorError>>,
     monotonic: Duration,
@@ -369,8 +398,7 @@ fn snapshot() -> NetworkSnapshot {
 
 fn options(duration: Duration) -> WatchOptions {
     WatchOptions {
-        tcp: true,
-        udp: true,
+        protocols: ProtocolSelection::Both,
         address: None,
         scope_id: None,
         port: Some(65_535),

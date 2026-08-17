@@ -9,7 +9,7 @@ use super::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::{
-    UnixProcessState, finish_stopped_termination, macos_cont_if_matches_with,
+    UnixProcessState, UnixProcessStatus, finish_stopped_termination, macos_cont_if_matches_with,
     macos_stop_observation_result, macos_tree_stop_result, outcome_after_thaw,
     refuse_stopped_termination, run_before_stop_deadline,
 };
@@ -44,16 +44,31 @@ impl Drop for ChildGuard {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_proc_state_parser_reads_stopped_state_and_identity() {
-    let stat = b"42 (worker with ) chars) T 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20";
-    let state = parse_linux_process_state(stat).expect("valid proc stat parses");
-
-    assert!(state.stopped);
-    assert!(!state.exited);
-    assert_eq!(
-        state.marker,
-        crate::observation::ProcessStartMarker::linux(987).expect("nonzero marker")
-    );
+fn linux_proc_state_parser_classifies_lifecycle_states_and_identity() {
+    for (stat, expected) in [
+        (
+            b"42 (worker with ) chars) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20"
+                .as_slice(),
+            UnixProcessStatus::Running,
+        ),
+        (
+            b"42 (worker with ) chars) T 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20"
+                .as_slice(),
+            UnixProcessStatus::Stopped,
+        ),
+        (
+            b"42 (worker with ) chars) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20"
+                .as_slice(),
+            UnixProcessStatus::Exited,
+        ),
+    ] {
+        let state = parse_linux_process_state(stat).expect("valid proc stat parses");
+        assert_eq!(state.status, expected);
+        assert_eq!(
+            state.marker,
+            crate::observation::ProcessStartMarker::linux(987).expect("nonzero marker")
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -75,10 +90,11 @@ fn linux_tree_stop_returns_only_after_stopped_state_is_observable() {
         take_tree_stop_result(pid),
         Some(crate::tree::TreeStopResult::Stopped { transitioned: true })
     );
-    assert!(
+    assert_eq!(
         linux_process_state(pid)
             .expect("child state remains readable")
-            .stopped
+            .status,
+        UnixProcessStatus::Stopped,
     );
 
     assert_eq!(
@@ -290,11 +306,10 @@ fn delayed_poll_does_not_acknowledge_a_stop_after_the_deadline() {
     let marker = crate::observation::ProcessStartMarker::linux(55).expect("test marker is nonzero");
     let before = UnixProcessState {
         marker,
-        stopped: false,
-        exited: false,
+        status: UnixProcessStatus::Running,
     };
     let observed = UnixProcessState {
-        stopped: true,
+        status: UnixProcessStatus::Stopped,
         ..before
     };
 
@@ -316,11 +331,10 @@ fn linux_delayed_poll_does_not_acknowledge_a_stop_after_the_deadline() {
     let marker = crate::observation::ProcessStartMarker::linux(55).expect("test marker is nonzero");
     let before = UnixProcessState {
         marker,
-        stopped: false,
-        exited: false,
+        status: UnixProcessStatus::Running,
     };
     let observed = UnixProcessState {
-        stopped: true,
+        status: UnixProcessStatus::Stopped,
         ..before
     };
 
@@ -344,13 +358,11 @@ fn macos_pre_stopped_identity_replacement_is_guardedly_thawed_when_observed_stop
         crate::observation::ProcessStartMarker::macos(21, 30).expect("replacement marker is valid");
     let before = UnixProcessState {
         marker: original,
-        stopped: true,
-        exited: false,
+        status: UnixProcessStatus::Stopped,
     };
     let observed = UnixProcessState {
         marker: replacement,
-        stopped: true,
-        exited: false,
+        status: UnixProcessStatus::Stopped,
     };
 
     let failure = macos_stop_observation_result(before, observed, false)

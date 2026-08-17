@@ -43,7 +43,7 @@ use crate::process_evidence::{
 use crate::protection::is_protected_process_name;
 use crate::tree::{
     self, MAX_TREE_PROCESSES, PROCESS_TREE_INDEX_MAX, ProcessTreeIndex, ProcessTreeTarget,
-    TreeKillOutcome as TreeRefusal, TreePlanError, TreeProcessInfo,
+    ScopeAuthorization, TreeKillOutcome as TreeRefusal, TreePlanError, TreeProcessInfo,
 };
 
 // Same finite convergence budget as the Unix freeze sweep. Windows containment
@@ -187,17 +187,10 @@ fn windows_plan_error(error: TreePlanError) -> WindowsTreeKillOutcome {
 pub(crate) fn execute_tree_kill(
     root: &KillTarget,
     protected_names: &[String],
-    protected_root_confirmed: bool,
-    prompt_skipped: bool,
+    authorization: ScopeAuthorization,
 ) -> WindowsTreeKillOutcome {
     let mut api = RealWindowsTreeApi::new();
-    execute_tree_kill_with(
-        root,
-        protected_names,
-        protected_root_confirmed,
-        prompt_skipped,
-        &mut api,
-    )
+    execute_tree_kill_with(root, protected_names, authorization, &mut api)
 }
 
 #[expect(
@@ -207,8 +200,7 @@ pub(crate) fn execute_tree_kill(
 fn execute_tree_kill_with<Api: WindowsTreeApi>(
     root: &KillTarget,
     protected_names: &[String],
-    protected_root_confirmed: bool,
-    prompt_skipped: bool,
+    authorization: ScopeAuthorization,
     api: &mut Api,
 ) -> WindowsTreeKillOutcome {
     if let Some(reason) = unsafe_pid_reason(root.pid) {
@@ -236,8 +228,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         &snapshot,
         &snapshot_index,
         protected_names,
-        protected_root_confirmed,
-        prompt_skipped,
+        authorization,
     ) {
         Ok(preview) => preview,
         Err(outcome) => return outcome,
@@ -257,7 +248,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         &members,
         root.pid,
         protected_names,
-        protected_root_confirmed,
+        authorization.protected_root_confirmed(),
     ) {
         return outcome;
     }
@@ -301,7 +292,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
         &job,
         root.pid,
         protected_names,
-        prompt_skipped,
+        authorization.prompt_skipped(),
         &mut members,
         &mut assigned,
         &mut report,
@@ -320,7 +311,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
                     &job,
                     root.pid,
                     protected_names,
-                    prompt_skipped,
+                    authorization.prompt_skipped(),
                     &mut members,
                     &mut assigned,
                     &mut report,
@@ -356,8 +347,7 @@ fn execute_tree_kill_with<Api: WindowsTreeApi>(
             &job,
             root.pid,
             protected_names,
-            protected_root_confirmed,
-            prompt_skipped,
+            authorization,
             &mut members,
             &mut assigned,
             &mut report,
@@ -422,8 +412,7 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
     job: &Api::JobHandle,
     root_pid: u32,
     protected_names: &[String],
-    protected_root_confirmed: bool,
-    prompt_skipped: bool,
+    authorization: ScopeAuthorization,
     members: &mut HashMap<u32, PinnedProcess<Api::ProcessHandle>>,
     assigned: &mut HashSet<u32>,
     report: &mut WindowsTreeKillReport,
@@ -528,11 +517,11 @@ fn reconcile_final_containment<Api: WindowsTreeApi>(
                 TreeRefusal::TargetChanged { pid },
             ));
         }
-        if protected && (pid != root_pid || !protected_root_confirmed) {
+        if protected && (pid != root_pid || !authorization.protected_root_confirmed()) {
             report.termination_state.withhold();
             return Err(protected_outcome(pid, root_pid, &process.verified_name));
         }
-        if prompt_skipped
+        if authorization.prompt_skipped()
             && (crate::model::SystemProcessCheck {
                 platform: Platform::Windows,
                 pid: Some(pid),
@@ -724,8 +713,7 @@ fn build_precommit_preview(
     snapshot: &[TreeProcessInfo],
     snapshot_index: &ProcessTreeIndex<'_>,
     protected_names: &[String],
-    protected_root_confirmed: bool,
-    prompt_skipped: bool,
+    authorization: ScopeAuthorization,
 ) -> Result<(ProcessTreeTarget, ProcessStartMarker), WindowsTreeKillOutcome> {
     let confirmed_root_marker = verify_snapshot_root_identity(root, snapshot_index)?;
     let preview = tree::plan_process_tree_with_index(
@@ -737,9 +725,9 @@ fn build_precommit_preview(
     )
     .map_err(windows_plan_error)?;
     tree::preflight_outcome(&preview).map_err(WindowsTreeKillOutcome::from_precommit_outcome)?;
-    tree::root_protection_outcome(&preview, protected_root_confirmed)
+    tree::root_protection_outcome(&preview, authorization.protected_root_confirmed())
         .map_err(WindowsTreeKillOutcome::from_precommit_outcome)?;
-    if prompt_skipped && preview.has_warnings() {
+    if authorization.prompt_skipped() && preview.has_warnings() {
         return Err(WindowsTreeKillOutcome::Refused(
             TreeRefusal::FreshConfirmationRequired,
         ));

@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use crate::config::Config;
 use crate::display::human_endpoint_text;
 use crate::labels::normalize_ip_address;
-use crate::model::{BindScope, Protocol};
+use crate::model::BindScope;
 use crate::observation::{
     EndpointIdentity, Ipv6Scope, MetadataCompleteness, NetworkSnapshot, OwnerCompleteness,
     OwnerObservation, ProcessIdentity, ProcessObservation, SocketObservation, SocketState,
@@ -158,11 +158,7 @@ pub(super) fn evaluate_event(
 }
 
 fn selectors_match(endpoint: &EndpointIdentity, options: &WatchOptions) -> bool {
-    let protocol = match endpoint.protocol {
-        Protocol::Tcp => options.tcp,
-        Protocol::Udp => options.udp,
-    };
-    protocol
+    options.protocols.includes(endpoint.protocol)
         && options
             .address
             .is_none_or(|address| normalize_ip_address(endpoint.address) == address)

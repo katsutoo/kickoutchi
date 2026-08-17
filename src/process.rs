@@ -81,8 +81,15 @@ struct StopFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UnixProcessState {
     marker: ProcessStartMarker,
-    stopped: bool,
-    exited: bool,
+    status: UnixProcessStatus,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixProcessStatus {
+    Running,
+    Stopped,
+    Exited,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

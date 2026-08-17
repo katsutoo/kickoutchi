@@ -7,7 +7,7 @@ use crate::observation::ProcessStartMarker;
 
 use super::{
     KillMode, KillTarget, StopFailure, TerminationHandle, TerminationOutcome, TreeDeliveryHandle,
-    UNIX_STOP_ACKNOWLEDGEMENT_MAX, UnixProcessState, check_final_evidence,
+    UNIX_STOP_ACKNOWLEDGEMENT_MAX, UnixProcessState, UnixProcessStatus, check_final_evidence,
     finish_stopped_termination, outcome_after_thaw, outcome_from_errno, record_tree_stop_result,
     refuse_stopped_termination, run_before_stop_deadline, stop_deadline_failure,
     tree_signal_result_from_errno, tree_stop_deadline, tree_stop_error, unix_signal,
@@ -150,8 +150,11 @@ pub(super) fn parse_linux_process_state(bytes: &[u8]) -> std::io::Result<UnixPro
     })?;
     Ok(UnixProcessState {
         marker,
-        stopped: matches!(state, b'T' | b't'),
-        exited: matches!(state, b'Z' | b'X' | b'x'),
+        status: match state {
+            b'T' | b't' => UnixProcessStatus::Stopped,
+            b'Z' | b'X' | b'x' => UnixProcessStatus::Exited,
+            _ => UnixProcessStatus::Running,
+        },
     })
 }
 
@@ -178,7 +181,7 @@ pub(super) fn linux_stop_observation_result(
     observed: UnixProcessState,
     deadline_expired: bool,
 ) -> Option<Result<bool, StopFailure>> {
-    if observed.marker != before.marker || observed.exited {
+    if observed.marker != before.marker || observed.status == UnixProcessStatus::Exited {
         return Some(Err(StopFailure {
             outcome: TerminationOutcome::AlreadyExited,
             cleanup_required: false,
@@ -188,7 +191,7 @@ pub(super) fn linux_stop_observation_result(
     if deadline_expired {
         return Some(Err(stop_deadline_failure(transitioned, None)));
     }
-    observed.stopped.then_some(Ok(transitioned))
+    (observed.status == UnixProcessStatus::Stopped).then_some(Ok(transitioned))
 }
 
 #[cfg(target_os = "linux")]
@@ -212,7 +215,7 @@ fn linux_stop_pidfd(
         cleanup_required: false,
         rollback_start_time_marker: None,
     })?;
-    if before.exited {
+    if before.status == UnixProcessStatus::Exited {
         return Err(StopFailure {
             outcome: TerminationOutcome::AlreadyExited,
             cleanup_required: false,
@@ -226,7 +229,7 @@ fn linux_stop_pidfd(
             rollback_start_time_marker: None,
         });
     }
-    let transitioned = !before.stopped;
+    let transitioned = before.status != UnixProcessStatus::Stopped;
     let result = run_before_stop_deadline(deadline, std::time::Instant::now, || unsafe {
         // SAFETY: pidfd is live for this call; SIGSTOP has no pointer payload.
         libc::syscall(

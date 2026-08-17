@@ -701,10 +701,7 @@ fn production_index_bound_is_wired_through_planning_and_final_verification() {
 /// Authorization for the common test case: no protected-root confirmation
 /// completed, and the typed-word prompt actually answered (not skipped).
 fn auth() -> ScopeAuthorization {
-    ScopeAuthorization {
-        protected_root_confirmed: false,
-        prompt_skipped: false,
-    }
+    ScopeAuthorization::TypedWordConfirmed
 }
 
 fn root_target(pid: u32, name: &str, marker: u64) -> KillTarget {
@@ -1647,8 +1644,12 @@ fn group_root_that_moved_groups_thaws_and_refuses() {
 fn group_cap_exceeded_during_freeze_thaws_and_refuses() {
     let root = root_target(100, "root", 10);
     let mut snapshot = vec![ginfo(100, Some(1), "root", 10, 42)];
-    let over_cap = u32::try_from(MAX_GROUP_PROCESSES).unwrap() + 5;
-    for pid in 1000..(1000 + over_cap) {
+    let current_pid = std::process::id();
+    let member_count = MAX_GROUP_PROCESSES + 5;
+    for pid in (2..)
+        .filter(|pid| *pid != root.pid && *pid != current_pid)
+        .take(member_count)
+    {
         snapshot.push(ginfo(pid, Some(1), "member", u64::from(pid), 42));
     }
     let mut ops = FakeOps::new(vec![snapshot.clone(), snapshot]);
@@ -1947,10 +1948,7 @@ fn root_exec_into_protected_name_refuses_without_protected_confirmation() {
         KillMode::Terminate,
         &protected,
         Platform::Linux,
-        ScopeAuthorization {
-            protected_root_confirmed: true,
-            prompt_skipped: false,
-        },
+        ScopeAuthorization::ProtectedRootAndWordConfirmed,
         &mut ops,
     );
     assert!(matches!(outcome, TreeKillOutcome::Completed(_)));
@@ -1967,10 +1965,7 @@ fn yes_skip_refuses_when_a_system_member_appears_mid_freeze() {
         info(100, Some(500), "root", 10),
         info(101, Some(100), "systemd", 11),
     ];
-    let skipped = ScopeAuthorization {
-        protected_root_confirmed: false,
-        prompt_skipped: true,
-    };
+    let skipped = ScopeAuthorization::SkippedAllClear;
     let mut ops = FakeOps::new(vec![base, grown]);
 
     let outcome = execute_tree_kill(
@@ -2001,10 +1996,7 @@ fn yes_skip_refuses_when_an_owner_mismatch_appears_mid_freeze() {
             ..info(101, Some(100), "worker", 11)
         },
     ];
-    let skipped = ScopeAuthorization {
-        protected_root_confirmed: false,
-        prompt_skipped: true,
-    };
+    let skipped = ScopeAuthorization::SkippedAllClear;
     let mut ops = FakeOps::new(vec![base, grown]);
 
     let outcome = execute_tree_kill(
@@ -2038,10 +2030,7 @@ fn yes_skip_refuses_when_the_group_outgrows_the_skip_cap_mid_freeze() {
         grown.push(ginfo(pid, Some(500), "joiner", u64::from(pid), 42));
     }
     assert!(grown.len() > GROUP_YES_SKIP_MAX_PROCESSES);
-    let skipped = ScopeAuthorization {
-        protected_root_confirmed: false,
-        prompt_skipped: true,
-    };
+    let skipped = ScopeAuthorization::SkippedAllClear;
     let mut ops = FakeOps::new(vec![small, grown]);
 
     let outcome = execute_group_kill(

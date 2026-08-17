@@ -146,9 +146,13 @@ pub(crate) fn kill_ports_from_snapshot(
     // An omitted gap is evidence we never got to inspect, so it is partial
     // before any socket is examined. Races stay distinct because a raced
     // observation cannot support a permission diagnosis from the same read.
-    let mut authority = Authority::complete();
-    authority.partial |= snapshot.omitted_evidence_gap_count != 0;
-    authority.raced |= snapshot.completeness == SnapshotCompleteness::Raced;
+    let mut authority = Authority::Complete;
+    if snapshot.omitted_evidence_gap_count != 0 {
+        authority.merge(Authority::Partial);
+    }
+    if snapshot.completeness == SnapshotCompleteness::Raced {
+        authority.merge(Authority::Raced);
+    }
 
     let mut matched_endpoints = std::collections::BTreeSet::new();
     for socket in &snapshot.sockets {
@@ -162,54 +166,44 @@ pub(crate) fn kill_ports_from_snapshot(
     for gap in &snapshot.evidence_gaps {
         // A raced observation invalidates the whole snapshot regardless of
         // which endpoint or PID the gap names.
-        authority.raced |= gap.code == EvidenceGapCode::ObservationRaced;
+        if gap.code == EvidenceGapCode::ObservationRaced {
+            authority.merge(Authority::Raced);
+        }
         if !gap_applies_to_target(gap, target_mode, &matched_endpoints) {
             continue;
         }
-        authority.permission_denied |= gap.code == EvidenceGapCode::OwnerPermissionDenied;
-        authority.partial = true;
+        authority.merge(if gap.code == EvidenceGapCode::OwnerPermissionDenied {
+            Authority::PermissionDenied
+        } else {
+            Authority::Partial
+        });
     }
 
-    // A race outranks all observations made inside that unstable read. Reporting
-    // permission denial would claim a stable cause we did not prove.
-    if authority.raced {
-        return Err(ObservationError::ObservationRaced.into());
-    }
-    // Permission denial outranks non-raced partiality: it is the more specific
-    // and actionable refusal, and it maps to a distinct exit code.
-    if authority.permission_denied {
-        return Err(CollectorError::OwnershipPermissionDenied);
-    }
-    if authority.partial {
-        return Err(ObservationError::PartialSocketSet.into());
+    match authority {
+        // A race outranks all observations made inside that unstable read.
+        // Reporting permission denial would claim a stable cause we did not prove.
+        Authority::Raced => return Err(ObservationError::ObservationRaced.into()),
+        // Permission denial outranks non-raced partiality because it is the more
+        // specific refusal and maps to a distinct exit code.
+        Authority::PermissionDenied => return Err(CollectorError::OwnershipPermissionDenied),
+        Authority::Partial => return Err(ObservationError::PartialSocketSet.into()),
+        Authority::Complete => {}
     }
     project_legacy_target(snapshot, pid, port).map_err(CollectorError::from)
 }
 
-/// Reasons a destructive command may not act on a snapshot.
-///
-/// The reasons remain separate because they map to different exit codes and
-/// guidance. Once raised, later evidence cannot clear them.
-#[derive(Debug, Clone, Copy)]
-struct Authority {
-    permission_denied: bool,
-    partial: bool,
-    raced: bool,
+/// Strongest reason a destructive command may not act on a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Authority {
+    Complete,
+    Partial,
+    PermissionDenied,
+    Raced,
 }
 
 impl Authority {
-    const fn complete() -> Self {
-        Self {
-            permission_denied: false,
-            partial: false,
-            raced: false,
-        }
-    }
-
     fn merge(&mut self, other: Self) {
-        self.permission_denied |= other.permission_denied;
-        self.partial |= other.partial;
-        self.raced |= other.raced;
+        *self = (*self).max(other);
     }
 }
 
@@ -284,24 +278,32 @@ fn socket_authority(
     let target_owner_permission_denied = target_match.unverified_target_reason
         == Some(crate::observation::UnverifiedOwnerReason::PermissionDenied);
 
-    let mut authority = Authority {
-        permission_denied: socket_local_permission_gap || target_owner_permission_denied,
-        partial: target_match.unverified_target_reason.is_some()
-            || !socket.owner_completeness.is_complete(),
-        raced: socket.owner_completeness == OwnerCompleteness::Raced
-            || target_match.unverified_target_reason
-                == Some(crate::observation::UnverifiedOwnerReason::Raced),
-    };
+    let mut authority = Authority::Complete;
+    if target_match.unverified_target_reason.is_some() || !socket.owner_completeness.is_complete() {
+        authority.merge(Authority::Partial);
+    }
+    if socket_local_permission_gap || target_owner_permission_denied {
+        authority.merge(Authority::PermissionDenied);
+    }
+    if socket.owner_completeness == OwnerCompleteness::Raced
+        || target_match.unverified_target_reason
+            == Some(crate::observation::UnverifiedOwnerReason::Raced)
+    {
+        authority.merge(Authority::Raced);
+    }
 
     if matches!(target_mode, DestructiveTargetMode::Port(_)) {
         // No owner at all, or any owner we could not tie to a start identity,
         // means the port's holder set is unproven.
-        authority.partial |= socket.owners.is_empty()
+        if socket.owners.is_empty()
             || socket
                 .owners
                 .iter()
-                .any(|owner| !matches!(owner, crate::observation::OwnerObservation::Verified(_)));
-        authority.permission_denied |= socket.owners.iter().any(|owner| {
+                .any(|owner| !matches!(owner, crate::observation::OwnerObservation::Verified(_)))
+        {
+            authority.merge(Authority::Partial);
+        }
+        if socket.owners.iter().any(|owner| {
             matches!(
                 owner,
                 crate::observation::OwnerObservation::UnverifiedPid {
@@ -309,7 +311,9 @@ fn socket_authority(
                     ..
                 }
             )
-        });
+        }) {
+            authority.merge(Authority::PermissionDenied);
+        }
     }
 
     authority
