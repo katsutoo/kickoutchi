@@ -193,6 +193,9 @@ pub(crate) fn kill_ports_from_snapshot(
 }
 
 /// Strongest reason a destructive command may not act on a snapshot.
+///
+/// Variant order is the refusal priority `merge` relies on: a race outranks a
+/// permission denial, which outranks plain partiality. Do not reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Authority {
     Complete,
