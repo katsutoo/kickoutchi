@@ -182,8 +182,12 @@ are excluded from publication.
 Release verification builds the native binaries for the exact workflow commit,
 then validates each native binary archive's checksum, layout, executable
 permissions where applicable, both binary entry points, runtime version, and
-updater startup before upload. Generated installers execute against local copies
-of those same-run artifacts before publication. Updater smoke tests invoke
+updater startup before publication. Linux archives are built in the Debian
+containers, then downloaded from the same workflow run and validated on
+native runners with the initial PID namespace and isolated network traffic.
+These Linux archive checks gate both artifact attestation and publication.
+Generated installers execute against local copies of those same-run artifacts
+before publication. Updater smoke tests invoke
 `--help`; they do not perform an update from an older installation. The workflow
 does not validate installation or updating through public URLs after publication.
 Homebrew publication waits for hosting, with no post-publication validation gate.

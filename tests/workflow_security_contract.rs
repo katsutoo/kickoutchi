@@ -217,6 +217,7 @@ fn release_validates_packages_before_attested_publication() {
             "plan",
             "publish-homebrew-formula",
             "validate-installers",
+            "validate-linux-archives",
         ])
     );
 
@@ -290,6 +291,35 @@ fn release_validates_packages_before_attested_publication() {
     );
 
     assert_no_ref_expression_in_scripts(RELEASE_WORKFLOW);
+}
+
+#[test]
+fn linux_release_archives_are_validated_natively_before_attestation_and_publication() {
+    let release = parsed_workflow(RELEASE_WORKFLOW);
+    let native = workflow_job(&release, "validate-linux-archives");
+    assert!(mapping_value(native, "container").is_none());
+    assert_eq!(job_needs(native), ["build-local-artifacts"]);
+    let targets = matrix_entries(native)
+        .iter()
+        .map(|entry| {
+            yaml_scalar(required_mapping(entry, "native Linux entry"), "target")
+                .expect("each native Linux runner must select a release target")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        targets,
+        strings(["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"])
+    );
+    let validation = step_script(named_job_step(native, "Validate native Linux archive"));
+    assert!(validation.contains("validate_generated_native_archive"));
+    assert!(validation.contains("unshare --net"));
+    assert!(!validation.contains("--pid"));
+    assert!(!validation.contains("--user"));
+    for job in ["attest-release-artifacts", "host"] {
+        assert!(
+            job_needs(workflow_job(&release, job)).contains(&"validate-linux-archives".to_owned())
+        );
+    }
 }
 
 #[test]

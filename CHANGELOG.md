@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those capabilities cannot prevent unrelated host sockets from changing.
   Linux CI now isolates test network traffic while retaining the runner's user
   and PID namespace for permission and ownership checks.
+- Linux release archives are now executed on native runners before attestation
+  and publication. Builds retain the Debian glibc compatibility floor, while
+  termination tests no longer assume complete PID visibility inside a build
+  container.
 
 ## [1.4.1] - 2026-08-13
 
