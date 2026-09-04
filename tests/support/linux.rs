@@ -899,18 +899,13 @@ fn stop_pid(pid: u32) {
 }
 
 /// Native hosts may expose either complete procfs evidence or a
-/// restricted/stacked mount. Only a successful signal or this exact
-/// fail-closed authority refusal is valid.
+/// restricted/stacked mount, and unrelated host sockets may change during
+/// collection even when namespace capabilities are available. Only a
+/// successful signal or these exact fail-closed authority refusals are valid.
 fn port_kill_refused_for_incomplete_authority(output: &Output) -> bool {
     let stderr = stderr(output);
     let observation_raced = output.status.code() == Some(1)
         && stderr.contains("collecting ports before kill failed: observation raced");
-    if observation_raced {
-        assert!(
-            !required_linux_capabilities(),
-            "the capability-required port-kill journey raced instead of succeeding:\n{stderr}"
-        );
-    }
     let refused_during_collection = observation_raced
         || (output.status.code() == Some(1)
             && stderr.contains("collecting ports before kill failed: socket set is partial"));

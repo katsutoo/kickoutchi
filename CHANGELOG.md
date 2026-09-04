@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-05
+
 ### Fixed
 
 - Linux now checks the kernel's initial PID namespace identity before claiming
@@ -20,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Corrected the security policy to match the release workflow's existing
   pre-publication checks, updater smoke tests, Homebrew publication, and final
   manifest attestation coverage.
+- Linux socket-helper cleanup tests now share the host observation lock, so
+  their socket changes cannot race concurrent port-kill tests. Host port-kill
+  tests also verify safe race refusals when namespace capabilities are required;
+  those capabilities cannot prevent unrelated host sockets from changing.
+  Linux CI now isolates test network traffic while retaining the runner's user
+  and PID namespace for permission and ownership checks.
 
 ## [1.4.1] - 2026-08-13
 
@@ -1493,7 +1501,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/nuggocto/kickoutchi/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...v1.4.0
 [1.3.10]: https://github.com/nuggocto/kickoutchi/compare/v1.3.9...v1.3.10

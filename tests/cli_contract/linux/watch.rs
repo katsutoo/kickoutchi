@@ -360,6 +360,7 @@ fn watch_wildcard_label_reaches_filtered_output() {
 
 #[test]
 fn socket_lifecycle_drop_forces_process_and_reader_cleanup() {
+    let _host_observation = lock_host_observation();
     let (_binary_guard, binary) = build_socket_lifecycle_helper();
     let pid = {
         let (helper, _port) = SocketLifecycle::spawn(&binary, &["tcp4", "exact", "default", "1"]);
@@ -386,6 +387,7 @@ fn reader_panic_is_joined_and_reported() {
 
 #[test]
 fn deep_chain_drop_terminates_every_owned_process() {
+    let _host_observation = lock_host_observation();
     let pids = {
         let helper = spawn_deep_chain_process(4);
         helper.pids.clone()

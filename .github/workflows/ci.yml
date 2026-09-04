@@ -112,7 +112,17 @@ jobs:
           fi
 
       - name: Run tests
-        run: KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 cargo test --locked --all-features
+        # Preserve the runner's user and PID namespace for permission/ownership
+        # assertions, but exclude unrelated runner traffic from socket snapshots.
+        run: |
+          sudo unshare --net bash -c '
+            set -euo pipefail
+            ip link set lo up
+            runner_user="$1"
+            shift
+            exec runuser -u "$runner_user" -- "$@"
+          ' sh "$(id -un)" env PATH="$PATH" KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES=1 \
+            cargo test --locked --all-features
 
       - name: Build release binaries
         run: cargo build --locked --release --all-features --bin kickoutchi --bin kick
@@ -124,8 +134,22 @@ jobs:
           KICKOUTCHI_E2E_KICK: ${{ github.workspace }}/target/release/kick
           KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES: "1"
         run: |
-          cargo test --locked --all-features --test cli_contract
-          cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
+          sudo unshare --net bash -c '
+            set -euo pipefail
+            ip link set lo up
+            runner_user="$1"
+            shift
+            exec runuser -u "$runner_user" -- "$@"
+          ' sh "$(id -un)" env PATH="$PATH" \
+            KICKOUTCHI_RELEASE_E2E_REQUIRED="$KICKOUTCHI_RELEASE_E2E_REQUIRED" \
+            KICKOUTCHI_E2E_KICKOUTCHI="$KICKOUTCHI_E2E_KICKOUTCHI" \
+            KICKOUTCHI_E2E_KICK="$KICKOUTCHI_E2E_KICK" \
+            KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES="$KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES" \
+            bash -c '
+              set -euo pipefail
+              cargo test --locked --all-features --test cli_contract
+              cargo test --locked --all-features --test cli_contract required_release_artifact_paths_are_complete_and_versioned -- --exact --ignored
+            '
 
   nix:
     name: Nix (${{ matrix.system }})
