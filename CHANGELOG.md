@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Linux now checks the kernel's initial PID namespace identity before claiming
+  complete socket ownership. Nested PID namespaces with their own procfs retain
+  partial ownership evidence, including sockets shared with invisible ancestor
+  processes.
+- Linux termination now handles process names truncated by the kernel midway
+  through a Unicode character. Final validation uses the same bounded lossy
+  decoding as collection and protection matching, while retaining process
+  identity checks and name-size limits.
+- Corrected the security policy to match the release workflow's existing
+  pre-publication checks, updater smoke tests, Homebrew publication, and final
+  manifest attestation coverage.
+
 ## [1.4.1] - 2026-08-13
 
 ### Changed

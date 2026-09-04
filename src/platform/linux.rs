@@ -1165,30 +1165,15 @@ fn proc_visibility_restricted(proc_root: &Path) -> bool {
 }
 
 fn ancestor_pid_visibility_not_proven(proc_root: &Path) -> bool {
-    let Ok(status) = read_bounded_text(&proc_root.join("self/status"), MAX_STATUS_BYTES) else {
-        return true;
-    };
-    let mut nspid_lines = status
-        .lines()
-        .filter_map(|line| line.strip_prefix("NSpid:"));
-    let Some(nspid) = nspid_lines.next() else {
-        return true;
-    };
-    if nspid_lines.next().is_some() {
-        return true;
-    }
-
-    let mut id_count = 0usize;
-    for field in nspid.split_whitespace() {
-        let Ok(pid) = field.parse::<u32>() else {
-            return true;
-        };
-        if pid == 0 {
-            return true;
-        }
-        id_count += 1;
-    }
-    id_count != 1
+    // NSpid is relative to the procfs mount, so a nested namespace with its
+    // own procfs also has one entry. Compare the kernel's reserved initial
+    // PID namespace identity instead. PID_NS_INIT_INO is 0xEFFFFFFC in
+    // include/uapi/linux/nsfs.h, formerly PROC_PID_INIT_INO in linux/proc_ns.h.
+    // https://github.com/torvalds/linux/blob/v6.19/include/uapi/linux/nsfs.h
+    // Unknown or unreadable identities cannot establish complete visibility.
+    const INITIAL_PID_NAMESPACE: &str = "pid:[4026531836]";
+    !read_link_bounded(&proc_root.join("self/ns/pid"), SCOPE_IDENTIFIER_MAX_BYTES)
+        .is_ok_and(|namespace| namespace.as_os_str() == INITIAL_PID_NAMESPACE)
 }
 
 #[cfg(test)]
@@ -1687,7 +1672,9 @@ fn read_fresh_process_evidence(
     let process_dir = proc_root.join(pid.to_string());
     let start_marker = read_process_start_time_ticks(&process_dir.join("stat"))
         .map_err(|error| process_evidence_io_error(pid, &error))?;
-    let name = read_bounded_text(
+    // comm is a byte string and the kernel can truncate it mid-UTF-8 scalar.
+    // Match collection and protection's bounded lossy representation.
+    let name = read_bounded_lossy_text(
         &process_dir.join("comm"),
         crate::observation::PROTECTION_NAME_MAX_BYTES,
     )

@@ -41,6 +41,7 @@ const HELPER_PORT_ENV: &str = "KICKOUTCHI_TEST_HELPER_PORT";
 const HELPER_READY_ENV: &str = "KICKOUTCHI_TEST_HELPER_READY";
 const HELPER_BIND_ANY_ENV: &str = "KICKOUTCHI_TEST_HELPER_BIND_ANY";
 const HELPER_NONDUMPABLE_ENV: &str = "KICKOUTCHI_TEST_HELPER_NONDUMPABLE";
+const HELPER_NAME_ENV: &str = "KICKOUTCHI_TEST_HELPER_NAME";
 const IPC_WAIT: Duration = Duration::from_secs(10);
 // Each no-match diagnostic runs in its own network namespace, where this
 // valid boundary port is guaranteed to have no unrelated host listener.
@@ -65,7 +66,11 @@ fn run_in_isolated_user_network_namespace(
         "sh",
     ]);
     command.args(arguments);
-    let output = match run_command_with_deadline(&mut command, None, CHILD_EXIT_WAIT) {
+    run_namespace_command(&mut command)
+}
+
+fn run_namespace_command(command: &mut Command) -> Option<Output> {
+    let output = match run_command_with_deadline(command, None, CHILD_EXIT_WAIT) {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             assert!(
@@ -721,6 +726,13 @@ fn spawn_listener_process() -> (ChildGuard, u16, PathBuf) {
 fn spawn_listener_process_with_metadata_access(
     metadata_accessible: bool,
 ) -> (ChildGuard, u16, PathBuf) {
+    spawn_listener_process_with_options(metadata_accessible, None)
+}
+
+fn spawn_listener_process_with_options(
+    metadata_accessible: bool,
+    name: Option<&str>,
+) -> (ChildGuard, u16, PathBuf) {
     let ready_file = temp_file_path("listener-ready");
     let mut command = Command::new(std::env::current_exe().expect("test binary path resolves"));
     command
@@ -737,6 +749,9 @@ fn spawn_listener_process_with_metadata_access(
         .stderr(Stdio::null());
     if !metadata_accessible {
         command.env(HELPER_NONDUMPABLE_ENV, "1");
+    }
+    if let Some(name) = name {
+        command.env(HELPER_NAME_ENV, name);
     }
     let child = command.spawn().expect("listener helper process must start");
     let guard = ChildGuard { child };
@@ -960,6 +975,12 @@ fn assert_json_keys_absent_recursively(value: &serde_json::Value, forbidden: &[&
 fn helper_tcp_listener_process() {
     if std::env::var_os(HELPER_LISTENER_ENV).is_none() {
         return;
+    }
+
+    if let Ok(name) = std::env::var(HELPER_NAME_ENV) {
+        // Set the process leader's name, not only the test worker thread's.
+        // The kernel performs its real byte truncation at this boundary.
+        fs::write("/proc/self/comm", name).expect("helper process name must be set");
     }
 
     if std::env::var_os(HELPER_NONDUMPABLE_ENV).is_some() {

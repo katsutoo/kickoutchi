@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn kernel_truncated_unicode_name_remains_protected_and_terminable() {
+    let _host_observation = lock_host_observation();
+    let name = "aaaaaaaaaaaaaaé";
+    let (mut helper, _port, ready_file) = spawn_listener_process_with_options(true, Some(name));
+    let _ready_file = FileGuard(ready_file);
+    let pid_text = helper.id().to_string();
+    let comm = fs::read(format!("/proc/{pid_text}/comm")).expect("helper comm must be readable");
+    assert_eq!(&comm[..comm.len() - 1], &name.as_bytes()[..15]);
+    assert!(std::str::from_utf8(&comm).is_err());
+
+    let protected = kickoutchi_with_config(
+        &["kill", "--pid", &pid_text, "--yes"],
+        &format!("protected_processes = [\"{name}\"]\n"),
+    );
+    assert_eq!(protected.status.code(), Some(6), "{}", stderr(&protected));
+    assert_helper_survived_refusal(&mut helper);
+
+    let killed = kickoutchi_with_config(&["kill", "--pid", &pid_text, "--yes"], "");
+    assert_eq!(killed.status.code(), Some(0), "{}", stderr(&killed));
+    assert!(
+        stderr(&killed).contains("sent SIGTERM"),
+        "{}",
+        stderr(&killed)
+    );
+    wait_for_child_exit(&mut helper);
+}
+
+#[test]
 fn configured_protected_process_refuses_yes_kill_with_exit_6() {
     let _host_observation = lock_host_observation();
     let (mut helper, _port, ready_file) = spawn_listener_process();

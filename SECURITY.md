@@ -139,21 +139,17 @@ installation. Explicit repository `GH_TOKEN` values exist only on the dist
 planning, hosting, and GitHub Release steps that require them. The Homebrew token
 exists only on the final tap push step. GitHub permissions remain job-scoped, so
 pinned actions in the host job still execute where `contents: write` is
-available. Post-publication updater validation receives a read-only repository
-token only when it invokes the updater. A manual workflow dispatch exercises the artifact graph without tag
+available. A manual workflow dispatch exercises the artifact graph without tag
 publication; tag runs repeat verification on their exact commit before any
 release is created.
 
-The Homebrew publisher formats the generated formula, places it in the canonical
-local tap path, and installs it in a disposable container pinned by the
-`homebrew/brew` image digest. It then executes the installed `kickoutchi
---version` and `kick --version` and requires the planned release version from
-both before staging the formula. The tap-scoped `HOMEBREW_TAP_TOKEN` exists only
-for the final push. Stable GitHub
-Releases are observed independently by the public Scoop bucket's scheduled
-Excavator workflow, which regenerates and commits its manifest URL and hash;
-Kickoutchi's release workflow does not hold a Scoop write token. Either package
-repository can lag a new release or fail independently.
+After hosting succeeds, the Homebrew publisher copies the generated formula into
+the tap's `Formula` directory, commits changes, and pushes them. It does not
+install or execute the formula. The tap-scoped `HOMEBREW_TAP_TOKEN` exists only
+for the final push. Stable GitHub Releases are observed independently by the
+public Scoop bucket's scheduled Excavator workflow, which regenerates and commits
+its manifest URL and hash; Kickoutchi's release workflow does not hold a Scoop
+write token. Either package repository can lag a new release or fail independently.
 
 The documented Unix and PowerShell installer commands execute content from the
 mutable GitHub Release `latest` URL. TLS and the GitHub repository are therefore
@@ -178,23 +174,20 @@ signature channel. After archive and installer validation, a dedicated
 least-privileged job creates GitHub artifact attestations for every prepared
 publication asset. Those attestations bind each file digest to the repository,
 workflow, commit, and triggering event. The host cannot publish those assets
-unless attestation and same-run verification succeed. Because cargo-dist creates
-the final `dist-manifest.json` while preparing the hosted release, a second
-least-privileged job downloads and attests that exact manifest after hosting;
-the public installer journey and package-manager publication remain blocked
-until its attestation verifies.
+unless attestation and same-run verification succeed. The final
+`dist-manifest.json` is generated during hosting, after that attestation job,
+and is published without its own artifact attestation. Internal build manifests
+are excluded from publication.
 
 Release verification builds the native binaries for the exact workflow commit,
 then validates each native binary archive's checksum, layout, executable
 permissions where applicable, both binary entry points, runtime version, and
-updater before upload. Generated installers execute against those same-run
-artifacts before publication. After a GitHub Release is created, a separate
-bounded Linux journey downloads every published asset, verifies its attestation,
-then installs from the public artifact URLs and executes the published updater
-against the release tag from a deliberately stale isolated installation.
-Homebrew publication waits for that public journey. Source archives do not
-receive an executable journey, and the post-publication check cannot make GitHub
-publication atomic.
+updater startup before upload. Generated installers execute against local copies
+of those same-run artifacts before publication. Updater smoke tests invoke
+`--help`; they do not perform an update from an older installation. The workflow
+does not validate installation or updating through public URLs after publication.
+Homebrew publication waits for hosting, with no post-publication validation gate.
+Source archives do not receive an executable journey.
 
 GitHub remains the identity and storage trust anchor for both release assets and
 their attestations. The attestations provide verifiable build provenance, but

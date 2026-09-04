@@ -74,11 +74,13 @@ socket sets by design.
 
 Procfs and PID namespaces impose a separate ownership boundary. Kickoutchi can
 enumerate only PIDs visible through its procfs mount and PID namespace. It treats
-ownership visibility as initial-PID-namespace complete only when
-`/proc/self/status` contains one bounded, unique, positive `NSpid` value. A
-nested, missing, unreadable, duplicate, zero, or malformed `NSpid` chain makes
-global ownership partial and makes retained socket owner sets partial: an
+ownership visibility as initial-PID-namespace complete only when the bounded
+`/proc/self/ns/pid` link matches Linux's reserved initial PID namespace identity,
+`pid:[4026531836]`. A nested, missing, unreadable, or unrecognized namespace
+identity makes global ownership and retained socket owner sets partial. An
 ancestor-namespace process may share an otherwise visible socket inode.
+`NSpid` alone cannot prove initial namespace visibility because its entries are
+relative to the procfs mount; a container with its own procfs can have one entry.
 
 A restricted, incomplete, or nonstandard procfs mount can hide socket tables,
 PIDs, descriptor links, identities, or metadata. Permission denial while reading

@@ -107,7 +107,10 @@ fn temp_proc_root(name: &str) -> PathBuf {
     fs::create_dir_all(path.join("net")).expect("test proc net directory must be created");
     fs::create_dir_all(path.join("self")).expect("test proc self directory must be created");
     fs::write(path.join("self/status"), "Name:\tkickoutchi\nNSpid:\t1\n")
-        .expect("initial PID namespace evidence must be written");
+        .expect("process status fixture must be written");
+    fs::create_dir_all(path.join("self/ns")).expect("namespace fixture directory");
+    std::os::unix::fs::symlink("pid:[4026531836]", path.join("self/ns/pid"))
+        .expect("initial PID namespace fixture");
     fs::write(
         path.join("mounts"),
         format!("proc {} proc rw,nosuid,nodev 0 0\n", path.display()),
@@ -188,6 +191,34 @@ fn fresh_name_reader_accepts_exact_4k_and_refuses_empty_and_max_plus_one() {
             }
         )
     );
+    fs::remove_dir_all(proc_root).expect("test proc root cleanup");
+}
+
+#[test]
+fn fresh_name_lossy_decoding_preserves_identity_and_bounds_decoded_bytes() {
+    let proc_root = temp_proc_root("fresh-name-lossy");
+    let pid = 42;
+    write_process(&proc_root, pid, "worker", 1);
+    let comm = proc_root.join("42/comm");
+    fs::write(&comm, b"aaaaaaaaaaaaaa\xc3\n").expect("kernel-truncated UTF-8 name");
+    let evidence = read_fresh_process_evidence(&proc_root, pid).expect("bounded lossy name");
+    assert_eq!(evidence.name, "aaaaaaaaaaaaaa�");
+    assert_eq!(evidence.pid, pid);
+    assert_eq!(
+        evidence.start_marker,
+        crate::observation::ProcessStartMarker::linux(420).unwrap()
+    );
+
+    // Raw bytes fit, but replacement characters expand beyond the name budget.
+    fs::write(
+        &comm,
+        vec![0xff; crate::observation::PROTECTION_NAME_MAX_BYTES / 3 + 1],
+    )
+    .expect("name exceeding the decoded budget");
+    assert!(matches!(
+        read_fresh_process_evidence(&proc_root, pid),
+        Err(crate::process_evidence::ProcessEvidenceError::NameOversized { pid: 42, .. })
+    ));
     fs::remove_dir_all(proc_root).expect("test proc root cleanup");
 }
 
@@ -955,11 +986,7 @@ fn unproven_mount_and_ancestor_visibility_are_losses_without_target_inodes() {
     let proc_root = temp_proc_root("unproven-empty-inodes");
     write_process(&proc_root, 42, "worker", 1);
     fs::remove_file(proc_root.join("mounts")).expect("remove mount evidence");
-    fs::write(
-        proc_root.join("self/status"),
-        "Name:\tkickoutchi\nNSpid:\t100\t1\n",
-    )
-    .expect("nested PID namespace evidence");
+    fs::remove_file(proc_root.join("self/ns/pid")).expect("remove namespace evidence");
 
     let scan = collect_socket_owners_detailed(&proc_root, &HashSet::new(), 0, 0)
         .expect("empty inode scan skips PID enumeration");
@@ -1035,9 +1062,12 @@ fn nested_pid_namespace_marks_visible_owner_and_hidden_co_owner_incomplete() {
     fs::create_dir_all(proc_root.join("self")).expect("self proc fixture");
     fs::write(
         proc_root.join("self/status"),
-        "Name:\tkickoutchi\nUmask:\t0022\nState:\tR (running)\nTgid:\t12\nNgid:\t0\nPid:\t12\nPPid:\t1\nTracerPid:\t0\nNSpid:\t4321\t12\nUid:\t1000\t1000\t1000\t1000\n",
+        "Name:\tkickoutchi\nUmask:\t0022\nState:\tR (running)\nTgid:\t12\nNgid:\t0\nPid:\t12\nPPid:\t1\nTracerPid:\t0\nNSpid:\t12\nUid:\t1000\t1000\t1000\t1000\n",
     )
-    .expect("production-shaped nested namespace status");
+    .expect("nested namespace status after remounting procfs");
+    fs::remove_file(proc_root.join("self/ns/pid")).expect("replace namespace fixture");
+    std::os::unix::fs::symlink("pid:[4026533000]", proc_root.join("self/ns/pid"))
+        .expect("nested PID namespace fixture");
 
     assert!(ancestor_pid_visibility_not_proven(&proc_root));
     let snapshot = <LinuxCollector as crate::collector::Collector>::collect(
@@ -1064,22 +1094,29 @@ fn nested_pid_namespace_marks_visible_owner_and_hidden_co_owner_incomplete() {
 }
 
 #[test]
-fn missing_or_malformed_nspid_cannot_prove_complete_pid_visibility() {
+fn missing_or_unrecognized_namespace_identity_cannot_prove_complete_pid_visibility() {
     let proc_root = temp_proc_root("unknown-pid-namespace");
-    fs::remove_file(proc_root.join("self/status")).expect("remove default status fixture");
+    let namespace = proc_root.join("self/ns/pid");
+    fs::remove_file(&namespace).expect("remove default namespace fixture");
     assert!(ancestor_pid_visibility_not_proven(&proc_root));
 
-    for status in [
-        "Name:\tkickoutchi\nPid:\t123\n",
-        "Name:\tkickoutchi\nNSpid:\t123\tnot-a-pid\n",
-        "Name:\tkickoutchi\nNSpid:\t123\t12\nNSpid:\t123\t12\n",
+    for identity in [
+        "pid:[4026533000]".to_owned(),
+        "net:[4026531836]".to_owned(),
+        "pid:[0]".to_owned(),
+        "pid:[4026531836]extra".to_owned(),
+        "x".repeat(SCOPE_IDENTIFIER_MAX_BYTES + 1),
     ] {
-        fs::write(proc_root.join("self/status"), status).expect("status fixture");
+        std::os::unix::fs::symlink(&identity, &namespace).expect("namespace identity fixture");
         assert!(
             ancestor_pid_visibility_not_proven(&proc_root),
-            "status: {status:?}"
+            "namespace: {identity:?}"
         );
+        fs::remove_file(&namespace).expect("remove namespace fixture");
     }
+
+    fs::write(&namespace, "pid:[4026531836]").expect("regular file is not namespace evidence");
+    assert!(ancestor_pid_visibility_not_proven(&proc_root));
 
     fs::remove_dir_all(proc_root).expect("temp proc root must clean up");
 }

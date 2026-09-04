@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn remounted_procfs_cannot_hide_an_ancestor_socket_co_owner_as_complete() {
+    let _host_observation = lock_host_observation();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener must bind");
+    let port = listener.local_addr().expect("test listener address").port();
+    let inherited = OwnedFd::from(listener.try_clone().expect("clone test listener"));
+    // The outer test retains the socket. The nested process inherits another
+    // descriptor as stdin, so one real co-owner is outside its procfs view.
+    let script = r#"
+        sed -n '/^NSpid:/p' /proc/self/status >&2
+        exec "$1" --config /dev/null list --snapshot-json
+    "#;
+    let output = run_namespace_command(
+        Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--mount-proc",
+                "sh",
+                "-c",
+            ])
+            .arg(script)
+            .arg("sh")
+            .arg(kickoutchi_binary())
+            .stdin(Stdio::from(inherited)),
+    );
+    let Some(output) = output else { return };
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    let nspid = diagnostic
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+        .expect("nested procfs must expose NSpid");
+    assert_eq!(nspid.split_whitespace().count(), 1);
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("nested snapshot must be JSON");
+    let socket = snapshot["sockets"]
+        .as_array()
+        .expect("socket array")
+        .iter()
+        .find(|socket| {
+            socket["endpoint"]["protocol"] == "tcp"
+                && socket["endpoint"]["address"] == "127.0.0.1"
+                && socket["endpoint"]["port"] == port
+        })
+        .expect("inherited listener must remain visible");
+    assert!(
+        socket["owners"]["owners"]
+            .as_array()
+            .expect("owner array")
+            .iter()
+            .any(|owner| owner["kind"] == "verified" && owner["identity"]["pid"] == 1)
+    );
+    assert_eq!(socket["owners"]["completeness"], "partial");
+    assert_eq!(snapshot["owner_completeness"], "partial");
+}
+
+#[test]
 fn human_list_no_match_prints_diagnostic_to_stderr() {
     let Some(output) = isolated_no_match_diagnostic(false) else {
         return;
