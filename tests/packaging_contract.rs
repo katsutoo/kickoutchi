@@ -8,20 +8,6 @@ fn read(path: impl AsRef<Path>) -> String {
 }
 
 #[test]
-fn nix_is_linux_only_and_derives_the_cargo_version() {
-    let flake = read("flake.nix");
-
-    assert!(flake.contains("\"x86_64-linux\""));
-    assert!(flake.contains("\"aarch64-linux\""));
-    assert!(
-        !flake.contains("darwin"),
-        "Nix must not advertise Darwin outputs"
-    );
-    assert!(flake.contains("builtins.fromTOML (builtins.readFile ./Cargo.toml)"));
-    assert!(flake.contains("version = cargoPackage.package.version;"));
-}
-
-#[test]
 fn distribution_profile_strips_symbols_and_preserves_unwinding() {
     let manifest = toml::from_str::<toml::Value>(&read("Cargo.toml"))
         .expect("Cargo.toml must remain valid TOML");

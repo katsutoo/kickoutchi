@@ -17,6 +17,17 @@ use crate::observation::Ipv6Scope;
 use crate::process::{ConfirmationRequirement, KillMode, KillTarget, TerminationOutcome};
 use crate::test_support::port_entry;
 
+// Complete the same worker channel consumed by production, without a thread or host I/O.
+fn start_test_refresh(app: &mut App, rows: Vec<PortEntry>) {
+    app.refresh_with(|| {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(Ok(crate::observation::snapshot_from_test_rows(rows))))
+            .expect("refresh receiver is retained");
+        Ok(receiver)
+    });
+}
+
 fn entry(port: u16, name: Option<&str>) -> PortEntry {
     PortEntry {
         protocol: Protocol::Tcp,
@@ -523,9 +534,9 @@ fn confirmed_kill_revalidates_signals_and_refreshes_rows() {
             kill_collect_calls += 1;
             Ok(fresh_before_signal.clone())
         },
-        || {
+        |app| {
             visibility_collect_calls += 1;
-            Ok(fresh_after_signal.clone())
+            start_test_refresh(app, fresh_after_signal.clone());
         },
         |_| context(55),
         Ok::<u32, TerminationOutcome>,
@@ -535,6 +546,12 @@ fn confirmed_kill_revalidates_signals_and_refreshes_rows() {
         },
     );
 
+    assert_eq!(
+        app.rows().len(),
+        1,
+        "rows remain until worker completion is polled"
+    );
+    app.poll_refresh();
     assert_eq!(terminated, Some((3000, KillMode::Terminate)));
     assert_eq!(kill_collect_calls, 1);
     assert_eq!(visibility_collect_calls, 1);
@@ -562,7 +579,7 @@ fn confirmed_kill_refuses_stale_process_identity_without_signalling() {
 
     app.execute_kill_confirmation_with(
         || Ok(fresh_rows.clone()),
-        || Ok(fresh_rows.clone()),
+        |app| start_test_refresh(app, fresh_rows.clone()),
         |_| context(99),
         Ok::<u32, TerminationOutcome>,
         |_pid, _target, _protected, _mode| {
@@ -594,9 +611,9 @@ fn prepare_already_exited_refreshes_snapshot_so_freed_port_drops() {
 
     app.execute_kill_confirmation_with(
         || panic!("prepare failure must not run authoritative collection"),
-        || {
+        |app| {
             collect_calls += 1;
-            Ok(fresh_after_exit.clone())
+            start_test_refresh(app, fresh_after_exit.clone());
         },
         |_| context(55),
         |_pid| -> Result<u32, TerminationOutcome> { Err(TerminationOutcome::AlreadyExited) },
@@ -608,6 +625,8 @@ fn prepare_already_exited_refreshes_snapshot_so_freed_port_drops() {
 
     assert!(!terminated);
     assert_eq!(collect_calls, 1);
+    assert_eq!(app.rows().len(), 1);
+    app.poll_refresh();
     assert_eq!(app.rows().len(), 0);
     assert_eq!(app.modal(), Modal::None);
     assert!(
@@ -641,9 +660,9 @@ fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear
             kill_collect_calls += 1;
             Ok(fresh_before_signal.clone())
         },
-        || {
+        |app| {
             visibility_collect_calls += 1;
-            Ok(fresh_after_signal.clone())
+            start_test_refresh(app, fresh_after_signal.clone());
         },
         |_| context(55),
         Ok::<u32, TerminationOutcome>,
@@ -670,10 +689,13 @@ fn confirmed_kill_discards_stale_in_flight_refresh_so_freed_port_cannot_reappear
     let mut fresh_collections = 0;
     app.poll_refresh_with(|app| {
         fresh_collections += 1;
-        app.finish_refresh_attempt(Ok(Vec::new()), Instant::now());
+        start_test_refresh(app, Vec::new());
     });
     assert_eq!(fresh_collections, 1);
     assert_eq!(app.pending_refresh, PendingRefresh::None);
+    assert!(app.refresh_in_progress());
+    assert_eq!(app.rows().len(), 1);
+    app.poll_refresh();
     assert!(!app.refresh_in_progress());
     assert_eq!(app.rows().len(), 0);
 }
@@ -718,7 +740,7 @@ fn same_length_refresh_invalidates_the_sorted_row_cache() {
     app.rebuild_visible_rows();
     assert_eq!(app.visible_row_indices, [1, 0]);
 
-    app.apply_successful_snapshot(
+    app.apply_test_rows(
         vec![entry(3000, Some("alpha")), entry(5173, Some("zulu"))],
         Instant::now(),
     );
@@ -739,7 +761,7 @@ fn search_edit_rebuilds_a_cache_missing_after_filtered_refresh() {
     app.apply_action(Action::StartSearch);
     app.apply_action(Action::SearchAppend('a'));
 
-    app.apply_successful_snapshot(
+    app.apply_test_rows(
         vec![entry(5173, Some("beta")), entry(3000, Some("alpha"))],
         Instant::now(),
     );
@@ -830,7 +852,7 @@ fn successful_refresh_preserves_selection_by_row_identity() {
     app.apply_action(Action::MoveDown);
     let refreshed = vec![entry(5173, Some("vite")), entry(3000, Some("node"))];
 
-    app.apply_successful_snapshot(refreshed, Instant::now());
+    app.apply_test_rows(refreshed, Instant::now());
 
     assert_eq!(app.selected_row().map(|row| row.local_port), Some(5173));
 }
@@ -844,7 +866,7 @@ fn refresh_reloads_details_context_when_modal_stays_open() {
     finish_selected_context(&mut app, context(55));
     assert!(app.selected_process_context().is_some());
 
-    app.apply_successful_snapshot(vec![entry(3000, Some("node"))], Instant::now());
+    app.apply_test_rows(vec![entry(3000, Some("node"))], Instant::now());
 
     assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
     assert_eq!(app.modal(), Modal::Details);
@@ -864,7 +886,7 @@ fn refresh_invalidates_details_context_when_modal_is_closed() {
     assert!(app.selected_process_context().is_some());
     app.apply_action(Action::CloseModal);
 
-    app.apply_successful_snapshot(vec![entry(3000, Some("node"))], Instant::now());
+    app.apply_test_rows(vec![entry(3000, Some("node"))], Instant::now());
 
     assert_eq!(app.selected_row().map(|row| row.local_port), Some(3000));
     assert_eq!(app.modal(), Modal::None);
@@ -881,7 +903,7 @@ fn refresh_moves_selection_to_nearest_row_when_selected_row_disappears() {
     app.apply_action(Action::MoveDown);
     let refreshed = vec![entry(3000, Some("node")), entry(8000, Some("python"))];
 
-    app.apply_successful_snapshot(refreshed, Instant::now());
+    app.apply_test_rows(refreshed, Instant::now());
 
     assert_eq!(app.selected_index(), Some(1));
     assert_eq!(app.selected_row().map(|row| row.local_port), Some(8000));
@@ -1002,7 +1024,7 @@ fn protected_names_are_marked_from_config() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tree_kill {
-    use super::{App, Modal, app_with_rows, context, entry, mpsc};
+    use super::{App, Modal, app_with_rows, context, entry, mpsc, start_test_refresh};
     use crate::app::{TreeConfirmStage, TreePreviewWorker};
     use crate::collector::{Collector, FakeCollector};
     use crate::input::Action;
@@ -1112,16 +1134,19 @@ mod tree_kill {
     }
 
     fn assert_authoritative_snapshot_refuses_before_tree_signals(snapshot: &NetworkSnapshot) {
-        let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+        let mut row = entry(3000, Some("node"));
+        row.pid = Some(18_422);
+        row.process_identity.as_mut().expect("fixture identity").pid = 18_422;
+        let mut app = app_with_rows(vec![row]);
         app.apply_action(Action::RequestTreeTerminate);
         set_tree_confirmation_start_time(&mut app, 55);
-        let infos = vec![tree_info(3000, Some(1), "node", 55)];
-        app.finish_tree_preview_for_test(Ok(preview_of(&infos, 3000)));
+        let infos = vec![tree_info(18_422, Some(1), "node", 55)];
+        app.finish_tree_preview_for_test(Ok(preview_of(&infos, 18_422)));
         let mut ops = FakeTreeOps::new(infos);
 
         app.execute_tree_kill_confirmation_with(
-            || crate::collector::kill_ports_from_snapshot(snapshot, Some(3000), None),
-            || panic!("authoritative refusal must not visibility-poll ports"),
+            || crate::collector::kill_ports_from_snapshot(snapshot, Some(18_422), None),
+            |_| panic!("authoritative refusal must not visibility-poll ports"),
             |_| context(55),
             &mut ops,
         );
@@ -1132,8 +1157,8 @@ mod tree_kill {
             "refusal must precede every delivery"
         );
         assert!(
-            app.kill_status()
-                .is_some_and(|status| status.contains("no termination was sent")),
+            app.kill_status().is_some_and(|status| status
+                .contains("collecting ports before tree kill failed; no termination was sent")),
             "{:?}",
             app.kill_status(),
         );
@@ -1229,7 +1254,7 @@ mod tree_kill {
 
         app.execute_tree_kill_confirmation_with(
             || panic!("metadata wait must precede port collection"),
-            || panic!("metadata wait must precede visibility polling"),
+            |_| panic!("metadata wait must precede visibility polling"),
             |_| panic!("metadata wait must precede synchronous context collection"),
             &mut ops,
         );
@@ -1334,7 +1359,7 @@ mod tree_kill {
 
         app.execute_tree_kill_confirmation_with(
             || Ok(fresh_rows.clone()),
-            || panic!("protected-root refusal must not visibility-poll ports"),
+            |_| panic!("protected-root refusal must not visibility-poll ports"),
             |_| context(55),
             &mut ops,
         );
@@ -1434,9 +1459,9 @@ mod tree_kill {
 
         app.execute_tree_kill_confirmation_with(
             || Ok(fresh_rows.clone()),
-            || {
+            |app| {
                 collect_calls += 1;
-                Ok(Vec::new())
+                start_test_refresh(app, Vec::new());
             },
             |_| context(55),
             &mut ops,
@@ -1452,6 +1477,55 @@ mod tree_kill {
             app.kill_status(),
         );
         assert_eq!(collect_calls, 1);
+        assert_eq!(app.rows().len(), 1);
+        app.poll_refresh();
         assert_eq!(app.rows().len(), 0);
     }
+}
+
+#[test]
+fn redraw_requests_follow_input_and_worker_completion_without_poll_churn() {
+    let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+    assert!(app.take_redraw_request());
+    app.apply_action(Action::Noop);
+    app.poll_refresh();
+    app.poll_process_context();
+    assert!(!app.take_redraw_request());
+
+    app.apply_action(Action::StartSearch);
+    assert!(app.take_redraw_request());
+    app.set_modal_scroll(2);
+    assert!(app.take_redraw_request());
+
+    let (sender, receiver) = mpsc::channel();
+    app.refresh_with(|| Ok(receiver));
+    assert!(app.take_redraw_request());
+    app.poll_refresh();
+    assert!(!app.take_redraw_request());
+    sender
+        .send(Ok(Ok(crate::observation::snapshot_from_test_rows(
+            Vec::new(),
+        ))))
+        .expect("worker receiver remains installed");
+    app.poll_refresh();
+    assert!(app.take_redraw_request());
+    assert_eq!(app.rows().len(), 0);
+    app.poll_refresh();
+    assert!(!app.take_redraw_request());
+}
+
+#[test]
+fn failed_refresh_start_preserves_rows_and_allows_a_later_refresh() {
+    let mut app = app_with_rows(vec![entry(3000, Some("node"))]);
+    app.refresh_with(|| Err(std::io::Error::other("worker capacity exhausted")));
+    assert!(!app.refresh_in_progress());
+    assert_eq!(app.rows().len(), 1);
+    assert!(
+        app.latest_error()
+            .is_some_and(|error| error.contains("worker capacity exhausted"))
+    );
+    start_test_refresh(&mut app, Vec::new());
+    app.poll_refresh();
+    assert_eq!(app.rows().len(), 0);
+    assert!(app.latest_error().is_none());
 }

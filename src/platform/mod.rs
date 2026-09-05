@@ -33,12 +33,6 @@ pub(crate) fn collect_process_context(pid: u32) -> ProcessContext {
     {
         macos::collect_process_context(pid)
     }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = pid;
-        ProcessContext::default()
-    }
 }
 
 pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint> {
@@ -55,12 +49,6 @@ pub(crate) fn collect_related_process_hints(port: u16) -> Vec<RelatedProcessHint
     #[cfg(target_os = "macos")]
     {
         macos::collect_related_process_hints(port)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        let _ = port;
-        Vec::new()
     }
 }
 

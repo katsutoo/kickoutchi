@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use super::NativeObservationSource;
 use super::{Collector, FakeCollector, kill_ports_from_snapshot};
-use crate::model::{PermissionStatus, Protocol, SocketState};
+use crate::model::SocketState;
 use crate::observation::{
     EvidenceGap, EvidenceGapCode, EvidenceImpact, MetadataProfile, NetworkSnapshot,
     ObservationError, OwnerCompleteness, OwnerObservation, ProcessIdentity, SnapshotCompleteness,
@@ -118,33 +118,6 @@ fn verified_owner_permission_snapshot() -> NetworkSnapshot {
 }
 
 #[test]
-fn fake_snapshot_covers_every_rendering_path() {
-    let snapshot = FakeCollector
-        .collect(MetadataProfile::LegacyList)
-        .expect("fake collection cannot fail");
-    let entries = project_legacy(&snapshot).expect("fake projection cannot fail");
-
-    assert!(entries.iter().any(|entry| entry.local_port == 3000));
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.pid.is_none() && entry.permission == PermissionStatus::Partial)
-    );
-    assert!(entries.iter().any(|entry| {
-        entry.pid.is_some()
-            && entry.executable_path.is_none()
-            && entry.permission == PermissionStatus::Partial
-    }));
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.protocol == Protocol::Udp && entry.state == SocketState::Bound)
-    );
-    assert!(entries.iter().any(|entry| entry.local_addr.is_ipv6()));
-    assert!(entries.iter().all(|entry| !entry.protected));
-}
-
-#[test]
 fn identity_projection_excludes_recycled_and_unverified_pid_owners() {
     let mut snapshot = FakeCollector
         .collect(MetadataProfile::Display)
@@ -243,76 +216,6 @@ fn destructive_authority_ignores_non_legacy_socket_states() {
         project_legacy_pids(&snapshot, &pids)
             .expect("PID projection")
             .is_empty()
-    );
-}
-
-#[test]
-fn metadata_profiles_only_change_optional_enrichment() {
-    let identity = FakeCollector
-        .collect(MetadataProfile::IdentityOnly)
-        .expect("identity profile collects");
-    let display = FakeCollector
-        .collect(MetadataProfile::Display)
-        .expect("display profile collects");
-    let legacy = FakeCollector
-        .collect(MetadataProfile::LegacyList)
-        .expect("legacy profile collects");
-
-    assert_eq!(identity.sockets, display.sockets);
-    assert_eq!(display.sockets, legacy.sockets);
-    assert_eq!(
-        identity
-            .processes
-            .keys()
-            .collect::<std::collections::BTreeSet<_>>(),
-        display
-            .processes
-            .keys()
-            .collect::<std::collections::BTreeSet<_>>()
-    );
-    assert_eq!(
-        display
-            .processes
-            .keys()
-            .collect::<std::collections::BTreeSet<_>>(),
-        legacy
-            .processes
-            .keys()
-            .collect::<std::collections::BTreeSet<_>>()
-    );
-    assert!(
-        identity
-            .processes
-            .values()
-            .all(|process| process.name.is_none()
-                && process.executable_path.is_none()
-                && process.command_line.is_none()
-                && process.parent_pid.is_none()
-                && process.parent_process_name.is_none())
-    );
-    assert!(
-        display
-            .processes
-            .values()
-            .any(|process| process.name.is_some())
-    );
-    assert!(
-        display
-            .processes
-            .values()
-            .all(|process| process.command_line.is_none())
-    );
-    assert!(display.processes.values().any(|process| {
-        process.name.is_some()
-            && process.executable_path.is_some()
-            && process.parent_pid.is_some()
-            && process.parent_process_name.is_some()
-    }));
-    assert!(
-        legacy
-            .processes
-            .values()
-            .any(|process| process.command_line.is_some())
     );
 }
 

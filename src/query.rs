@@ -107,45 +107,6 @@ pub(crate) enum StateFilter {
     Unknown,
 }
 
-pub(crate) fn query_view_indices(
-    entries: &[PortEntryView<'_>],
-    options: QueryOptions<'_>,
-) -> Result<QueryIndexResult, QueryError> {
-    let prepared = prepare_query(options)?;
-    let filter_plan = QueryFilterPlan::new(&options, &prepared);
-    let mut indices = if filter_plan.all_rows_match_without_metadata() {
-        Vec::with_capacity(entries.len())
-    } else {
-        Vec::new()
-    };
-    let mut hidden_system_process_count = 0;
-    let mut metadata = MetadataMatchCache::new(
-        metadata_match_cache_limit(entries.len()),
-        filter_plan.metadata_needle_mode,
-    );
-    for (index, entry) in entries.iter().copied().enumerate() {
-        if filter_plan.hide_system_processes && entry.is_system_process() {
-            hidden_system_process_count += 1;
-            continue;
-        }
-        if entry_matches(entry, filter_plan, &mut metadata) {
-            indices.push(index);
-        }
-    }
-    sort_view_indices(
-        entries,
-        &mut indices,
-        options.sort_mode,
-        &mut metadata.normalization,
-    );
-
-    Ok(QueryIndexResult {
-        indices,
-        explicit_filter_active: prepared.explicit_filter_active,
-        hidden_system_process_count,
-    })
-}
-
 /// Query a bounded row source without first materializing every borrowed view.
 ///
 /// The callback is evaluated exactly once per source row. Matching facts are
@@ -544,106 +505,6 @@ fn compare_normalized_keys(
     let left = left.map(|key| normalization.value(key));
     let right = right.map(|key| normalization.value(key));
     (left.is_none(), left).cmp(&(right.is_none(), right))
-}
-
-const MISSING_NORMALIZED_NAME_KEY: usize = usize::MAX;
-
-#[derive(Clone, Copy)]
-struct NameSortCandidate {
-    source_index: usize,
-    normalized_name_key: usize,
-}
-
-fn normalized_candidate_name<'a>(
-    candidate: &NameSortCandidate,
-    normalization: &'a NormalizationCache<'_>,
-) -> Option<&'a str> {
-    (candidate.normalized_name_key != MISSING_NORMALIZED_NAME_KEY)
-        .then(|| normalization.value(candidate.normalized_name_key))
-}
-
-fn sort_view_indices<'a>(
-    entries: &[PortEntryView<'a>],
-    indices: &mut [usize],
-    mode: SortMode,
-    normalization: &mut NormalizationCache<'a>,
-) {
-    if indices.len() < 2 {
-        return;
-    }
-    if matches!(mode, SortMode::Process | SortMode::Parent) {
-        let mut candidates = indices
-            .iter()
-            .copied()
-            .map(|source_index| {
-                let value = match mode {
-                    SortMode::Process => entries[source_index].process_name,
-                    SortMode::Parent => entries[source_index].parent_process_name,
-                    _ => unreachable!("only name sort modes enter this branch"),
-                };
-                let normalized_name_key = value.map_or(MISSING_NORMALIZED_NAME_KEY, |value| {
-                    let key = normalization.key(value);
-                    debug_assert_ne!(
-                        key, MISSING_NORMALIZED_NAME_KEY,
-                        "normalization key space must retain its missing-value sentinel"
-                    );
-                    key
-                });
-                NameSortCandidate {
-                    source_index,
-                    normalized_name_key,
-                }
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|left, right| {
-            compare_views(
-                entries[left.source_index],
-                entries[right.source_index],
-                mode,
-                normalized_candidate_name(left, normalization),
-                normalized_candidate_name(right, normalization),
-            )
-            .then_with(|| left.source_index.cmp(&right.source_index))
-        });
-        for (destination, candidate) in indices.iter_mut().zip(candidates) {
-            *destination = candidate.source_index;
-        }
-        return;
-    }
-    indices.sort_unstable_by(|left, right| {
-        compare_views(entries[*left], entries[*right], mode, None, None)
-            .then_with(|| left.cmp(right))
-    });
-}
-
-fn compare_views(
-    left: PortEntryView<'_>,
-    right: PortEntryView<'_>,
-    mode: SortMode,
-    normalized_left: Option<&str>,
-    normalized_right: Option<&str>,
-) -> Ordering {
-    let primary = match mode {
-        SortMode::Port => Ordering::Equal,
-        SortMode::Pid => (left.pid.is_none(), left.pid).cmp(&(right.pid.is_none(), right.pid)),
-        SortMode::Protocol => left.protocol.cmp(&right.protocol),
-        SortMode::Process => (normalized_left.is_none(), normalized_left)
-            .cmp(&(normalized_right.is_none(), normalized_right)),
-        SortMode::Parent => (
-            normalized_left.is_none(),
-            normalized_left,
-            left.parent_pid.is_none(),
-            left.parent_pid,
-        )
-            .cmp(&(
-                normalized_right.is_none(),
-                normalized_right,
-                right.parent_pid.is_none(),
-                right.parent_pid,
-            )),
-        SortMode::Scope => left.scope().cmp(&right.scope()),
-    };
-    primary.then_with(|| SortTieBreak::from(left).cmp(&SortTieBreak::from(right)))
 }
 
 pub(crate) fn validate_filter_text(
@@ -1166,13 +1027,20 @@ mod tests {
 
     use super::{
         FILTER_TEXT_MAX_BYTES, QueryCapabilities, QueryError, QueryOptions,
-        filter_preordered_view_indices_by, query_view_indices, query_view_indices_by,
+        filter_preordered_view_indices_by, query_view_indices_by,
     };
     use crate::labels::SELECTOR_ADDRESS_MAX_BYTES;
     use crate::model::{
         PermissionStatus, Platform, PortEntry, PortEntryView, Protocol, SocketState, SortMode,
     };
     use crate::observation::Ipv6Scope;
+
+    fn query_view_indices(
+        entries: &[PortEntryView<'_>],
+        options: QueryOptions<'_>,
+    ) -> Result<super::QueryIndexResult, QueryError> {
+        query_view_indices_by(entries.len(), |index| entries[index], options)
+    }
 
     fn entry(port: u16, name: &str) -> PortEntry {
         PortEntry {
@@ -1657,23 +1525,17 @@ mod tests {
                 sort_mode,
                 ..query("")
             };
-            let slice_result = query_view_indices(&views, options)
-                .expect("slice-backed list sort options are valid");
-            let indexed_result = query_view_indices_by(views.len(), |index| views[index], options)
-                .expect("indexed list sort options are valid");
+            let result =
+                query_view_indices(&views, options).expect("indexed list sort options are valid");
             assert_eq!(
-                slice_result.indices, expected,
-                "unexpected slice-backed {sort_mode:?} order"
-            );
-            assert_eq!(
-                indexed_result.indices, expected,
+                result.indices, expected,
                 "unexpected indexed {sort_mode:?} order"
             );
         }
     }
 
     #[test]
-    fn slice_and_indexed_queries_apply_multi_needle_filters_identically() {
+    fn multiple_metadata_needles_must_match_the_same_row() {
         let mut alpha = entry(3000, "alpha");
         alpha.parent_process_name = Some("runner".into());
         let mut beta = entry(4000, "beta");
@@ -1682,12 +1544,9 @@ mod tests {
         let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
         let options = query("runner alpha");
 
-        let slice_result = query_view_indices(&views, options).expect("filter is valid");
-        let indexed_result = query_view_indices_by(views.len(), |index| views[index], options)
-            .expect("filter is valid");
+        let result = query_view_indices(&views, options).expect("filter is valid");
 
-        assert_eq!(slice_result.indices, [0]);
-        assert_eq!(indexed_result.indices, slice_result.indices);
+        assert_eq!(result.indices, [0]);
     }
 
     #[test]
@@ -1821,9 +1680,9 @@ mod tests {
 
     #[test]
     fn sparse_name_sorts_keep_source_indices_aligned_with_compact_keys() {
-        let mut alpha = entry(4000, "alpha");
+        let mut alpha = entry(4000, "selected-alpha");
         alpha.parent_process_name = Some("alpha-parent".into());
-        let mut zulu = entry(6000, "Zulu");
+        let mut zulu = entry(6000, "Selected-Zulu");
         zulu.parent_process_name = Some("Zulu Parent".into());
         let rows = [
             entry(3000, "ignored-a"),
@@ -1834,13 +1693,16 @@ mod tests {
         let views = rows.iter().map(PortEntryView::from).collect::<Vec<_>>();
 
         for mode in [SortMode::Process, SortMode::Parent] {
-            let mut indices = vec![3, 1];
-            let mut normalization = super::NormalizationCache::default();
-
-            super::sort_view_indices(&views, &mut indices, mode, &mut normalization);
-
-            assert_eq!(indices, [1, 3]);
-            assert_eq!(normalization.values.len(), 2);
+            let result = query_view_indices(
+                &views,
+                QueryOptions {
+                    sort_mode: mode,
+                    process: Some("selected"),
+                    ..query("")
+                },
+            )
+            .expect("filtered sort is valid");
+            assert_eq!(result.indices, [1, 3]);
         }
     }
 
@@ -1877,12 +1739,8 @@ mod tests {
         let views = [PortEntryView::from(&rows[0]).with_label(Some("alpha"))];
         let options = query("alpha label:beta");
 
-        let slice_result =
-            query_view_indices(&views, options).expect("metadata filter syntax is valid");
-        let indexed_result = query_view_indices_by(1, |_| views[0], options)
-            .expect("metadata filter syntax is valid");
+        let result = query_view_indices(&views, options).expect("metadata filter syntax is valid");
 
-        assert!(slice_result.indices.is_empty());
-        assert!(indexed_result.indices.is_empty());
+        assert!(result.indices.is_empty());
     }
 }

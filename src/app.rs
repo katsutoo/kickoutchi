@@ -250,6 +250,10 @@ impl DockerEnrichmentPolicy {
 }
 
 /// Mutable TUI state.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "redraw invalidation is independent of search, visibility, and quit state"
+)]
 #[derive(Debug)]
 pub(crate) struct App {
     row_descriptors: Vec<crate::observation::PortEntryDescriptor>,
@@ -285,6 +289,7 @@ pub(crate) struct App {
     worker_failure: Option<crate::ui::WorkerFailure>,
     filter_error: Option<String>,
     should_quit: bool,
+    redraw_needed: bool,
 }
 
 impl App {
@@ -354,6 +359,7 @@ impl App {
             worker_failure: None,
             filter_error: None,
             should_quit: false,
+            redraw_needed: true,
         }
     }
 
@@ -367,19 +373,31 @@ impl App {
     }
 
     pub(crate) fn refresh(&mut self) {
+        self.refresh_with(|| {
+            crate::ui::spawn_worker(
+                thread::Builder::new().name("kickoutchi-refresh".to_owned()),
+                || collector::collect_snapshot(crate::observation::MetadataProfile::LegacyList),
+            )
+            .map(crate::ui::Worker::detach)
+        });
+    }
+
+    fn refresh_with(
+        &mut self,
+        start: impl FnOnce()
+            -> std::io::Result<Receiver<Result<RefreshResult, crate::ui::WorkerFailure>>>,
+    ) {
         if self.refresh_worker.is_some() {
             return;
         }
 
         // Keep collection off the render loop and allow only one worker. The
         // Linux collector may scan every process descriptor directory.
-        match crate::ui::spawn_worker(
-            thread::Builder::new().name("kickoutchi-refresh".to_owned()),
-            move || collector::collect_snapshot(crate::observation::MetadataProfile::LegacyList),
-        ) {
-            Ok(worker) => {
+        self.redraw_needed = true;
+        match start() {
+            Ok(receiver) => {
                 self.refresh_worker = Some(RefreshWorker {
-                    receiver: worker.detach(),
+                    receiver,
                     stale: false,
                 });
             }
@@ -435,12 +453,14 @@ impl App {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.context_worker = None;
+                self.redraw_needed = true;
                 self.latest_error =
                     Some("details worker exited before returning context".to_owned());
                 self.start_pending_process_context_request();
                 return;
             }
         };
+        self.redraw_needed = true;
         let worker_key = worker.key;
         let stale = worker.stale;
         self.context_worker = None;
@@ -466,14 +486,14 @@ impl App {
         result: Result<Vec<PortEntry>, collector::CollectorError>,
         completed_at: Instant,
     ) {
-        self.last_refresh_attempt = completed_at;
-        match result {
-            Ok(rows) => self.apply_successful_snapshot(rows, completed_at),
-            Err(error) => self.latest_error = Some(error.to_string()),
-        }
+        self.finish_snapshot_refresh_attempt(
+            result.map(crate::observation::snapshot_from_test_rows),
+            completed_at,
+        );
     }
 
     fn finish_snapshot_refresh_attempt(&mut self, result: RefreshResult, completed_at: Instant) {
+        self.redraw_needed = true;
         self.last_refresh_attempt = completed_at;
         match result {
             Ok(snapshot) => self.apply_network_snapshot(snapshot, completed_at),
@@ -486,6 +506,7 @@ impl App {
         snapshot: crate::observation::NetworkSnapshot,
         now: Instant,
     ) {
+        self.redraw_needed = true;
         let descriptors = match snapshot.port_entry_descriptors(&self.protected_processes) {
             Ok(descriptors) => descriptors,
             Err(error) => {
@@ -616,6 +637,21 @@ impl App {
         (0..self.row_count()).map(|index| self.row_view(index).expect("row index is valid"))
     }
 
+    pub(crate) fn selected_process_metadata(
+        &self,
+    ) -> Option<&crate::observation::ProcessObservation> {
+        let identity = self.selected_row()?.process_identity?;
+        self.network_snapshot.as_ref()?.processes.get(&identity)
+    }
+
+    pub(crate) fn request_redraw(&mut self) {
+        self.redraw_needed = true;
+    }
+
+    pub(crate) fn take_redraw_request(&mut self) -> bool {
+        std::mem::take(&mut self.redraw_needed)
+    }
+
     pub(crate) fn selected_process_context(&self) -> Option<&ProcessContext> {
         let selected_key = self.selected_row().map(RowKey::from)?;
         if self.selected_context_key == Some(selected_key) {
@@ -647,6 +683,7 @@ impl App {
     }
 
     pub(crate) fn scroll_modal_by(&mut self, rows: i32) {
+        self.redraw_needed = true;
         self.modal_scroll = if rows.is_negative() {
             self.modal_scroll
                 .saturating_sub(u16::try_from(rows.unsigned_abs()).unwrap_or(u16::MAX))
@@ -657,6 +694,7 @@ impl App {
     }
 
     pub(crate) fn set_modal_scroll(&mut self, rows: u16) {
+        self.redraw_needed |= self.modal_scroll != rows;
         self.modal_scroll = rows;
     }
 
@@ -713,6 +751,7 @@ impl App {
     }
 
     pub(crate) fn apply_action(&mut self, action: Action) {
+        self.redraw_needed |= action != Action::Noop;
         match action {
             Action::MoveDown => self.select_next(),
             Action::MoveUp => self.select_previous(),
@@ -1015,6 +1054,7 @@ impl App {
                 Err("tree preview worker exited before returning".to_owned())
             }
         };
+        self.redraw_needed = true;
         let worker_pid = worker.root_pid;
         self.tree_preview_worker = None;
         self.apply_tree_preview(worker_pid, result);
@@ -1195,7 +1235,7 @@ impl App {
         let mut ops = host_tree_ops();
         self.execute_tree_kill_confirmation_with(
             || collector::collect_kill_ports(Some(pid), None),
-            || collector::collect_target_ports(pid),
+            Self::refresh,
             platform::collect_process_context,
             &mut ops,
         );
@@ -1207,15 +1247,15 @@ impl App {
     /// and now, but every gate must re-pass against reality, and the root must
     /// still be exactly the confirmed process.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn execute_tree_kill_confirmation_with<CollectKillPorts, CollectPorts, CollectContext, Ops>(
+    fn execute_tree_kill_confirmation_with<CollectKillPorts, StartRefresh, CollectContext, Ops>(
         &mut self,
         mut collect_kill_ports: CollectKillPorts,
-        mut collect_ports: CollectPorts,
+        mut start_refresh: StartRefresh,
         mut collect_context: CollectContext,
         ops: &mut Ops,
     ) where
         CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
-        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        StartRefresh: FnMut(&mut Self),
         CollectContext: FnMut(u32) -> ProcessContext,
         Ops: tree::TreeProcessOps,
     {
@@ -1240,7 +1280,7 @@ impl App {
                 &confirmation.target,
                 confirmation.mode,
                 &outcome,
-                &mut collect_ports,
+                &mut start_refresh,
             );
             return;
         }
@@ -1257,8 +1297,7 @@ impl App {
         };
         mark_protected(&mut fresh_rows, &self.protected_processes);
         let fresh_context = collect_context(confirmation.target.pid);
-        // The rows stay owned because the table keeps them after this check;
-        // revalidation only reads, so it borrows them.
+        // Revalidation borrows the freshly collected rows until the gate completes.
         let fresh_views = fresh_rows
             .iter()
             .map(PortEntryView::from)
@@ -1275,7 +1314,7 @@ impl App {
                     confirmation.mode,
                     &outcome,
                 ));
-                self.apply_successful_snapshot(fresh_rows, Instant::now());
+                self.refresh_after_kill(&mut start_refresh);
                 return;
             }
         };
@@ -1289,7 +1328,7 @@ impl App {
                 &outcome,
             ));
             if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
-                self.refresh_after_kill(&mut collect_ports);
+                self.refresh_after_kill(&mut start_refresh);
             }
             return;
         }
@@ -1316,22 +1355,22 @@ impl App {
         // Best-effort post-kill refresh so freed ports drop from the table; a
         // failed re-collect shows as the standard error line rather than the
         // status overclaiming a refresh that did not run.
-        self.refresh_after_kill(&mut collect_ports);
+        self.refresh_after_kill(&mut start_refresh);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn apply_tree_pin_refusal<CollectPorts>(
+    fn apply_tree_pin_refusal<StartRefresh>(
         &mut self,
         target: &KillTarget,
         mode: KillMode,
         outcome: &tree::TreeKillOutcome,
-        collect_ports: &mut CollectPorts,
+        start_refresh: &mut StartRefresh,
     ) where
-        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        StartRefresh: FnMut(&mut Self),
     {
         self.kill_status = Some(tree_kill_status_line(target, mode, outcome));
         if matches!(outcome, tree::TreeKillOutcome::RootAlreadyExited) {
-            self.refresh_after_kill(collect_ports);
+            self.refresh_after_kill(start_refresh);
         }
     }
 
@@ -1345,7 +1384,7 @@ impl App {
         };
         self.execute_kill_confirmation_with(
             || collector::collect_kill_ports(Some(pid), None),
-            collector::collect_ports,
+            Self::refresh,
             platform::collect_process_context,
             process::prepare_termination,
             process::terminate_handle_checked,
@@ -1354,7 +1393,7 @@ impl App {
 
     fn execute_kill_confirmation_with<
         CollectKillPorts,
-        CollectVisibilityPorts,
+        StartRefresh,
         CollectContext,
         Prepare,
         Terminate,
@@ -1362,13 +1401,13 @@ impl App {
     >(
         &mut self,
         mut collect_kill_ports: CollectKillPorts,
-        mut collect_visibility_ports: CollectVisibilityPorts,
+        mut start_refresh: StartRefresh,
         mut collect_context: CollectContext,
         mut prepare: Prepare,
         mut terminate: Terminate,
     ) where
         CollectKillPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
-        CollectVisibilityPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
+        StartRefresh: FnMut(&mut Self),
         CollectContext: FnMut(u32) -> ProcessContext,
         Prepare: FnMut(u32) -> Result<Handle, TerminationOutcome>,
         Terminate: FnMut(&Handle, &KillTarget, &[String], KillMode) -> TerminationOutcome,
@@ -1398,7 +1437,7 @@ impl App {
                 // leave the table. Other preparation failures leave the process
                 // running and need no refresh.
                 if matches!(outcome, TerminationOutcome::AlreadyExited) {
-                    self.refresh_after_kill(&mut collect_visibility_ports);
+                    self.refresh_after_kill(&mut start_refresh);
                 }
                 return;
             }
@@ -1416,7 +1455,7 @@ impl App {
         };
         mark_protected(&mut fresh_rows, &self.protected_processes);
         let fresh_context = collect_context(confirmation.target.pid);
-        // Same split as the tree path: owned for the table, borrowed for the check.
+        // Revalidation borrows the freshly collected rows until the gate completes.
         let fresh_views = fresh_rows
             .iter()
             .map(PortEntryView::from)
@@ -1433,7 +1472,7 @@ impl App {
                     confirmation.mode,
                     &outcome,
                 ));
-                self.refresh_after_kill(&mut collect_visibility_ports);
+                self.refresh_after_kill(&mut start_refresh);
                 return;
             }
         };
@@ -1445,7 +1484,7 @@ impl App {
                 confirmation.mode,
                 &outcome,
             ));
-            self.refresh_after_kill(&mut collect_visibility_ports);
+            self.refresh_after_kill(&mut start_refresh);
             return;
         }
         let outcome = terminate(
@@ -1463,47 +1502,21 @@ impl App {
         // The status reports only the signal result; a failed re-collect shows up
         // as the standard error line rather than letting the status overclaim a
         // refresh that did not run.
-        self.refresh_after_kill(&mut collect_visibility_ports);
+        self.refresh_after_kill(&mut start_refresh);
     }
 
-    fn refresh_after_kill<CollectPorts>(&mut self, collect_ports: &mut CollectPorts)
-    where
-        CollectPorts: FnMut() -> Result<Vec<PortEntry>, collector::CollectorError>,
-    {
-        #[cfg(not(test))]
-        {
-            let _ = collect_ports;
-            self.queue_post_kill_refresh();
-        }
-        #[cfg(test)]
-        if self.refresh_worker.is_some() {
-            let _ = collect_ports;
-            self.queue_post_kill_refresh();
-        } else {
-            self.finish_refresh_attempt(collect_ports(), Instant::now());
-        }
-    }
-
-    fn queue_post_kill_refresh(&mut self) {
+    fn refresh_after_kill(&mut self, start_refresh: &mut impl FnMut(&mut Self)) {
         if let Some(worker) = self.refresh_worker.as_mut() {
             worker.stale = true;
             self.pending_refresh = PendingRefresh::PostKill;
         } else {
-            self.refresh();
+            start_refresh(self);
         }
     }
 
-    #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-    fn apply_successful_snapshot(&mut self, rows: Vec<PortEntry>, now: Instant) {
-        #[cfg(not(test))]
-        {
-            let _ = (rows, now);
-            self.refresh();
-        }
-        #[cfg(test)]
-        {
-            self.apply_network_snapshot(crate::observation::snapshot_from_test_rows(rows), now);
-        }
+    #[cfg(test)]
+    pub(crate) fn apply_test_rows(&mut self, rows: Vec<PortEntry>, now: Instant) {
+        self.apply_network_snapshot(crate::observation::snapshot_from_test_rows(rows), now);
     }
 
     fn rebuild_visible_rows(&mut self) {
@@ -1548,7 +1561,7 @@ impl App {
         selected_key: Option<RowKey>,
         fallback_index: usize,
     ) {
-        // Vec<bool> stores one bit per source row. Recording key matches during
+        // The selection mask stores one bool per source row. Recording key matches during
         // the query's sole projection avoids rebuilding views while preserving
         // the existing first-visible-match behavior for duplicate row keys.
         let mut selected_source_rows = selected_key.map(|_| vec![false; self.row_count()]);

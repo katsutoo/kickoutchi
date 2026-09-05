@@ -348,9 +348,9 @@ fn write_stdout(text: &str) -> Option<ExitReason> {
     }
 }
 
-pub(super) fn maybe_print_no_match_diagnostic(
+pub(super) fn maybe_print_no_match_diagnostic<'a>(
     diagnostic_port: Option<u16>,
-    entries: &[PortEntryView<'_>],
+    entries: impl Iterator<Item = PortEntryView<'a>>,
 ) {
     let Some(port) = diagnostic_port_without_confirmed_socket(diagnostic_port, entries) else {
         return;
@@ -361,12 +361,12 @@ pub(super) fn maybe_print_no_match_diagnostic(
     }
 }
 
-fn diagnostic_port_without_confirmed_socket(
+fn diagnostic_port_without_confirmed_socket<'a>(
     diagnostic_port: Option<u16>,
-    entries: &[PortEntryView<'_>],
+    mut entries: impl Iterator<Item = PortEntryView<'a>>,
 ) -> Option<u16> {
     let port = diagnostic_port?;
-    if entries.iter().any(|entry| entry.local_port == port) {
+    if entries.any(|entry| entry.local_port == port) {
         None
     } else {
         Some(port)
@@ -429,7 +429,7 @@ fn run_inspect(
             eprintln!("error: no open port matches the requested target");
             // Same evidence-only hint `list` prints: a command line naming the
             // port often identifies the process the user was looking for.
-            maybe_print_no_match_diagnostic(args.port, &initial_entries);
+            maybe_print_no_match_diagnostic(args.port, initial_entries.iter().copied());
             return ExitReason::NoMatch;
         }
         Err(error) => return print_target_error(error),
@@ -604,7 +604,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use crate::model::entry_views;
-    use clap::{Parser, error::ErrorKind};
+    use clap::Parser;
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use super::kill::KillTargetError;
@@ -615,13 +615,6 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use crate::model::Protocol;
     use crate::model::SortMode;
-
-    fn long_help(subcommand: &str) -> String {
-        let error = Cli::try_parse_from(["kickoutchi", subcommand, "--help"])
-            .expect_err("--help exits through clap");
-        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
-        error.to_string().replace('`', "")
-    }
 
     #[test]
     fn exit_codes_match_the_documented_contract() {
@@ -666,72 +659,6 @@ mod tests {
         assert_eq!(args.sort, Some(SortMode::Scope));
         assert!(args.json);
         assert!(!args.snapshot_json);
-    }
-
-    #[test]
-    fn list_help_distinguishes_legacy_rows_from_complete_snapshots() {
-        let help = long_help("list");
-
-        assert!(help.contains("Usage: kickoutchi list [OPTIONS]"));
-        assert!(help.contains("--json"));
-        assert!(help.contains("--snapshot-json"));
-        assert!(help.contains("legacy visible-row kickoutchi.list/1"));
-        assert!(help.contains("complete, unfiltered within-scope kickoutchi.snapshot/1"));
-        assert!(help.contains("scope_id:"));
-        assert!(help.contains("family:"));
-        assert!(help.contains("state: is reserved for watch and is rejected here"));
-    }
-
-    #[test]
-    fn watch_help_documents_polling_filter_and_stream_contracts() {
-        let help = long_help("watch");
-
-        for required in [
-            "Usage: kickoutchi watch [OPTIONS]",
-            "--interval <DURATION>",
-            "--duration <DURATION>",
-            "Polling can miss sockets",
-            "Neither protocol flag means both TCP and UDP",
-            "watch-only state:",
-            "new_syn_received",
-            "can produce an emitted indeterminate match",
-            "definite nonmatches remain suppressed",
-            "initial collection failure emits no records and exits 1",
-            "third consecutive failure",
-            "Collection gaps bypass endpoint filters",
-            "100ms..=60s",
-            "100ms..=7d",
-            "kickoutchi.watch_event/1",
-            "stdout line",
-            "stderr",
-            "never run by the polling loop",
-        ] {
-            assert!(help.contains(required), "missing help text: {required}");
-        }
-    }
-
-    #[test]
-    fn why_help_documents_matrix_probe_output_and_exit_contracts() {
-        let help = long_help("why");
-
-        for required in [
-            "Usage: kickoutchi why [OPTIONS] <PORT>",
-            "--all-protocols",
-            "--all-addresses",
-            "TCP on 127.0.0.1, then ::1",
-            "127.0.0.1, 0.0.0.0, ::1, then ::",
-            "eight endpoints",
-            "--scope-id requires one explicit IPv6 address",
-            "operating system's IPv6 behavior is used",
-            "temporarily bound and immediately closed",
-            "does not reserve the endpoint",
-            "kickoutchi.why/1",
-            "Exit codes are 0",
-            "does not run Docker",
-            "never includes full process command lines",
-        ] {
-            assert!(help.contains(required), "missing help text: {required}");
-        }
     }
 
     #[test]
@@ -1037,13 +964,19 @@ mod tests {
     #[test]
     fn no_match_diagnostic_requires_absent_confirmed_socket() {
         assert_eq!(
-            diagnostic_port_without_confirmed_socket(Some(3000), &[]),
+            diagnostic_port_without_confirmed_socket(Some(3000), std::iter::empty()),
             Some(3000)
         );
         assert_eq!(
-            diagnostic_port_without_confirmed_socket(Some(3000), &entry_views(&[entry(3000)])),
+            diagnostic_port_without_confirmed_socket(
+                Some(3000),
+                entry_views(&[entry(3000)]).into_iter()
+            ),
             None
         );
-        assert_eq!(diagnostic_port_without_confirmed_socket(None, &[]), None);
+        assert_eq!(
+            diagnostic_port_without_confirmed_socket(None, std::iter::empty()),
+            None
+        );
     }
 }

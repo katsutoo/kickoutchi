@@ -97,15 +97,27 @@ fn workflow_steps(workflow: &Value) -> Vec<&Mapping> {
         .collect()
 }
 
-fn step_name(step: &Mapping) -> Option<&str> {
-    mapping_value(step, "name").and_then(Value::as_str)
+fn step_runs(step: &Mapping, command: &str) -> bool {
+    mapping_value(step, "run")
+        .and_then(Value::as_str)
+        .is_some_and(|script| script.contains(command))
 }
 
-fn named_job_step<'a>(job: &'a Mapping, name: &str) -> &'a Mapping {
+fn step_uses(step: &Mapping, action: &str) -> bool {
+    mapping_value(step, "uses")
+        .and_then(Value::as_str)
+        .is_some_and(|reference| {
+            reference
+                .split_once('@')
+                .is_some_and(|(name, _)| name == action)
+        })
+}
+
+fn job_step_running<'a>(job: &'a Mapping, command: &str) -> &'a Mapping {
     job_steps(job)
         .into_iter()
-        .find(|step| step_name(step) == Some(name))
-        .unwrap_or_else(|| panic!("missing workflow step {name}"))
+        .find(|step| step_runs(step, command))
+        .unwrap_or_else(|| panic!("missing workflow command {command}"))
 }
 
 fn step_script(step: &Mapping) -> &str {
@@ -193,7 +205,8 @@ fn assert_permission_maps(value: &Value) {
 fn assert_release_job_permissions(workflow: &Value) {
     for name in workflow_job_names(workflow) {
         let job = workflow_job(workflow, &name);
-        let permissions = mapping_value(job, "permissions").map(|_| yaml_mapping(job, "permissions"));
+        let permissions =
+            mapping_value(job, "permissions").map(|_| yaml_mapping(job, "permissions"));
         match name.as_str() {
             "host" => assert_eq!(permissions, Some(vec![("contents".into(), "write".into())])),
             "attest-release-artifacts" => assert_eq!(

@@ -332,8 +332,6 @@ pub(crate) struct TerminationHandle {
     process_handle: OwnedHandle,
     #[cfg(target_os = "macos")]
     process_start_time_marker: ProcessStartMarker,
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    _unsupported: (),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,31 +1028,6 @@ mod windows;
 use windows::{native_utf16_prefix, windows_api_outcome};
 #[cfg(windows)]
 use windows::{prepare_termination_platform, terminate_handle_checked_platform};
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn prepare_termination_platform(pid: u32) -> Result<TerminationHandle, TerminationOutcome> {
-    Ok(TerminationHandle {
-        pid,
-        _unsupported: (),
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn terminate_handle_platform(_handle: &TerminationHandle, _mode: KillMode) -> TerminationOutcome {
-    TerminationOutcome::UnknownFailure(
-        "termination is only implemented for Linux, macOS, and Windows".to_owned(),
-    )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn terminate_handle_checked_platform(
-    handle: &TerminationHandle,
-    _target: &KillTarget,
-    _protected_names: &[String],
-    mode: KillMode,
-) -> TerminationOutcome {
-    terminate_handle_platform(handle, mode)
-}
 
 #[cfg(test)]
 mod tests;

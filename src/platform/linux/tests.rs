@@ -2200,3 +2200,54 @@ fn collector_enforces_pid_budget_through_production_orchestration() {
     ));
     fs::remove_dir_all(proc_root).expect("test proc root must clean up");
 }
+
+#[test]
+fn native_metadata_profiles_preserve_socket_owners_and_limit_enrichment() {
+    use crate::collector::Collector;
+    use crate::observation::MetadataProfile;
+    let proc_root = temp_proc_root("metadata-profiles");
+    write_socket_table(&proc_root, "net/tcp", &[row("0100007F:0BB8", "0A", 77)]);
+    write_socket_table(&proc_root, "net/udp", &[]);
+    write_process(&proc_root, 1234, "worker", 1);
+    write_process(&proc_root, 1, "parent", 0);
+    std::os::unix::fs::symlink("socket:[77]", proc_root.join("1234/fd/3"))
+        .expect("socket owner fixture");
+    let collector = LinuxCollector::with_proc_root(proc_root.clone());
+    let identity = collector
+        .collect(MetadataProfile::IdentityOnly)
+        .expect("identity collection");
+    let display = collector
+        .collect(MetadataProfile::Display)
+        .expect("display collection");
+    let legacy = collector
+        .collect(MetadataProfile::LegacyList)
+        .expect("legacy collection");
+    fs::remove_dir_all(proc_root).expect("fixture cleanup");
+
+    assert_eq!(identity.sockets.len(), 1);
+    assert_eq!(identity.sockets, display.sockets);
+    assert_eq!(display.sockets, legacy.sockets);
+    let owner = crate::observation::ProcessIdentity {
+        pid: 1234,
+        start_marker: crate::observation::ProcessStartMarker::linux(12340).expect("fixture marker"),
+    };
+    assert_eq!(
+        identity.sockets[0].owners,
+        [crate::observation::OwnerObservation::Verified(owner)]
+    );
+    assert_eq!(identity.processes.len(), 1);
+    assert_eq!(
+        identity.processes[&owner],
+        crate::observation::ProcessObservation::identity_only()
+    );
+    assert_eq!(display.processes[&owner].name.as_deref(), Some("worker"));
+    assert_eq!(
+        display.processes[&owner].parent_process_name.as_deref(),
+        Some("parent")
+    );
+    assert_eq!(display.processes[&owner].command_line, None);
+    assert_eq!(
+        legacy.processes[&owner].command_line.as_deref(),
+        Some("worker --test")
+    );
+}

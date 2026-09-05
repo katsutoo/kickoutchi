@@ -1,5 +1,8 @@
 //! Selected-row details panel and modal.
 
+use std::path::Path;
+use std::sync::Arc;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -17,7 +20,76 @@ use super::{field, rendered_rows, theme::Theme, wrapped_rows};
 const MISSING: &str = "-";
 const CHILDREN_DISPLAY_MAX: usize = 8;
 
-pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+/// At most one selected command and path. Sources share the snapshot's immutable
+/// Arcs; sanitized text is bounded by three times the native metadata byte caps.
+/// Retaining the source Arc prevents pointer reuse from hiding a metadata change.
+#[derive(Default)]
+pub(super) struct TextCache {
+    command: Option<Arc<str>>,
+    command_text: String,
+    path: Option<Arc<Path>>,
+    path_text: String,
+}
+
+impl TextCache {
+    pub(super) fn update(&mut self, metadata: Option<&crate::observation::ProcessObservation>) {
+        update_text(
+            &mut self.command,
+            &mut self.command_text,
+            metadata.and_then(|process| process.command_line.as_ref()),
+            sanitize,
+        );
+        update_text(
+            &mut self.path,
+            &mut self.path_text,
+            metadata.and_then(|process| process.executable_path.as_ref()),
+            |path| sanitize(&path.display().to_string()),
+        );
+    }
+
+    fn command(&self) -> &str {
+        if self.command.is_some() {
+            &self.command_text
+        } else {
+            MISSING
+        }
+    }
+
+    fn path(&self) -> &str {
+        if self.path.is_some() {
+            &self.path_text
+        } else {
+            MISSING
+        }
+    }
+}
+
+fn update_text<T: ?Sized>(
+    source: &mut Option<Arc<T>>,
+    text: &mut String,
+    current: Option<&Arc<T>>,
+    render: impl FnOnce(&T) -> String,
+) {
+    match current {
+        Some(current) if source.as_ref().is_some_and(|old| Arc::ptr_eq(old, current)) => {}
+        Some(current) => {
+            *text = render(current);
+            *source = Some(Arc::clone(current));
+        }
+        None => {
+            *source = None;
+            *text = String::new();
+        }
+    }
+}
+
+pub(super) fn render_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: Theme,
+    text: &TextCache,
+) {
     let block = Block::bordered()
         .title("Details")
         .title_style(theme.title())
@@ -43,6 +115,7 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
             app.selected_process_context_loading(),
             theme,
             usize::from(chunks[0].height),
+            text,
         );
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
         frame.render_widget(
@@ -59,6 +132,7 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
                     app.selected_process_context_loading(),
                     theme,
                     usize::from(inner.height),
+                    text,
                 )
             },
         );
@@ -66,7 +140,13 @@ pub(crate) fn render_panel(frame: &mut Frame, area: Rect, app: &App, theme: Them
     }
 }
 
-pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+pub(super) fn render_modal(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: Theme,
+    text: &TextCache,
+) {
     let lines = app.selected_row().map_or_else(
         || empty_lines(theme),
         |entry| {
@@ -75,6 +155,7 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
                 app.selected_process_context(),
                 app.selected_process_context_loading(),
                 theme,
+                text,
             )
         },
     );
@@ -129,61 +210,64 @@ pub(crate) fn render_modal(frame: &mut Frame, area: Rect, app: &App, theme: Them
     );
 }
 
-fn panel_lines(
+fn panel_lines<'a>(
     entry: PortEntryView<'_>,
     context: Option<&ProcessContext>,
     context_loading: bool,
     theme: Theme,
     max_rows: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        field(
-            "PID",
-            format!(
-                "{} | Process: {}",
-                optional_u32(entry.pid),
-                sanitize_optional_str(entry.process_name)
+    text: &'a TextCache,
+) -> Vec<Line<'a>> {
+    // Evaluate only visible fields. A hidden command can be a full MiB.
+    let mut lines = (0..max_rows.min(7))
+        .map(|index| match index {
+            0 => field(
+                "PID",
+                format!(
+                    "{} | Process: {}",
+                    optional_u32(entry.pid),
+                    sanitize_optional_str(entry.process_name)
+                ),
+                theme,
             ),
-            theme,
-        ),
-        field(
-            "Bind",
-            format!(
-                "{} {} {} | {}",
-                entry.protocol.label(),
-                human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope),
-                entry.state.label(),
-                entry.scope_label()
+            1 => field(
+                "Bind",
+                format!(
+                    "{} {} {} | {}",
+                    entry.protocol.label(),
+                    human_endpoint_text(entry.local_addr, entry.local_port, entry.ipv6_scope),
+                    entry.state.label(),
+                    entry.scope_label()
+                ),
+                theme,
             ),
-            theme,
-        ),
-        field("Permission", permission_text(entry.permission), theme),
-    ];
-    lines.extend([
-        field("Parent", parent_text(entry), theme),
-        field(
-            "Children",
-            children_text(entry, context, context_loading),
-            theme,
-        ),
-        field("Path", path_text(entry), theme),
-        field("Command", sanitize_optional_str(entry.command_line), theme),
-    ]);
+            2 => field("Permission", permission_text(entry.permission), theme),
+            3 => field("Parent", parent_text(entry), theme),
+            4 => field(
+                "Children",
+                children_text(entry, context, context_loading),
+                theme,
+            ),
+            5 => field("Path", text.path(), theme),
+            6 => field("Command", text.command(), theme),
+            _ => unreachable!("the panel has seven fields"),
+        })
+        .collect::<Vec<_>>();
     if lines.len() < max_rows
         && let Some(text) = docker_panel_text(context)
     {
         lines.insert(2, field("Docker", text, theme));
     }
-    lines.truncate(max_rows);
     lines
 }
 
-fn modal_lines(
+fn modal_lines<'a>(
     entry: PortEntryView<'_>,
     context: Option<&ProcessContext>,
     context_loading: bool,
     theme: Theme,
-) -> Vec<Line<'static>> {
+    text: &'a TextCache,
+) -> Vec<Line<'a>> {
     let mut lines = vec![
         field("Protocol", entry.protocol.label().to_owned(), theme),
         field(
@@ -209,12 +293,8 @@ fn modal_lines(
         field("Permission", permission_text(entry.permission), theme),
     ]);
 
-    lines.push(field("Path", path_text(entry), theme));
-    lines.push(field(
-        "Command",
-        sanitize_optional_str(entry.command_line),
-        theme,
-    ));
+    lines.push(field("Path", text.path(), theme));
+    lines.push(field("Command", text.command(), theme));
 
     if let Some(docker) = context.and_then(|context| context.docker.as_ref()) {
         let docker_rows = docker_modal_lines(docker, theme);
@@ -230,13 +310,6 @@ fn empty_lines(theme: Theme) -> Vec<Line<'static>> {
 
 fn optional_u32(value: Option<u32>) -> String {
     value.map_or_else(|| MISSING.to_owned(), |value| value.to_string())
-}
-
-fn path_text(entry: PortEntryView<'_>) -> String {
-    entry.executable_path.map_or_else(
-        || MISSING.to_owned(),
-        |path| sanitize(&path.display().to_string()),
-    )
 }
 
 fn sanitize_optional_str(value: Option<&str>) -> String {
@@ -428,23 +501,9 @@ mod tests {
     }
 
     #[test]
-    fn panel_summary_fits_the_default_details_area() {
-        let context = ProcessContext::default();
-        let row = entry();
-        let lines = panel_lines(
-            PortEntryView::from(&row),
-            Some(&context),
-            false,
-            Theme::from_environment(),
-            7,
-        );
-
-        assert_eq!(lines.len(), 7);
-    }
-
-    #[test]
     fn protected_panel_keeps_permission_and_leaves_warning_to_the_reserved_row() {
         let mut row = entry();
+        let text = super::TextCache::default();
         row.protected = true;
         let lines = panel_lines(
             PortEntryView::from(&row),
@@ -452,6 +511,7 @@ mod tests {
             false,
             Theme::from_environment(),
             6,
+            &text,
         );
         let text = lines
             .iter()
@@ -466,6 +526,7 @@ mod tests {
     #[test]
     fn panel_bind_text_preserves_ipv6_interface_scope() {
         let mut row = entry();
+        let text = super::TextCache::default();
         row.local_addr = IpAddr::V6("fe80::1".parse().expect("test address is valid"));
         row.ipv6_scope =
             Some(crate::observation::Ipv6Scope::interface_index(3).expect("test scope is valid"));
@@ -475,6 +536,7 @@ mod tests {
             false,
             Theme::from_environment(),
             7,
+            &text,
         );
 
         assert!(
@@ -503,12 +565,14 @@ mod tests {
             ..ProcessContext::default()
         };
         let row = entry();
+        let text = super::TextCache::default();
         let lines = panel_lines(
             PortEntryView::from(&row),
             Some(&context),
             false,
             Theme::from_environment(),
             7,
+            &text,
         );
 
         assert_eq!(lines.len(), 7);
@@ -533,6 +597,7 @@ mod tests {
             false,
             Theme::from_environment(),
             8,
+            &text,
         );
         assert_eq!(expanded.len(), 8);
         assert!(

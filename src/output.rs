@@ -15,6 +15,9 @@ use crate::display::{human_address_text, sanitize};
 use crate::labels::label_display_text;
 use crate::model::PortEntryView;
 
+// 64 KiB bounds retained CLI output without buffering an entire document.
+pub(crate) const OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+
 const COLUMN_COUNT: usize = 6;
 const HEADERS: [&str; COLUMN_COUNT] = ["PROTO", "ADDRESS", "PORT", "PID", "PROCESS", "STATE"];
 const LABELED_COLUMN_COUNT: usize = 7;
@@ -43,14 +46,14 @@ const PADDING: [u8; crate::observation::PROCESS_NAME_MAX_BYTES] =
 ///
 /// Uses plain spaces instead of box-drawing characters so shell tools can split
 /// each line on whitespace.
-pub(crate) fn write_view_table(
+pub(crate) fn write_view_table<'a>(
     writer: &mut impl Write,
-    entries: &[PortEntryView<'_>],
+    view_at: impl Fn(usize) -> PortEntryView<'a>,
     indices: &[usize],
     show_labels: bool,
 ) -> std::io::Result<()> {
     if show_labels {
-        return write_labeled_view_table(writer, entries, indices);
+        return write_labeled_view_table(writer, view_at, indices);
     }
     // Each column grows to its widest cell. The model's own types keep content
     // in check (addresses, ports, PIDs, short comm-style names), so there's no
@@ -60,26 +63,26 @@ pub(crate) fn write_view_table(
     // byte length suggests.
     let mut widths: [usize; COLUMN_COUNT] = HEADERS.map(UnicodeWidthStr::width);
     for &index in indices {
-        update_widths(&entries[index], &mut widths);
+        update_widths(&view_at(index), &mut widths);
     }
 
     write_cells(writer, HEADERS, &widths)?;
     writer.write_all(b"\n")?;
     for &index in indices {
-        write_entry(writer, &entries[index], &widths)?;
+        write_entry(writer, &view_at(index), &widths)?;
         writer.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn write_labeled_view_table(
+fn write_labeled_view_table<'a>(
     writer: &mut impl Write,
-    entries: &[PortEntryView<'_>],
+    view_at: impl Fn(usize) -> PortEntryView<'a>,
     indices: &[usize],
 ) -> std::io::Result<()> {
     let mut widths: [usize; LABELED_COLUMN_COUNT] = LABELED_HEADERS.map(UnicodeWidthStr::width);
     for &index in indices {
-        let entry = &entries[index];
+        let entry = &view_at(index);
         update_widths(entry, &mut widths);
         widths[6] = widths[6].max(
             entry
@@ -91,7 +94,7 @@ fn write_labeled_view_table(
     write_cells(writer, LABELED_HEADERS, &widths)?;
     writer.write_all(b"\n")?;
     for &index in indices {
-        write_labeled_entry(writer, &entries[index], &widths)?;
+        write_labeled_entry(writer, &view_at(index), &widths)?;
         writer.write_all(b"\n")?;
     }
     Ok(())
@@ -99,18 +102,18 @@ fn write_labeled_view_table(
 
 /// Render entries as pretty-printed JSON using the `PortEntry` serialization
 /// contract pinned by model tests.
-pub(crate) fn write_view_json(
+pub(crate) fn write_view_json<'a>(
     writer: &mut impl Write,
-    entries: &[PortEntryView<'_>],
+    view_at: impl Fn(usize) -> PortEntryView<'a>,
     indices: &[usize],
 ) -> Result<(), serde_json::Error> {
     let formatter = serde_json::ser::PrettyFormatter::with_indent(b"  ");
     let mut serializer = serde_json::Serializer::with_formatter(&mut *writer, formatter);
     let mut sequence = serializer.serialize_seq(Some(indices.len()))?;
     for &index in indices {
-        sequence.serialize_element(&crate::public_output::LegacyListRecord::from(
-            &entries[index],
-        ))?;
+        sequence.serialize_element(&crate::public_output::LegacyListRecord::from(&view_at(
+            index,
+        )))?;
     }
     sequence.end()?;
     writer.write_all(b"\n").map_err(serde_json::Error::io)
@@ -228,7 +231,7 @@ mod tests {
         let indices = (0..entries.len()).collect::<Vec<_>>();
         let views = entry_views(entries);
         let mut bytes = Vec::new();
-        write_view_table(&mut bytes, &views, &indices, false).expect("table writes");
+        write_view_table(&mut bytes, |index| views[index], &indices, false).expect("table writes");
         String::from_utf8(bytes).expect("table is UTF-8")
     }
 
@@ -236,7 +239,7 @@ mod tests {
         let indices = (0..entries.len()).collect::<Vec<_>>();
         let views = entry_views(entries);
         let mut bytes = Vec::new();
-        write_view_json(&mut bytes, &views, &indices).expect("JSON writes");
+        write_view_json(&mut bytes, |index| views[index], &indices).expect("JSON writes");
         String::from_utf8(bytes).expect("JSON is UTF-8")
     }
 
@@ -247,7 +250,8 @@ mod tests {
         }
         let indices = (0..views.len()).collect::<Vec<_>>();
         let mut bytes = Vec::new();
-        write_view_table(&mut bytes, &views, &indices, true).expect("labeled table writes");
+        write_view_table(&mut bytes, |index| views[index], &indices, true)
+            .expect("labeled table writes");
         String::from_utf8(bytes).expect("table is UTF-8")
     }
 
@@ -377,7 +381,7 @@ mod tests {
         let mut views = entry_views(&entries);
         views[0].label = Some("web dev");
         let mut bytes = Vec::new();
-        write_view_json(&mut bytes, &views, &[0, 1]).unwrap();
+        write_view_json(&mut bytes, |index| views[index], &[0, 1]).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(value[0]["label"], "web dev");

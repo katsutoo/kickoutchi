@@ -1,11 +1,10 @@
 //! The `list` command: filter and sort the collected port table, then print
 //! it as the human-facing table or the stable JSON contract.
 
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufWriter, ErrorKind, Write};
 
 use crate::config::Config;
 use crate::diagnostic::requested_diagnostic_port;
-use crate::model::PortEntryView;
 use crate::observation::NetworkSnapshot;
 use crate::output;
 use crate::query::{self, QueryCapabilities, QueryOptions};
@@ -26,20 +25,36 @@ fn run_list_snapshot_with_writer(
     snapshot: &NetworkSnapshot,
     writer: &mut impl Write,
 ) -> ExitReason {
+    // Bound bulk output memory while amortizing line-buffered stdout writes.
+    let mut buffered = BufWriter::with_capacity(output::OUTPUT_BUFFER_BYTES, writer);
+    let result = run_list_snapshot_buffered(args, config, snapshot, &mut buffered);
+    // Success explicitly flushes. Discard pending bytes after failure so Drop
+    // cannot retry a write after the command has already selected its exit code.
+    let _ = buffered.into_parts();
+    result
+}
+
+fn run_list_snapshot_buffered(
+    args: &ListArgs,
+    config: &Config,
+    snapshot: &NetworkSnapshot,
+    writer: &mut impl Write,
+) -> ExitReason {
     if args.snapshot_json {
-        match crate::public_output::write_snapshot_json(writer, snapshot, &config.labels) {
-            Ok(()) => {}
+        return match crate::public_output::write_snapshot_json(writer, snapshot, &config.labels)
+            .and_then(|()| {
+                writer
+                    .flush()
+                    .map_err(crate::public_output::PublicOutputError::from)
+            }) {
+            Ok(()) => ExitReason::Success,
             Err(error) if error.io_error_kind() == Some(ErrorKind::BrokenPipe) => {
-                return ExitReason::Success;
+                ExitReason::Success
             }
             Err(error) => {
                 eprintln!("error: rendering snapshot JSON failed: {error}");
-                return ExitReason::Failure;
+                ExitReason::Failure
             }
-        }
-        return match writer.flush() {
-            Ok(()) => ExitReason::Success,
-            Err(error) => output_error_reason(&error),
         };
     }
 
@@ -50,33 +65,22 @@ fn run_list_snapshot_with_writer(
             return ExitReason::Failure;
         }
     };
-    let views = descriptors
-        .iter()
-        .map(|descriptor| {
-            let view = snapshot.port_entry_view(descriptor);
-            let label = config.labels.resolve_parts(
-                view.protocol,
-                view.local_addr,
-                view.local_port,
-                view.ipv6_scope,
-            );
-            view.with_label(label)
-        })
-        .collect::<Vec<_>>();
-    run_list_views_with_writer(args, config, &views, writer)
-}
-
-fn run_list_views_with_writer(
-    args: &ListArgs,
-    config: &Config,
-    entries: &[PortEntryView<'_>],
-    writer: &mut impl Write,
-) -> ExitReason {
+    let view_at = |index: usize| {
+        let view = snapshot.port_entry_view(&descriptors[index]);
+        let label = config.labels.resolve_parts(
+            view.protocol,
+            view.local_addr,
+            view.local_port,
+            view.ipv6_scope,
+        );
+        view.with_label(label)
+    };
     let sort_mode = args.sort.unwrap_or(config.default_sort);
     let diagnostic_port =
         requested_diagnostic_port(args.port, args.filter.as_deref().unwrap_or_default());
-    let result = match query::query_view_indices(
-        entries,
+    let result = match query::query_view_indices_by(
+        descriptors.len(),
+        view_at,
         QueryOptions {
             port: args.port,
             process: args.process.as_deref(),
@@ -95,7 +99,7 @@ fn run_list_views_with_writer(
     let visible_indices = result.indices;
 
     if args.json {
-        match output::write_view_json(writer, entries, &visible_indices) {
+        match output::write_view_json(writer, view_at, &visible_indices) {
             Ok(()) => {}
             Err(error) if error.io_error_kind() == Some(ErrorKind::BrokenPipe) => {
                 return ExitReason::Success;
@@ -116,9 +120,9 @@ fn run_list_views_with_writer(
         if let Err(error) = writeln!(writer, "no open ports{suffix}") {
             return output_error_reason(&error);
         }
-        maybe_print_no_match_diagnostic(diagnostic_port, entries);
+        maybe_print_no_match_diagnostic(diagnostic_port, (0..descriptors.len()).map(view_at));
     } else if let Err(error) =
-        output::write_view_table(writer, entries, &visible_indices, !config.labels.is_empty())
+        output::write_view_table(writer, view_at, &visible_indices, !config.labels.is_empty())
     {
         return output_error_reason(&error);
     }
@@ -370,6 +374,43 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_output_stops_at_the_first_write_failure_without_retrying_on_drop() {
+        struct FailOnce {
+            calls: usize,
+            kind: io::ErrorKind,
+        }
+
+        impl Write for FailOnce {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                assert_eq!(self.calls, 1, "failed output must not be retried");
+                Err(io::Error::new(self.kind, "injected bulk write failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("a failed write must stop before flushing");
+            }
+        }
+
+        let rows = (1000..3000)
+            .map(crate::cli::test_support::entry)
+            .collect::<Vec<_>>();
+        for options in [args(false), args(true), snapshot_args()] {
+            for (kind, expected) in [
+                (io::ErrorKind::BrokenPipe, ExitReason::Success),
+                (io::ErrorKind::Other, ExitReason::Failure),
+            ] {
+                let mut writer = FailOnce { calls: 0, kind };
+                assert_eq!(
+                    run_list_with_writer(&options, &Config::default(), &rows, &mut writer),
+                    expected,
+                );
+                assert_eq!(writer.calls, 1);
             }
         }
     }

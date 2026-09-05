@@ -109,8 +109,8 @@ impl BindScope {
 /// snapshot is authoritative for anything a destructive decision rests on.
 ///
 /// Read-only consumers use [`PortEntryView`] to avoid copying shared metadata.
-/// This owned form is limited to the TUI's stored rows, collection seams that
-/// return after dropping their snapshot, and compact test fixtures. Add new
+/// This owned form is used by workers and collection seams that outlive their
+/// source snapshot, and by compact test fixtures. Add new
 /// source facts to `NetworkSnapshot`, then project them here if required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PortEntry {

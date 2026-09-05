@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-09-05
+
+### Changed
+
+- The TUI redraws when input, worker results, resizing, or the displayed refresh
+  age changes. Cached command and executable-path text avoids repeated
+  sanitization. In local Linux tests with a 960 KB command line, idle CPU fell
+  from about 19% of one core to 2–2.3% across three paired runs.
+- Buffered list output reduces small stdout writes while preserving JSON,
+  exit-code, flush-error, and broken-pipe behavior. With 5,000 additional TCP
+  listeners, 30 paired local Linux runs measured median legacy JSON time falling
+  from 44.8 to 37.1 ms and snapshot JSON time from 61.3 to 39.4 ms. Single-port
+  queries measured about 3–4% slower in the larger fixtures; the stripped binary
+  grew by 1.3%.
+- CLI queries and rendering share the indexed borrowed projection used by the
+  TUI, removing an intermediate row allocation and duplicate sorting code.
+- Refresh tests now use the production worker channel and post-kill scheduling
+  path. Added coverage for stale refresh completion, redraw and text-cache
+  invalidation, worker startup failure, native metadata profiles, and bulk
+  output failures.
+- Removed unreachable platform fallbacks and tests tied only to fixture
+  contents, help prose, or incidental workflow labels and tool versions.
+  Workflow security and publication-order checks remain in place.
+
 ## [1.4.2] - 2026-09-05
 
 ### Fixed
@@ -1505,7 +1529,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.3...HEAD
+[1.4.3]: https://github.com/nuggocto/kickoutchi/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/nuggocto/kickoutchi/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/nuggocto/kickoutchi/compare/v1.3.10...v1.4.0

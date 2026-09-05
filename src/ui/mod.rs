@@ -9,6 +9,7 @@ mod table;
 mod theme;
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -688,6 +689,8 @@ fn event_loop(
     config: &Config,
     theme: Theme,
 ) -> AppResult<EventLoopExit> {
+    let mut details_text = details::TextCache::default();
+    let mut rendered_age = None;
     loop {
         #[cfg(unix)]
         if let Some(signal) = take_termination_signal() {
@@ -697,7 +700,13 @@ fn event_loop(
         if let Some(error) = poll_workers(app) {
             return Err(error.into());
         }
-        terminal.draw(|frame| draw(frame, app, theme))?;
+        // Poll signals/workers at 100 ms, but redraw the age only when its
+        // displayed whole second changes. Input and worker results request frames.
+        let age = app.refresh_age().map(|age| age.as_secs());
+        if app.take_redraw_request() || rendered_age != Some(age) {
+            terminal.draw(|frame| draw(frame, app, theme, &mut details_text))?;
+            rendered_age = Some(age);
+        }
 
         let wait = std::cmp::min(
             config.tick_interval,
@@ -705,7 +714,11 @@ fn event_loop(
         );
         match event::poll(bounded_event_wait(wait)) {
             Ok(true) => {
-                if let Event::Key(key) = event::read()? {
+                let event = event::read()?;
+                if matches!(event, Event::Resize(_, _)) {
+                    app.request_redraw();
+                }
+                if let Event::Key(key) = event {
                     if handle_modal_scroll(app, key) {
                         continue;
                     }
@@ -786,7 +799,8 @@ fn take_termination_signal() -> Option<libc::c_int> {
     take_first_signal(&TERMINATION_SIGNAL)
 }
 
-fn draw(frame: &mut Frame, app: &mut App, theme: Theme) {
+fn draw(frame: &mut Frame, app: &mut App, theme: Theme, details_text: &mut details::TextCache) {
+    details_text.update(app.selected_process_metadata());
     let area = frame.area();
 
     if is_too_small(area) {
@@ -807,13 +821,13 @@ fn draw(frame: &mut Frame, app: &mut App, theme: Theme) {
 
     render_header(frame, chunks[0], theme);
     table::render(frame, chunks[1], app, theme);
-    details::render_panel(frame, chunks[2], app, theme);
+    details::render_panel(frame, chunks[2], app, theme, details_text);
     render_status(frame, chunks[3], app, theme);
 
     let modal_area = centered_rect(76, 76, area);
     match app.modal() {
         Modal::None => {}
-        Modal::Details => details::render_modal(frame, modal_area, app, theme),
+        Modal::Details => details::render_modal(frame, modal_area, app, theme, details_text),
         Modal::Help => help::render(frame, centered_rect(90, 90, area), app, theme),
         Modal::ConfirmKill => confirm::render(frame, modal_area, app, theme),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -940,7 +954,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// the kill-confirmation modal so those panels stay visually consistent. It
 /// lives in the parent module so all panels use the same label style and
 /// separator.
-fn field(label: &'static str, value: String, theme: Theme) -> Line<'static> {
+fn field<'a>(label: &'static str, value: impl Into<Cow<'a, str>>, theme: Theme) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("{label}: "), theme.label()),
         Span::raw(value),

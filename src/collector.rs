@@ -2,7 +2,7 @@
 //!
 //! Platform collectors implement one interface consumed by the CLI and TUI.
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(any(test, target_os = "linux"))]
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::model::{PortEntry, Protocol};
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(test)]
 use crate::observation::{
     EndpointIdentity, EvidenceGap, Ipv6Scope, MetadataCompleteness, ProcessIdentity,
     ProcessObservation, ProcessStartMarker, SocketObservation,
@@ -88,23 +88,12 @@ pub(crate) fn collect_snapshot(
             profile,
         )
     }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    {
-        FakeCollector.collect(profile)
-    }
 }
 
 /// Collect one snapshot and return owned legacy rows that outlive it.
 ///
-/// The owned projection exists because this function drops its snapshot. The
-/// TUI stores rows across frames, while kill seams re-collect through closures
-/// that return after the snapshot is dropped. Callers that hold a live snapshot
-/// should project `PortEntryView` from it instead.
-pub(crate) fn collect_ports() -> Result<Vec<PortEntry>, CollectorError> {
-    collect_ports_with_profile(MetadataProfile::LegacyList)
-}
-
+/// Kill seams return after dropping the snapshot. Callers that retain their
+/// snapshot should borrow `PortEntryView` instead.
 pub(crate) fn collect_ports_with_profile(
     profile: MetadataProfile,
 ) -> Result<Vec<PortEntry>, CollectorError> {
@@ -118,13 +107,6 @@ pub(crate) fn collect_kill_ports(
 ) -> Result<Vec<PortEntry>, CollectorError> {
     let snapshot = collect_snapshot(MetadataProfile::Display)?;
     kill_ports_from_snapshot(&snapshot, pid, port)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn collect_target_ports(pid: u32) -> Result<Vec<PortEntry>, CollectorError> {
-    let snapshot = collect_snapshot(MetadataProfile::Display)?;
-    crate::observation::project_legacy_target(&snapshot, Some(pid), None)
-        .map_err(CollectorError::from)
 }
 
 /// Project the rows a destructive command is allowed to act on, or refuse.
@@ -377,15 +359,14 @@ impl CollectorError {
     }
 }
 
-/// Deterministic rows for tests and the fallback collector on
-/// platforms that don't have a native one yet.
+/// Deterministic rows for tests.
 ///
 /// The rows cover full and partial metadata, a default-protected name, IPv6,
 /// and a bound UDP socket.
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(test)]
 pub(crate) struct FakeCollector;
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(test)]
 impl Collector for FakeCollector {
     fn collect(&self, profile: MetadataProfile) -> Result<NetworkSnapshot, CollectorError> {
         Ok(fake_snapshot(profile)?)
@@ -477,7 +458,7 @@ where
 
 /// Deterministic authoritative fixture. It is built in snapshot form so tests
 /// exercise the same borrowed projection as native collectors.
-#[cfg(any(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+#[cfg(test)]
 #[expect(
     clippy::too_many_lines,
     reason = "the five-row authoritative fixture keeps all snapshot facts together"

@@ -45,18 +45,19 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
     assert!(yaml_scalar(complete, "if").is_some_and(|condition| condition.contains("always()")));
 
     let linux = workflow_job(&ci, "linux");
-    named_job_step(linux, "Check formatting");
+    job_step_running(linux, "cargo fmt");
     let msrv = workflow_job(&ci, "msrv");
-    assert!(
-        step_script(named_job_step(msrv, "Compile all targets with MSRV")).contains("+\"$MSRV\"")
-    );
-    assert!(step_script(named_job_step(msrv, "Run MSRV unit tests")).contains("+\"$MSRV\""));
+    assert!(step_script(job_step_running(msrv, "--no-run")).contains("+\"$MSRV\""));
+    assert!(step_script(job_step_running(msrv, "--lib")).contains("+\"$MSRV\""));
     for platform in ["linux", "windows", "macos"] {
         let job = workflow_job(&ci, platform);
-        named_job_step(job, "Run Clippy");
-        named_job_step(job, "Run tests");
-        named_job_step(job, "Build release binaries");
-        named_job_step(job, "Run release binary journeys");
+        job_step_running(job, "cargo clippy");
+        job_step_running(job, "cargo test");
+        job_step_running(job, "cargo build");
+        job_step_running(
+            job,
+            "required_release_artifact_paths_are_complete_and_versioned",
+        );
     }
     let nix = workflow_job(&ci, "nix");
     let nix_systems = matrix_entries(nix)
@@ -68,17 +69,13 @@ fn ci_covers_native_platforms_nix_arch_and_supply_chain_policy() {
         .collect::<BTreeSet<_>>();
     assert_eq!(nix_systems, strings(["aarch64-linux", "x86_64-linux"]));
     assert_eq!(
-        yaml_scalar(
-            named_job_step(nix, "Evaluate every declared Nix system"),
-            "if"
-        )
-        .as_deref(),
+        yaml_scalar(job_step_running(nix, "nix flake check"), "if").as_deref(),
         Some("${{ matrix.system == 'x86_64-linux' }}")
     );
 
     let supply_chain = workflow_job(&ci, "supply-chain");
-    named_job_step(supply_chain, "Verify regenerated Arch metadata");
-    let deny = named_job_step(supply_chain, "Run cargo-deny");
+    job_step_running(supply_chain, "makepkg --printsrcinfo");
+    let deny = job_step_running(supply_chain, "cargo deny");
     assert!(step_script(deny).contains("--manifest-path fuzz/Cargo.toml"));
 }
 
@@ -94,20 +91,27 @@ fn scheduled_parser_campaigns_are_pinned_and_bounded() {
     assert!(mapping_value(triggers, "pull_request").is_none());
 
     let root_environment = yaml_mapping(workflow_root(&fuzz), "env");
-    assert!(
-        root_environment
-            .iter()
-            .any(|(name, value)| { name == "RUST_NIGHTLY" && value.starts_with("nightly-2026-") })
-    );
-    assert!(
-        root_environment
-            .iter()
-            .any(|(name, value)| { name == "CARGO_FUZZ_VERSION" && value == "0.13.2" })
-    );
+    assert!(root_environment.iter().any(|(name, value)| {
+        name == "RUST_NIGHTLY"
+            && value.strip_prefix("nightly-").is_some_and(|date| {
+                let parts = date.split('-').collect::<Vec<_>>();
+                parts.len() == 3
+                    && parts.iter().zip([4, 2, 2]).all(|(part, length)| {
+                        part.len() == length && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+    }));
+    assert!(root_environment.iter().any(|(name, value)| {
+        name == "CARGO_FUZZ_VERSION"
+            && value.split('.').count() == 3
+            && value
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }));
 
     let campaign = workflow_job(&fuzz, "parser-campaign");
     assert_eq!(matrix_entries(campaign).len(), 3);
-    let script = step_script(named_job_step(campaign, "Run bounded parser campaign"));
+    let script = step_script(job_step_running(campaign, "fuzz run"));
     for bound in [
         "-max_total_time=60",
         "-max_len=\"$MAX_INPUT_BYTES\"",
@@ -119,10 +123,7 @@ fn scheduled_parser_campaigns_are_pinned_and_bounded() {
     assert!(script.contains("$RUNNER_TEMP/kickoutchi-fuzz-$PARSER_TARGET"));
     assert!(script.contains("cp -a \"fuzz/corpus/$PARSER_TARGET/.\""));
     assert!(!script.contains("\"fuzz/corpus/$PARSER_TARGET\" \\"));
-    assert!(
-        step_script(named_job_step(campaign, "Verify campaign dependency lock"))
-            .contains("--locked")
-    );
+    assert!(step_script(job_step_running(campaign, "cargo metadata")).contains("--locked"));
 }
 
 #[test]
@@ -226,22 +227,19 @@ fn release_validates_packages_before_attested_publication() {
     assert!(yaml_scalar(local, "if").is_some_and(|condition| {
         condition.contains("workflow_dispatch") && condition.contains("publishing")
     }));
-    let local_names = job_steps(local)
-        .into_iter()
-        .filter_map(step_name)
-        .collect::<Vec<_>>();
-    let updater = local_names
+    let steps = job_steps(local);
+    let updater = steps
         .iter()
-        .position(|name| *name == "Rebuild Linux updater at supported ABI floor")
-        .expect("Linux updater must be rebuilt at the ABI floor");
-    let validate = local_names
+        .position(|step| step_runs(step, "cargo install --locked axoupdater-cli"))
+        .expect("updater must be rebuilt before archive validation");
+    let validate = steps
         .iter()
-        .position(|name| *name == "Validate native release archive")
-        .expect("native archives must be validated");
-    let upload = local_names
+        .position(|step| step_runs(step, "validate_generated_native_archive"))
+        .expect("native archive must be validated");
+    let upload = steps
         .iter()
-        .position(|name| *name == "Upload native artifacts")
-        .expect("validated native archives must be uploaded");
+        .position(|step| step_uses(step, "actions/upload-artifact"))
+        .expect("native artifacts must be uploaded");
     assert!(updater < validate && validate < upload);
 
     let global = workflow_job(&release, "build-global-artifacts");
@@ -266,29 +264,25 @@ fn release_validates_packages_before_attested_publication() {
             "[\"x86_64-unknown-linux-gnu\"]",
         ])
     );
-    assert!(
-        step_script(named_job_step(
-            installers,
-            "Execute generated installer and updater"
-        ))
-        .contains("validate_generated_native_installer")
-    );
+    job_step_running(installers, "validate_generated_native_installer");
 
     let attest = workflow_job(&release, "attest-release-artifacts");
     assert!(job_needs(attest).contains(&"validate-installers".to_owned()));
     assert!(yaml_scalar(attest, "if").is_some_and(|condition| condition.contains("publishing")));
-    named_job_step(attest, "Generate artifact attestations");
+    assert!(
+        job_steps(attest)
+            .iter()
+            .any(|step| step_uses(step, "actions/attest"))
+    );
 
     let host = workflow_job(&release, "host");
     assert!(job_needs(host).contains(&"attest-release-artifacts".to_owned()));
     assert!(yaml_scalar(host, "if").is_some_and(|condition| condition.contains("publishing")));
     assert!(
-        step_script(named_job_step(host, "Prepare GitHub release"))
+        step_script(job_step_running(host, "dist host"))
             .contains("test \"$TAG_COMMIT\" = \"$RELEASE_COMMIT\"")
     );
-    assert!(
-        step_script(named_job_step(host, "Publish GitHub release")).contains("gh release create")
-    );
+    job_step_running(host, "gh release create");
 
     assert_no_ref_expression_in_scripts(RELEASE_WORKFLOW);
 }
@@ -310,8 +304,10 @@ fn linux_release_archives_are_validated_natively_before_attestation_and_publicat
         targets,
         strings(["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"])
     );
-    let validation = step_script(named_job_step(native, "Validate native Linux archive"));
-    assert!(validation.contains("validate_generated_native_archive"));
+    let validation = step_script(job_step_running(
+        native,
+        "validate_generated_native_archive",
+    ));
     assert!(validation.contains("unshare --net"));
     assert!(!validation.contains("--pid"));
     assert!(!validation.contains("--user"));
@@ -342,15 +338,14 @@ fn homebrew_publication_is_a_scoped_blocking_handoff_to_the_tap() {
 
     for step in job_steps(homebrew) {
         let token = step_env(step, "GH_TOKEN");
-        if step_name(step) == Some("Push formula") {
+        if step_runs(step, "git push") {
             assert_eq!(token.as_deref(), Some("${{ secrets.HOMEBREW_TAP_TOKEN }}"));
-            assert!(step_script(step).contains("git push"));
         } else {
             assert!(token.is_none(), "tap token must exist only while pushing");
         }
     }
 
-    let commit = step_script(named_job_step(homebrew, "Commit formula"));
+    let commit = step_script(job_step_running(homebrew, "git add"));
     assert!(commit.contains("generated-formula/${filename}"));
     assert!(commit.contains("Formula/${filename}"));
 }

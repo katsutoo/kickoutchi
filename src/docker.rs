@@ -46,8 +46,6 @@ const LINUX_STATUS_READ_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_LOCAL_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 #[cfg(windows)]
 const DEFAULT_LOCAL_DOCKER_HOST: &str = "npipe:////./pipe/docker_engine";
-#[cfg(not(any(unix, windows)))]
-const DEFAULT_LOCAL_DOCKER_HOST: &str = "";
 
 const DOCKER_PROCESS_NAMES: &[&str] = &[
     "docker",
@@ -223,9 +221,6 @@ fn docker_host_is_local(host: &str) -> bool {
     {
         normalize_windows_npipe_host(host).is_some()
     }
-
-    #[cfg(not(any(unix, windows)))]
-    false
 }
 
 #[cfg(any(windows, test))]
@@ -413,11 +408,6 @@ pub(crate) fn process_is_elevated() -> bool {
         )
     };
     queried == 0 || returned_bytes != expected_bytes || elevation.TokenIsElevated != 0
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn process_is_elevated() -> bool {
-    false
 }
 
 #[derive(Debug)]

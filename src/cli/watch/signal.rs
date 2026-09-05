@@ -136,19 +136,3 @@ impl Drop for WatchSignalGuard {
         }
     }
 }
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) struct WatchSignalGuard {
-    _private: (),
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-impl WatchSignalGuard {
-    pub(crate) const fn cancelled() -> bool {
-        false
-    }
-
-    pub(crate) fn install() -> io::Result<Self> {
-        Ok(Self { _private: () })
-    }
-}

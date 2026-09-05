@@ -20,10 +20,26 @@ extern "C" fn custom_sigterm_handler(_: libc::c_int) {
 }
 
 fn render_text(app: &mut App, width: u16, height: u16) -> String {
+    render_text_cached(
+        app,
+        width,
+        height,
+        &mut super::details::TextCache::default(),
+    )
+}
+
+fn render_text_cached(
+    app: &mut App,
+    width: u16,
+    height: u16,
+    cache: &mut super::details::TextCache,
+) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test backend must initialize");
     terminal
-        .draw(|frame| draw(frame, app, Theme::from_environment()))
+        .draw(|frame| {
+            draw(frame, app, Theme::from_environment(), cache);
+        })
         .expect("test frame must draw");
 
     let buffer = terminal.backend().buffer();
@@ -62,6 +78,12 @@ fn protected_details_render_one_warning_and_keep_permission_at_minimum_size() {
         ..Config::default()
     };
     let mut app = App::new_fake(&config);
+    let mut row =
+        crate::test_support::port_entry(3000, Some(42), crate::model::Protocol::Tcp, "node");
+    row.executable_path =
+        Some(std::path::PathBuf::from(format!("/{}", "long-path/".repeat(1024))).into());
+    row.command_line = Some("hidden command ".repeat(8192).into());
+    app.apply_test_rows(vec![row], std::time::Instant::now());
 
     let text = render_text(&mut app, 80, 20);
 
@@ -71,6 +93,10 @@ fn protected_details_render_one_warning_and_keep_permission_at_minimum_size() {
         "{text}",
     );
     assert!(text.contains("Permission: full"), "{text}");
+    assert!(
+        !text.contains("Command:"),
+        "hidden fields cannot displace the warning"
+    );
 }
 
 #[test]
@@ -755,4 +781,42 @@ fn small_terminal_cancels_a_tree_confirmation() {
     assert_eq!(app.kill_status(), Some("tree kill cancelled"));
     app.apply_action(Action::SubmitKillConfirmation);
     assert_eq!(app.modal(), Modal::None);
+}
+
+#[test]
+fn details_cache_tracks_selection_refresh_and_missing_metadata() {
+    use crate::model::Protocol;
+    use crate::test_support::port_entry;
+    let mut first = port_entry(3000, Some(42), Protocol::Tcp, "first");
+    first.command_line = Some("first-command".into());
+    first.executable_path = Some(std::path::PathBuf::from("/first-path").into());
+    let mut second = port_entry(4000, Some(43), Protocol::Tcp, "second");
+    second.command_line = Some("second-command".into());
+    second.executable_path = Some(std::path::PathBuf::from("/second-path").into());
+    let mut app = App::new_fake(&Config::default());
+    app.apply_test_rows(vec![first, second.clone()], std::time::Instant::now());
+    let mut cache = super::details::TextCache::default();
+    let initial = render_text_cached(&mut app, 100, 30, &mut cache);
+    assert!(initial.contains("Command: first-command"));
+    assert!(initial.contains("Path: /first-path"));
+    app.apply_action(Action::MoveDown);
+    let selected = render_text_cached(&mut app, 100, 30, &mut cache);
+    assert!(selected.contains("Command: second-command"));
+    assert!(!selected.contains("first-command"));
+
+    // Same PID and start identity, new immutable metadata from a refresh.
+    second.command_line = Some("changed\x1b[31m-command\x1b[0m".into());
+    second.executable_path = None;
+    app.apply_test_rows(vec![second.clone()], std::time::Instant::now());
+    let refreshed = render_text_cached(&mut app, 100, 30, &mut cache);
+    assert!(refreshed.contains("Command: changed-command"));
+    assert!(refreshed.contains("Path: -"));
+    assert!(!refreshed.contains("second-command"));
+    assert!(!refreshed.contains("second-path"));
+
+    second.command_line = None;
+    app.apply_test_rows(vec![second], std::time::Instant::now());
+    let missing = render_text_cached(&mut app, 100, 30, &mut cache);
+    assert!(missing.contains("Command: -"));
+    assert!(!missing.contains("changed-command"));
 }
