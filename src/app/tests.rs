@@ -444,13 +444,22 @@ fn windows_terminate_key_uses_yes_confirmation() {
 
 #[test]
 fn protected_process_uses_stronger_confirmation() {
-    let mut app = app_with_rows(vec![entry(5432, Some("postgres"))]);
+    // A port-derived PID can equal the test runner's own PID on CI. That
+    // correctly trips the self-kill guard instead of reaching confirmation.
+    let pid = std::process::id()
+        .checked_add(1)
+        .expect("fixture PID fits u32");
+    let mut app = app_with_rows(vec![port_entry(5432, Some(pid), Protocol::Tcp, "postgres")]);
+    finish_selected_context(&mut app, context(55));
 
     app.apply_action(Action::RequestTerminate);
 
-    let confirmation = app
-        .kill_confirmation()
-        .expect("protected target still opens confirmation");
+    let confirmation = app.kill_confirmation().unwrap_or_else(|| {
+        panic!(
+            "protected target must open confirmation: {:?}",
+            app.kill_status()
+        )
+    });
     assert!(confirmation.target.protected);
     assert_eq!(
         confirmation.requirement,
