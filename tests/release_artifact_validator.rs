@@ -1,11 +1,16 @@
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::str;
+use std::time::Duration;
+
+#[path = "support/command.rs"]
+mod command;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use tar::Archive;
 use xz4rust::{XzDecoder, XzReader};
@@ -14,6 +19,12 @@ use zip::ZipArchive;
 #[path = "../src/release_archive_path.rs"]
 mod release_archive_path;
 use release_archive_path::safe_member_name;
+
+// Installers use local artifacts, but extraction and PowerShell startup need
+// more time than a binary version check on the slowest supported runner.
+const RELEASE_COMMAND_WAIT: Duration = Duration::from_mins(2);
+const BINARY_COMMAND_WAIT: Duration = Duration::from_secs(10);
+const ARCHIVE_JOURNEY_WAIT: Duration = Duration::from_mins(15);
 
 const ARCHIVE_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const BINARY_BYTES_MAX: u64 = 256 * 1024 * 1024;
@@ -495,16 +506,22 @@ fn validate_glibc_requirements(output: &str) -> ValidationResult<Vec<u32>> {
     Ok(maximum)
 }
 
-fn run_command(command: &mut Command, description: &str) -> ValidationResult<Output> {
-    command
-        .stdin(Stdio::null())
-        .output()
+fn run_command(
+    command: &mut Command,
+    description: &str,
+    wait: Duration,
+) -> ValidationResult<Output> {
+    command::run_command_with_deadline(command.stdin(Stdio::null()), None, wait)
         .map_err(|error| format!("could not execute {description}: {error}"))
 }
 
 fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
     let description = format!("{} --version", binary.display());
-    let output = run_command(Command::new(binary).arg("--version"), &description)?;
+    let output = run_command(
+        Command::new(binary).arg("--version"),
+        &description,
+        BINARY_COMMAND_WAIT,
+    )?;
     let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| format!("version output was not UTF-8 for {}", binary.display()))?;
     let stderr = str::from_utf8(&output.stderr)
@@ -522,7 +539,11 @@ fn run_version(binary: &Path, expected_version: &str) -> ValidationResult<()> {
 
 fn run_updater_help(updater: &Path) -> ValidationResult<()> {
     let description = format!("{} --help", updater.display());
-    let output = run_command(Command::new(updater).arg("--help"), &description)?;
+    let output = run_command(
+        Command::new(updater).arg("--help"),
+        &description,
+        BINARY_COMMAND_WAIT,
+    )?;
     let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| format!("updater help was not UTF-8 for {}", updater.display()))?;
     if !output.status.success() || !stdout.contains("Usage:") || !stdout.contains("--tag") {
@@ -595,6 +616,7 @@ fn inspect_glibc_abi(binary: &Path) -> ValidationResult<()> {
             .arg(binary)
             .env("LC_ALL", "C"),
         &description,
+        BINARY_COMMAND_WAIT,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -629,10 +651,7 @@ fn run_archive_journeys(canonical: &Path, short: &Path, runner_os: &str) -> Vali
         ])
         .env("KICKOUTCHI_RELEASE_E2E_REQUIRED", "1")
         .env("KICKOUTCHI_E2E_KICKOUTCHI", canonical)
-        .env("KICKOUTCHI_E2E_KICK", short)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .env("KICKOUTCHI_E2E_KICK", short);
     let release_container = matches!(
         std::env::var("KICKOUTCHI_RELEASE_CONTAINER").as_deref(),
         Ok("1")
@@ -640,12 +659,19 @@ fn run_archive_journeys(canonical: &Path, short: &Path, runner_os: &str) -> Vali
     if runner_os == "Linux" && !release_container {
         command.env("KICKOUTCHI_REQUIRE_LINUX_CAPABILITIES", "1");
     }
-    let status = command
-        .status()
-        .map_err(|error| format!("could not run release archive journeys: {error}"))?;
-    if !status.success() {
+    let output = run_command(
+        &mut command,
+        "release archive journeys",
+        ARCHIVE_JOURNEY_WAIT,
+    )?;
+    io::stdout()
+        .write_all(&output.stdout)
+        .and_then(|()| io::stderr().write_all(&output.stderr))
+        .map_err(|error| format!("could not write archive journey output: {error}"))?;
+    if !output.status.success() {
         return Err(format!(
-            "release archive journeys failed with status {status}"
+            "release archive journeys failed with status {}",
+            output.status
         ));
     }
     Ok(())
@@ -894,7 +920,11 @@ fn validate_generated_installer(
         &install_root,
         Some(&local_url),
     );
-    let output = run_command(&mut command, "generated release installer")?;
+    let output = run_command(
+        &mut command,
+        "generated release installer",
+        RELEASE_COMMAND_WAIT,
+    )?;
     if !output.status.success() {
         return Err(format!(
             "generated installer failed: status={}, stdout={:?}, stderr={:?}",
@@ -1044,6 +1074,65 @@ fn validate_generated_native_installer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess fixture; invoked explicitly by validator runner tests"]
+    fn validator_command_helper() {
+        match std::env::var("KICKOUTCHI_VALIDATOR_COMMAND_HELPER").as_deref() {
+            Ok("stdout") => {
+                let bytes =
+                    vec![0xa5; usize::try_from(command::COMMAND_OUTPUT_BYTES_MAX + 1).unwrap()];
+                let _ = io::stdout().write_all(&bytes);
+            }
+            Ok("stderr") => {
+                let bytes =
+                    vec![0xa5; usize::try_from(command::COMMAND_OUTPUT_BYTES_MAX + 1).unwrap()];
+                let _ = io::stderr().write_all(&bytes);
+            }
+            Ok("park") => std::thread::sleep(Duration::from_secs(30)),
+            _ => {}
+        }
+    }
+
+    fn helper_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::validator_command_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KICKOUTCHI_VALIDATOR_COMMAND_HELPER", mode);
+        command
+    }
+
+    #[test]
+    fn validator_rejects_oversized_stdout_and_stderr() {
+        for stream in ["stdout", "stderr"] {
+            let Err(error) = run_command(
+                &mut helper_command(stream),
+                "validator probe",
+                BINARY_COMMAND_WAIT,
+            ) else {
+                panic!("oversized validator {stream} must fail");
+            };
+            assert!(error.contains("validator probe"), "{error}");
+            assert!(error.contains("byte limit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn validator_reports_command_deadline_with_context() {
+        let error = run_command(
+            &mut helper_command("park"),
+            "validator probe",
+            Duration::from_millis(100),
+        )
+        .expect_err("stuck validator command must fail");
+        assert!(error.contains("validator probe"), "{error}");
+        assert!(error.contains("exit deadline"), "{error}");
+    }
 
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";

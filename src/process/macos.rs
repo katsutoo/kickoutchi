@@ -229,6 +229,10 @@ pub(super) fn terminate_handle_checked_platform(
     if target.process_start_time_marker != Some(handle.process_start_time_marker) {
         return TerminationOutcome::TargetChanged;
     }
+    let cancellation = match super::cancellation::KillCancellationGuard::block() {
+        Ok(guard) => guard,
+        Err(error) => return TerminationOutcome::UnknownFailure(error.to_string()),
+    };
     let stop_deadline = std::time::Instant::now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
     let transitioned =
         match macos_stop_process(handle.pid, target.process_start_time_marker, stop_deadline) {
@@ -263,6 +267,9 @@ pub(super) fn terminate_handle_checked_platform(
         transitioned,
         fresh,
         |mode| {
+            if let Err(error) = cancellation.check() {
+                return TerminationOutcome::UnknownFailure(error.to_string());
+            }
             let signal = unix_signal(mode);
             let result = unsafe {
                 // SAFETY: pid is range checked and signal is one of two fixed values.

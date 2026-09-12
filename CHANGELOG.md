@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-09-12
+
+### Fixed
+
+- Unix process, tree, and group kills defer Ctrl-C, SIGTERM, and SIGHUP while
+  targets are frozen. Interruption before delivery aborts the kill and resumes
+  only processes Kickoutchi stopped. Once delivery starts, the bounded delivery
+  and cleanup sequence finishes before the pending signal takes effect.
+- Release artifact and installer checks now share the CLI tests' bounded
+  subprocess runner. Each output stream is limited to 8 MiB; binary checks have
+  a 10-second deadline and local installer checks have a two-minute deadline.
+  The nested archive CLI suite has a 15-minute deadline. Timed-out child
+  processes are killed and reaped.
+
+### Changed
+
+- Added real-binary interruption regressions for single-process, tree, and group
+  kills, including interruption after SIGTERM is queued and preservation of an
+  already-stopped child. Native Unix tests also verify signal-handler and mask
+  restoration. Validator regressions cover oversized stdout/stderr and timeout
+  diagnostics.
+
 ## [1.4.3] - 2026-09-05
 
 ### Changed
@@ -1529,7 +1551,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tracing` diagnostics routed to stderr only, never the TUI surface.
 - Unit tests for the quit predicate, including the key-release edge case.
 
-[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.3...HEAD
+[Unreleased]: https://github.com/nuggocto/kickoutchi/compare/v1.4.4...HEAD
+[1.4.4]: https://github.com/nuggocto/kickoutchi/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/nuggocto/kickoutchi/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/nuggocto/kickoutchi/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/nuggocto/kickoutchi/compare/v1.4.0...v1.4.1

@@ -944,6 +944,9 @@ use macos::{prepare_termination_platform, terminate_handle_checked_platform};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{tree_deliver_by_pid, tree_prepare_delivery_probe, tree_stop};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod cancellation;
+
 #[cfg(target_os = "linux")]
 mod linux;
 

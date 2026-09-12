@@ -63,6 +63,10 @@ pub(super) fn terminate_handle_checked_platform(
     protected_names: &[String],
     mode: KillMode,
 ) -> TerminationOutcome {
+    let cancellation = match super::cancellation::KillCancellationGuard::block() {
+        Ok(guard) => guard,
+        Err(error) => return TerminationOutcome::UnknownFailure(error.to_string()),
+    };
     let stop_deadline = std::time::Instant::now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
     let transitioned = match linux_stop_pidfd(
         handle.pid,
@@ -100,6 +104,9 @@ pub(super) fn terminate_handle_checked_platform(
         transitioned,
         target.process_start_time_marker,
         |_| {
+            if let Err(error) = cancellation.check() {
+                return TerminationOutcome::UnknownFailure(error.to_string());
+            }
             linux_pidfd_signal(handle, signal)
                 .map_or_else(|outcome| outcome, |()| TerminationOutcome::Success)
         },

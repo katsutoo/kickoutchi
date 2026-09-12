@@ -12,6 +12,8 @@ use crate::model::Platform;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::observation::ProcessStartMarker;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::process::cancellation::KillCancellationGuard;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process::{
     KillMode, KillTarget, UNIX_STOP_ACKNOWLEDGEMENT_MAX, current_user_id, unsafe_pid_reason,
 };
@@ -338,6 +340,10 @@ pub(crate) fn execute_group_kill<Ops: TreeProcessOps>(
 /// deepest-first/root-last, or group members with every terminating signal
 /// queued before any continue.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep freeze, cancellation, verification, delivery, and rollback ordering together"
+)]
 fn execute_freeze_kill<Ops: TreeProcessOps>(
     root: &KillTarget,
     scope: SweepScope,
@@ -363,6 +369,10 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
     });
 
     let stop_deadline = ops.stop_acknowledgement_now() + UNIX_STOP_ACKNOWLEDGEMENT_MAX;
+    let cancellation = match KillCancellationGuard::block() {
+        Ok(guard) => guard,
+        Err(error) => return TreeKillOutcome::SnapshotFailed(error.to_string()),
+    };
 
     // Stop the root before anything else: while it remains stopped it cannot
     // fork on its own, normally freezing growth before we inspect membership.
@@ -434,10 +444,11 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
         }
     };
 
-    let convergence_snapshot = match freeze_sweep(&mut frozen, scope, stop_deadline, ops) {
-        Ok(snapshot) => snapshot,
-        Err(outcome) => return refuse_after_thaw(outcome, &frozen, ops),
-    };
+    let convergence_snapshot =
+        match freeze_sweep(&mut frozen, scope, stop_deadline, &cancellation, ops) {
+            Ok(snapshot) => snapshot,
+            Err(outcome) => return refuse_after_thaw(outcome, &frozen, ops),
+        };
     if let Err(outcome) = verify_frozen_identities(&mut frozen, scope, &convergence_snapshot) {
         return refuse_after_thaw(outcome, &frozen, ops);
     }
@@ -453,6 +464,17 @@ fn execute_freeze_kill<Ops: TreeProcessOps>(
         return refuse_after_thaw(outcome, &frozen, ops);
     }
 
+    if let Err(error) = cancellation.check() {
+        return refuse_after_thaw(
+            TreeKillOutcome::SnapshotFailed(error.to_string()),
+            &frozen,
+            ops,
+        );
+    }
+
+    // Once delivery starts, finish the bounded batch and its cleanup before
+    // unblocking signals. In particular, a group must queue all terminating
+    // signals before any member resumes.
     TreeKillOutcome::Completed(signal_tree(&mut frozen, scope, mode, ops))
 }
 
@@ -533,10 +555,14 @@ fn freeze_sweep<Ops: TreeProcessOps>(
     frozen: &mut Vec<FrozenNode>,
     scope: SweepScope,
     stop_deadline: std::time::Instant,
+    cancellation: &KillCancellationGuard,
     ops: &mut Ops,
 ) -> Result<Vec<TreeProcessInfo>, TreeKillOutcome> {
     let member_cap = scope.member_cap();
     for _ in 0..MAX_FREEZE_PASSES {
+        cancellation
+            .check()
+            .map_err(|error| TreeKillOutcome::SnapshotFailed(error.to_string()))?;
         let snapshot = ops.snapshot().map_err(TreeKillOutcome::SnapshotFailed)?;
         let index =
             ProcessTreeIndex::new(&snapshot, PROCESS_TREE_INDEX_MAX).map_err(
@@ -566,6 +592,9 @@ fn freeze_sweep<Ops: TreeProcessOps>(
             }
             discovered_in_pass = true;
             for member in discovered {
+                cancellation
+                    .check()
+                    .map_err(|error| TreeKillOutcome::SnapshotFailed(error.to_string()))?;
                 if frozen.len() >= member_cap {
                     return Err(TreeKillOutcome::Truncated { limit: member_cap });
                 }

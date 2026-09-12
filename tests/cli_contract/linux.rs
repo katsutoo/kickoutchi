@@ -1,5 +1,9 @@
 include!("../support/linux.rs");
 
+#[cfg(target_env = "gnu")]
+#[path = "linux/cancellation.rs"]
+mod cancellation;
+
 #[path = "linux/inspect.rs"]
 mod inspect;
 #[path = "linux/kill.rs"]

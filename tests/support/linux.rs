@@ -763,6 +763,39 @@ fn spawn_listener_process_with_options(
     (guard, port, ready_file)
 }
 
+fn spawn_group_process() -> (ChildGuard, u16, u32, PathBuf) {
+    let ready_file = temp_file_path("group-ready");
+    let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
+        .env(HELPER_TREE_ENV, "group-orphan")
+        .env(HELPER_READY_ENV, &ready_file)
+        .args([
+            "--exact",
+            "linux::helper_process_tree",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("group helper process must start");
+    let guard = ChildGuard { child };
+    wait_for_file(&ready_file);
+    let ready = fs::read_to_string(&ready_file).expect("group ready file must be readable");
+    let mut parts = ready.split_whitespace();
+    let port = parts
+        .next()
+        .expect("ready file must contain port")
+        .parse::<u16>()
+        .expect("group helper port must be a u16");
+    let orphan_pid = parts
+        .next()
+        .expect("ready file must contain orphan pid")
+        .parse::<u32>()
+        .expect("group orphan pid must be a u32");
+    (guard, port, orphan_pid, ready_file)
+}
+
+
 fn spawn_tree_process(mode: &str) -> (ChildGuard, u16, u32, PathBuf) {
     let ready_file = temp_file_path("tree-ready");
     let child = Command::new(std::env::current_exe().expect("test binary path must resolve"))
