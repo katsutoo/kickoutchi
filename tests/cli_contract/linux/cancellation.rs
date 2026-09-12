@@ -13,23 +13,7 @@ fn interrupt_after_signal(
     let config = super::super::TemporaryDirectory::new("interrupt-kill");
     let config_path = config.path().join("config.toml");
     fs::write(&config_path, "").unwrap();
-    let mut command = Command::new(kick_binary());
-    command
-        .arg("--config")
-        .arg(config_path)
-        .args(["kill", "--pid", &target_pid.to_string(), "--yes"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(scope) = scope {
-        command.arg(scope);
-    }
-    // SAFETY: the post-fork callback calls only async-signal-safe libc APIs.
-    // TRACEME allows this test to trace only its own child, starting at exec.
-    unsafe {
-        command.pre_exec(trace_pidfd_signals);
-    }
-    let mut child = CommandChild(Some(command.spawn().expect("traced CLI must start")));
+    let mut child = spawn_traced_kill(target_pid, scope, &config_path);
     let pid = libc::pid_t::try_from(child.child_mut().id()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     wait_for_trace_stop(pid, deadline, &mut child);
@@ -121,6 +105,41 @@ fn interrupt_after_signal(
         .expect("interrupted CLI must exit after cleanup");
     assert_eq!(output.status.signal(), Some(interrupt), "{output:?}");
     output
+}
+
+fn spawn_traced_kill(target_pid: u32, scope: Option<&str>, config_path: &Path) -> CommandChild {
+    let mut command = Command::new(kick_binary());
+    command
+        .arg("--config")
+        .arg(config_path)
+        .args(["kill", "--pid", &target_pid.to_string()])
+        .stdin(if scope == Some("--group") {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(scope) = scope {
+        command.arg(scope);
+    }
+    if scope != Some("--group") {
+        command.arg("--yes");
+    }
+    // SAFETY: the post-fork callback calls only async-signal-safe libc APIs.
+    // TRACEME allows this test to trace only its own child, starting at exec.
+    unsafe {
+        command.pre_exec(trace_pidfd_signals);
+    }
+    let mut child = CommandChild(Some(command.spawn().expect("traced CLI must start")));
+    if let Some(mut stdin) = child.child_mut().stdin.take() {
+        // The orphan can be classified as a service on native CI hosts. Always
+        // confirm the group explicitly, regardless of its warning profile.
+        stdin
+            .write_all(b"group\n")
+            .expect("group confirmation must be writable");
+    }
+    child
 }
 
 fn wait_for_trace_stop(
